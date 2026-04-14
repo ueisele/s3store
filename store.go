@@ -98,10 +98,11 @@ func (s *Store[T]) s3URI(key string) string {
 	return fmt.Sprintf("s3://%s/%s", s.cfg.Bucket, key)
 }
 
-// sqlQuote returns a DuckDB single-quoted string literal with
-// embedded single quotes escaped (' -> ''). Callers pass the
-// raw value; the returned string includes the surrounding
-// quotes, so it can be concatenated directly into SQL.
+// sqlQuote returns a DuckDB single-quoted string literal. Any
+// embedded apostrophe is doubled, which is the SQL standard
+// escape for a single quote inside a string literal. The
+// returned value includes the surrounding quotes and can be
+// concatenated directly into SQL.
 //
 // Used everywhere we embed a user-derived value (parquet URI,
 // error message) into a SQL string, so partition values that

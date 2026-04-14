@@ -123,9 +123,9 @@ func TestParseRefKeyInvalid(t *testing.T) {
 	cases := []string{
 		"not-a-ref-key",
 		"refs/garbage.ref",
-		"refs/1710684000000000.ref",                    // no separator
-		"refs/1710684000000000;period=X.ref",           // no '-' between ts and id
-		"refs/1710684000000000-id;period=X%ZZabc.ref",  // invalid percent escape
+		"refs/1710684000000000.ref",                   // no separator
+		"refs/1710684000000000;period=X.ref",          // no '-' between ts and id
+		"refs/1710684000000000-id;period=X%ZZabc.ref", // invalid percent escape
 	}
 	for _, raw := range cases {
 		t.Run(raw, func(t *testing.T) {

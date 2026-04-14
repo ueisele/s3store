@@ -12,10 +12,16 @@
 //
 //   - Write / WriteWithKey: append Parquet + stream ref
 //   - Poll: stream of refs (which keys changed)
-//   - PollRecords: flat stream of typed records
+//   - PollRecords: typed records for the refs Poll would
+//     return. Dedups to latest-per-key by default (Kafka
+//     compacted-topic semantics); pass WithHistory() for a
+//     pure stream of every version.
 //   - Read: typed, deduplicated snapshot with glob support
-//   - Query: DuckDB SQL with auto-dedup and schema evolution
+//   - Query / QueryRow: DuckDB SQL with auto-dedup and schema
+//     evolution
 //
-// Poll = lightweight refs. PollRecords/Read = typed []T via
-// ScanFunc. Query = *sql.Rows for aggregations and complex SQL.
+// Every read API defaults to latest-per-key deduplication and
+// accepts WithHistory() to opt out. Poll = lightweight refs.
+// PollRecords/Read = typed []T via ScanFunc. Query/QueryRow
+// = *sql.Rows / *sql.Row for aggregations and complex SQL.
 package s3store

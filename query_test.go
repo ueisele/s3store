@@ -285,7 +285,7 @@ func TestWrapScanExprShapes(t *testing.T) {
 			wantMissing: []string{"QUALIFY"},
 		},
 		{
-			name: "dedup + transforms combine correctly",
+			name:       "dedup + transforms combine correctly",
 			versionCol: "ts",
 			aliases: map[string][]string{
 				"cost": {"price"},
