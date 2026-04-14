@@ -44,7 +44,12 @@ func (s *Store[T]) Poll(
 		input.StartAfter = aws.String(string(since))
 	}
 
-	entries := make([]StreamEntry, 0, maxEntries)
+	// Lazy allocation: grow via append instead of pre-sizing
+	// to maxEntries. Avoids wasted capacity for callers that
+	// ask for a large cap but typically receive far fewer
+	// entries (and append's doubling is cheap at the sizes
+	// Poll actually returns).
+	var entries []StreamEntry
 	var lastKey string
 
 	paginator := s3.NewListObjectsV2Paginator(s.s3, input)

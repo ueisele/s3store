@@ -1,7 +1,10 @@
 package s3store
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // testRecord is the shared record type used by unit tests. The
@@ -278,6 +281,99 @@ func TestSQLQuote(t *testing.T) {
 			if got := sqlQuote(tc.in); got != tc.want {
 				t.Errorf("sqlQuote(%q) = %q, want %q",
 					tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// validNewConfig returns a Config with every required field
+// populated so each TestNewValidation sub-case can null out
+// exactly one field and trigger a specific error path. The
+// S3Client is a zero-value *s3.Client, which is non-nil (so
+// it passes validation) but never actually dialed — New's
+// error paths all return before openDuckDB runs.
+func validNewConfig() Config[testRecord] {
+	return Config[testRecord]{
+		Bucket:     "b",
+		Prefix:     "p",
+		TableAlias: "t",
+		S3Client:   &s3.Client{},
+		KeyParts:   []string{"period", "customer"},
+	}
+}
+
+func TestNewValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config[testRecord])
+		wantSub string
+	}{
+		{
+			name:    "missing Bucket",
+			mutate:  func(c *Config[testRecord]) { c.Bucket = "" },
+			wantSub: "Bucket is required",
+		},
+		{
+			name:    "missing Prefix",
+			mutate:  func(c *Config[testRecord]) { c.Prefix = "" },
+			wantSub: "Prefix is required",
+		},
+		{
+			name:    "missing TableAlias",
+			mutate:  func(c *Config[testRecord]) { c.TableAlias = "" },
+			wantSub: "TableAlias is required",
+		},
+		{
+			name:    "missing S3Client",
+			mutate:  func(c *Config[testRecord]) { c.S3Client = nil },
+			wantSub: "S3Client is required",
+		},
+		{
+			name:    "missing KeyParts",
+			mutate:  func(c *Config[testRecord]) { c.KeyParts = nil },
+			wantSub: "KeyParts is required",
+		},
+		{
+			name: "KeyPart is empty",
+			mutate: func(c *Config[testRecord]) {
+				c.KeyParts = []string{"period", ""}
+			},
+			wantSub: "is empty",
+		},
+		{
+			name: "KeyPart contains equals",
+			mutate: func(c *Config[testRecord]) {
+				c.KeyParts = []string{"period", "cust=bad"}
+			},
+			wantSub: "must not contain '=' or '/'",
+		},
+		{
+			name: "KeyPart contains slash",
+			mutate: func(c *Config[testRecord]) {
+				c.KeyParts = []string{"per/iod", "customer"}
+			},
+			wantSub: "must not contain '=' or '/'",
+		},
+		{
+			name: "KeyParts contains duplicate",
+			mutate: func(c *Config[testRecord]) {
+				c.KeyParts = []string{"period", "period"}
+			},
+			wantSub: "is duplicated",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validNewConfig()
+			tc.mutate(&cfg)
+			_, err := New(cfg)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if tc.wantSub != "" &&
+				!strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q did not contain %q",
+					err.Error(), tc.wantSub)
 			}
 		})
 	}

@@ -2,6 +2,8 @@ package s3store
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/parquet-go/parquet-go"
@@ -105,7 +107,10 @@ func TestEncodeParquet(t *testing.T) {
 
 	got := make([]testRecord, len(input))
 	n, err := reader.Read(got)
-	if err != nil && n == 0 {
+	// io.EOF after reading all rows is the normal terminator
+	// and must not be treated as a failure; any other non-nil
+	// error is real.
+	if err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("read: %v", err)
 	}
 	if n != len(input) {

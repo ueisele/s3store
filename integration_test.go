@@ -849,12 +849,21 @@ func TestIntegration_SettleWindow(t *testing.T) {
 			len(entries))
 	}
 
-	// After waiting past the settle window, the ref becomes
-	// visible.
-	time.Sleep(700 * time.Millisecond)
-	entries, _, err = store.Poll(ctx, "", 100)
-	if err != nil {
-		t.Fatalf("Poll after window: %v", err)
+	// Poll in a loop until the ref becomes visible or the
+	// deadline passes. Lets slow/virtualized hosts take a
+	// little extra time without risking a flaky fixed sleep.
+	// The 500ms settle window means the first successful Poll
+	// should land a few dozen ms after the window closes.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		entries, _, err = store.Poll(ctx, "", 100)
+		if err != nil {
+			t.Fatalf("Poll after window: %v", err)
+		}
+		if len(entries) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if len(entries) != 1 {
 		t.Errorf("after settle window: got %d entries, want 1",

@@ -46,6 +46,9 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		return nil, fmt.Errorf(
 			"s3store: KeyParts is required")
 	}
+	if err := validateKeyParts(cfg.KeyParts); err != nil {
+		return nil, err
+	}
 
 	db, err := openDuckDB(cfg.S3Endpoint, cfg.ExtraInitSQL)
 	if err != nil {
@@ -64,6 +67,31 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 
 func (s *Store[T]) Close() error {
 	return s.db.Close()
+}
+
+// validateKeyParts rejects KeyParts entries that would break
+// the Hive layout or the key parser: empty strings, names
+// containing '=' (the k-v separator) or '/' (the segment
+// separator), and duplicate names. Called once from New().
+func validateKeyParts(parts []string) error {
+	seen := make(map[string]bool, len(parts))
+	for i, p := range parts {
+		if p == "" {
+			return fmt.Errorf(
+				"s3store: KeyParts[%d] is empty", i)
+		}
+		if strings.ContainsAny(p, "=/") {
+			return fmt.Errorf(
+				"s3store: KeyParts[%d] %q must not contain "+
+					"'=' or '/'", i, p)
+		}
+		if seen[p] {
+			return fmt.Errorf(
+				"s3store: KeyParts[%d] %q is duplicated", i, p)
+		}
+		seen[p] = true
+	}
+	return nil
 }
 
 func (s *Store[T]) s3URI(key string) string {

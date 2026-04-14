@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,9 +40,12 @@ func (s *Store[T]) Write(
 
 	grouped := s.groupByKey(records)
 
+	// Sorted key iteration keeps the returned results (and
+	// the sequence of S3 PUTs) deterministic across runs,
+	// instead of following map iteration order.
 	var results []WriteResult
-	for key, group := range grouped {
-		result, err := s.WriteWithKey(ctx, key, group)
+	for _, key := range slices.Sorted(maps.Keys(grouped)) {
+		result, err := s.WriteWithKey(ctx, key, grouped[key])
 		if err != nil {
 			return results, err
 		}
