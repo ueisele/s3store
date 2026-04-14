@@ -5,11 +5,8 @@ package s3store
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"net/url"
 	"os"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -105,6 +102,26 @@ func scanIntRecord(rows *sql.Rows) (IntRecord, error) {
 	return r, err
 }
 
+// duckDBAuthSettings returns the DuckDB SET statements needed
+// for httpfs to talk to the MinIO test container. Shared by
+// every integration test that builds a Store.
+func duckDBAuthSettings() []string {
+	return []string{
+		"SET s3_use_ssl=false",
+		fmt.Sprintf("SET s3_access_key_id='%s'", minioUser),
+		fmt.Sprintf("SET s3_secret_access_key='%s'", minioPass),
+		"SET s3_region='us-east-1'",
+	}
+}
+
+// uniquePrefix returns a prefix that is unique to this test
+// run and monotonic within a run, so tests can't collide in
+// the shared bucket.
+func uniquePrefix(kind string) string {
+	return fmt.Sprintf("it-%s-%d-%d", kind,
+		time.Now().UnixNano(), prefixCounter.Add(1))
+}
+
 // newStore creates a Store on a unique prefix so tests don't
 // collide in the shared bucket. `dedupBy` can be empty to
 // accept the default (KeyParts-based) dedup.
@@ -112,12 +129,10 @@ func newStore(
 	t *testing.T, versionCol string, dedupBy ...string,
 ) *Store[IntRecord] {
 	t.Helper()
-	prefix := fmt.Sprintf("it-%d-%d",
-		time.Now().UnixNano(), prefixCounter.Add(1))
 
 	store, err := New[IntRecord](Config[IntRecord]{
 		Bucket:        bucketName,
-		Prefix:        prefix,
+		Prefix:        uniquePrefix("store"),
 		S3Client:      s3Client,
 		KeyParts:      []string{"period", "customer"},
 		TableAlias:    "records",
@@ -129,14 +144,9 @@ func newStore(
 				"period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ScanFunc:   scanIntRecord,
-		S3Endpoint: minioHostPort,
-		ExtraInitSQL: []string{
-			"SET s3_use_ssl=false",
-			fmt.Sprintf("SET s3_access_key_id='%s'", minioUser),
-			fmt.Sprintf("SET s3_secret_access_key='%s'", minioPass),
-			"SET s3_region='us-east-1'",
-		},
+		ScanFunc:     scanIntRecord,
+		S3Endpoint:   minioHostPort,
+		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -307,9 +317,11 @@ func TestIntegration_PollRejectsMaxZero(t *testing.T) {
 	}
 }
 
-func TestIntegration_PollRecordsCompacted(t *testing.T) {
-	// Regression for #6: WithCompaction dedupes latest-per-key
-	// within the batch.
+// TestIntegration_PollRecordsDedupDefault is the regression
+// for #6 as redesigned: PollRecords is dedup-by-default
+// (compacted-topic semantics) like every other read API.
+// WithHistory() opts into the full stream.
+func TestIntegration_PollRecordsDedupDefault(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, "ts")
 
@@ -327,37 +339,56 @@ func TestIntegration_PollRecordsCompacted(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	// Stream mode returns both.
-	stream, _, err := store.PollRecords(ctx, "", 100)
+	// Default is compacted: only the latest version comes back.
+	compact, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
-		t.Fatalf("PollRecords stream: %v", err)
-	}
-	if len(stream) != 2 {
-		t.Errorf("stream mode: got %d records, want 2", len(stream))
-	}
-
-	// Compacted mode returns only the latest version.
-	compact, _, err := store.PollRecords(ctx, "", 100, WithCompaction())
-	if err != nil {
-		t.Fatalf("PollRecords compacted: %v", err)
+		t.Fatalf("PollRecords default: %v", err)
 	}
 	if len(compact) != 1 {
-		t.Fatalf("compacted: got %d records, want 1", len(compact))
+		t.Fatalf("default (compacted): got %d records, want 1", len(compact))
 	}
 	if compact[0].Amount != 99 {
-		t.Errorf("compacted: got amount %v, want 99", compact[0].Amount)
+		t.Errorf("default (compacted): got amount %v, want 99", compact[0].Amount)
+	}
+
+	// WithHistory opts into the full stream.
+	stream, _, err := store.PollRecords(ctx, "", 100, WithHistory())
+	if err != nil {
+		t.Fatalf("PollRecords WithHistory: %v", err)
+	}
+	if len(stream) != 2 {
+		t.Errorf("stream (WithHistory): got %d records, want 2", len(stream))
 	}
 }
 
-func TestIntegration_CompactionRequiresVersionColumn(t *testing.T) {
-	// Regression for #6: WithCompaction errors when
-	// VersionColumn is not set, instead of silently no-oping.
+// TestIntegration_PollRecordsWithoutVersionColumn verifies
+// that dedup is a silent no-op when VersionColumn is empty
+// (same convention as Query / Read). The returned records
+// should be the full batch, whether or not WithHistory is
+// passed, because there's no ordering to dedup on.
+func TestIntegration_PollRecordsWithoutVersionColumn(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, "") // no version column
 
-	_, _, err := store.PollRecords(ctx, "", 100, WithCompaction())
-	if err == nil {
-		t.Error("expected error for WithCompaction without VersionColumn")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if _, err := store.Write(ctx, []IntRecord{
+		{Period: "2026-03-17", Customer: "alpha", SKU: "x", Amount: 10, Currency: "EUR", Ts: now},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := store.Write(ctx, []IntRecord{
+		{Period: "2026-03-17", Customer: "alpha", SKU: "x", Amount: 99, Currency: "EUR", Ts: now.Add(1 * time.Second)},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	got, _, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("no VersionColumn: got %d, want 2 (dedup should be no-op)", len(got))
 	}
 }
 
@@ -678,10 +709,254 @@ func TestIntegration_QueryAggregation(t *testing.T) {
 	}
 }
 
-// Below are helpers not used by any test yet; kept to silence
-// potential unused-import lints when tests are trimmed.
-var (
-	_ = url.QueryEscape
-	_ = strings.Contains
-	_ = errors.New
-)
+// TestIntegration_EmptyStream verifies a fresh store returns
+// (nil, since, nil) from Poll — the quiet contract at the
+// top of poll.go that keeps consumers simple.
+func TestIntegration_EmptyStream(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, "ts")
+
+	entries, off, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll fresh: %v", err)
+	}
+	if entries != nil {
+		t.Errorf("fresh Poll entries: got %v, want nil", entries)
+	}
+	if off != "" {
+		t.Errorf("fresh Poll offset: got %q, want empty", off)
+	}
+
+	records, off2, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords fresh: %v", err)
+	}
+	if records != nil {
+		t.Errorf("fresh PollRecords: got %v, want nil", records)
+	}
+	if off2 != "" {
+		t.Errorf("fresh PollRecords offset: got %q, want empty", off2)
+	}
+}
+
+// TestIntegration_OffsetAdvancement verifies the core stream
+// contract: Poll with the offset from the previous call picks
+// up exactly where it left off, no duplicates and no gaps.
+func TestIntegration_OffsetAdvancement(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, "ts")
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	want := []IntRecord{
+		{Period: "2026-03-17", Customer: "a", SKU: "x", Amount: 1, Currency: "EUR", Ts: now},
+		{Period: "2026-03-17", Customer: "b", SKU: "x", Amount: 2, Currency: "EUR", Ts: now},
+		{Period: "2026-03-17", Customer: "c", SKU: "x", Amount: 3, Currency: "EUR", Ts: now},
+		{Period: "2026-03-17", Customer: "d", SKU: "x", Amount: 4, Currency: "EUR", Ts: now},
+		{Period: "2026-03-17", Customer: "e", SKU: "x", Amount: 5, Currency: "EUR", Ts: now},
+	}
+	if _, err := store.Write(ctx, want); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Walk the stream in chunks of 2. Should see every ref
+	// exactly once across calls and the offsets should be
+	// strictly increasing.
+	var offset Offset
+	var seen []string
+	var prevOffset Offset
+	for i := 0; i < 5; i++ {
+		entries, newOffset, err := store.Poll(ctx, offset, 2)
+		if err != nil {
+			t.Fatalf("Poll %d: %v", i, err)
+		}
+		if len(entries) == 0 {
+			break
+		}
+		if prevOffset != "" && string(newOffset) <= string(prevOffset) {
+			t.Errorf("offset not monotonic: %q -> %q",
+				prevOffset, newOffset)
+		}
+		for _, e := range entries {
+			seen = append(seen, e.Key)
+		}
+		prevOffset = newOffset
+		offset = newOffset
+	}
+	if len(seen) != 5 {
+		t.Errorf("walked stream: got %d entries, want 5 (seen=%v)",
+			len(seen), seen)
+	}
+
+	// Re-calling Poll with the final offset returns nothing
+	// (no more refs) and the offset stays put.
+	entries, finalOffset, err := store.Poll(ctx, offset, 100)
+	if err != nil {
+		t.Fatalf("Poll trailing: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("trailing Poll: got %d entries, want 0", len(entries))
+	}
+	if finalOffset != offset {
+		t.Errorf("trailing Poll offset: got %q, want %q (unchanged)",
+			finalOffset, offset)
+	}
+}
+
+// TestIntegration_SettleWindow verifies that writes inside
+// the settle window are hidden from Poll, and become visible
+// once the cutoff passes. Uses a longer-than-usual window so
+// the test can observe both states with deterministic waits.
+func TestIntegration_SettleWindow(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := New[IntRecord](Config[IntRecord]{
+		Bucket:        bucketName,
+		Prefix:        uniquePrefix("settle"),
+		S3Client:      s3Client,
+		KeyParts:      []string{"period", "customer"},
+		TableAlias:    "records",
+		VersionColumn: "ts",
+		SettleWindow:  500 * time.Millisecond,
+		KeyFunc: func(r IntRecord) string {
+			return fmt.Sprintf(
+				"period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		ScanFunc:     scanIntRecord,
+		S3Endpoint:   minioHostPort,
+		ExtraInitSQL: duckDBAuthSettings(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if _, err := store.Write(ctx, []IntRecord{
+		{Period: "2026-03-17", Customer: "alpha", SKU: "x", Amount: 10, Currency: "EUR", Ts: now},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Immediately after writing, the ref is inside the settle
+	// window and should not be visible to Poll.
+	entries, _, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll inside window: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("inside settle window: got %d entries, want 0",
+			len(entries))
+	}
+
+	// After waiting past the settle window, the ref becomes
+	// visible.
+	time.Sleep(700 * time.Millisecond)
+	entries, _, err = store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll after window: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("after settle window: got %d entries, want 1",
+			len(entries))
+	}
+}
+
+// TestIntegration_QueryWithHistory verifies that WithHistory
+// on Query returns every version of a key (not just the
+// latest), and that the same option works on the same type
+// as PollRecords after the unification.
+func TestIntegration_QueryWithHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, "ts")
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if _, err := store.Write(ctx, []IntRecord{
+		{Period: "2026-03-17", Customer: "alpha", SKU: "x", Amount: 10, Currency: "EUR", Ts: now},
+	}); err != nil {
+		t.Fatalf("Write v1: %v", err)
+	}
+	if _, err := store.Write(ctx, []IntRecord{
+		{Period: "2026-03-17", Customer: "alpha", SKU: "x", Amount: 99, Currency: "EUR", Ts: now.Add(time.Second)},
+	}); err != nil {
+		t.Fatalf("Write v2: %v", err)
+	}
+
+	// Default Query returns the latest version only.
+	rows, err := store.Query(ctx, "period=2026-03-17/customer=alpha",
+		"SELECT amount FROM records ORDER BY amount")
+	if err != nil {
+		t.Fatalf("Query default: %v", err)
+	}
+	var amounts []float64
+	for rows.Next() {
+		var a float64
+		if err := rows.Scan(&a); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		amounts = append(amounts, a)
+	}
+	rows.Close()
+	if len(amounts) != 1 || amounts[0] != 99 {
+		t.Errorf("default dedup: got %v, want [99]", amounts)
+	}
+
+	// WithHistory returns both versions.
+	rows, err = store.Query(ctx, "period=2026-03-17/customer=alpha",
+		"SELECT amount FROM records ORDER BY amount",
+		WithHistory())
+	if err != nil {
+		t.Fatalf("Query WithHistory: %v", err)
+	}
+	amounts = amounts[:0]
+	for rows.Next() {
+		var a float64
+		if err := rows.Scan(&a); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		amounts = append(amounts, a)
+	}
+	rows.Close()
+	if len(amounts) != 2 || amounts[0] != 10 || amounts[1] != 99 {
+		t.Errorf("WithHistory: got %v, want [10 99]", amounts)
+	}
+}
+
+// TestIntegration_QueryRow exercises both the happy path and
+// the error-propagation-through-*sql.Row machinery from the
+// #7 fix (errors surface at Scan time via DuckDB's error()
+// function).
+func TestIntegration_QueryRow(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, "ts")
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if _, err := store.Write(ctx, []IntRecord{
+		{Period: "2026-03-17", Customer: "alpha", SKU: "x", Amount: 10, Currency: "EUR", Ts: now},
+		{Period: "2026-03-17", Customer: "alpha", SKU: "y", Amount: 20, Currency: "EUR", Ts: now},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Happy path: single-row aggregation.
+	var total float64
+	err := store.QueryRow(ctx, "period=2026-03-17/customer=alpha",
+		"SELECT SUM(amount) FROM records",
+		WithHistory()).Scan(&total)
+	if err != nil {
+		t.Fatalf("QueryRow Scan: %v", err)
+	}
+	if total != 30 {
+		t.Errorf("QueryRow sum: got %v, want 30", total)
+	}
+
+	// Error path: invalid key pattern routes through errorRow
+	// and surfaces at Scan.
+	var discard any
+	err = store.QueryRow(ctx, "period=2026-03-17", // truncated
+		"SELECT 1").Scan(&discard)
+	if err == nil {
+		t.Error("QueryRow with truncated pattern: expected Scan error")
+	}
+}

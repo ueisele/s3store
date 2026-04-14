@@ -1,6 +1,8 @@
 package s3store
 
 import (
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -27,14 +29,6 @@ func TestWithHistory(t *testing.T) {
 	}
 }
 
-func TestWithCompaction(t *testing.T) {
-	var o pollOpts
-	WithCompaction()(&o)
-	if !o.compacted {
-		t.Error("WithCompaction didn't set compacted=true")
-	}
-}
-
 func TestDuckDBSettingsSQLNoEndpoint(t *testing.T) {
 	stmts := duckDBSettingsSQL("")
 	if len(stmts) == 0 {
@@ -42,34 +36,46 @@ func TestDuckDBSettingsSQLNoEndpoint(t *testing.T) {
 	}
 	for _, stmt := range stmts {
 		if stmt == "" {
-			t.Error("empty statement in duckDBSettingsSQL output")
+			t.Error("empty statement in output")
 		}
 	}
-	for _, stmt := range stmts {
-		if contains(stmt, "s3_endpoint") {
-			t.Errorf("unexpected s3_endpoint setting: %q", stmt)
-		}
+	if slices.ContainsFunc(stmts, func(s string) bool {
+		return strings.Contains(s, "s3_endpoint")
+	}) {
+		t.Errorf("unexpected s3_endpoint setting: %v", stmts)
 	}
 }
 
 func TestDuckDBSettingsSQLWithEndpoint(t *testing.T) {
 	stmts := duckDBSettingsSQL("minio:9000")
-	found := false
-	for _, stmt := range stmts {
-		if contains(stmt, "s3_endpoint='minio:9000'") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected s3_endpoint in output, got %v", stmts)
+	if !slices.ContainsFunc(stmts, func(s string) bool {
+		return strings.Contains(s, "s3_endpoint='minio:9000'")
+	}) {
+		t.Errorf("expected s3_endpoint='minio:9000' in %v", stmts)
 	}
 }
 
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
+// TestDuckDBSettingsSQLEnablesObjectCache guards the #10
+// performance fix: the parquet-footer cache must be enabled so
+// the schema-introspection LIMIT 0 query and the main query
+// don't double-read metadata.
+func TestDuckDBSettingsSQLEnablesObjectCache(t *testing.T) {
+	stmts := duckDBSettingsSQL("")
+	if !slices.ContainsFunc(stmts, func(s string) bool {
+		return strings.Contains(s, "enable_object_cache=true")
+	}) {
+		t.Errorf("expected enable_object_cache=true in %v", stmts)
 	}
-	return false
+}
+
+// TestDuckDBSettingsSQLPathStyle guards that path-style
+// addressing is always set — required for MinIO and for
+// virtual-hosted buckets with dots in their names.
+func TestDuckDBSettingsSQLPathStyle(t *testing.T) {
+	stmts := duckDBSettingsSQL("")
+	if !slices.ContainsFunc(stmts, func(s string) bool {
+		return strings.Contains(s, "s3_url_style='path'")
+	}) {
+		t.Errorf("expected s3_url_style='path' in %v", stmts)
+	}
 }

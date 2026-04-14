@@ -127,19 +127,29 @@ to react to changes without fetching the data itself.
 ### Stream — typed records
 
 ```go
-// Pure stream: every record in every referenced file
+// Default: Kafka compacted-topic semantics — latest-per-key
+// within each batch, deduped by VersionColumn
 records, newOffset, err := store.PollRecords(ctx, lastOffset, 100)
 
-// Compacted-topic semantics: latest-per-key within each batch
+// Full stream: every record in every referenced file
 records, newOffset, err = store.PollRecords(ctx, lastOffset, 100,
-    s3store.WithCompaction())
+    s3store.WithHistory())
 ```
 
-Default is a pure stream — returns every record in every file referenced
-by the batch. `WithCompaction()` enables Kafka compacted-topic semantics:
-within each batch, only the latest version of each key (by `VersionColumn`)
-is returned. Consumers converge on a latest-per-key view when they apply
-records as upserts.
+Default is **compacted-topic semantics**: within each batch, only the
+latest version of each key (by `VersionColumn`) is returned. Consumers that
+apply each record as an upsert to a local store converge on the latest-per-
+key view — the primary use case for materialized-view consumers like the
+billing example above.
+
+`WithHistory()` opts out of dedup and returns every record in every
+referenced file. Use it for audit logs, or whenever you need to observe
+superseded versions.
+
+`WithHistory()` is the same option that works on `Query` and `QueryRow` —
+every read API in s3store shares the "dedup by default, `WithHistory()` to
+see all versions" convention. When `VersionColumn` is empty, dedup is a
+no-op regardless.
 
 Schema evolution (`ColumnAliases`, `ColumnDefaults`) applies to both modes.
 

@@ -85,35 +85,37 @@ outer:
 // PollRecords returns a flat slice of typed records from the
 // files referenced by up to maxEntries refs after the offset.
 //
-// By default PollRecords is a pure stream: every record in
-// every referenced file is returned, in file and row order,
-// with schema evolution (ColumnAliases, ColumnDefaults,
-// union_by_name) applied.
+// By default — consistent with Query, QueryRow, and Read —
+// PollRecords applies latest-per-key deduplication within each
+// batch by VersionColumn. Across batches, newer writes
+// supersede older ones in the consumer's view, so a consumer
+// that applies each record as an upsert to a local store
+// converges on a latest-per-key view. This is Kafka
+// compacted-topic semantics and the primary use case for
+// materialized-view consumers (the billing example in the
+// README).
 //
-// Pass WithCompaction() to get Kafka compacted-topic semantics
-// instead: within each batch, only the latest version
-// (by VersionColumn) of each key is returned. Across batches,
-// newer writes supersede older ones in the consumer's view, so
-// a consumer that applies each record as an upsert to a local
-// store converges on the latest-per-key view. WithCompaction
-// requires Config.VersionColumn to be set.
+// Pass WithHistory() to disable dedup and get a pure stream:
+// every record in every referenced file, in file and row
+// order. Use this for audit logs or when you need to observe
+// superseded versions.
 //
-// For point-in-time deduplicated snapshots use Read. For full
-// SQL access including WithHistory use Query.
+// When VersionColumn is empty, dedup is a no-op regardless of
+// WithHistory — there's no ordering to dedup on, so the result
+// is always the stream.
+//
+// Note: s3store is append-only, so the default compacted mode
+// is upsert-only — there is no tombstone or key-delete
+// mechanism.
 func (s *Store[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
-	opts ...PollOption,
+	opts ...QueryOption,
 ) ([]T, Offset, error) {
-	o := &pollOpts{}
+	o := &queryOpts{}
 	for _, opt := range opts {
 		opt(o)
-	}
-	if o.compacted && s.cfg.VersionColumn == "" {
-		return nil, since, fmt.Errorf(
-			"s3store: WithCompaction requires " +
-				"Config.VersionColumn to be set")
 	}
 
 	entries, newOffset, err :=
@@ -136,7 +138,7 @@ func (s *Store[T]) PollRecords(
 		strings.Join(uris, ", "))
 
 	query, err := s.buildWrappedQuery(ctx, scanExpr,
-		"SELECT * FROM "+s.cfg.TableAlias, !o.compacted)
+		"SELECT * FROM "+s.cfg.TableAlias, o.includeHistory)
 	if err != nil {
 		return nil, since, err
 	}

@@ -74,6 +74,47 @@ func TestRefKeyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRefKeyLexicalOrdering verifies that ref filenames sort
+// in timestamp order via plain byte comparison. Poll relies on
+// this via S3 ListObjectsV2's StartAfter parameter to walk the
+// stream chronologically, so any encoding change that broke
+// lexical = chronological would silently corrupt streaming.
+func TestRefKeyLexicalOrdering(t *testing.T) {
+	s := newTestStore()
+	const key = "period=2026-03-17/customer=abc"
+
+	// Three timestamps spanning a few orders of magnitude to
+	// defend against future encoding changes that break on
+	// varying-width integers.
+	timestamps := []int64{
+		1_000_000_000_000_000,
+		1_710_684_000_000_000,
+		9_000_000_000_000_000,
+	}
+
+	var encoded []string
+	for _, ts := range timestamps {
+		encoded = append(encoded, s.encodeRefKey(ts, "abcd1234", key))
+	}
+
+	// Every adjacent pair must satisfy earlier < later as
+	// bytewise-compared strings.
+	for i := 0; i < len(encoded)-1; i++ {
+		if encoded[i] >= encoded[i+1] {
+			t.Errorf("lexical order violated:\n %q\n !< %q",
+				encoded[i], encoded[i+1])
+		}
+	}
+
+	// And encoded keys within the same timestamp sort by id
+	// (or at least are mutually distinct).
+	a := s.encodeRefKey(1_710_684_000_000_000, "aaaaaaaa", key)
+	b := s.encodeRefKey(1_710_684_000_000_000, "bbbbbbbb", key)
+	if a >= b {
+		t.Errorf("same-ts id ordering: %q !< %q", a, b)
+	}
+}
+
 func TestParseRefKeyInvalid(t *testing.T) {
 	s := newTestStore()
 	cases := []string{

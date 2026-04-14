@@ -84,40 +84,26 @@ type StreamEntry struct {
 	DataPath string
 }
 
-// QueryOption configures query behavior.
+// QueryOption configures read-path behavior. Shared across
+// Query, QueryRow, and PollRecords so there's one option and
+// one mental model for every read API.
 type QueryOption func(*queryOpts)
 
 type queryOpts struct {
 	includeHistory bool
 }
 
-// WithHistory disables deduplication.
+// WithHistory disables latest-per-key deduplication on any
+// read path (Query, QueryRow, PollRecords). Without it, reads
+// are deduped by VersionColumn + DeduplicateBy (defaulting to
+// KeyParts); with it, every version of every record is
+// returned.
+//
+// When VersionColumn is empty, dedup is a no-op regardless of
+// this option — there's no ordering to dedup on.
 func WithHistory() QueryOption {
 	return func(o *queryOpts) {
 		o.includeHistory = true
-	}
-}
-
-// PollOption configures PollRecords behavior.
-type PollOption func(*pollOpts)
-
-type pollOpts struct {
-	compacted bool
-}
-
-// WithCompaction makes PollRecords apply latest-per-key
-// deduplication within each batch — Kafka compacted-topic
-// semantics. Without it (the default), PollRecords is a pure
-// stream that returns every record in every referenced file.
-//
-// Requires Config.VersionColumn to be set; PollRecords errors
-// otherwise, since there is no ordering to dedupe on.
-//
-// Note: s3store is append-only, so compacted mode is
-// upsert-only — there is no tombstone or key-delete mechanism.
-func WithCompaction() PollOption {
-	return func(o *pollOpts) {
-		o.compacted = true
 	}
 }
 

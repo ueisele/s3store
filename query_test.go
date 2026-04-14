@@ -229,7 +229,7 @@ func TestWrapScanExprShapes(t *testing.T) {
 			wantMissing: []string{"REPLACE"},
 		},
 		{
-			name: "mixed replaces and additions",
+			name: "mixed replaces, additions, and EXCLUDE",
 			aliases: map[string][]string{
 				"cost": {"price"},
 			},
@@ -243,8 +243,45 @@ func TestWrapScanExprShapes(t *testing.T) {
 			},
 			history: true,
 			wantContains: []string{
+				"* EXCLUDE (price)",
 				"REPLACE (COALESCE(currency, 'EUR') AS currency)",
 				"COALESCE(price) AS cost",
+			},
+			wantMissing: []string{"QUALIFY"},
+		},
+		{
+			name: "alias with existing new name uses REPLACE + EXCLUDE",
+			aliases: map[string][]string{
+				"cost": {"price", "unit_price"},
+			},
+			existingCols: map[string]bool{
+				"cost":       true,
+				"price":      true,
+				"unit_price": true,
+			},
+			history: true,
+			wantContains: []string{
+				"* EXCLUDE (price, unit_price) REPLACE " +
+					"(COALESCE(cost, price, unit_price) AS cost)",
+			},
+			wantMissing: []string{"QUALIFY"},
+		},
+		{
+			name: "dedup + transforms combine correctly",
+			versionCol: "ts",
+			aliases: map[string][]string{
+				"cost": {"price"},
+			},
+			existingCols: map[string]bool{
+				"price": true,
+				// cost missing -> addition, price excluded
+			},
+			wantContains: []string{
+				"* EXCLUDE (price)",
+				"COALESCE(price) AS cost",
+				"QUALIFY ROW_NUMBER()",
+				"PARTITION BY period, customer",
+				"ORDER BY ts DESC",
 			},
 		},
 	}
