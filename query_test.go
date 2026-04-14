@@ -128,6 +128,24 @@ func TestBuildColumnTransforms(t *testing.T) {
 				"COALESCE(z, 0) AS z",
 			},
 		},
+		{
+			// Two aliases absorbing the same old column must
+			// not produce EXCLUDE (value, value) — that would
+			// error in DuckDB at plan time.
+			name: "shared old name across aliases deduplicates EXCLUDE",
+			aliases: map[string][]string{
+				"amount": {"value"},
+				"cost":   {"value"},
+			},
+			existingCols: map[string]bool{"value": true},
+			wantAdditions: []string{
+				"COALESCE(value) AS amount",
+				"COALESCE(value) AS cost",
+			},
+			// "value" appears once in excludes, even though
+			// both aliases reference it.
+			wantExcludes: []string{"value"},
+		},
 	}
 
 	for _, tc := range cases {

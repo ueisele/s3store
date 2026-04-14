@@ -594,13 +594,19 @@ func TestIntegration_TruncatedPatternErrors(t *testing.T) {
 
 func TestIntegration_RefKeyParseSpecialChars(t *testing.T) {
 	// Regression for #3: partition values with `--`, `;`,
-	// `/`, and percent round-trip through encode/parse/Poll.
+	// `/`, `%`, and `'` (SQL-quote hazard) round-trip through
+	// encode/parse/Poll and through read paths that embed the
+	// value in SQL literals.
 	ctx := context.Background()
 	store := newStore(t, "ts")
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	// Customer values containing tricky characters
-	for _, customer := range []string{"foo--bar", "semi;colon", "50%off"} {
+	// Customer values containing tricky characters — the
+	// apostrophe case is a regression for the SQL-quote-escape
+	// fix (sqlQuote helper in store.go).
+	for _, customer := range []string{
+		"foo--bar", "semi;colon", "50%off", "o'brien",
+	} {
 		if _, err := store.Write(ctx, []IntRecord{
 			{Period: "2026-03-17", Customer: customer, SKU: "x", Amount: 10, Currency: "EUR", Ts: now},
 		}); err != nil {
@@ -613,8 +619,8 @@ func TestIntegration_RefKeyParseSpecialChars(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("Poll: got %d entries, want 3", len(entries))
+	if len(entries) != 4 {
+		t.Fatalf("Poll: got %d entries, want 4", len(entries))
 	}
 
 	// Every returned Key must round-trip back to the exact
@@ -623,9 +629,9 @@ func TestIntegration_RefKeyParseSpecialChars(t *testing.T) {
 		"foo--bar":   false,
 		"semi;colon": false,
 		"50%off":     false,
+		"o'brien":    false,
 	}
 	for _, e := range entries {
-		// Extract the customer value from the key
 		for wanted := range found {
 			if e.Key == "period=2026-03-17/customer="+wanted {
 				found[wanted] = true
@@ -636,6 +642,18 @@ func TestIntegration_RefKeyParseSpecialChars(t *testing.T) {
 		if !ok {
 			t.Errorf("customer %q not round-tripped: entries=%+v", k, entries)
 		}
+	}
+
+	// The apostrophe case also has to survive a full Read
+	// path — this is the SQL-quote regression. Before the fix,
+	// embedding the data-path URI as 'customer=o'brien/...'
+	// was a parse error at DuckDB plan time.
+	got, err := store.Read(ctx, "period=2026-03-17/customer=o'brien")
+	if err != nil {
+		t.Fatalf("Read o'brien: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("Read o'brien: got %d, want 1", len(got))
 	}
 }
 

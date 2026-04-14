@@ -25,8 +25,20 @@ type Config[T any] struct {
 
 	// ScanFunc maps a sql.Rows row to a record.
 	// Used by Read() and PollRecords() to return typed []T.
-	// Column order must match SELECT * with ColumnAliases and
-	// ColumnDefaults applied.
+	//
+	// The column order ScanFunc must read matches this:
+	//
+	//   - base columns from the scanned files, in their
+	//     file-schema order (union_by_name),
+	//   - minus any old-name columns EXCLUDEd by an alias,
+	//   - with ColumnAliases / ColumnDefaults on existing
+	//     columns REPLACEd in their original position,
+	//   - with alias targets whose new name isn't in any file
+	//     yet, and defaults for columns that don't exist at
+	//     all, appended at the end (in sorted-key order).
+	//
+	// When no schema-evolution transforms are configured, the
+	// order is just the file-schema order.
 	ScanFunc func(*sql.Rows) (T, error)
 
 	// VersionColumn is the column name used for deduplication.
@@ -48,8 +60,27 @@ type Config[T any] struct {
 	// for files that predate the column.
 	ColumnDefaults map[string]string
 
-	// ColumnAliases maps new column names to a chain of old names.
-	// Generates COALESCE(new, old1, old2, ...).
+	// ColumnAliases maps a new column name to a chain of old
+	// names it should absorb, in priority order. Behavior:
+	//
+	//   - If the new column exists in at least one scanned
+	//     file, the library emits
+	//     SELECT * REPLACE (COALESCE(new, old1, old2, ...) AS new)
+	//     so new files' values take precedence with old files
+	//     falling back to the old names.
+	//   - If the new column doesn't exist in any scanned file
+	//     yet, the library emits the COALESCE as a new
+	//     appended column (useful for preemptive rename
+	//     configuration before any file has the new name).
+	//   - Old-name columns named in the chain are EXCLUDEd
+	//     from the star expansion in both cases, so they
+	//     don't linger next to the aliased column.
+	//   - If neither the new name nor any old name exists in
+	//     any scanned file, a typed NULL is appended under
+	//     the new name so ScanFunc always finds the column.
+	//
+	// The same old-name may appear in multiple aliases;
+	// duplicates in the resulting EXCLUDE list are removed.
 	ColumnAliases map[string][]string
 
 	// S3Client is the AWS S3 client to use.

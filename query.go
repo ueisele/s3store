@@ -65,6 +65,9 @@ func (s *Store[T]) QueryRow(
 
 // scanExprForPattern returns the base read_parquet scan for a
 // Hive-glob pattern. Shared by Query, QueryRow, and Read.
+//
+// The URI is SQL-quoted via sqlQuote so partition values that
+// contain an apostrophe don't break the query at plan time.
 func (s *Store[T]) scanExprForPattern(
 	key string,
 ) (string, error) {
@@ -73,9 +76,9 @@ func (s *Store[T]) scanExprForPattern(
 		return "", err
 	}
 	return fmt.Sprintf(
-		"SELECT * FROM read_parquet('%s', "+
+		"SELECT * FROM read_parquet(%s, "+
 			"hive_partitioning=true, union_by_name=true)",
-		parquetURI), nil
+		sqlQuote(parquetURI)), nil
 }
 
 // buildWrappedQuery does the work shared by every read path:
@@ -108,9 +111,8 @@ func (s *Store[T]) buildWrappedQuery(
 func (s *Store[T]) errorRow(
 	ctx context.Context, err error,
 ) *sql.Row {
-	msg := strings.ReplaceAll(err.Error(), "'", "''")
 	return s.db.QueryRowContext(ctx,
-		"SELECT error('"+msg+"')")
+		"SELECT error("+sqlQuote(err.Error())+")")
 }
 
 // wrapScanExpr wraps a base scan expression with column
@@ -265,6 +267,22 @@ func (s *Store[T]) buildColumnTransforms(
 		replaces = append(replaces, fmt.Sprintf(
 			"COALESCE(%s, %s) AS %s",
 			col, defaultVal, col))
+	}
+
+	// Dedupe excludes: two or more aliases can reference the
+	// same old column ({amount: [value], cost: [value]}), which
+	// would otherwise emit SELECT * EXCLUDE (value, value) and
+	// fail at plan time. Preserves first-seen order.
+	if len(excludes) > 1 {
+		seen := make(map[string]bool, len(excludes))
+		deduped := make([]string, 0, len(excludes))
+		for _, col := range excludes {
+			if !seen[col] {
+				seen[col] = true
+				deduped = append(deduped, col)
+			}
+		}
+		excludes = deduped
 	}
 
 	return replaces, additions, excludes

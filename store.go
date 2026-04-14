@@ -70,6 +70,19 @@ func (s *Store[T]) s3URI(key string) string {
 	return fmt.Sprintf("s3://%s/%s", s.cfg.Bucket, key)
 }
 
+// sqlQuote returns a DuckDB single-quoted string literal with
+// embedded single quotes escaped (' -> ''). Callers pass the
+// raw value; the returned string includes the surrounding
+// quotes, so it can be concatenated directly into SQL.
+//
+// Used everywhere we embed a user-derived value (parquet URI,
+// error message) into a SQL string, so partition values that
+// contain an apostrophe (e.g. customer=o'brien) can't break
+// the query.
+func sqlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
 // buildParquetURI compiles a user-supplied key pattern into an
 // S3 glob that matches exactly the intended set of parquet
 // files under Config.Prefix/data.

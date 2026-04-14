@@ -129,7 +129,7 @@ func (s *Store[T]) PollRecords(
 
 	uris := make([]string, len(entries))
 	for i, e := range entries {
-		uris[i] = "'" + s.s3URI(e.DataPath) + "'"
+		uris[i] = sqlQuote(s.s3URI(e.DataPath))
 	}
 
 	scanExpr := fmt.Sprintf(

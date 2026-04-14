@@ -260,6 +260,29 @@ func TestBuildDataPath(t *testing.T) {
 	}
 }
 
+func TestSQLQuote(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "''"},
+		{"plain", "'plain'"},
+		{"o'brien", "'o''brien'"},
+		{"'", "''''"},
+		{"a'b'c", "'a''b''c'"},
+		{"s3://x/data/customer=o'brien/abc.parquet",
+			"'s3://x/data/customer=o''brien/abc.parquet'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := sqlQuote(tc.in); got != tc.want {
+				t.Errorf("sqlQuote(%q) = %q, want %q",
+					tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDedupColumns(t *testing.T) {
 	s := newTestStore("period", "customer")
 
