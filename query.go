@@ -120,26 +120,36 @@ func (s *Store[T]) errorRow(
 // existingCols is the set of columns the base scanExpr actually
 // produces (or nil when no schema-evolution transforms are
 // configured and introspection was skipped). It drives the
-// split between REPLACE clauses (for columns already in _raw)
-// and appended SELECT expressions (for columns that don't exist
-// yet and have to be materialized from olds, a default literal,
-// or NULL).
+// split between:
+//
+//   - replaces: expressions for columns that already exist in
+//     _raw — emitted inside SELECT * REPLACE (...)
+//   - additions: expressions for new columns that have to be
+//     materialized from olds, a default literal, or NULL —
+//     appended after the star expansion
+//   - excludes: old source-column names consumed by an alias —
+//     removed from the star expansion so they don't linger next
+//     to the aliased column in the output
 func (s *Store[T]) wrapScanExpr(
 	scanExpr string,
 	userSQL string,
 	existingCols map[string]bool,
 	includeHistory bool,
 ) string {
-	replaces, additions := s.buildColumnTransforms(existingCols)
-	hasTransforms := len(replaces) > 0 || len(additions) > 0
+	replaces, additions, excludes := s.buildColumnTransforms(existingCols)
+	hasTransforms := len(replaces) > 0 || len(additions) > 0 || len(excludes) > 0
 
 	var rawCTE string
 	if hasTransforms {
 		rawCTE = fmt.Sprintf("_raw AS (%s),\n", scanExpr)
 
 		starExpr := "*"
+		if len(excludes) > 0 {
+			starExpr += fmt.Sprintf(" EXCLUDE (%s)",
+				strings.Join(excludes, ", "))
+		}
 		if len(replaces) > 0 {
-			starExpr = fmt.Sprintf("* REPLACE (%s)",
+			starExpr += fmt.Sprintf(" REPLACE (%s)",
 				strings.Join(replaces, ", "))
 		}
 		selectList := starExpr
@@ -178,22 +188,26 @@ func (s *Store[T]) wrapScanExpr(
 }
 
 // buildColumnTransforms splits ColumnAliases and ColumnDefaults
-// into two slices:
+// into three slices:
 //
 //   - replaces: expressions for columns that already exist in
 //     the base scan; emitted inside SELECT * REPLACE (...)
 //   - additions: expressions for columns that do not exist in
 //     the base scan yet; appended after the star expansion
+//   - excludes: old source-column names that an alias has
+//     consumed; removed from the star expansion so they don't
+//     linger next to the aliased column
 //
 // existingCols is the set of columns present in _raw. When nil
-// (no transforms are configured), both returned slices are nil.
+// (no transforms are configured), all three returned slices
+// are nil.
 //
 // Map keys are iterated in sorted order so generated SQL is
 // deterministic run to run — important for plan-cache hit
 // rates, diffable logs, and snapshot-style tests.
 func (s *Store[T]) buildColumnTransforms(
 	existingCols map[string]bool,
-) (replaces []string, additions []string) {
+) (replaces []string, additions []string, excludes []string) {
 	for _, newName := range slices.Sorted(
 		maps.Keys(s.cfg.ColumnAliases),
 	) {
@@ -207,6 +221,8 @@ func (s *Store[T]) buildColumnTransforms(
 		for _, old := range oldNames {
 			if existingCols[old] {
 				args = append(args, old)
+				// Consumed by the alias — drop from output.
+				excludes = append(excludes, old)
 			}
 		}
 
@@ -251,5 +267,5 @@ func (s *Store[T]) buildColumnTransforms(
 			col, defaultVal, col))
 	}
 
-	return replaces, additions
+	return replaces, additions, excludes
 }

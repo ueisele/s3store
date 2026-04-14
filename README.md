@@ -237,6 +237,16 @@ type Config[T any] struct {
 }
 ```
 
+## Testing
+
+```
+go test ./...                                # unit tests, no dependencies
+go test -tags integration -timeout 5m ./...  # full round-trip vs. a MinIO
+                                             # container via testcontainers
+```
+
+Integration tests require Docker and pull `minio/minio:latest` on first run.
+
 ## Limitations
 
 - **Single-process reads.** DuckDB runs embedded in your Go process.

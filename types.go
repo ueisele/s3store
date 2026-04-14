@@ -55,8 +55,16 @@ type Config[T any] struct {
 	// S3Client is the AWS S3 client to use.
 	S3Client *s3.Client
 
-	// S3Endpoint overrides the S3 endpoint.
+	// S3Endpoint overrides the S3 endpoint passed to DuckDB's
+	// httpfs extension (format: "host:port", no scheme).
 	S3Endpoint string
+
+	// ExtraInitSQL are additional DuckDB statements executed
+	// once, after the default init (httpfs, settings, endpoint).
+	// Useful for injecting S3 credentials, disabling SSL for
+	// MinIO / localstack, setting a region, or loading other
+	// DuckDB extensions. Statements run in order.
+	ExtraInitSQL []string
 }
 
 func (c Config[T]) settleWindow() time.Duration {
@@ -152,7 +160,7 @@ func ensureHTTPFS(db *sql.DB) error {
 	return err
 }
 
-func openDuckDB(endpoint string) (*sql.DB, error) {
+func openDuckDB(endpoint string, extra []string) (*sql.DB, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, err
@@ -162,6 +170,12 @@ func openDuckDB(endpoint string) (*sql.DB, error) {
 		return nil, err
 	}
 	for _, stmt := range duckDBSettingsSQL(endpoint) {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	for _, stmt := range extra {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
 			return nil, err

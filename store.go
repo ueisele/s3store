@@ -47,7 +47,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 			"s3store: KeyParts is required")
 	}
 
-	db, err := openDuckDB(cfg.S3Endpoint)
+	db, err := openDuckDB(cfg.S3Endpoint, cfg.ExtraInitSQL)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"s3store: failed to open DuckDB: %w", err)
