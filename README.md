@@ -22,8 +22,10 @@ consistently across every access pattern. Writes use `parquet-go` directly.
 go get github.com/ueisele/s3store
 ```
 
-Requires Go 1.22+ and the DuckDB httpfs extension (auto-installed on first
-use, or pre-installed in air-gapped environments).
+Requires Go 1.26.2+ (declared in [go.mod](go.mod); the code also depends on
+iterator-returning `maps.Keys` which is Go 1.23+, so that's the absolute
+minimum if you override the toolchain). DuckDB's httpfs extension is
+auto-installed on first use, or pre-installed in air-gapped environments.
 
 ## Quick start
 
@@ -117,12 +119,16 @@ check to detect lost-ack).
 // Returns up to 100 stream entries past the given offset
 entries, newOffset, err := store.Poll(ctx, lastOffset, 100)
 for _, e := range entries {
-    fmt.Println(e.Key, e.DataPath)
+    fmt.Println(e.Offset, e.Key, e.DataPath)
 }
+// Pass newOffset back on the next call to continue where you left off
 ```
 
-Returns only metadata (partition key and parquet path). Use when you want
-to react to changes without fetching the data itself.
+Each `StreamEntry` carries the ref's `Offset` (opaque cursor, pass back as
+`since` on the next call), the `Key` (partition key as written), and the
+`DataPath` (S3 key of the parquet file). No GETs are issued — the entire
+batch is one S3 LIST call over `_stream/refs/`. Use this when you want to
+react to *which* keys changed without fetching the data itself.
 
 ### Stream — typed records
 
@@ -175,12 +181,22 @@ clear error.
 ### SQL query
 
 ```go
+// Multi-row query
 rows, err := store.Query(ctx, "charge_period=2026-03-*/*",
     "SELECT customer, sku, SUM(net_cost) AS total "+
         "FROM costs GROUP BY customer, sku")
+
+// Single-row query — errors surface via the returned *sql.Row on Scan
+var total float64
+err = store.QueryRow(ctx, "charge_period=2026-03-17/*",
+    "SELECT SUM(net_cost) FROM costs").Scan(&total)
 ```
 
 Deduplicated by default. Pass `s3store.WithHistory()` to see all versions.
+`QueryRow` is the `database/sql` convention for queries that should return
+at most one row — construction-time errors (invalid key pattern, column
+introspection failure) surface through the returned `*sql.Row` at `Scan`
+time, matching stdlib behavior.
 
 ## Schema evolution
 
@@ -199,18 +215,29 @@ Config[T]{
 ```
 
 Both are applied at query time across all read paths (`Read`, `Query`,
-`PollRecords`). s3store introspects the scanned files' schemas and emits
-the right SQL shape:
+`QueryRow`, `PollRecords`). s3store introspects the scanned files' schemas
+and picks the right SQL shape:
 
-- If the target column already exists in some files: `SELECT * REPLACE
-  (COALESCE(newName, old1, old2) AS newName)` — fills gaps while
-  preserving column position.
-- If the target column doesn't exist in any file yet: emits it as a new
-  column (from olds, or as a constant default, or as `NULL` if nothing
-  is available).
+- **Target column already exists in some files** —
+  `SELECT * EXCLUDE (old1, old2) REPLACE (COALESCE(newName, old1, old2) AS newName) FROM _raw`.
+  The new column keeps its original position; the old names are removed
+  from the output so they don't linger next to the aliased column.
+- **Target column does not exist in any file yet** —
+  `SELECT * EXCLUDE (old1, old2), COALESCE(old1, old2) AS newName FROM _raw`.
+  The alias is appended as a new column, the old names are still removed.
+- **Nothing on either side of the alias exists** — `NULL AS newName` is
+  appended, so the output schema is still well-formed.
+- **`ColumnDefault` on a column that no file has** — the default is
+  emitted as a constant-valued column (`'EUR' AS currency`).
 
 So you can add a `ColumnAlias` or `ColumnDefault` before any file contains
-the new column, and it just works.
+the new column, and the first read that produces a file with the new name
+will transparently switch from "appended" to "REPLACEd in place". The
+column order visible to `ScanFunc` is always `_raw.*` minus EXCLUDEs, with
+REPLACEs in place, plus additions at the end (in sorted-key order).
+
+When two aliases absorb the same old column, the `EXCLUDE` list is
+deduplicated automatically.
 
 ## Settle window
 
@@ -231,21 +258,53 @@ or dedup bookkeeping.
 
 ```go
 type Config[T any] struct {
-    Bucket         string             // S3 bucket name
-    Prefix         string             // prefix under which data lives
-    KeyParts       []string           // ordered Hive partition key names
-    KeyFunc        func(T) string     // how to derive the key from a record
-    ScanFunc       func(*sql.Rows) (T, error) // how to map a DuckDB row to T
-    VersionColumn  string             // column to order by for dedup
-    DeduplicateBy  []string           // dedup columns (defaults to KeyParts)
-    TableAlias     string             // name used in Query SQL
-    SettleWindow   time.Duration      // default: 5s
-    ColumnDefaults map[string]string  // SQL expressions for missing columns
-    ColumnAliases  map[string][]string // new → old column chains
-    S3Client       *s3.Client
-    S3Endpoint     string             // override endpoint (MinIO, etc.)
+    // Required
+    Bucket     string                     // S3 bucket name
+    Prefix     string                     // prefix under which data lives
+    KeyParts   []string                   // ordered Hive partition key names
+    TableAlias string                     // name used in Query SQL
+    S3Client   *s3.Client                 // AWS SDK v2 S3 client
+
+    // Required for Write / PollRecords / Read (respectively)
+    KeyFunc  func(T) string               // derive key from record (Write)
+    ScanFunc func(*sql.Rows) (T, error)   // map DuckDB row to typed record
+
+    // Deduplication
+    VersionColumn string                  // column to ORDER BY for latest
+    DeduplicateBy []string                // dedup keys (default: KeyParts)
+
+    // Stream
+    SettleWindow time.Duration            // default: 5s
+
+    // Schema evolution (applied on all read paths)
+    ColumnDefaults map[string]string      // SQL expr per missing column
+    ColumnAliases  map[string][]string    // new name → old name chain
+
+    // S3 endpoint / extensions
+    S3Endpoint   string                   // host:port, no scheme; for MinIO
+    ExtraInitSQL []string                 // DuckDB SET/LOAD/CREATE SECRET
+                                          // statements run after the default
+                                          // init — used for S3 credentials,
+                                          // SSL toggles, extra extensions
 }
 ```
+
+`ExtraInitSQL` is how you pass S3 credentials and SSL settings through to
+DuckDB's httpfs extension for non-default endpoints. For example, a MinIO
+integration test uses:
+
+```go
+ExtraInitSQL: []string{
+    "SET s3_use_ssl=false",
+    "SET s3_access_key_id='minioadmin'",
+    "SET s3_secret_access_key='minioadmin'",
+    "SET s3_region='us-east-1'",
+},
+```
+
+On real AWS, both the SDK and DuckDB's httpfs pick up credentials from the
+default AWS provider chain (IAM role, env vars, `~/.aws/credentials`), so
+`ExtraInitSQL` is typically empty.
 
 ## Testing
 
