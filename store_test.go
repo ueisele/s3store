@@ -225,10 +225,38 @@ func TestBuildParquetURI(t *testing.T) {
 
 func TestBuildDataPath(t *testing.T) {
 	s := newTestStore()
-	got := s.buildDataPath("period=2026-03-17/customer=abc", "a3f2e1b4")
-	want := "test-prefix/data/period=2026-03-17/customer=abc/a3f2e1b4.parquet"
-	if got != want {
-		t.Errorf("\ngot  %q\nwant %q", got, want)
+	cases := []struct {
+		name    string
+		key     string
+		shortID string
+		want    string
+	}{
+		{
+			name:    "standard key",
+			key:     "period=2026-03-17/customer=abc",
+			shortID: "a3f2e1b4",
+			want:    "test-prefix/data/period=2026-03-17/customer=abc/a3f2e1b4.parquet",
+		},
+		{
+			name:    "value with hyphen",
+			key:     "period=2026-03-17/customer=foo-bar",
+			shortID: "c7d9f0e2",
+			want:    "test-prefix/data/period=2026-03-17/customer=foo-bar/c7d9f0e2.parquet",
+		},
+		{
+			name:    "value with double hyphen",
+			key:     "period=X/customer=foo--bar",
+			shortID: "11111111",
+			want:    "test-prefix/data/period=X/customer=foo--bar/11111111.parquet",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := s.buildDataPath(tc.key, tc.shortID)
+			if got != tc.want {
+				t.Errorf("\ngot  %q\nwant %q", got, tc.want)
+			}
+		})
 	}
 }
 

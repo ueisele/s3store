@@ -415,16 +415,7 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 		Currency string
 	}
 
-	prefix := fmt.Sprintf("it-evo-%d", time.Now().UnixNano())
-
-	commonConfig := func(prefix string) []string {
-		return []string{
-			"SET s3_use_ssl=false",
-			fmt.Sprintf("SET s3_access_key_id='%s'", minioUser),
-			fmt.Sprintf("SET s3_secret_access_key='%s'", minioPass),
-			"SET s3_region='us-east-1'",
-		}
-	}
+	prefix := uniquePrefix("evo")
 
 	// Write a v1 file (no currency column).
 	writer, err := New[v1](Config[v1]{
@@ -442,7 +433,7 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Amount, &r.Ts)
 		},
 		S3Endpoint:   minioHostPort,
-		ExtraInitSQL: commonConfig(prefix),
+		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
 		t.Fatalf("New v1: %v", err)
@@ -475,7 +466,7 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 				&r.Period, &r.Customer, &r.Amount, &r.Ts, &r.Currency)
 		},
 		S3Endpoint:   minioHostPort,
-		ExtraInitSQL: commonConfig(prefix),
+		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
 		t.Fatalf("New v2: %v", err)
@@ -514,7 +505,7 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 		Amount   float64
 	}
 
-	prefix := fmt.Sprintf("it-alias-%d", time.Now().UnixNano())
+	prefix := uniquePrefix("alias")
 
 	writerOld, err := New[recOld](Config[recOld]{
 		Bucket:     bucketName,
@@ -530,13 +521,8 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 			var r recOld
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Value, &r.Ts)
 		},
-		S3Endpoint: minioHostPort,
-		ExtraInitSQL: []string{
-			"SET s3_use_ssl=false",
-			fmt.Sprintf("SET s3_access_key_id='%s'", minioUser),
-			fmt.Sprintf("SET s3_secret_access_key='%s'", minioPass),
-			"SET s3_region='us-east-1'",
-		},
+		S3Endpoint:   minioHostPort,
+		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
 		t.Fatalf("New old: %v", err)
@@ -567,13 +553,8 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 			var r recNew
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Ts, &r.Amount)
 		},
-		S3Endpoint: minioHostPort,
-		ExtraInitSQL: []string{
-			"SET s3_use_ssl=false",
-			fmt.Sprintf("SET s3_access_key_id='%s'", minioUser),
-			fmt.Sprintf("SET s3_secret_access_key='%s'", minioPass),
-			"SET s3_region='us-east-1'",
-		},
+		S3Endpoint:   minioHostPort,
+		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
 		t.Fatalf("New new: %v", err)

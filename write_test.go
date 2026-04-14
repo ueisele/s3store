@@ -1,7 +1,10 @@
 package s3store
 
 import (
+	"bytes"
 	"testing"
+
+	"github.com/parquet-go/parquet-go"
 )
 
 func TestValidateKey(t *testing.T) {
@@ -78,20 +81,40 @@ func TestGroupByKey(t *testing.T) {
 
 func TestEncodeParquet(t *testing.T) {
 	s := newTestStore()
-	records := []testRecord{
+	input := []testRecord{
 		{Customer: "a", Period: "p1", Value: 1},
 		{Customer: "b", Period: "p1", Value: 2},
+		{Customer: "c", Period: "p2", Value: 3},
 	}
-	got, err := s.encodeParquet(records)
+
+	encoded, err := s.encodeParquet(input)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}
-	if len(got) == 0 {
-		t.Error("encodeParquet returned empty buffer")
+	if len(encoded) < 8 || string(encoded[:4]) != "PAR1" ||
+		string(encoded[len(encoded)-4:]) != "PAR1" {
+		t.Fatalf("not a valid parquet file: len=%d head=%x tail=%x",
+			len(encoded), encoded[:min(4, len(encoded))],
+			encoded[max(0, len(encoded)-4):])
 	}
-	// Parquet files start with the magic bytes "PAR1".
-	if len(got) < 4 || string(got[:4]) != "PAR1" {
-		t.Errorf("buffer does not start with PAR1 magic: %x", got[:min(4, len(got))])
+
+	// Round-trip: decode via parquet-go and compare.
+	reader := parquet.NewGenericReader[testRecord](
+		bytes.NewReader(encoded))
+	defer reader.Close()
+
+	got := make([]testRecord, len(input))
+	n, err := reader.Read(got)
+	if err != nil && n == 0 {
+		t.Fatalf("read: %v", err)
+	}
+	if n != len(input) {
+		t.Fatalf("read %d rows, want %d", n, len(input))
+	}
+	for i, want := range input {
+		if got[i] != want {
+			t.Errorf("row %d: got %+v, want %+v", i, got[i], want)
+		}
 	}
 }
 
