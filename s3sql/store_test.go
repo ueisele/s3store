@@ -144,38 +144,8 @@ func TestDedupColumns(t *testing.T) {
 	}
 }
 
-// TestBuildColumnTransforms smoke-tests the REPLACE / additions
-// / excludes split for both ColumnAliases and ColumnDefaults.
-func TestBuildColumnTransforms(t *testing.T) {
-	s := newTestStore()
-	s.cfg.ColumnAliases = map[string][]string{
-		"amount": {"old_amount", "ancient_amount"},
-	}
-	s.cfg.ColumnDefaults = map[string]string{
-		"currency": "'USD'",
-	}
-	existing := map[string]bool{
-		"amount":     true,
-		"old_amount": true,
-		// ancient_amount not in schema
-	}
-	replaces, additions, excludes := s.buildColumnTransforms(existing)
-
-	// amount exists and at least one old exists → REPLACE.
-	wantReplace := "COALESCE(amount, old_amount) AS amount"
-	if len(replaces) != 1 || replaces[0] != wantReplace {
-		t.Errorf("replaces: got %v, want [%q]", replaces, wantReplace)
-	}
-	// currency doesn't exist → addition with default.
-	wantAdd := "'USD' AS currency"
-	if len(additions) != 1 || additions[0] != wantAdd {
-		t.Errorf("additions: got %v, want [%q]", additions, wantAdd)
-	}
-	// old_amount consumed → excluded.
-	if len(excludes) != 1 || excludes[0] != "old_amount" {
-		t.Errorf("excludes: got %v", excludes)
-	}
-}
+// buildColumnTransforms is exhaustively covered in
+// transforms_test.go's TestBuildColumnTransformsAllCases.
 
 // TestSettleWindowDefault guards the 5s default.
 func TestSettleWindowDefault(t *testing.T) {

@@ -120,6 +120,30 @@ func TestDedupLatest_EmptyInput(t *testing.T) {
 	}
 }
 
+// TestStripVersions drops the per-record insertedAt metadata
+// while preserving order and record values. It's used on the
+// non-dedup path so a regression here would show up as a
+// missing field in user-visible output.
+func TestStripVersions(t *testing.T) {
+	now := time.UnixMicro(1)
+	in := []versionedRecord[dedupRec]{
+		{rec: dedupRec{entity: "a", payload: "first"}, insertedAt: now},
+		{rec: dedupRec{entity: "b", payload: "second"}, insertedAt: now},
+	}
+	got := stripVersions(in)
+	if len(got) != 2 {
+		t.Fatalf("got %d, want 2", len(got))
+	}
+	if got[0].payload != "first" || got[1].payload != "second" {
+		t.Errorf("order or values wrong: %+v", got)
+	}
+
+	// Nil input returns nil, not a zero-length allocation.
+	if v := stripVersions[dedupRec](nil); v != nil {
+		t.Errorf("stripVersions(nil) = %v, want nil", v)
+	}
+}
+
 // TestDedupLatest_TieKeepsFirst documents the
 // stability-on-tie invariant: when two records share the same
 // version, the first occurrence wins. Integration tests can't
