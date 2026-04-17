@@ -6,94 +6,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/testcontainers/testcontainers-go"
-	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
+	"github.com/ueisele/s3store/internal/testutil"
 )
-
-// Shared MinIO fixture: started once in TestMain, reused by
-// every integration test via unique prefixes for isolation.
-var (
-	minioHostPort string
-	minioUser     string
-	minioPass     string
-	s3Client      *s3.Client
-	bucketName    = "s3store-it"
-	prefixCounter atomic.Int64
-)
-
-func TestMain(m *testing.M) {
-	os.Exit(runIntegrationTests(m))
-}
-
-// runIntegrationTests owns the MinIO container lifecycle so the
-// deferred TerminateContainer actually runs — os.Exit in TestMain
-// would skip it. Returns the exit code for m.Run().
-func runIntegrationTests(m *testing.M) int {
-	ctx := context.Background()
-
-	// Disable testcontainers' ryuk reaper sidecar — it fails
-	// to bind its port on recent Docker Desktop versions. We
-	// terminate the MinIO container via defer below instead.
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
-
-	container, err := tcminio.Run(ctx, "minio/minio:latest")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start MinIO: %v\n", err)
-		return 1
-	}
-	defer func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to terminate MinIO: %v\n", err)
-		}
-	}()
-
-	connURL, err := container.ConnectionString(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get MinIO endpoint: %v\n", err)
-		return 1
-	}
-	minioHostPort = connURL // host:port
-
-	minioUser = container.Username
-	minioPass = container.Password
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion("us-east-1"),
-		awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(
-				minioUser, minioPass, "")),
-	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to build AWS config: %v\n", err)
-		return 1
-	}
-	s3Client = s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String("http://" + minioHostPort)
-		o.UsePathStyle = true
-	})
-
-	if _, err := s3Client.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: aws.String(bucketName),
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create bucket: %v\n", err)
-		return 1
-	}
-
-	return m.Run()
-}
 
 // IntRecord is the record type used by integration tests.
-// Lives outside store_test.go's testRecord so we can use
-// different tag names for schema-evolution scenarios.
+// Lives alongside the umbrella suite with its own tag layout so
+// schema-evolution scenarios can swap in adjacent struct types.
 type IntRecord struct {
 	Period   string    `parquet:"period"`
 	Customer string    `parquet:"customer"`
@@ -111,38 +32,21 @@ func scanIntRecord(rows *sql.Rows) (IntRecord, error) {
 	return r, err
 }
 
-// duckDBAuthSettings returns the DuckDB SET statements needed
-// for httpfs to talk to the MinIO test container. Endpoint,
-// region, URL style, and use_ssl are now auto-derived from the
-// S3Client's Options(); only credentials still need an explicit
-// SET.
-func duckDBAuthSettings() []string {
-	return []string{
-		fmt.Sprintf("SET s3_access_key_id='%s'", minioUser),
-		fmt.Sprintf("SET s3_secret_access_key='%s'", minioPass),
-	}
-}
-
-// uniquePrefix returns a prefix that is unique to this test
-// run and monotonic within a run, so tests can't collide in
-// the shared bucket.
-func uniquePrefix(kind string) string {
-	return fmt.Sprintf("it-%s-%d-%d", kind,
-		time.Now().UnixNano(), prefixCounter.Add(1))
-}
-
-// newStore creates a Store on a unique prefix so tests don't
-// collide in the shared bucket. `dedupBy` can be empty to
-// accept the default (KeyParts-based) dedup.
+// newStore creates an umbrella Store against a fresh bucket on
+// the shared MinIO fixture. The underlying container is reused
+// across every integration test and package in this `go test`
+// invocation (see internal/testutil). `dedupBy` can be empty
+// to accept the default (KeyParts-based) dedup.
 func newStore(
 	t *testing.T, versionCol string, dedupBy ...string,
 ) *Store[IntRecord] {
 	t.Helper()
+	f := testutil.New(t)
 
 	store, err := New[IntRecord](Config[IntRecord]{
-		Bucket:        bucketName,
-		Prefix:        uniquePrefix("store"),
-		S3Client:      s3Client,
+		Bucket:        f.Bucket,
+		Prefix:        "store",
+		S3Client:      f.S3Client,
 		KeyParts:      []string{"period", "customer"},
 		TableAlias:    "records",
 		VersionColumn: versionCol,
@@ -154,7 +58,7 @@ func newStore(
 				r.Period, r.Customer)
 		},
 		ScanFunc:     scanIntRecord,
-		ExtraInitSQL: duckDBAuthSettings(),
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -423,13 +327,13 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 		Currency string
 	}
 
-	prefix := uniquePrefix("evo")
+	f := testutil.New(t)
 
 	// Write a v1 file (no currency column).
 	writer, err := New[v1](Config[v1]{
-		Bucket:     bucketName,
-		Prefix:     prefix,
-		S3Client:   s3Client,
+		Bucket:     f.Bucket,
+		Prefix:     "store",
+		S3Client:   f.S3Client,
 		KeyParts:   []string{"period", "customer"},
 		TableAlias: "t",
 		PartitionKeyOf: func(r v1) string {
@@ -440,7 +344,7 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 			var r v1
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Amount, &r.Ts)
 		},
-		ExtraInitSQL: duckDBAuthSettings(),
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("New v1: %v", err)
@@ -455,9 +359,9 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 
 	// Read as v2 with a ColumnDefault for the missing column.
 	reader, err := New[v2](Config[v2]{
-		Bucket:     bucketName,
-		Prefix:     prefix,
-		S3Client:   s3Client,
+		Bucket:     f.Bucket,
+		Prefix:     "store",
+		S3Client:   f.S3Client,
 		KeyParts:   []string{"period", "customer"},
 		TableAlias: "t",
 		ColumnDefaults: map[string]string{
@@ -472,7 +376,7 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 			return r, rows.Scan(
 				&r.Period, &r.Customer, &r.Amount, &r.Ts, &r.Currency)
 		},
-		ExtraInitSQL: duckDBAuthSettings(),
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("New v2: %v", err)
@@ -511,12 +415,12 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 		Amount   float64
 	}
 
-	prefix := uniquePrefix("alias")
+	f := testutil.New(t)
 
 	writerOld, err := New[recOld](Config[recOld]{
-		Bucket:     bucketName,
-		Prefix:     prefix,
-		S3Client:   s3Client,
+		Bucket:     f.Bucket,
+		Prefix:     "store",
+		S3Client:   f.S3Client,
 		KeyParts:   []string{"period", "customer"},
 		TableAlias: "t",
 		PartitionKeyOf: func(r recOld) string {
@@ -527,7 +431,7 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 			var r recOld
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Value, &r.Ts)
 		},
-		ExtraInitSQL: duckDBAuthSettings(),
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("New old: %v", err)
@@ -542,9 +446,9 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 
 	// Reader projects both generations into the new name.
 	reader, err := New[recNew](Config[recNew]{
-		Bucket:     bucketName,
-		Prefix:     prefix,
-		S3Client:   s3Client,
+		Bucket:     f.Bucket,
+		Prefix:     "store",
+		S3Client:   f.S3Client,
 		KeyParts:   []string{"period", "customer"},
 		TableAlias: "t",
 		ColumnAliases: map[string][]string{
@@ -558,7 +462,7 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 			var r recNew
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Ts, &r.Amount)
 		},
-		ExtraInitSQL: duckDBAuthSettings(),
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("New new: %v", err)
@@ -813,10 +717,11 @@ func TestIntegration_OffsetAdvancement(t *testing.T) {
 func TestIntegration_SettleWindow(t *testing.T) {
 	ctx := context.Background()
 
+	f := testutil.New(t)
 	store, err := New[IntRecord](Config[IntRecord]{
-		Bucket:        bucketName,
-		Prefix:        uniquePrefix("settle"),
-		S3Client:      s3Client,
+		Bucket:        f.Bucket,
+		Prefix:        "store",
+		S3Client:      f.S3Client,
 		KeyParts:      []string{"period", "customer"},
 		TableAlias:    "records",
 		VersionColumn: "ts",
@@ -827,7 +732,7 @@ func TestIntegration_SettleWindow(t *testing.T) {
 				r.Period, r.Customer)
 		},
 		ScanFunc:     scanIntRecord,
-		ExtraInitSQL: duckDBAuthSettings(),
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

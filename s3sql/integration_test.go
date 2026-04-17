@@ -6,8 +6,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,56 +45,8 @@ func scanRec(rows *sql.Rows) (Rec, error) {
 	return r, err
 }
 
-var (
-	fixture  *testutil.Fixture
-	prefixCt atomic.Int64
-)
-
-func TestMain(m *testing.M) {
-	os.Exit(run(m))
-}
-
-func run(m *testing.M) int {
-	ctx := context.Background()
-	f, err := testutil.Start(ctx, "s3sql-it")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "fixture: %v\n", err)
-		return 1
-	}
-	fixture = f
-	defer func() {
-		if err := fixture.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "fixture close: %v\n", err)
-		}
-	}()
-	return m.Run()
-}
-
-func uniquePrefix(kind string) string {
-	return fmt.Sprintf("it-%s-%d-%d", kind,
-		time.Now().UnixNano(), prefixCt.Add(1))
-}
-
-// writerFor returns an s3parquet.Store sharing the same prefix
-// as the companion s3sql.Store — needed because s3sql is
-// read-only; every integration test writes via s3parquet first.
-func writerFor[T any](
-	t *testing.T, prefix string, partitionKeyOf func(T) string,
-) *s3parquet.Store[T] {
-	t.Helper()
-	w, err := s3parquet.New[T](s3parquet.Config[T]{
-		Bucket:         fixture.Bucket,
-		Prefix:         prefix,
-		S3Client:       fixture.S3Client,
-		KeyParts:       []string{"period", "customer"},
-		PartitionKeyOf: partitionKeyOf,
-		SettleWindow:   10 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("s3parquet.New: %v", err)
-	}
-	t.Cleanup(func() { _ = w.Close() })
-	return w
+func partitionKeyOfRec(r Rec) string {
+	return fmt.Sprintf("period=%s/customer=%s", r.Period, r.Customer)
 }
 
 // sqlOpts dials in the dedup and schema-evolution config a
@@ -108,14 +58,38 @@ type sqlOpts struct {
 	columnDefaults map[string]string
 }
 
-// newSQLStore constructs a s3sql.Store against a given prefix
-// with the shared MinIO fixture's credentials wired in.
-func newSQLStore(t *testing.T, prefix string, opts sqlOpts) *s3sql.Store[Rec] {
+// testFixture bundles the per-test MinIO bucket + a matching
+// s3parquet writer + an s3sql reader pointed at the same
+// Bucket/Prefix.
+type testFixture struct {
+	bucket string
+	writer *s3parquet.Store[Rec]
+	sql    *s3sql.Store[Rec]
+}
+
+// newFixture creates a fresh bucket on the shared MinIO,
+// constructs a matching writer (s3parquet) and reader
+// (s3sql) against it, and wires cleanup.
+func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	t.Helper()
+	f := testutil.New(t)
+	w, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:         f.Bucket,
+		Prefix:         "store",
+		S3Client:       f.S3Client,
+		KeyParts:       []string{"period", "customer"},
+		PartitionKeyOf: partitionKeyOfRec,
+		SettleWindow:   10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
 	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
-		Bucket:         fixture.Bucket,
-		Prefix:         prefix,
-		S3Client:       fixture.S3Client,
+		Bucket:         f.Bucket,
+		Prefix:         "store",
+		S3Client:       f.S3Client,
 		KeyParts:       []string{"period", "customer"},
 		ScanFunc:       scanRec,
 		TableAlias:     "records",
@@ -124,26 +98,21 @@ func newSQLStore(t *testing.T, prefix string, opts sqlOpts) *s3sql.Store[Rec] {
 		ColumnAliases:  opts.columnAliases,
 		ColumnDefaults: opts.columnDefaults,
 		SettleWindow:   10 * time.Millisecond,
-		ExtraInitSQL:   fixture.DuckDBCredentials(),
+		ExtraInitSQL:   f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("s3sql.New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
+
+	return &testFixture{bucket: f.Bucket, writer: w, sql: s}
 }
 
-func partitionKeyOfRec(r Rec) string {
-	return fmt.Sprintf("period=%s/customer=%s", r.Period, r.Customer)
-}
-
-// writeSome writes records and returns once they've settled
-// enough that the next Poll will see them.
-func writeSome[T any](
-	t *testing.T, w *s3parquet.Store[T], records []T,
-) {
+// writeSome writes records through the parquet writer and
+// sleeps long enough for them to fall past the SettleWindow.
+func (f *testFixture) writeSome(t *testing.T, recs []Rec) {
 	t.Helper()
-	if _, err := w.Write(context.Background(), records); err != nil {
+	if _, err := f.writer.Write(context.Background(), recs); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	time.Sleep(30 * time.Millisecond)
@@ -152,18 +121,16 @@ func writeSome[T any](
 // TestRead_WithDedup exercises the SQL read path end-to-end,
 // including DuckDB's QUALIFY-based dedup via VersionColumn.
 func TestRead_WithDedup(t *testing.T) {
-	prefix := uniquePrefix("read")
-	w := writerFor[Rec](t, prefix, partitionKeyOfRec)
-	s := newSQLStore(t, prefix, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{versionColumn: "ts"})
 
-	writeSome(t, w, []Rec{
+	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
 	})
-	writeSome(t, w, []Rec{
+	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 99, Currency: "USD", Ts: time.UnixMilli(200)},
 	})
 
-	got, err := s.Read(context.Background(),
+	got, err := f.sql.Read(context.Background(),
 		"period=2026-03-17/customer=abc")
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -179,19 +146,17 @@ func TestRead_WithDedup(t *testing.T) {
 // TestRead_WithHistory verifies every version is returned when
 // WithHistory disables dedup.
 func TestRead_WithHistory(t *testing.T) {
-	prefix := uniquePrefix("read-hist")
-	w := writerFor[Rec](t, prefix, partitionKeyOfRec)
-	s := newSQLStore(t, prefix, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{versionColumn: "ts"})
 
 	for i := int64(0); i < 3; i++ {
-		writeSome(t, w, []Rec{
+		f.writeSome(t, []Rec{
 			{Period: "2026-03-17", Customer: "abc", SKU: "s1",
 				Amount: float64(i), Currency: "USD",
 				Ts: time.UnixMilli((i + 1) * 100)},
 		})
 	}
 
-	got, err := s.Read(context.Background(),
+	got, err := f.sql.Read(context.Background(),
 		"period=2026-03-17/customer=abc", s3sql.WithHistory())
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -201,27 +166,21 @@ func TestRead_WithHistory(t *testing.T) {
 	}
 }
 
-// TestQuery covers the arbitrary-SQL path with an aggregation,
-// the primary use case the umbrella forwards here.
+// TestQuery covers the arbitrary-SQL path with an aggregation.
 func TestQuery(t *testing.T) {
-	prefix := uniquePrefix("query")
-	w := writerFor[Rec](t, prefix, partitionKeyOfRec)
-	// Dedup at sku granularity so multiple SKUs per (period,
-	// customer) are treated as distinct entities — the realistic
-	// billing scenario for a SUM(amount) GROUP BY customer.
-	s := newSQLStore(t, prefix, sqlOpts{
+	f := newFixture(t, sqlOpts{
 		versionColumn: "ts",
 		dedupBy:       []string{"period", "customer", "sku"},
 	})
 
-	writeSome(t, w, []Rec{
+	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(1)},
 		{Period: "2026-03-17", Customer: "abc", SKU: "s2", Amount: 20, Currency: "USD", Ts: time.UnixMilli(2)},
 		{Period: "2026-03-17", Customer: "def", SKU: "s1", Amount: 30, Currency: "USD", Ts: time.UnixMilli(3)},
 	})
 
 	ctx := context.Background()
-	rows, err := s.Query(ctx, "*",
+	rows, err := f.sql.Query(ctx, "*",
 		"SELECT customer, SUM(amount) AS total FROM records "+
 			"GROUP BY customer ORDER BY customer")
 	if err != nil {
@@ -263,18 +222,16 @@ func TestQuery(t *testing.T) {
 // errorRow path: an invalid key pattern must surface as an
 // error at Scan time (database/sql convention).
 func TestQueryRow(t *testing.T) {
-	prefix := uniquePrefix("queryrow")
-	w := writerFor[Rec](t, prefix, partitionKeyOfRec)
-	s := newSQLStore(t, prefix, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{versionColumn: "ts"})
 
-	writeSome(t, w, []Rec{
+	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 42, Currency: "USD", Ts: time.UnixMilli(1)},
 	})
 
 	ctx := context.Background()
 
 	var total float64
-	err := s.QueryRow(ctx,
+	err := f.sql.QueryRow(ctx,
 		"period=2026-03-17/customer=abc",
 		"SELECT SUM(amount) FROM records").Scan(&total)
 	if err != nil {
@@ -284,9 +241,7 @@ func TestQueryRow(t *testing.T) {
 		t.Errorf("got total=%v, want 42", total)
 	}
 
-	// Invalid pattern — segment count mismatch. Error surfaces
-	// through Scan, not through the QueryRow call itself.
-	err = s.QueryRow(ctx, "period=X/customer=Y/extra=Z",
+	err = f.sql.QueryRow(ctx, "period=X/customer=Y/extra=Z",
 		"SELECT 1").Scan(&total)
 	if err == nil {
 		t.Error("expected error for invalid pattern, got nil")
@@ -297,12 +252,10 @@ func TestQueryRow(t *testing.T) {
 // s3parquet-forwarded version used by the umbrella). Entries
 // must be chronological and the cursor must advance correctly.
 func TestPoll(t *testing.T) {
-	prefix := uniquePrefix("poll")
-	w := writerFor[Rec](t, prefix, partitionKeyOfRec)
-	s := newSQLStore(t, prefix, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{versionColumn: "ts"})
 
 	for i := 0; i < 3; i++ {
-		writeSome(t, w, []Rec{
+		f.writeSome(t, []Rec{
 			{Period: "2026-03-17", Customer: fmt.Sprintf("c%d", i),
 				SKU: "s1", Amount: float64(i),
 				Currency: "USD", Ts: time.UnixMilli(int64(i) + 1)},
@@ -310,7 +263,7 @@ func TestPoll(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	entries, newOffset, err := s.Poll(ctx, "", 100)
+	entries, newOffset, err := f.sql.Poll(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
@@ -318,7 +271,7 @@ func TestPoll(t *testing.T) {
 		t.Fatalf("got %d entries, want 3", len(entries))
 	}
 
-	empty, off2, err := s.Poll(ctx, newOffset, 100)
+	empty, off2, err := f.sql.Poll(ctx, newOffset, 100)
 	if err != nil {
 		t.Fatalf("Poll past offset: %v", err)
 	}
@@ -333,20 +286,18 @@ func TestPoll(t *testing.T) {
 // TestPollRecords covers the DuckDB-powered PollRecords path,
 // including dedup semantics against a multi-write key.
 func TestPollRecords(t *testing.T) {
-	prefix := uniquePrefix("pollrec")
-	w := writerFor[Rec](t, prefix, partitionKeyOfRec)
-	s := newSQLStore(t, prefix, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{versionColumn: "ts"})
 
-	writeSome(t, w, []Rec{
+	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
 	})
-	writeSome(t, w, []Rec{
+	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 99, Currency: "USD", Ts: time.UnixMilli(200)},
 	})
 
 	ctx := context.Background()
 
-	deduped, off, err := s.PollRecords(ctx, "", 100)
+	deduped, off, err := f.sql.PollRecords(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
 	}
@@ -357,7 +308,7 @@ func TestPollRecords(t *testing.T) {
 		t.Error("offset empty after non-empty PollRecords")
 	}
 
-	full, _, err := s.PollRecords(ctx, "", 100, s3sql.WithHistory())
+	full, _, err := f.sql.PollRecords(ctx, "", 100, s3sql.WithHistory())
 	if err != nil {
 		t.Fatalf("PollRecords history: %v", err)
 	}
@@ -368,42 +319,80 @@ func TestPollRecords(t *testing.T) {
 
 // TestColumnAliasesAndDefaults exercises schema-evolution
 // transforms — the SQL-path feature s3parquet doesn't support.
-// Old files have old_amount and no currency; the aliased
-// column chains old_amount → amount, and currency gets a
-// default value when missing.
+// Writes an old-shape file and a new-shape file under the same
+// key and verifies the aliased column + default value surface
+// correctly through the SQL read.
 func TestColumnAliasesAndDefaults(t *testing.T) {
-	prefix := uniquePrefix("evo")
+	testFix := testutil.New(t)
 
-	// Write an old-shape file first.
-	wOld := writerFor[RecOld](t, prefix, func(r RecOld) string {
-		return fmt.Sprintf("period=%s/customer=%s", r.Period, r.Customer)
+	// Old-shape writer + file.
+	wOld, err := s3parquet.New[RecOld](s3parquet.Config[RecOld]{
+		Bucket:   testFix.Bucket,
+		Prefix:   "store",
+		S3Client: testFix.S3Client,
+		KeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r RecOld) string {
+			return fmt.Sprintf("period=%s/customer=%s", r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
 	})
-	writeSome(t, wOld, []RecOld{
+	if err != nil {
+		t.Fatalf("s3parquet.New(RecOld): %v", err)
+	}
+	t.Cleanup(func() { _ = wOld.Close() })
+	if _, err := wOld.Write(context.Background(), []RecOld{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", OldAmount: 10, Ts: time.UnixMilli(100)},
-	})
+	}); err != nil {
+		t.Fatalf("Write RecOld: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
 
-	// Now a new-shape file for the same key: amount (new name),
-	// currency added.
-	wNew := writerFor[Rec](t, prefix, partitionKeyOfRec)
-	writeSome(t, wNew, []Rec{
+	// New-shape writer + file.
+	wNew, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:         testFix.Bucket,
+		Prefix:         "store",
+		S3Client:       testFix.S3Client,
+		KeyParts:       []string{"period", "customer"},
+		PartitionKeyOf: partitionKeyOfRec,
+		SettleWindow:   10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New(Rec): %v", err)
+	}
+	t.Cleanup(func() { _ = wNew.Close() })
+	if _, err := wNew.Write(context.Background(), []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 99, Currency: "EUR", Ts: time.UnixMilli(200)},
-	})
+	}); err != nil {
+		t.Fatalf("Write Rec: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
 
-	s := newSQLStore(t, prefix, sqlOpts{
-		versionColumn: "ts",
-		columnAliases: map[string][]string{
+	// Reader with alias + default.
+	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
+		Bucket:        testFix.Bucket,
+		Prefix:        "store",
+		S3Client:      testFix.S3Client,
+		KeyParts:      []string{"period", "customer"},
+		ScanFunc:      scanRec,
+		TableAlias:    "records",
+		VersionColumn: "ts",
+		ColumnAliases: map[string][]string{
 			"amount": {"old_amount"},
 		},
-		columnDefaults: map[string]string{
+		ColumnDefaults: map[string]string{
 			"currency": "'USD'",
 		},
+		SettleWindow: 10 * time.Millisecond,
+		ExtraInitSQL: testFix.DuckDBCredentials(),
 	})
+	if err != nil {
+		t.Fatalf("s3sql.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
 
-	// Read uses scanRec, which depends on the full column order
-	// coming out of union_by_name + transforms. Schema-evolution
-	// tests want to verify just the alias/default columns without
-	// getting tangled in column-order shifts, so use Query and
-	// pull exactly the columns we care about.
+	// Use Query with explicit columns to avoid depending on
+	// the exact column order produced by union_by_name +
+	// transforms.
 	ctx := context.Background()
 	rows, err := s.Query(ctx,
 		"period=2026-03-17/customer=abc",
@@ -433,25 +422,16 @@ func TestColumnAliasesAndDefaults(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d records, want 2", len(got))
 	}
-	// First row came from the old file: alias chain must have
-	// mapped old_amount=10 to amount, and the default must have
-	// filled in currency.
 	if got[0].amount != 10 {
-		t.Errorf("[0] amount=%v, want 10 (alias from old_amount)",
-			got[0].amount)
+		t.Errorf("[0] amount=%v, want 10 (alias from old_amount)", got[0].amount)
 	}
 	if got[0].currency != "USD" {
-		t.Errorf("[0] currency=%q, want USD (default)",
-			got[0].currency)
+		t.Errorf("[0] currency=%q, want USD (default)", got[0].currency)
 	}
-	// Second row is from the new file — amount is native,
-	// currency comes from the file itself (EUR, not the
-	// default).
 	if got[1].amount != 99 {
 		t.Errorf("[1] amount=%v, want 99", got[1].amount)
 	}
 	if got[1].currency != "EUR" {
-		t.Errorf("[1] currency=%q, want EUR (native value)",
-			got[1].currency)
+		t.Errorf("[1] currency=%q, want EUR (native)", got[1].currency)
 	}
 }

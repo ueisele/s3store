@@ -1,16 +1,20 @@
 //go:build integration
 
 // Package testutil provides shared integration-test helpers:
-// launching a MinIO container, creating an S3 client pointed at
-// it, and cleanly terminating it. Gated on the `integration`
-// build tag so the testcontainers dependency never ends up in
-// non-test builds.
+// one MinIO container per `go test` invocation (reused across
+// every package), each test gets its own bucket.
+//
+// Gated on the `integration` build tag so the testcontainers
+// dependency never ends up in non-test builds.
 package testutil
 
 import (
 	"context"
 	"fmt"
-	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -20,88 +24,121 @@ import (
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 )
 
-// Fixture bundles a running MinIO container with a ready-to-use
-// S3 client and a pre-created bucket.
-type Fixture struct {
-	container *tcminio.MinioContainer
-	HostPort  string // "host:port", no scheme
-	Username  string
-	Password  string
-	Bucket    string
-	S3Client  *s3.Client
+const (
+	minioImage    = "minio/minio:latest"
+	minioUsername = "minioadmin"
+	minioPassword = "minioadmin"
+)
+
+type sharedMinio struct {
+	client   *s3.Client
+	hostPort string
 }
 
-// Start launches MinIO, creates an AWS SDK client configured to
-// talk to it (BaseEndpoint, path-style addressing, static
-// credentials), and creates the named bucket. Returns a
-// Fixture whose Close must be called to terminate the
-// container.
+//nolint:gochecknoglobals // test-only singleton
+var (
+	sharedOnce    sync.Once
+	shared        *sharedMinio
+	sharedErr     error
+	bucketCounter atomic.Int64
+)
+
+// shareMinio lazily starts (or joins) the MinIO container.
+// Reuse is keyed by testcontainers.SessionID so every test
+// binary spawned by the same `go test` invocation — even
+// across packages — shares one physical container. Ryuk reaps
+// it when the invocation ends, so there is no explicit
+// terminate.
 //
-// Disables testcontainers' ryuk reaper sidecar, which fails to
-// bind its port on recent Docker Desktop versions. Cleanup goes
-// through the Fixture's Close instead.
-func Start(ctx context.Context, bucket string) (*Fixture, error) {
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
-
-	container, err := tcminio.Run(ctx, "minio/minio:latest")
-	if err != nil {
-		return nil, fmt.Errorf("minio run: %w", err)
-	}
-	cleanup := func() {
-		_ = testcontainers.TerminateContainer(container)
-	}
-
-	connURL, err := container.ConnectionString(ctx)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("minio connection string: %w", err)
-	}
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion("us-east-1"),
-		awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(
-				container.Username, container.Password, "")),
-	)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("aws config: %w", err)
-	}
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String("http://" + connURL)
-		o.UsePathStyle = true
+// On Docker Desktop setups where Ryuk fails to bind its port
+// (a known issue with some versions), the reused container
+// persists between invocations. `docker rm -f s3store-minio-*`
+// cleans them up manually. CI runners are typically ephemeral
+// so this isn't a production concern.
+func shareMinio(ctx context.Context) (*sharedMinio, error) {
+	sharedOnce.Do(func() {
+		container, err := tcminio.Run(ctx, minioImage,
+			tcminio.WithUsername(minioUsername),
+			tcminio.WithPassword(minioPassword),
+			testcontainers.CustomizeRequestOption(
+				func(req *testcontainers.GenericContainerRequest) error {
+					req.Name = "s3store-minio-" + testcontainers.SessionID()
+					req.Reuse = true
+					return nil
+				},
+			),
+		)
+		if err != nil {
+			sharedErr = fmt.Errorf("start MinIO: %w", err)
+			return
+		}
+		connURL, err := container.ConnectionString(ctx)
+		if err != nil {
+			sharedErr = fmt.Errorf("get MinIO endpoint: %w", err)
+			return
+		}
+		cfg, err := awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion("us-east-1"),
+			awsconfig.WithCredentialsProvider(
+				credentials.NewStaticCredentialsProvider(
+					minioUsername, minioPassword, "")),
+		)
+		if err != nil {
+			sharedErr = fmt.Errorf("aws config: %w", err)
+			return
+		}
+		client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String("http://" + connURL)
+			o.UsePathStyle = true
+		})
+		shared = &sharedMinio{client: client, hostPort: connURL}
 	})
-
-	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: aws.String(bucket),
-	}); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("create bucket: %w", err)
-	}
-
-	return &Fixture{
-		container: container,
-		HostPort:  connURL,
-		Username:  container.Username,
-		Password:  container.Password,
-		Bucket:    bucket,
-		S3Client:  client,
-	}, nil
+	return shared, sharedErr
 }
 
-// Close terminates the MinIO container.
-func (f *Fixture) Close() error {
-	return testcontainers.TerminateContainer(f.container)
+// Fixture carries an S3 client pointed at the shared MinIO
+// container together with a freshly-created per-test bucket.
+type Fixture struct {
+	S3Client *s3.Client
+	HostPort string // "host:port"
+	Bucket   string
 }
 
-// DuckDBCredentials returns the SET statements needed for
-// DuckDB's httpfs extension to authenticate against this MinIO
-// fixture. Endpoint, region, URL style, and use_ssl are
-// auto-derived by s3sql from S3Client.Options().
+// DuckDBCredentials returns the DuckDB SET statements needed
+// for httpfs to authenticate against the shared MinIO fixture.
+// Endpoint, region, URL style, and use_ssl are auto-derived by
+// s3sql from S3Client.Options().
 func (f *Fixture) DuckDBCredentials() []string {
 	return []string{
-		fmt.Sprintf("SET s3_access_key_id='%s'", f.Username),
-		fmt.Sprintf("SET s3_secret_access_key='%s'", f.Password),
+		fmt.Sprintf("SET s3_access_key_id='%s'", minioUsername),
+		fmt.Sprintf("SET s3_secret_access_key='%s'", minioPassword),
+	}
+}
+
+// New returns a Fixture for the calling test. A fresh bucket is
+// created for isolation; the underlying MinIO container is
+// shared with every other test in the same `go test`
+// invocation (across packages).
+//
+// No Close or TestMain needed: Ryuk terminates the container
+// when the invocation ends.
+func New(t *testing.T) *Fixture {
+	t.Helper()
+	ctx := t.Context()
+	s, err := shareMinio(ctx)
+	if err != nil {
+		t.Fatalf("testutil: MinIO fixture: %v", err)
+	}
+	bucket := fmt.Sprintf("s3store-it-%d-%d",
+		time.Now().UnixNano(), bucketCounter.Add(1))
+	if _, err := s.client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	}); err != nil {
+		t.Fatalf("testutil: create bucket %q: %v", bucket, err)
+	}
+	return &Fixture{
+		S3Client: s.client,
+		HostPort: s.hostPort,
+		Bucket:   bucket,
 	}
 }

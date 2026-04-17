@@ -5,8 +5,6 @@ package s3parquet_test
 import (
 	"context"
 	"fmt"
-	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,38 +24,6 @@ type Rec struct {
 	Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
 }
 
-var (
-	fixture  *testutil.Fixture
-	prefixCt atomic.Int64
-)
-
-func TestMain(m *testing.M) {
-	os.Exit(run(m))
-}
-
-func run(m *testing.M) int {
-	ctx := context.Background()
-	f, err := testutil.Start(ctx, "s3parquet-it")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "fixture: %v\n", err)
-		return 1
-	}
-	fixture = f
-	defer func() {
-		if err := fixture.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "fixture close: %v\n", err)
-		}
-	}()
-	return m.Run()
-}
-
-// uniquePrefix returns a new Prefix value isolated from every
-// other sub-test sharing this package's single bucket.
-func uniquePrefix(kind string) string {
-	return fmt.Sprintf("it-%s-%d-%d", kind,
-		time.Now().UnixNano(), prefixCt.Add(1))
-}
-
 // storeOpts lets each test dial in the bits of the dedup
 // contract it cares about while re-using the MinIO fixture.
 type storeOpts struct {
@@ -65,14 +31,16 @@ type storeOpts struct {
 	versionOf   func(Rec, time.Time) int64
 }
 
-// newStore constructs a fresh s3parquet.Store on a unique
-// prefix. KeyParts are (period, customer) across every test.
+// newStore builds a fresh s3parquet.Store against a freshly
+// created bucket on the shared MinIO fixture. KeyParts are
+// (period, customer) across every test.
 func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 	t.Helper()
+	f := testutil.New(t)
 	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:   fixture.Bucket,
-		Prefix:   uniquePrefix("store"),
-		S3Client: fixture.S3Client,
+		Bucket:   f.Bucket,
+		Prefix:   "store",
+		S3Client: f.S3Client,
 		KeyParts: []string{"period", "customer"},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -150,8 +118,6 @@ func TestWriteWithKey(t *testing.T) {
 		t.Errorf("incomplete result: %+v", result)
 	}
 
-	// Read back under the exact key so we're not depending on
-	// glob semantics here.
 	got, err := store.Read(ctx, key)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -257,9 +223,6 @@ func TestDedupDefault(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("first Write: %v", err)
 	}
-	// Nudge the clock forward enough that the second file's
-	// tsMicros is strictly greater than the first's; 2 ms is
-	// orders of magnitude past µs precision.
 	time.Sleep(2 * time.Millisecond)
 	if _, err := store.WriteWithKey(ctx, key, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 99},
@@ -297,7 +260,6 @@ func TestReadWithHistory(t *testing.T) {
 		}
 	}
 
-	// No WithHistory → dedup to the max-version record.
 	deduped, err := store.Read(ctx, key)
 	if err != nil {
 		t.Fatalf("Read (deduped): %v", err)
@@ -337,7 +299,6 @@ func TestPoll(t *testing.T) {
 		lastOffset = append(lastOffset, string(r.Offset))
 	}
 
-	// Give the settle window time to pass.
 	time.Sleep(30 * time.Millisecond)
 
 	entries, newOffset, err := store.Poll(ctx, "", 100)
@@ -350,10 +311,6 @@ func TestPoll(t *testing.T) {
 	if string(newOffset) == "" {
 		t.Error("newOffset empty after non-empty Poll")
 	}
-
-	// Entries are chronological by tsMicros, not by partition
-	// path. WriteWithKey was sequential; the ref order must
-	// mirror the write order.
 	for i, e := range entries {
 		if string(e.Offset) != lastOffset[i] {
 			t.Errorf("[%d] offset %q != write offset %q",
@@ -361,7 +318,6 @@ func TestPoll(t *testing.T) {
 		}
 	}
 
-	// Fresh Poll past the offset returns nothing.
 	gone, off2, err := store.Poll(ctx, newOffset, 100)
 	if err != nil {
 		t.Fatalf("Poll (past offset): %v", err)
