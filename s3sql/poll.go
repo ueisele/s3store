@@ -117,11 +117,8 @@ func (s *Store[T]) PollRecords(
 			"union_by_name=true)",
 		strings.Join(uris, ", "))
 
-	query, err := s.buildWrappedQuery(ctx, scanExpr,
+	query := s.wrapScanExpr(scanExpr,
 		"SELECT * FROM "+s.cfg.TableAlias, o.IncludeHistory)
-	if err != nil {
-		return nil, since, err
-	}
 
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {

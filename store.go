@@ -19,8 +19,7 @@ import (
 //   - Write, WriteWithKey  → s3parquet (encode + S3 PUT + ref)
 //   - Poll                 → s3parquet (S3 LIST)
 //   - Read, Query,
-//     QueryRow, PollRecords → s3sql (DuckDB-powered, supports
-//     ColumnAliases / ColumnDefaults)
+//     QueryRow, PollRecords → s3sql (DuckDB-powered)
 //
 // Importing this package transitively pulls in DuckDB (cgo).
 // If you want a cgo-free build, import s3store/s3parquet or
@@ -54,13 +53,10 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		Prefix:            cfg.Prefix,
 		PartitionKeyParts: cfg.PartitionKeyParts,
 		S3Client:          cfg.S3Client,
-		ScanFunc:          cfg.ScanFunc,
 		TableAlias:        cfg.TableAlias,
 		SettleWindow:      cfg.SettleWindow,
 		VersionColumn:     cfg.VersionColumn,
 		DeduplicateBy:     cfg.DeduplicateBy,
-		ColumnDefaults:    cfg.ColumnDefaults,
-		ColumnAliases:     cfg.ColumnAliases,
 		ExtraInitSQL:      cfg.ExtraInitSQL,
 	})
 	if err != nil {
@@ -101,8 +97,8 @@ func (s *Store[T]) Poll(
 	return s.parquet.Poll(ctx, since, maxEntries)
 }
 
-// Read delegates to the SQL sub-store so schema-evolution
-// transforms (ColumnAliases / ColumnDefaults) apply.
+// Read delegates to the SQL sub-store so dedup semantics and
+// the reflection-based row binder match Query / PollRecords.
 func (s *Store[T]) Read(
 	ctx context.Context, keyPattern string, opts ...QueryOption,
 ) ([]T, error) {

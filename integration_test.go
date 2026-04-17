@@ -4,7 +4,6 @@ package s3store
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -12,22 +11,15 @@ import (
 	"github.com/ueisele/s3store/internal/testutil"
 )
 
-// IntRecord is the umbrella-test record shape. Simple primitives
-// plus a timestamp so Read, Query, Poll, and PollRecords all
-// have something to exercise.
+// IntRecord is the umbrella-test record shape. Parquet tags
+// drive both the write path (s3parquet) and the SQL-side row
+// binder (s3sql).
 type IntRecord struct {
 	Period   string    `parquet:"period"`
 	Customer string    `parquet:"customer"`
 	SKU      string    `parquet:"sku"`
 	Amount   float64   `parquet:"amount"`
 	Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
-}
-
-func scanIntRecord(rows *sql.Rows) (IntRecord, error) {
-	var r IntRecord
-	err := rows.Scan(
-		&r.Period, &r.Customer, &r.SKU, &r.Amount, &r.Ts)
-	return r, err
 }
 
 // newStore builds an umbrella Store against a fresh bucket on
@@ -60,7 +52,6 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 				"period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ScanFunc:     scanIntRecord,
 		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
@@ -312,7 +303,6 @@ func TestUmbrella_Close(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ScanFunc:     scanIntRecord,
 		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {

@@ -1,7 +1,6 @@
 package s3store
 
 import (
-	"database/sql"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -16,6 +15,12 @@ import (
 // full feature set construct a single config. Users who need
 // only write, only read, or only SQL should import
 // s3store/s3parquet or s3store/s3sql directly.
+//
+// T must be a struct whose exported fields carry parquet struct
+// tags (e.g. `parquet:"customer"`). s3store uses those tags to
+// drive both the parquet writer (via s3parquet) and the SQL
+// reader's reflection-based row binder (via s3sql) — one schema
+// declaration covers both sides.
 type Config[T any] struct {
 	// S3 bucket name.
 	Bucket string
@@ -35,11 +40,6 @@ type Config[T any] struct {
 	// record. Required for Write(); used to group records.
 	PartitionKeyOf func(T) string
 
-	// ScanFunc maps a sql.Rows row to a record. Used by Read
-	// and PollRecords (which go through DuckDB) to return
-	// typed []T.
-	ScanFunc func(*sql.Rows) (T, error)
-
 	// VersionColumn is the column name used for deduplication
 	// in Read / PollRecords / Query. Leave empty to disable
 	// dedup on the SQL path.
@@ -56,15 +56,6 @@ type Config[T any] struct {
 	// SettleWindow is how far behind the stream tip Poll and
 	// PollRecords read. Default: 5s.
 	SettleWindow time.Duration
-
-	// ColumnDefaults maps column names to SQL default
-	// expressions for files that predate the column.
-	ColumnDefaults map[string]string
-
-	// ColumnAliases maps a new column name to a chain of old
-	// names it should absorb, in priority order. See s3sql's
-	// package docs for the full semantics.
-	ColumnAliases map[string][]string
 
 	// ExtraInitSQL runs after the auto-derived S3 settings at
 	// DuckDB init. Use for CREATE SECRET, credential overrides,

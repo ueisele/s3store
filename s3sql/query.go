@@ -24,19 +24,14 @@ func (s *Store[T]) Query(
 	if err != nil {
 		return nil, err
 	}
-	wrapped, err := s.buildWrappedQuery(
-		ctx, scanExpr, sqlQuery, o.IncludeHistory)
-	if err != nil {
-		return nil, err
-	}
-	return s.db.QueryContext(ctx, wrapped)
+	return s.db.QueryContext(ctx,
+		s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
 }
 
 // QueryRow executes a query returning at most one row. Any
-// construction-time error (pattern validation, column
-// introspection failure) is surfaced through the returned
-// *sql.Row when Scan is called, matching database/sql
-// conventions.
+// construction-time error (pattern validation) is surfaced
+// through the returned *sql.Row when Scan is called, matching
+// database/sql conventions.
 func (s *Store[T]) QueryRow(
 	ctx context.Context,
 	keyPattern string,
@@ -50,10 +45,6 @@ func (s *Store[T]) QueryRow(
 	if err != nil {
 		return s.errorRow(ctx, err)
 	}
-	wrapped, err := s.buildWrappedQuery(
-		ctx, scanExpr, sqlQuery, o.IncludeHistory)
-	if err != nil {
-		return s.errorRow(ctx, err)
-	}
-	return s.db.QueryRowContext(ctx, wrapped)
+	return s.db.QueryRowContext(ctx,
+		s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
 }

@@ -4,8 +4,8 @@ package s3sql_test
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -14,9 +14,9 @@ import (
 	"github.com/ueisele/s3store/s3sql"
 )
 
-// Rec is the on-disk shape used by these tests. All fields are
-// parquet-go-friendly; the struct tags drive both the write
-// (via s3parquet) and the SQL column names DuckDB sees.
+// Rec is the on-disk shape used by these tests. Parquet tags
+// drive both the write (via s3parquet) and the SQL-side row
+// binder (via s3sql) — one schema declaration covers both.
 type Rec struct {
 	Period   string    `parquet:"period"`
 	Customer string    `parquet:"customer"`
@@ -26,36 +26,24 @@ type Rec struct {
 	Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
 }
 
-// RecOld is the same record without Amount / Currency — used
-// to exercise schema evolution via ColumnAliases and
-// ColumnDefaults.
-type RecOld struct {
-	Period    string    `parquet:"period"`
-	Customer  string    `parquet:"customer"`
-	SKU       string    `parquet:"sku"`
-	OldAmount float64   `parquet:"old_amount"`
-	Ts        time.Time `parquet:"ts,timestamp(millisecond)"`
-}
-
-func scanRec(rows *sql.Rows) (Rec, error) {
-	var r Rec
-	err := rows.Scan(
-		&r.Period, &r.Customer, &r.SKU,
-		&r.Amount, &r.Currency, &r.Ts)
-	return r, err
+// RecNarrow is Rec without Amount / Currency — used to simulate
+// older files that pre-date those columns, so reads against the
+// new Rec shape must zero-fill them.
+type RecNarrow struct {
+	Period   string    `parquet:"period"`
+	Customer string    `parquet:"customer"`
+	SKU      string    `parquet:"sku"`
+	Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
 }
 
 func partitionKeyOfRec(r Rec) string {
 	return fmt.Sprintf("period=%s/customer=%s", r.Period, r.Customer)
 }
 
-// sqlOpts dials in the dedup and schema-evolution config a
-// given test cares about.
+// sqlOpts dials in the dedup config a given test cares about.
 type sqlOpts struct {
-	versionColumn  string
-	dedupBy        []string
-	columnAliases  map[string][]string
-	columnDefaults map[string]string
+	versionColumn string
+	dedupBy       []string
 }
 
 // testFixture bundles the per-test MinIO bucket + a matching
@@ -91,12 +79,9 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		ScanFunc:          scanRec,
 		TableAlias:        "records",
 		VersionColumn:     opts.versionColumn,
 		DeduplicateBy:     opts.dedupBy,
-		ColumnAliases:     opts.columnAliases,
-		ColumnDefaults:    opts.columnDefaults,
 		SettleWindow:      10 * time.Millisecond,
 		ExtraInitSQL:      f.DuckDBCredentials(),
 	})
@@ -317,121 +302,142 @@ func TestPollRecords(t *testing.T) {
 	}
 }
 
-// TestColumnAliasesAndDefaults exercises schema-evolution
-// transforms — the SQL-path feature s3parquet doesn't support.
-// Writes an old-shape file and a new-shape file under the same
-// key and verifies the aliased column + default value surface
-// correctly through the SQL read.
-func TestColumnAliasesAndDefaults(t *testing.T) {
+// TestRead_MissingColumnZeroFills guards the "added a new
+// column to T" contract on the SQL side: a file missing a
+// column the reader expects must come back with that column as
+// NULL, which the reflection binder maps to the field's Go
+// zero value — not an error.
+func TestRead_MissingColumnZeroFills(t *testing.T) {
 	testFix := testutil.New(t)
 
-	// Old-shape writer + file.
-	wOld, err := s3parquet.New[RecOld](s3parquet.Config[RecOld]{
+	// Old-shape file: no Amount, no Currency.
+	wOld, err := s3parquet.New[RecNarrow](s3parquet.Config[RecNarrow]{
 		Bucket:            testFix.Bucket,
 		Prefix:            "store",
 		S3Client:          testFix.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf: func(r RecOld) string {
-			return fmt.Sprintf("period=%s/customer=%s", r.Period, r.Customer)
+		PartitionKeyOf: func(r RecNarrow) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
 		},
 		SettleWindow: 10 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("s3parquet.New(RecOld): %v", err)
+		t.Fatalf("s3parquet.New(RecNarrow): %v", err)
 	}
 	t.Cleanup(func() { _ = wOld.Close() })
-	if _, err := wOld.Write(context.Background(), []RecOld{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", OldAmount: 10, Ts: time.UnixMilli(100)},
+	if _, err := wOld.Write(context.Background(), []RecNarrow{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
 	}); err != nil {
-		t.Fatalf("Write RecOld: %v", err)
+		t.Fatalf("Write RecNarrow: %v", err)
 	}
 	time.Sleep(30 * time.Millisecond)
 
-	// New-shape writer + file.
-	wNew, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:            testFix.Bucket,
-		Prefix:            "store",
-		S3Client:          testFix.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf:    partitionKeyOfRec,
-		SettleWindow:      10 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("s3parquet.New(Rec): %v", err)
-	}
-	t.Cleanup(func() { _ = wNew.Close() })
-	if _, err := wNew.Write(context.Background(), []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 99, Currency: "EUR", Ts: time.UnixMilli(200)},
-	}); err != nil {
-		t.Fatalf("Write Rec: %v", err)
-	}
-	time.Sleep(30 * time.Millisecond)
-
-	// Reader with alias + default.
+	// Reader scans into Rec (which has Amount + Currency).
 	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
 		Bucket:            testFix.Bucket,
 		Prefix:            "store",
 		S3Client:          testFix.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		ScanFunc:          scanRec,
 		TableAlias:        "records",
-		VersionColumn:     "ts",
-		ColumnAliases: map[string][]string{
-			"amount": {"old_amount"},
-		},
-		ColumnDefaults: map[string]string{
-			"currency": "'USD'",
-		},
-		SettleWindow: 10 * time.Millisecond,
-		ExtraInitSQL: testFix.DuckDBCredentials(),
+		SettleWindow:      10 * time.Millisecond,
+		ExtraInitSQL:      testFix.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("s3sql.New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	// Use Query with explicit columns to avoid depending on
-	// the exact column order produced by union_by_name +
-	// transforms.
-	ctx := context.Background()
-	rows, err := s.Query(ctx,
-		"period=2026-03-17/customer=abc",
-		"SELECT amount, currency FROM records ORDER BY ts",
-		s3sql.WithHistory())
+	got, err := s.Read(context.Background(),
+		"period=2026-03-17/customer=abc")
 	if err != nil {
-		t.Fatalf("Query: %v", err)
+		t.Fatalf("Read: %v", err)
 	}
-	defer rows.Close()
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if got[0].Amount != 0 {
+		t.Errorf("got Amount=%v, want 0 (NULL→zero)", got[0].Amount)
+	}
+	if got[0].Currency != "" {
+		t.Errorf("got Currency=%q, want \"\" (NULL→zero)",
+			got[0].Currency)
+	}
+	if got[0].SKU != "s1" {
+		t.Errorf("got SKU=%q, want s1", got[0].SKU)
+	}
+}
 
-	type row struct {
-		amount   float64
-		currency string
-	}
-	var got []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.amount, &r.currency); err != nil {
-			t.Fatalf("Scan: %v", err)
-		}
-		got = append(got, r)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows.Err: %v", err)
-	}
+// TagRec exercises the composite-type code path on the SQL
+// side: parquet-go writes Tags as a LIST<VARCHAR>, and the
+// s3sql reflection binder decodes it back into a []string via
+// mapstructure.
+type TagRec struct {
+	Period   string    `parquet:"period"`
+	Customer string    `parquet:"customer"`
+	Tags     []string  `parquet:"tags"`
+	Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
+}
 
-	if len(got) != 2 {
-		t.Fatalf("got %d records, want 2", len(got))
+// TestRead_SliceField round-trips a []string field through S3:
+// s3parquet writes it as a parquet LIST, DuckDB reads it back
+// through s3sql, and the binder decodes into []string. Guards
+// the "composite types work end-to-end" contract.
+func TestRead_SliceField(t *testing.T) {
+	f := testutil.New(t)
+	ctx := context.Background()
+
+	w, err := s3parquet.New[TagRec](s3parquet.Config[TagRec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r TagRec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
 	}
-	if got[0].amount != 10 {
-		t.Errorf("[0] amount=%v, want 10 (alias from old_amount)", got[0].amount)
+	t.Cleanup(func() { _ = w.Close() })
+
+	if _, err := w.Write(ctx, []TagRec{
+		{
+			Period:   "2026-03-17",
+			Customer: "abc",
+			Tags:     []string{"alpha", "beta", "gamma"},
+			Ts:       time.UnixMilli(100),
+		},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
 	}
-	if got[0].currency != "USD" {
-		t.Errorf("[0] currency=%q, want USD (default)", got[0].currency)
+	time.Sleep(30 * time.Millisecond)
+
+	s, err := s3sql.New[TagRec](s3sql.Config[TagRec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		TableAlias:        "records",
+		SettleWindow:      10 * time.Millisecond,
+		ExtraInitSQL:      f.DuckDBCredentials(),
+	})
+	if err != nil {
+		t.Fatalf("s3sql.New: %v", err)
 	}
-	if got[1].amount != 99 {
-		t.Errorf("[1] amount=%v, want 99", got[1].amount)
+	t.Cleanup(func() { _ = s.Close() })
+
+	got, err := s.Read(ctx, "period=2026-03-17/customer=abc")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
 	}
-	if got[1].currency != "EUR" {
-		t.Errorf("[1] currency=%q, want EUR (native)", got[1].currency)
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	want := []string{"alpha", "beta", "gamma"}
+	if !reflect.DeepEqual(got[0].Tags, want) {
+		t.Errorf("Tags: got %v, want %v", got[0].Tags, want)
 	}
 }

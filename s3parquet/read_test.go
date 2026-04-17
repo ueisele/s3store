@@ -144,6 +144,60 @@ func TestStripVersions(t *testing.T) {
 	}
 }
 
+// narrowRec / wideRec simulate schema evolution: a file written
+// with the narrow type must still decode cleanly into the wide
+// type, with missing columns zero-filled.
+type narrowRec struct {
+	Period   string `parquet:"period"`
+	Customer string `parquet:"customer"`
+	Value    int64  `parquet:"value"`
+}
+
+type wideRec struct {
+	Period   string  `parquet:"period"`
+	Customer string  `parquet:"customer"`
+	Value    int64   `parquet:"value"`
+	Amount   float64 `parquet:"amount"`   // added after file written
+	Currency string  `parquet:"currency"` // added after file written
+}
+
+// TestDecodeParquet_MissingColumnsZeroFill guards the public
+// contract of the read path: when a parquet file lacks a column
+// present in T, parquet-go must zero-fill rather than error. If
+// this ever regresses, "added a new column to T" becomes a
+// breaking change against older files on disk.
+func TestDecodeParquet_MissingColumnsZeroFill(t *testing.T) {
+	in := []narrowRec{
+		{Period: "2026-03-17", Customer: "abc", Value: 1},
+		{Period: "2026-03-17", Customer: "def", Value: 2},
+	}
+	data, err := encodeParquet(in)
+	if err != nil {
+		t.Fatalf("encodeParquet: %v", err)
+	}
+
+	out, err := decodeParquet[wideRec](data)
+	if err != nil {
+		t.Fatalf("decodeParquet[wideRec]: %v", err)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("got %d rows, want %d", len(out), len(in))
+	}
+	for i, r := range out {
+		if r.Period != in[i].Period ||
+			r.Customer != in[i].Customer ||
+			r.Value != in[i].Value {
+			t.Errorf("[%d] carried fields wrong: got %+v", i, r)
+		}
+		if r.Amount != 0 {
+			t.Errorf("[%d] Amount=%v, want 0", i, r.Amount)
+		}
+		if r.Currency != "" {
+			t.Errorf("[%d] Currency=%q, want \"\"", i, r.Currency)
+		}
+	}
+}
+
 // TestDedupLatest_TieKeepsFirst documents the
 // stability-on-tie invariant: when two records share the same
 // version, the first occurrence wins. Integration tests can't

@@ -330,6 +330,78 @@ func TestPoll(t *testing.T) {
 	}
 }
 
+// RecNarrow is Rec without the Value column. Used to write an
+// "old-shape" file that a reader with the full Rec schema must
+// still decode without error.
+type RecNarrow struct {
+	Period   string    `parquet:"period"`
+	Customer string    `parquet:"customer"`
+	SKU      string    `parquet:"sku"`
+	Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
+}
+
+// TestRead_MissingColumnZeroFills guards the end-to-end "added
+// a new column to T" story: a file written with a narrower
+// schema, then read back through a Store[Rec] that expects the
+// extra column, returns the row with Value = 0 (Go zero), not
+// an error.
+func TestRead_MissingColumnZeroFills(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+
+	wNarrow, err := s3parquet.New[RecNarrow](s3parquet.Config[RecNarrow]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r RecNarrow) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New(RecNarrow): %v", err)
+	}
+	t.Cleanup(func() { _ = wNarrow.Close() })
+
+	if _, err := wNarrow.Write(ctx, []RecNarrow{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	rWide, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New(Rec): %v", err)
+	}
+	t.Cleanup(func() { _ = rWide.Close() })
+
+	got, err := rWide.Read(ctx, "period=2026-03-17/customer=abc")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if got[0].Value != 0 {
+		t.Errorf("got Value=%d, want 0 (zero-fill)", got[0].Value)
+	}
+	if got[0].SKU != "s1" {
+		t.Errorf("got SKU=%q, want s1", got[0].SKU)
+	}
+}
+
 // TestPollRecords mirrors TestPoll for the typed-record path,
 // with dedup behaviour verified against the same expectations
 // as Read.

@@ -12,10 +12,9 @@
 //   - Poll, PollRecords: stream ref entries or records from
 //     the ref stream, starting after a caller-supplied offset.
 //
-// For SQL queries, arbitrary aggregations, and richer
-// schema-evolution transforms (ColumnAliases / ColumnDefaults),
-// use github.com/ueisele/s3store/s3sql instead, which requires
-// cgo (embedded DuckDB).
+// For SQL queries and arbitrary aggregations, use
+// github.com/ueisele/s3store/s3sql instead, which requires cgo
+// (embedded DuckDB).
 //
 // Limitations vs. s3sql:
 //
@@ -25,6 +24,4 @@
 //     internal/core.ValidateKeyPattern for the full spec.
 //   - Deduplication is in-memory; large key cardinalities can
 //     exceed available RAM. Route those workloads to s3sql.
-//   - No ColumnAliases / ColumnDefaults (those are SQL-level
-//     rewrites).
 package s3parquet

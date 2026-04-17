@@ -12,9 +12,9 @@
 //     WriteWithKey, Read, Poll, PollRecords via parquet-go
 //     directly. In-memory latest-per-entity dedup.
 //   - s3store/s3sql — requires cgo (embedded DuckDB). Read,
-//     Query, QueryRow, PollRecords with arbitrary SQL,
-//     schema-evolution transforms (ColumnAliases,
-//     ColumnDefaults), and streaming dedup.
+//     Query, QueryRow, PollRecords with arbitrary SQL and
+//     streaming dedup. Typed records are produced by a
+//     reflection-based row binder driven off T's parquet tags.
 //
 // Importing this umbrella pulls in DuckDB (cgo). If you only
 // need the cgo-free subset (writes, or writes plus simple
@@ -28,10 +28,9 @@
 //   - Poll: stream of refs (which keys changed)
 //   - PollRecords: typed records for the refs Poll would
 //     return. Through the umbrella, records go through DuckDB
-//     so dedup + schema-evolution transforms match Read.
+//     so dedup matches Read.
 //   - Read: typed, deduplicated snapshot with glob support
-//   - Query / QueryRow: DuckDB SQL with auto-dedup and schema
-//     evolution
+//   - Query / QueryRow: DuckDB SQL with auto-dedup
 //
 // Every read API defaults to latest-per-key deduplication and
 // accepts WithHistory() to opt out.

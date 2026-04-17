@@ -10,8 +10,7 @@ library and an S3 bucket.
 - **Stream** changes via lightweight "ref" files — one empty S3 object per
   write, all metadata in the object key.
 - **Read** point-in-time deduplicated snapshots with glob support.
-- **Query** the whole store with DuckDB SQL, including schema evolution,
-  column aliases, and defaults — in a single embedded process.
+- **Query** the whole store with DuckDB SQL in a single embedded process.
 
 ## Packages
 
@@ -21,7 +20,7 @@ needs:
 | Package | cgo | Import path | Capabilities |
 |---|---|---|---|
 | `s3parquet` | **no** | `github.com/ueisele/s3store/s3parquet` | Write, WriteWithKey, Read, Poll, PollRecords. Pure Go / parquet-go; in-memory dedup. |
-| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | Read, Query, QueryRow, Poll, PollRecords. Embedded DuckDB; SQL; schema-evolution transforms. |
+| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | Read, Query, QueryRow, Poll, PollRecords. Embedded DuckDB; SQL. |
 | `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Forwards to `s3parquet` for writes/poll, `s3sql` for typed reads. |
 
 Binary size: DuckDB bundles a ~50 MB C++ library. `CGO_ENABLED=0 go build
@@ -63,13 +62,6 @@ store, err := s3store.New[CostRecord](s3store.Config[CostRecord]{
     PartitionKeyOf: func(r CostRecord) string {
         return fmt.Sprintf("charge_period=%s/customer=%s",
             r.ChargePeriod, r.CustomerID)
-    },
-    ScanFunc: func(rows *sql.Rows) (CostRecord, error) {
-        var r CostRecord
-        err := rows.Scan(
-            &r.CustomerID, &r.ChargePeriod, &r.SKU,
-            &r.NetCost, &r.Currency, &r.CalculatedAt)
-        return r, err
     },
 })
 if err != nil {
@@ -114,13 +106,15 @@ store, err := s3parquet.New[CostRecord](s3parquet.Config[CostRecord]{
     },
 })
 
-// parquet-go decodes directly into []CostRecord — no ScanFunc needed
+// parquet-go decodes directly into []CostRecord via the parquet tags
 latest, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
 ```
 
-`s3parquet` has no `ScanFunc` (parquet-go handles typed decode via struct
-tags), no `ColumnAliases` / `ColumnDefaults` (those are SQL-expression
-features), and a narrower glob grammar (see below).
+Both packages drive typed results off the parquet struct tags on `T` —
+`s3parquet` via parquet-go's `GenericReader[T]`, `s3sql` via a NULL-safe
+reflection binder built at `New()`. No `ScanFunc` or manual column-order
+bookkeeping on either side. A field whose column is missing from a given
+file lands as Go's zero value.
 
 ## Non-trivial Go types (`decimal.Decimal`, UUID wrappers, …)
 
@@ -293,10 +287,10 @@ Whether dedup actually runs depends on which package you use:
 records, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
 ```
 
-Returns every record matching the glob, typed via `ScanFunc` (or decoded
-directly into T via parquet-go for `s3parquet`). When dedup is configured
-(see Stream above), the result is the latest version per key; otherwise
-every version comes through.
+Returns every record matching the glob, decoded directly into `[]T` via
+the parquet tags (parquet-go for `s3parquet`, the reflection binder for
+`s3sql`). When dedup is configured (see Stream above), the result is the
+latest version per key; otherwise every version comes through.
 
 ### SQL query (umbrella or `s3sql`)
 
@@ -315,31 +309,23 @@ Deduplicated by default. Pass `s3store.WithHistory()` to see all versions.
 most one row — construction-time errors surface through the returned
 `*sql.Row` at `Scan` time.
 
-## Schema evolution (s3sql only)
+## Schema evolution
 
-```go
-Config[T]{
-    // Fill NULLs or materialize missing columns with a default
-    ColumnDefaults: map[string]string{
-        "currency": "'EUR'",
-    },
-    // Handle column renames: each new column can chain to old names
-    ColumnAliases: map[string][]string{
-        "cost_per_unit": {"price_per_unit", "unit_price"},
-    },
-}
-```
+Both read paths tolerate missing columns out of the box: a field whose
+column isn't in a given parquet file lands as Go's zero value, never an
+error. That covers the common "added a column" case without any extra
+configuration.
 
-Applied at query time across all SQL-path reads (`Read`, `Query`,
-`QueryRow`, `PollRecords` via the umbrella). s3store introspects the
-scanned files' schemas and picks the right SQL shape — `SELECT * REPLACE`
-when the target column already exists, `SELECT *, alias` when it doesn't,
-`NULL AS col` when neither side is present. The old-name columns are
-`EXCLUDE`d so they don't linger next to the aliased column.
+- **`s3parquet`** — parquet-go matches columns to struct fields by the
+  `parquet:` tag, so column order in the file doesn't matter and unknown
+  columns are ignored.
+- **`s3sql`** — the reflection binder does the same for DuckDB results:
+  unused columns are discarded, missing columns leave the field at its
+  Go zero, and user types implementing `sql.Scanner` (e.g.
+  `shopspring/decimal.Decimal`) are supported natively.
 
-`s3parquet.Read` relies on parquet-go's native schema tolerance instead
-(fields missing from a file decode as zero-values; unknown fields in a
-file are ignored). For renames or SQL-expression defaults, use `s3sql`.
+Renames, splits, and row-level computed derivations still require a
+migration tool — rewrite the affected files with the new shape.
 
 ## Settle window
 
@@ -367,9 +353,8 @@ type Config[T any] struct {
     TableAlias string                     // name used in Query SQL
     S3Client   *s3.Client                 // AWS SDK v2 S3 client
 
-    // Required for Write / typed reads
+    // Required for Write
     PartitionKeyOf func(T) string         // derive key from record (Write)
-    ScanFunc       func(*sql.Rows) (T, error) // map DuckDB row → typed record
 
     // SQL-side dedup (used by Read / PollRecords / Query)
     VersionColumn string                  // column to ORDER BY for latest
@@ -377,10 +362,6 @@ type Config[T any] struct {
 
     // Stream
     SettleWindow time.Duration            // default: 5s
-
-    // Schema evolution (SQL path only)
-    ColumnDefaults map[string]string      // SQL expr per missing column
-    ColumnAliases  map[string][]string    // new name → old name chain
 
     // DuckDB extras
     ExtraInitSQL []string                 // SET / CREATE SECRET / LOAD
@@ -415,6 +396,15 @@ Breaking changes in the package-split refactor:
   single trailing `*` per value are accepted. If you relied on the richer
   DuckDB glob dialect, file an issue — we can relax the parser if there's
   real usage.
+- **`Config.ScanFunc` removed** — `s3sql` now reflects over `T`'s parquet
+  tags to build a NULL-safe row binder at `New()`. Drop your `ScanFunc`
+  closure; the library decodes into `[]T` directly. Custom types need to
+  implement `sql.Scanner` (e.g. `shopspring/decimal.Decimal` already
+  does).
+- **`Config.ColumnAliases` / `Config.ColumnDefaults` removed** — the
+  "missing column → Go zero" contract is now built in to both read paths.
+  For non-zero defaults, apply them in your app code or use `Query` with
+  `COALESCE`. For column renames, rewrite the affected files.
 
 ## Testing
 
@@ -446,12 +436,10 @@ unchanged packages return cached results.
   mechanism — keys can only be updated, not removed.
 - **`s3parquet` dedup is in-memory.** Large key cardinality can OOM;
   route those workloads to `s3sql` which streams through DuckDB.
-- **Schema evolution** differs by package: `s3sql` applies SQL-expression
-  transforms (`ColumnAliases`, `ColumnDefaults`) at query time, good for
-  renames and column defaults. `s3parquet` relies on parquet-go's native
-  schema tolerance (missing fields decode as zero values; unknown fields
-  are ignored) — no SQL rewrites. Type changes, splits, or row-level
-  computed derivations still require a migration tool in both cases.
+- **Schema evolution is limited to tolerant reads.** Both packages handle
+  "column added to T that isn't in an old file" by returning the Go zero
+  value. Renames, splits, type changes, and row-level computed
+  derivations require rewriting the affected files.
 
 ## License
 

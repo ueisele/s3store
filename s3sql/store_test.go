@@ -1,7 +1,6 @@
 package s3sql
 
 import (
-	"database/sql"
 	"strings"
 	"testing"
 
@@ -9,9 +8,9 @@ import (
 )
 
 type testRec struct {
-	Period   string
-	Customer string
-	Value    int64
+	Period   string `parquet:"period"`
+	Customer string `parquet:"customer"`
+	Value    int64  `parquet:"value"`
 }
 
 func validConfig() Config[testRec] {
@@ -144,27 +143,10 @@ func TestDedupColumns(t *testing.T) {
 	}
 }
 
-// buildColumnTransforms is exhaustively covered in
-// transforms_test.go's TestBuildColumnTransformsAllCases.
-
 // TestSettleWindowDefault guards the 5s default.
 func TestSettleWindowDefault(t *testing.T) {
 	var c Config[testRec]
 	if got := c.settleWindow(); got.String() != "5s" {
 		t.Errorf("default: got %v", got)
-	}
-}
-
-// TestScanAllNilScanFunc guards that the missing-ScanFunc error
-// surfaces correctly instead of panicking.
-func TestScanAllNilScanFunc(t *testing.T) {
-	s := newTestStore()
-	// Construct a zero-value *sql.Rows via nil; scanAll should
-	// return an error on the nil-ScanFunc check before touching
-	// rows.
-	var rows *sql.Rows
-	_, err := s.scanAll(rows)
-	if err == nil || !strings.Contains(err.Error(), "ScanFunc is required") {
-		t.Errorf("expected ScanFunc-required error, got %v", err)
 	}
 }

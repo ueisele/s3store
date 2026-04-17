@@ -3,6 +3,7 @@ package s3sql
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -14,6 +15,14 @@ import (
 // Config defines how an s3sql Store is set up. T is the record
 // type returned by Read and PollRecords; arbitrary SQL queries
 // via Query / QueryRow return *sql.Rows / *sql.Row directly.
+//
+// T must be a struct whose exported fields carry parquet struct
+// tags (e.g. `parquet:"customer"`). s3sql builds a reflection-
+// based row binder once at New() from those tags; the binder
+// drives both the SELECT column list and the per-row Scan into
+// typed records. Columns absent from the parquet file land as
+// the field's Go zero value; user types implementing
+// sql.Scanner are supported.
 type Config[T any] struct {
 	// Bucket is the S3 bucket name.
 	Bucket string
@@ -31,9 +40,6 @@ type Config[T any] struct {
 	// use_ssl). Override via ExtraInitSQL if needed.
 	S3Client *s3.Client
 
-	// ScanFunc maps a sql.Rows row to a record.
-	ScanFunc func(*sql.Rows) (T, error)
-
 	// TableAlias is the name used in SQL queries for the CTE
 	// that wraps the base parquet scan. Required.
 	TableAlias string
@@ -49,15 +55,6 @@ type Config[T any] struct {
 	// DeduplicateBy defines the columns that identify a unique
 	// record for dedup purposes. Defaults to PartitionKeyParts.
 	DeduplicateBy []string
-
-	// ColumnDefaults maps column names to SQL default expressions
-	// for files that predate the column.
-	ColumnDefaults map[string]string
-
-	// ColumnAliases maps a new column name to a chain of old
-	// names it should absorb, in priority order. See package
-	// docs / README for the full semantics.
-	ColumnAliases map[string][]string
 
 	// ExtraInitSQL runs after the auto-derived S3 settings and
 	// the object-cache pragma, in order. Use for CREATE SECRET,
@@ -86,6 +83,7 @@ type Store[T any] struct {
 	db       *sql.DB
 	dataPath string
 	refPath  string
+	binder   *binder
 }
 
 // New constructs a Store, opens a DuckDB connection, loads
@@ -107,6 +105,12 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		return nil, err
 	}
 
+	var zero T
+	b, err := buildBinder(reflect.TypeOf(zero))
+	if err != nil {
+		return nil, fmt.Errorf("s3sql: %w", err)
+	}
+
 	db, err := openDuckDB(cfg.S3Client, cfg.ExtraInitSQL)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -119,6 +123,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		db:       db,
 		dataPath: core.DataPath(cfg.Prefix),
 		refPath:  core.RefPath(cfg.Prefix),
+		binder:   b,
 	}, nil
 }
 
