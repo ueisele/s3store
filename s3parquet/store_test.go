@@ -209,6 +209,18 @@ func TestNewLeavesUserVersionOfAlone(t *testing.T) {
 	}
 }
 
+// TestDefaultVersionOf guards that the exported helper returns
+// insertedAt in microseconds, matching what the doc comment
+// promises. Users who reference the helper explicitly rely on
+// this contract.
+func TestDefaultVersionOf(t *testing.T) {
+	ts := time.UnixMicro(1_710_684_000_000_000)
+	got := DefaultVersionOf(testRec{}, ts)
+	if got != 1_710_684_000_000_000 {
+		t.Errorf("got %d, want %d", got, 1_710_684_000_000_000)
+	}
+}
+
 // TestNewSkipsDefaultWhenNoEntityKey guards that New does not
 // assign VersionOf when the user hasn't asked for dedup
 // (EntityKeyOf nil). Unnecessary allocation and a subtle

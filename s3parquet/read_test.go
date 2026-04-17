@@ -5,12 +5,15 @@ import (
 	"time"
 )
 
+// dedupRec is a pure-Go scratch record used to exercise
+// dedupLatest without paying for parquet encode / decode.
 type dedupRec struct {
 	entity  string
 	ver     int64
 	payload string
 }
 
+// vr is a terse constructor for versionedRecord[dedupRec].
 func vr(e string, v int64, p string, insertedAt time.Time) versionedRecord[dedupRec] {
 	return versionedRecord[dedupRec]{
 		rec:        dedupRec{entity: e, ver: v, payload: p},
@@ -75,7 +78,8 @@ func TestDedupLatest_UsesInsertedAtFromFile(t *testing.T) {
 
 // TestDedupLatest_HybridVersion mixes a business timestamp with
 // insertedAt fallback: records with a non-zero ver win on ver,
-// records with zero ver fall back to insertedAt.
+// records with zero ver fall back to insertedAt. Hard to set up
+// via integration without µs-precision timing, so lives here.
 func TestDedupLatest_HybridVersion(t *testing.T) {
 	earlier := time.UnixMicro(1_000_000)
 	later := time.UnixMicro(2_000_000)
@@ -103,6 +107,10 @@ func TestDedupLatest_HybridVersion(t *testing.T) {
 	}
 }
 
+// TestDedupLatest_EmptyInput guards the nil/empty-slice fast
+// path. Integration can't easily produce a genuinely-empty
+// record batch because every ref corresponds to a file with
+// at least one row.
 func TestDedupLatest_EmptyInput(t *testing.T) {
 	got := dedupLatest(nil,
 		func(r dedupRec) string { return r.entity },
@@ -112,6 +120,11 @@ func TestDedupLatest_EmptyInput(t *testing.T) {
 	}
 }
 
+// TestDedupLatest_TieKeepsFirst documents the
+// stability-on-tie invariant: when two records share the same
+// version, the first occurrence wins. Integration tests can't
+// reliably reproduce this (same-µs file timestamps are rare on
+// fast hardware).
 func TestDedupLatest_TieKeepsFirst(t *testing.T) {
 	now := time.UnixMicro(1_000_000)
 	recs := []versionedRecord[dedupRec]{
@@ -126,13 +139,5 @@ func TestDedupLatest_TieKeepsFirst(t *testing.T) {
 	}
 	if got[0].payload != "first" {
 		t.Errorf("got %q, want first", got[0].payload)
-	}
-}
-
-func TestDefaultVersionOf(t *testing.T) {
-	ts := time.UnixMicro(1_710_684_000_000_000)
-	got := DefaultVersionOf(dedupRec{}, ts)
-	if got != 1_710_684_000_000_000 {
-		t.Errorf("got %d, want %d", got, 1_710_684_000_000_000)
 	}
 }
