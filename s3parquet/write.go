@@ -83,7 +83,15 @@ func (s *Store[T]) WriteWithKey(
 
 	shortID := uuid.New().String()[:8]
 
-	dataKey := core.BuildDataFilePath(s.dataPath, key, shortID)
+	// Capture the write timestamp before the data PUT so both
+	// the data filename and the ref filename share a single
+	// tsMicros — the data file is chronologically sortable in
+	// S3 LIST without consulting refs, and the invariant
+	// "ref visible implies data exists" still holds because
+	// the ref PUT is sequenced after the data PUT.
+	tsMicros := time.Now().UnixMicro()
+
+	dataKey := core.BuildDataFilePath(s.dataPath, key, tsMicros, shortID)
 	if err := s.putObject(
 		ctx, dataKey, parquetBytes,
 		"application/octet-stream",
@@ -92,7 +100,6 @@ func (s *Store[T]) WriteWithKey(
 			"s3parquet: put data: %w", err)
 	}
 
-	tsMicros := time.Now().UnixMicro()
 	refKey := core.EncodeRefKey(s.refPath, tsMicros, shortID, key)
 
 	result := &core.WriteResult{

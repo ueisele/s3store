@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -37,9 +38,11 @@ func EncodeRefKey(
 
 // ParseRefKey is the inverse of EncodeRefKey. It accepts any
 // S3-style key (with or without a path prefix) ending in the
-// encoded ref filename and returns the decoded Hive key and the
-// shortID.
-func ParseRefKey(refKey string) (hiveKey string, shortID string, err error) {
+// encoded ref filename and returns the decoded Hive key, the
+// write timestamp (µs since epoch), and the shortID.
+func ParseRefKey(refKey string) (
+	hiveKey string, tsMicros int64, shortID string, err error,
+) {
 	name := refKey
 	if idx := strings.LastIndex(name, "/"); idx >= 0 {
 		name = name[idx+1:]
@@ -48,29 +51,39 @@ func ParseRefKey(refKey string) (hiveKey string, shortID string, err error) {
 
 	parts := strings.SplitN(name, RefSeparator, 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf(
+		return "", 0, "", fmt.Errorf(
 			"s3store: invalid ref key: %s", refKey)
 	}
 
-	_, shortID, ok := strings.Cut(parts[0], "-")
+	tsStr, short, ok := strings.Cut(parts[0], "-")
 	if !ok {
-		return "", "", fmt.Errorf(
+		return "", 0, "", fmt.Errorf(
 			"s3store: invalid ref key: %s", refKey)
+	}
+	tsMicros, err = strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return "", 0, "", fmt.Errorf(
+			"s3store: invalid ts in ref key %q: %w", refKey, err)
 	}
 
 	hiveKey, err = url.PathUnescape(parts[1])
 	if err != nil {
-		return "", "", fmt.Errorf(
+		return "", 0, "", fmt.Errorf(
 			"s3store: invalid ref key %q: %w", refKey, err)
 	}
-	return hiveKey, shortID, nil
+	return hiveKey, tsMicros, short, nil
 }
 
-// BuildDataFilePath returns the S3 object key for a data file,
-// given the store's data prefix (from DataPath), the Hive-style
-// partition key, and the shortID.
-func BuildDataFilePath(dataPath string, hiveKey string, shortID string) string {
-	return fmt.Sprintf("%s/%s/%s.parquet", dataPath, hiveKey, shortID)
+// BuildDataFilePath returns the S3 object key for a data file.
+// The filename includes the write timestamp (µs since epoch)
+// followed by the shortID so S3 LIST of a partition prefix
+// returns files in chronological write order, and so the
+// timestamp is recoverable without consulting the ref stream.
+func BuildDataFilePath(
+	dataPath string, hiveKey string, tsMicros int64, shortID string,
+) string {
+	return fmt.Sprintf("%s/%s/%d-%s.parquet",
+		dataPath, hiveKey, tsMicros, shortID)
 }
 
 // RefCutoff returns the upper-bound refs-prefix for a given

@@ -28,12 +28,15 @@ func TestRefKeyRoundTrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			encoded := EncodeRefKey(refPath, ts, shortID, tc.key)
 
-			gotKey, gotID, err := ParseRefKey(encoded)
+			gotKey, gotTs, gotID, err := ParseRefKey(encoded)
 			if err != nil {
 				t.Fatalf("ParseRefKey(%q): %v", encoded, err)
 			}
 			if gotKey != tc.key {
 				t.Errorf("key: got %q want %q", gotKey, tc.key)
+			}
+			if gotTs != ts {
+				t.Errorf("ts: got %d want %d", gotTs, ts)
 			}
 			if gotID != shortID {
 				t.Errorf("id: got %q want %q", gotID, shortID)
@@ -80,11 +83,12 @@ func TestParseRefKeyInvalid(t *testing.T) {
 		"refs/garbage.ref",
 		"refs/1710684000000000.ref",                   // no separator
 		"refs/1710684000000000;period=X.ref",          // no '-' between ts and id
+		"refs/notanumber-id;period=X.ref",             // non-numeric ts
 		"refs/1710684000000000-id;period=X%ZZabc.ref", // invalid percent escape
 	}
 	for _, raw := range cases {
 		t.Run(raw, func(t *testing.T) {
-			if _, _, err := ParseRefKey(raw); err == nil {
+			if _, _, _, err := ParseRefKey(raw); err == nil {
 				t.Errorf("ParseRefKey(%q): expected error", raw)
 			}
 		})
@@ -94,31 +98,50 @@ func TestParseRefKeyInvalid(t *testing.T) {
 func TestBuildDataFilePath(t *testing.T) {
 	const dataPath = "test-prefix/data"
 	cases := []struct {
-		name    string
-		key     string
-		shortID string
-		want    string
+		name     string
+		key      string
+		tsMicros int64
+		shortID  string
+		want     string
 	}{
 		{
-			name:    "standard key",
-			key:     "period=2026-03-17/customer=abc",
-			shortID: "a3f2e1b4",
-			want:    "test-prefix/data/period=2026-03-17/customer=abc/a3f2e1b4.parquet",
+			name:     "standard key",
+			key:      "period=2026-03-17/customer=abc",
+			tsMicros: 1710684000000000,
+			shortID:  "a3f2e1b4",
+			want:     "test-prefix/data/period=2026-03-17/customer=abc/1710684000000000-a3f2e1b4.parquet",
 		},
 		{
-			name:    "value with hyphen",
-			key:     "period=X/customer=foo-bar",
-			shortID: "c7d9f0e2",
-			want:    "test-prefix/data/period=X/customer=foo-bar/c7d9f0e2.parquet",
+			name:     "value with hyphen",
+			key:      "period=X/customer=foo-bar",
+			tsMicros: 1710770400000000,
+			shortID:  "c7d9f0e2",
+			want:     "test-prefix/data/period=X/customer=foo-bar/1710770400000000-c7d9f0e2.parquet",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := BuildDataFilePath(dataPath, tc.key, tc.shortID)
+			got := BuildDataFilePath(dataPath, tc.key, tc.tsMicros, tc.shortID)
 			if got != tc.want {
 				t.Errorf("\ngot  %q\nwant %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestBuildDataFilePathLexicalOrdering guards that two writes
+// to the same partition key sort chronologically in S3 LIST by
+// filename — the primary reason we embed tsMicros in the data
+// filename.
+func TestBuildDataFilePathLexicalOrdering(t *testing.T) {
+	const (
+		dataPath = "p/data"
+		key      = "period=X/customer=Y"
+	)
+	earlier := BuildDataFilePath(dataPath, key, 1_000_000_000_000, "aaaaaaaa")
+	later := BuildDataFilePath(dataPath, key, 2_000_000_000_000, "aaaaaaaa")
+	if earlier >= later {
+		t.Errorf("earlier %q should sort before later %q", earlier, later)
 	}
 }
 

@@ -203,8 +203,8 @@ s3://warehouse/billing/
   data/
     charge_period=2026-03-17/
       customer=abc/
-        a3f2e1b4.parquet
-        c7d9f0e2.parquet            ← recalculation
+        1710684000000000-a3f2e1b4.parquet
+        1710770400000000-c7d9f0e2.parquet   ← recalculation (sorts after the first)
   _stream/
     refs/
       1710684000000000-a3f2e1b4;charge_period=2026-03-17%2Fcustomer=abc.ref

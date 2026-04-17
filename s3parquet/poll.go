@@ -67,14 +67,15 @@ outer:
 			if objKey > cutoffPrefix {
 				break outer
 			}
-			key, shortID, err := core.ParseRefKey(objKey)
+			key, tsMicros, shortID, err := core.ParseRefKey(objKey)
 			if err != nil {
 				return nil, since, err
 			}
 			entries = append(entries, core.StreamEntry{
-				Offset:   core.Offset(objKey),
-				Key:      key,
-				DataPath: core.BuildDataFilePath(s.dataPath, key, shortID),
+				Offset: core.Offset(objKey),
+				Key:    key,
+				DataPath: core.BuildDataFilePath(
+					s.dataPath, key, tsMicros, shortID),
 			})
 			lastKey = objKey
 		}
