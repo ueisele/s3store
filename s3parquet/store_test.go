@@ -1,6 +1,7 @@
 package s3parquet
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -106,6 +107,46 @@ func TestSettleWindowDefault(t *testing.T) {
 	var c Config[testRec]
 	if got := c.settleWindow(); got.String() != "5s" {
 		t.Errorf("default: got %v, want 5s", got)
+	}
+}
+
+// TestWriteEmptyRecords guards that Write and WriteWithKey
+// return (nil, nil) for empty input instead of erroring. This
+// lets callers forward their batch pipelines without a manual
+// length check before every Write call. No S3 is contacted
+// because the empty-records fast path returns before any
+// method touches s.s3.
+func TestWriteEmptyRecords(t *testing.T) {
+	s := &Store[testRec]{cfg: Config[testRec]{
+		KeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r testRec) string {
+			return "period=" + r.Period + "/customer=" + r.Customer
+		},
+	}}
+
+	got, err := s.Write(context.Background(), nil)
+	if err != nil {
+		t.Errorf("Write(nil): unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("Write(nil): expected nil slice, got %v", got)
+	}
+
+	got, err = s.Write(context.Background(), []testRec{})
+	if err != nil {
+		t.Errorf("Write([]): unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("Write([]): expected nil slice, got %v", got)
+	}
+
+	ptr, err := s.WriteWithKey(context.Background(),
+		"period=X/customer=Y", nil)
+	if err != nil {
+		t.Errorf("WriteWithKey(nil): unexpected error: %v", err)
+	}
+	if ptr != nil {
+		t.Errorf("WriteWithKey(nil): expected nil result, got %+v", ptr)
 	}
 }
 

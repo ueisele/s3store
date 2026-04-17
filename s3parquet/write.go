@@ -23,12 +23,15 @@ const writeCleanupTimeout = 5 * time.Second
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
 // key. Returns a WriteResult per group.
+//
+// An empty records slice is a no-op: (nil, nil) is returned so
+// callers don't have to guard against batch-pipeline edge
+// cases.
 func (s *Store[T]) Write(
 	ctx context.Context, records []T,
 ) ([]core.WriteResult, error) {
 	if len(records) == 0 {
-		return nil, fmt.Errorf(
-			"s3parquet: records must not be empty")
+		return nil, nil
 	}
 	if s.cfg.PartitionKeyOf == nil {
 		return nil, fmt.Errorf(
@@ -66,8 +69,7 @@ func (s *Store[T]) WriteWithKey(
 	ctx context.Context, key string, records []T,
 ) (*core.WriteResult, error) {
 	if len(records) == 0 {
-		return nil, fmt.Errorf(
-			"s3parquet: records must not be empty")
+		return nil, nil
 	}
 	if err := s.validateKey(key); err != nil {
 		return nil, err
