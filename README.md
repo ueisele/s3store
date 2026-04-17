@@ -1,8 +1,8 @@
 # s3store
 
-Append-only, versioned data storage on S3 with a change stream and embedded
-DuckDB queries. No server. No broker. No coordinator. Just a Go library and
-an S3 bucket.
+Append-only, versioned data storage on S3 with a change stream and optional
+embedded DuckDB queries. No server. No broker. No coordinator. Just a Go
+library and an S3 bucket.
 
 ## What it does
 
@@ -13,8 +13,23 @@ an S3 bucket.
 - **Query** the whole store with DuckDB SQL, including schema evolution,
   column aliases, and defaults — in a single embedded process.
 
-Reads are unified through one engine (DuckDB) so schema evolution works
-consistently across every access pattern. Writes use `parquet-go` directly.
+## Packages
+
+s3store ships as three packages. Pick the smallest one that covers your
+needs:
+
+| Package | cgo | Import path | Capabilities |
+|---|---|---|---|
+| `s3parquet` | **no** | `github.com/ueisele/s3store/s3parquet` | Write, WriteWithKey, Read, Poll, PollRecords. Pure Go / parquet-go; in-memory dedup. |
+| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | Read, Query, QueryRow, Poll, PollRecords. Embedded DuckDB; SQL; schema-evolution transforms. |
+| `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Forwards to `s3parquet` for writes/poll, `s3sql` for typed reads. |
+
+Binary size: DuckDB bundles a ~50 MB C++ library. `CGO_ENABLED=0 go build
+./s3parquet/...` produces a small static binary with none of it. The
+umbrella and `s3sql` both require cgo.
+
+Both sub-packages share the S3 layout and ref-stream wire format, so the
+same data is accessible through either.
 
 ## Install
 
@@ -22,12 +37,11 @@ consistently across every access pattern. Writes use `parquet-go` directly.
 go get github.com/ueisele/s3store
 ```
 
-Requires Go 1.26.2+ (declared in [go.mod](go.mod); the code also depends on
-iterator-returning `maps.Keys` which is Go 1.23+, so that's the absolute
-minimum if you override the toolchain). DuckDB's httpfs extension is
-auto-installed on first use, or pre-installed in air-gapped environments.
+Requires Go 1.26.2+ (declared in [go.mod](go.mod)). DuckDB's httpfs
+extension is auto-installed on first use or pre-installed in air-gapped
+environments.
 
-## Quick start
+## Quick start — full umbrella
 
 ```go
 type CostRecord struct {
@@ -46,7 +60,7 @@ store, err := s3store.New[CostRecord](s3store.Config[CostRecord]{
     KeyParts:      []string{"charge_period", "customer"},
     VersionColumn: "calculated_at",
     TableAlias:    "costs",
-    KeyFunc: func(r CostRecord) string {
+    PartitionKeyOf: func(r CostRecord) string {
         return fmt.Sprintf("charge_period=%s/customer=%s",
             r.ChargePeriod, r.CustomerID)
     },
@@ -63,19 +77,124 @@ if err != nil {
 }
 defer store.Close()
 
-// Write — groups records by KeyFunc, one Parquet file per group
+// Write — groups records by PartitionKeyOf, one Parquet file per group
 _, err = store.Write(ctx, records)
 
-// Snapshot read — deduplicated by VersionColumn
+// Snapshot read — deduplicated by VersionColumn via DuckDB
 latest, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
-
-// Glob across partitions
-march, err := store.Read(ctx, "charge_period=2026-03-*/customer=abc")
 
 // SQL query — DuckDB handles the aggregation
 rows, err := store.Query(ctx, "charge_period=2026-03-*/*",
     "SELECT customer, SUM(net_cost) FROM costs GROUP BY customer")
 ```
+
+## Quick start — cgo-free (`s3parquet` only)
+
+For write-heavy services or consumers that don't need SQL:
+
+```go
+store, err := s3parquet.New[CostRecord](s3parquet.Config[CostRecord]{
+    Bucket:   "warehouse",
+    Prefix:   "billing",
+    S3Client: s3Client,
+    KeyParts: []string{"charge_period", "customer"},
+    PartitionKeyOf: func(r CostRecord) string {
+        return fmt.Sprintf("charge_period=%s/customer=%s",
+            r.ChargePeriod, r.CustomerID)
+    },
+    // Optional: enable latest-per-entity dedup on Read / PollRecords
+    EntityKeyOf: func(r CostRecord) string {
+        return r.CustomerID + "|" + r.SKU
+    },
+    VersionOf: func(r CostRecord) int64 {
+        return r.CalculatedAt.UnixNano()
+    },
+})
+
+// parquet-go decodes directly into []CostRecord — no ScanFunc needed
+latest, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
+```
+
+`s3parquet` has no `ScanFunc` (parquet-go handles typed decode via struct
+tags), no `ColumnAliases` / `ColumnDefaults` (those are SQL-expression
+features), and a narrower glob grammar (see below).
+
+## Non-trivial Go types (`decimal.Decimal`, UUID wrappers, …)
+
+parquet-go can't encode types like `shopspring/decimal.Decimal` or wrapper
+types with custom marshaling. The library takes no opinion on the
+translation — define a parquet-friendly shadow struct in your package and
+translate at the boundary:
+
+```go
+// Domain type — used throughout your app
+type Usage struct {
+    InstanceID     string
+    SkuID          string
+    ProjectID      uuid.UUID
+    Amount         decimal.Decimal
+    CalculatedAt   time.Time
+}
+
+// File layout — parquet-friendly primitives only
+type UsageFile struct {
+    InstanceID   string    `parquet:"instance_id"`
+    SkuID        string    `parquet:"sku_id"`
+    ProjectID    string    `parquet:"project_id"`
+    Amount       int64     `parquet:"amount,decimal(18,6)"` // scaled integer
+    CalculatedAt time.Time `parquet:"calculated_at,timestamp(millisecond)"`
+}
+
+func toFile(u Usage) (UsageFile, error) {
+    scaled := u.Amount.Shift(6)
+    if !scaled.IsInteger() {
+        return UsageFile{}, fmt.Errorf(
+            "amount %s has more than 6 decimal places", u.Amount)
+    }
+    return UsageFile{
+        InstanceID:   u.InstanceID,
+        SkuID:        u.SkuID,
+        ProjectID:    u.ProjectID.String(),
+        Amount:       scaled.BigInt().Int64(),
+        CalculatedAt: u.CalculatedAt,
+    }, nil
+}
+
+func fromFile(f UsageFile) (Usage, error) {
+    pid, err := uuid.Parse(f.ProjectID)
+    if err != nil { return Usage{}, err }
+    return Usage{
+        InstanceID:   f.InstanceID,
+        SkuID:        f.SkuID,
+        ProjectID:    pid,
+        Amount:       decimal.New(f.Amount, -6),
+        CalculatedAt: f.CalculatedAt,
+    }, nil
+}
+
+// Hand the library UsageFile, not Usage.
+store, _ := s3parquet.New[UsageFile](s3parquet.Config[UsageFile]{ /* ... */ })
+
+// Writes:
+files := make([]UsageFile, len(usages))
+for i, u := range usages {
+    f, err := toFile(u); if err != nil { return err }
+    files[i] = f
+}
+_, err := store.Write(ctx, files)
+
+// Reads:
+files, err := store.Read(ctx, "...")
+usages := make([]Usage, len(files))
+for i, f := range files {
+    u, err := fromFile(f); if err != nil { return err }
+    usages[i] = u
+}
+```
+
+Parquet's `DECIMAL(p, s)` logical type is the preferred encoding for
+monetary values — DuckDB reads it as a real decimal so `SUM(amount)` just
+works. Use `int64` backing for precision ≤ 18, `[N]byte` for more.
 
 ## S3 layout
 
@@ -97,12 +216,30 @@ s3://warehouse/billing/
   the timestamp, a short UUID, and the partition key. `Poll` is a single
   S3 LIST over this prefix — no GETs.
 
+## Glob grammar
+
+Both `s3parquet` and `s3sql` share one grammar, validated identically:
+
+| Pattern | Accepted? |
+|---|---|
+| `*` (literal) — match everything | ✓ |
+| `charge_period=2026-03-17/customer=abc` — exact | ✓ |
+| `charge_period=2026-03-*/customer=abc` — trailing `*` in value | ✓ |
+| `*/customer=abc` — whole-segment `*` | ✓ |
+| `charge_period=*-17/customer=abc` — leading `*` | ✗ |
+| `charge_period=2026-*-17/customer=abc` — middle `*` | ✗ |
+| `charge_period=[0-9]/customer=abc` — char class | ✗ |
+| `charge_period={2026,2027}/customer=abc` — alternation | ✗ |
+
+Truncated patterns (fewer segments than `KeyParts`) and mislabelled
+segments (part name in the wrong position) are also rejected.
+
 ## Access patterns
 
 ### Write
 
 ```go
-// Groups records by KeyFunc, one PUT per group
+// Groups records by PartitionKeyOf, one PUT per group
 results, err := store.Write(ctx, records)
 
 // Or skip the grouping step and write a pre-grouped batch
@@ -116,25 +253,19 @@ check to detect lost-ack).
 ### Stream — refs only
 
 ```go
-// Returns up to 100 stream entries past the given offset
 entries, newOffset, err := store.Poll(ctx, lastOffset, 100)
-for _, e := range entries {
-    fmt.Println(e.Offset, e.Key, e.DataPath)
-}
-// Pass newOffset back on the next call to continue where you left off
 ```
 
 Each `StreamEntry` carries the ref's `Offset` (opaque cursor, pass back as
 `since` on the next call), the `Key` (partition key as written), and the
 `DataPath` (S3 key of the parquet file). No GETs are issued — the entire
-batch is one S3 LIST call over `_stream/refs/`. Use this when you want to
-react to *which* keys changed without fetching the data itself.
+batch is one S3 LIST call over `_stream/refs/`.
 
 ### Stream — typed records
 
 ```go
 // Default: Kafka compacted-topic semantics — latest-per-key
-// within each batch, deduped by VersionColumn
+// within each batch
 records, newOffset, err := store.PollRecords(ctx, lastOffset, 100)
 
 // Full stream: every record in every referenced file
@@ -142,22 +273,9 @@ records, newOffset, err = store.PollRecords(ctx, lastOffset, 100,
     s3store.WithHistory())
 ```
 
-Default is **compacted-topic semantics**: within each batch, only the
-latest version of each key (by `VersionColumn`) is returned. Consumers that
-apply each record as an upsert to a local store converge on the latest-per-
-key view — the primary use case for materialized-view consumers like the
-billing example above.
-
-`WithHistory()` opts out of dedup and returns every record in every
-referenced file. Use it for audit logs, or whenever you need to observe
-superseded versions.
-
-`WithHistory()` is the same option that works on `Query` and `QueryRow` —
-every read API in s3store shares the "dedup by default, `WithHistory()` to
-see all versions" convention. When `VersionColumn` is empty, dedup is a
-no-op regardless.
-
-Schema evolution (`ColumnAliases`, `ColumnDefaults`) applies to both modes.
+Through the umbrella, `PollRecords` runs through DuckDB so dedup and
+schema-evolution transforms match `Read`. `s3parquet.PollRecords` does the
+same in pure Go, using `EntityKeyOf` + `VersionOf` for in-memory dedup.
 
 ### Snapshot
 
@@ -165,40 +283,26 @@ Schema evolution (`ColumnAliases`, `ColumnDefaults`) applies to both modes.
 records, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
 ```
 
-Returns the deduplicated latest version of every record matching the glob,
-typed via `ScanFunc`. Glob syntax matches `KeyParts`:
+Returns the deduplicated latest version of every record matching the glob.
 
-| Pattern | Meaning |
-|---|---|
-| `"charge_period=X/customer=Y"` | exact |
-| `"charge_period=X/*"` | all customers for period X |
-| `"charge_period=2026-03-*/customer=abc"` | partial-value glob |
-| `"*"` | all data |
-
-Truncated patterns (fewer segments than `KeyParts`) are rejected with a
-clear error.
-
-### SQL query
+### SQL query (umbrella or `s3sql`)
 
 ```go
-// Multi-row query
 rows, err := store.Query(ctx, "charge_period=2026-03-*/*",
     "SELECT customer, sku, SUM(net_cost) AS total "+
         "FROM costs GROUP BY customer, sku")
 
-// Single-row query — errors surface via the returned *sql.Row on Scan
 var total float64
 err = store.QueryRow(ctx, "charge_period=2026-03-17/*",
     "SELECT SUM(net_cost) FROM costs").Scan(&total)
 ```
 
 Deduplicated by default. Pass `s3store.WithHistory()` to see all versions.
-`QueryRow` is the `database/sql` convention for queries that should return
-at most one row — construction-time errors (invalid key pattern, column
-introspection failure) surface through the returned `*sql.Row` at `Scan`
-time, matching stdlib behavior.
+`QueryRow` is the `database/sql` convention for queries that return at
+most one row — construction-time errors surface through the returned
+`*sql.Row` at `Scan` time.
 
-## Schema evolution
+## Schema evolution (s3sql only)
 
 ```go
 Config[T]{
@@ -206,7 +310,6 @@ Config[T]{
     ColumnDefaults: map[string]string{
         "currency": "'EUR'",
     },
-
     // Handle column renames: each new column can chain to old names
     ColumnAliases: map[string][]string{
         "cost_per_unit": {"price_per_unit", "unit_price"},
@@ -214,30 +317,16 @@ Config[T]{
 }
 ```
 
-Both are applied at query time across all read paths (`Read`, `Query`,
-`QueryRow`, `PollRecords`). s3store introspects the scanned files' schemas
-and picks the right SQL shape:
+Applied at query time across all SQL-path reads (`Read`, `Query`,
+`QueryRow`, `PollRecords` via the umbrella). s3store introspects the
+scanned files' schemas and picks the right SQL shape — `SELECT * REPLACE`
+when the target column already exists, `SELECT *, alias` when it doesn't,
+`NULL AS col` when neither side is present. The old-name columns are
+`EXCLUDE`d so they don't linger next to the aliased column.
 
-- **Target column already exists in some files** —
-  `SELECT * EXCLUDE (old1, old2) REPLACE (COALESCE(newName, old1, old2) AS newName) FROM _raw`.
-  The new column keeps its original position; the old names are removed
-  from the output so they don't linger next to the aliased column.
-- **Target column does not exist in any file yet** —
-  `SELECT * EXCLUDE (old1, old2), COALESCE(old1, old2) AS newName FROM _raw`.
-  The alias is appended as a new column, the old names are still removed.
-- **Nothing on either side of the alias exists** — `NULL AS newName` is
-  appended, so the output schema is still well-formed.
-- **`ColumnDefault` on a column that no file has** — the default is
-  emitted as a constant-valued column (`'EUR' AS currency`).
-
-So you can add a `ColumnAlias` or `ColumnDefault` before any file contains
-the new column, and the first read that produces a file with the new name
-will transparently switch from "appended" to "REPLACEd in place". The
-column order visible to `ScanFunc` is always `_raw.*` minus EXCLUDEs, with
-REPLACEs in place, plus additions at the end (in sorted-key order).
-
-When two aliases absorb the same old column, the `EXCLUDE` list is
-deduplicated automatically.
+`s3parquet.Read` relies on parquet-go's native schema tolerance instead
+(fields missing from a file decode as zero-values; unknown fields in a
+file are ignored). For renames or SQL-expression defaults, use `s3sql`.
 
 ## Settle window
 
@@ -254,7 +343,7 @@ S3 PUTs aren't globally ordered, so `Poll` reads up to `now - SettleWindow`
 already-read one. This gives you a single monotonic offset with no seen-set
 or dedup bookkeeping.
 
-## Configuration
+## Configuration — umbrella
 
 ```go
 type Config[T any] struct {
@@ -265,46 +354,52 @@ type Config[T any] struct {
     TableAlias string                     // name used in Query SQL
     S3Client   *s3.Client                 // AWS SDK v2 S3 client
 
-    // Required for Write / PollRecords / Read (respectively)
-    KeyFunc  func(T) string               // derive key from record (Write)
-    ScanFunc func(*sql.Rows) (T, error)   // map DuckDB row to typed record
+    // Required for Write / typed reads
+    PartitionKeyOf func(T) string         // derive key from record (Write)
+    ScanFunc       func(*sql.Rows) (T, error) // map DuckDB row → typed record
 
-    // Deduplication
+    // SQL-side dedup (used by Read / PollRecords / Query)
     VersionColumn string                  // column to ORDER BY for latest
     DeduplicateBy []string                // dedup keys (default: KeyParts)
 
     // Stream
     SettleWindow time.Duration            // default: 5s
 
-    // Schema evolution (applied on all read paths)
+    // Schema evolution (SQL path only)
     ColumnDefaults map[string]string      // SQL expr per missing column
     ColumnAliases  map[string][]string    // new name → old name chain
 
-    // S3 endpoint / extensions
-    S3Endpoint   string                   // host:port, no scheme; for MinIO
-    ExtraInitSQL []string                 // DuckDB SET/LOAD/CREATE SECRET
-                                          // statements run after the default
-                                          // init — used for S3 credentials,
-                                          // SSL toggles, extra extensions
+    // DuckDB extras
+    ExtraInitSQL []string                 // SET / CREATE SECRET / LOAD
+                                          // statements run after the
+                                          // auto-derived S3 settings
 }
 ```
 
-`ExtraInitSQL` is how you pass S3 credentials and SSL settings through to
-DuckDB's httpfs extension for non-default endpoints. For example, a MinIO
-integration test uses:
+`S3Endpoint` is no longer in the config — endpoint, region, URL style,
+and use_ssl are auto-derived from `S3Client.Options()` at `New()` time.
+Credentials are not auto-derived (they can rotate); pass them via
+`ExtraInitSQL` with `SET s3_access_key_id=...` or, on real AWS with IAM
+roles, use `CREATE SECRET ... PROVIDER credential_chain` so DuckDB
+resolves them itself and stays fresh.
 
-```go
-ExtraInitSQL: []string{
-    "SET s3_use_ssl=false",
-    "SET s3_access_key_id='minioadmin'",
-    "SET s3_secret_access_key='minioadmin'",
-    "SET s3_region='us-east-1'",
-},
-```
+Configuration for `s3parquet` and `s3sql` directly is narrower — see each
+package's `Config[T]` for the exact fields.
 
-On real AWS, both the SDK and DuckDB's httpfs pick up credentials from the
-default AWS provider chain (IAM role, env vars, `~/.aws/credentials`), so
-`ExtraInitSQL` is typically empty.
+## Migration from earlier versions
+
+Breaking changes in the package-split refactor:
+
+- **`Config.KeyFunc` → `Config.PartitionKeyOf`** — new name better reflects
+  the field's role.
+- **`Config.S3Endpoint` removed** — auto-derived from
+  `S3Client.Options().BaseEndpoint`. For MinIO-style setups, just pass the
+  full URL (`http://minio:9000`) on your `s3.Options`.
+- **Glob grammar narrowed** — `?`, `[abc]`, `{a,b}` alternation, and
+  leading/middle `*` in values are rejected. Only whole-segment `*` and a
+  single trailing `*` per value are accepted. If you relied on the richer
+  DuckDB glob dialect, file an issue — we can relax the parser if there's
+  real usage.
 
 ## Testing
 
@@ -312,6 +407,8 @@ default AWS provider chain (IAM role, env vars, `~/.aws/credentials`), so
 go test ./...                                # unit tests, no dependencies
 go test -tags integration -timeout 5m ./...  # full round-trip vs. a MinIO
                                              # container via testcontainers
+CGO_ENABLED=0 go test -short ./s3parquet/... ./internal/...
+                                             # cgo-free subset
 ```
 
 Integration tests require Docker and pull `minio/minio:latest` on first run.
@@ -323,6 +420,8 @@ Integration tests require Docker and pull `minio/minio:latest` on first run.
 - **Stream latency = poll interval + settle window.** Not real-time.
 - **Upsert-only compacted mode.** There is no tombstone / key-delete
   mechanism — keys can only be updated, not removed.
+- **s3parquet dedup is in-memory.** Large key cardinality can OOM; route
+  those workloads to `s3sql` which streams through DuckDB.
 - **Schema evolution is query-time.** Good for renames, new columns, and
   column defaults. Type changes, splits, or row-level computed derivations
   still require a migration tool.
