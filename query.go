@@ -28,7 +28,7 @@ func (s *Store[T]) Query(
 		return nil, err
 	}
 	wrapped, err := s.buildWrappedQuery(
-		ctx, scanExpr, sqlQuery, o.includeHistory)
+		ctx, scanExpr, sqlQuery, o.IncludeHistory)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func (s *Store[T]) QueryRow(
 		return s.errorRow(ctx, err)
 	}
 	wrapped, err := s.buildWrappedQuery(
-		ctx, scanExpr, sqlQuery, o.includeHistory)
+		ctx, scanExpr, sqlQuery, o.IncludeHistory)
 	if err != nil {
 		return s.errorRow(ctx, err)
 	}

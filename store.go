@@ -4,18 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"net/url"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/ueisele/s3store/internal/core"
 )
-
-// refSeparator splits the fixed-width "{ts}-{id}" header from
-// the PathEscape'd Hive key in a ref filename. PathEscape always
-// escapes ';' (as %3B), so this character cannot appear in the
-// encoded key — the split on it is unambiguous even when the
-// original key contains arbitrary bytes.
-const refSeparator = ";"
 
 // Store provides append-only storage on S3 with Parquet data
 // files, a change stream, and embedded DuckDB for all reads.
@@ -42,11 +35,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		return nil, fmt.Errorf(
 			"s3store: S3Client is required")
 	}
-	if len(cfg.KeyParts) == 0 {
-		return nil, fmt.Errorf(
-			"s3store: KeyParts is required")
-	}
-	if err := validateKeyParts(cfg.KeyParts); err != nil {
+	if err := core.ValidateKeyParts(cfg.KeyParts); err != nil {
 		return nil, err
 	}
 
@@ -60,38 +49,13 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		cfg:      cfg,
 		s3:       cfg.S3Client,
 		db:       db,
-		dataPath: cfg.Prefix + "/data",
-		refPath:  cfg.Prefix + "/_stream/refs",
+		dataPath: core.DataPath(cfg.Prefix),
+		refPath:  core.RefPath(cfg.Prefix),
 	}, nil
 }
 
 func (s *Store[T]) Close() error {
 	return s.db.Close()
-}
-
-// validateKeyParts rejects KeyParts entries that would break
-// the Hive layout or the key parser: empty strings, names
-// containing '=' (the k-v separator) or '/' (the segment
-// separator), and duplicate names. Called once from New().
-func validateKeyParts(parts []string) error {
-	seen := make(map[string]bool, len(parts))
-	for i, p := range parts {
-		if p == "" {
-			return fmt.Errorf(
-				"s3store: KeyParts[%d] is empty", i)
-		}
-		if strings.ContainsAny(p, "=/") {
-			return fmt.Errorf(
-				"s3store: KeyParts[%d] %q must not contain "+
-					"'=' or '/'", i, p)
-		}
-		if seen[p] {
-			return fmt.Errorf(
-				"s3store: KeyParts[%d] %q is duplicated", i, p)
-		}
-		seen[p] = true
-	}
-	return nil
 }
 
 func (s *Store[T]) s3URI(key string) string {
@@ -174,47 +138,19 @@ func (s *Store[T]) dedupColumns() []string {
 func (s *Store[T]) encodeRefKey(
 	tsMicros int64, shortID string, key string,
 ) string {
-	return fmt.Sprintf("%s/%d-%s%s%s.ref",
-		s.refPath, tsMicros, shortID,
-		refSeparator, url.PathEscape(key))
+	return core.EncodeRefKey(s.refPath, tsMicros, shortID, key)
 }
 
 func (s *Store[T]) parseRefKey(refKey string) (
 	key string, shortID string, err error,
 ) {
-	name := refKey
-	if idx := strings.LastIndex(name, "/"); idx >= 0 {
-		name = name[idx+1:]
-	}
-	name = strings.TrimSuffix(name, ".ref")
-
-	parts := strings.SplitN(name, refSeparator, 2)
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf(
-			"s3store: invalid ref key: %s", refKey)
-	}
-
-	tsAndID := parts[0]
-	dashIdx := strings.Index(tsAndID, "-")
-	if dashIdx < 0 {
-		return "", "", fmt.Errorf(
-			"s3store: invalid ref key: %s", refKey)
-	}
-	shortID = tsAndID[dashIdx+1:]
-
-	key, err = url.PathUnescape(parts[1])
-	if err != nil {
-		return "", "", fmt.Errorf(
-			"s3store: invalid ref key %q: %w", refKey, err)
-	}
-	return key, shortID, nil
+	return core.ParseRefKey(refKey)
 }
 
 func (s *Store[T]) buildDataPath(
 	key string, shortID string,
 ) string {
-	return fmt.Sprintf("%s/%s/%s.parquet",
-		s.dataPath, key, shortID)
+	return core.BuildDataFilePath(s.dataPath, key, shortID)
 }
 
 // introspectColumns returns the set of columns the given base

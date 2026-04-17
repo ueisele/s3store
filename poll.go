@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/ueisele/s3store/internal/core"
 )
 
 // s3ListMaxKeys is the per-request page size cap enforced by S3.
@@ -26,9 +27,8 @@ func (s *Store[T]) Poll(
 			"s3store: maxEntries must be > 0")
 	}
 
-	cutoff := time.Now().Add(-s.cfg.settleWindow())
-	cutoffPrefix := fmt.Sprintf("%s/%d",
-		s.refPath, cutoff.UnixMicro())
+	cutoffPrefix := core.RefCutoff(
+		s.refPath, time.Now(), s.cfg.settleWindow())
 
 	pageSize := maxEntries
 	if pageSize > s3ListMaxKeys {
@@ -143,7 +143,7 @@ func (s *Store[T]) PollRecords(
 		strings.Join(uris, ", "))
 
 	query, err := s.buildWrappedQuery(ctx, scanExpr,
-		"SELECT * FROM "+s.cfg.TableAlias, o.includeHistory)
+		"SELECT * FROM "+s.cfg.TableAlias, o.IncludeHistory)
 	if err != nil {
 		return nil, since, err
 	}

@@ -24,8 +24,8 @@ func TestConfigSettleWindowOverride(t *testing.T) {
 func TestWithHistory(t *testing.T) {
 	var o queryOpts
 	WithHistory()(&o)
-	if !o.includeHistory {
-		t.Error("WithHistory didn't set includeHistory=true")
+	if !o.IncludeHistory {
+		t.Error("WithHistory didn't set IncludeHistory=true")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/ueisele/s3store/internal/core"
 )
 
 // Config defines how a Store is set up. T is the record type.
@@ -106,23 +107,18 @@ func (c Config[T]) settleWindow() time.Duration {
 }
 
 // Offset represents a position in the stream.
-type Offset string
+type Offset = core.Offset
 
 // StreamEntry is a lightweight ref.
-type StreamEntry struct {
-	Offset   Offset
-	Key      string
-	DataPath string
-}
+type StreamEntry = core.StreamEntry
+
+// WriteResult contains metadata about a completed write.
+type WriteResult = core.WriteResult
 
 // QueryOption configures read-path behavior. Shared across
 // Query, QueryRow, and PollRecords so there's one option and
 // one mental model for every read API.
-type QueryOption func(*queryOpts)
-
-type queryOpts struct {
-	includeHistory bool
-}
+type QueryOption = core.QueryOption
 
 // WithHistory disables latest-per-key deduplication on any
 // read path (Query, QueryRow, PollRecords). Without it, reads
@@ -133,16 +129,7 @@ type queryOpts struct {
 // When VersionColumn is empty, dedup is a no-op regardless of
 // this option — there's no ordering to dedup on.
 func WithHistory() QueryOption {
-	return func(o *queryOpts) {
-		o.includeHistory = true
-	}
-}
-
-// WriteResult contains metadata about a completed write.
-type WriteResult struct {
-	Offset   Offset
-	DataPath string
-	RefPath  string
+	return core.WithHistory()
 }
 
 // duckDBSettingsSQL returns the non-extension session settings
@@ -200,3 +187,8 @@ func openDuckDB(endpoint string, extra []string) (*sql.DB, error) {
 	}
 	return db, nil
 }
+
+// queryOpts is kept as an alias of the core type for internal
+// use; methods on the root Store construct it from QueryOption
+// values before passing to DuckDB.
+type queryOpts = core.QueryOpts
