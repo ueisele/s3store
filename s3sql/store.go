@@ -21,8 +21,8 @@ type Config[T any] struct {
 	// Prefix under which data files are stored.
 	Prefix string
 
-	// KeyParts defines the Hive-partition key segments in order.
-	KeyParts []string
+	// PartitionKeyParts defines the Hive-partition key segments in order.
+	PartitionKeyParts []string
 
 	// S3Client is the AWS S3 client used for ref listing (Poll).
 	// DuckDB's httpfs extension uses its own S3 client for actual
@@ -47,7 +47,7 @@ type Config[T any] struct {
 	VersionColumn string
 
 	// DeduplicateBy defines the columns that identify a unique
-	// record for dedup purposes. Defaults to KeyParts.
+	// record for dedup purposes. Defaults to PartitionKeyParts.
 	DeduplicateBy []string
 
 	// ColumnDefaults maps column names to SQL default expressions
@@ -76,7 +76,7 @@ func (c Config[T]) dedupColumns() []string {
 	if len(c.DeduplicateBy) > 0 {
 		return c.DeduplicateBy
 	}
-	return c.KeyParts
+	return c.PartitionKeyParts
 }
 
 // Store is the cgo / DuckDB entry point to an s3store.
@@ -103,7 +103,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if cfg.S3Client == nil {
 		return nil, fmt.Errorf("s3sql: S3Client is required")
 	}
-	if err := core.ValidateKeyParts(cfg.KeyParts); err != nil {
+	if err := core.ValidatePartitionKeyParts(cfg.PartitionKeyParts); err != nil {
 		return nil, err
 	}
 
@@ -147,7 +147,7 @@ func (s *Store[T]) buildParquetURI(
 	keyPattern string,
 ) (string, error) {
 	if err := core.ValidateKeyPattern(
-		keyPattern, s.cfg.KeyParts,
+		keyPattern, s.cfg.PartitionKeyParts,
 	); err != nil {
 		return "", err
 	}
@@ -159,7 +159,7 @@ func (s *Store[T]) buildParquetURI(
 	segments := strings.Split(keyPattern, "/")
 	for i, seg := range segments {
 		if seg == "*" {
-			segments[i] = s.cfg.KeyParts[i] + "=*"
+			segments[i] = s.cfg.PartitionKeyParts[i] + "=*"
 		}
 	}
 	return s.s3URI(

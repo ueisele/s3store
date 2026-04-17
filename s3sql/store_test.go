@@ -16,11 +16,11 @@ type testRec struct {
 
 func validConfig() Config[testRec] {
 	return Config[testRec]{
-		Bucket:     "b",
-		Prefix:     "p",
-		KeyParts:   []string{"period", "customer"},
-		S3Client:   &s3.Client{},
-		TableAlias: "t",
+		Bucket:            "b",
+		Prefix:            "p",
+		PartitionKeyParts: []string{"period", "customer"},
+		S3Client:          &s3.Client{},
+		TableAlias:        "t",
 	}
 }
 
@@ -34,7 +34,7 @@ func TestNew_Validation(t *testing.T) {
 		{"missing Prefix", func(c *Config[testRec]) { c.Prefix = "" }, "Prefix is required"},
 		{"missing TableAlias", func(c *Config[testRec]) { c.TableAlias = "" }, "TableAlias is required"},
 		{"missing S3Client", func(c *Config[testRec]) { c.S3Client = nil }, "S3Client is required"},
-		{"missing KeyParts", func(c *Config[testRec]) { c.KeyParts = nil }, "KeyParts is required"},
+		{"missing PartitionKeyParts", func(c *Config[testRec]) { c.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -132,7 +132,7 @@ func TestBuildParquetURI(t *testing.T) {
 }
 
 func TestDedupColumns(t *testing.T) {
-	c := Config[testRec]{KeyParts: []string{"period", "customer"}}
+	c := Config[testRec]{PartitionKeyParts: []string{"period", "customer"}}
 	got := c.dedupColumns()
 	if len(got) != 2 || got[0] != "period" || got[1] != "customer" {
 		t.Errorf("default: got %v", got)

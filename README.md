@@ -57,7 +57,7 @@ store, err := s3store.New[CostRecord](s3store.Config[CostRecord]{
     Bucket:        "warehouse",
     Prefix:        "billing",
     S3Client:      s3Client,
-    KeyParts:      []string{"charge_period", "customer"},
+    PartitionKeyParts:      []string{"charge_period", "customer"},
     VersionColumn: "calculated_at",
     TableAlias:    "costs",
     PartitionKeyOf: func(r CostRecord) string {
@@ -97,7 +97,7 @@ store, err := s3parquet.New[CostRecord](s3parquet.Config[CostRecord]{
     Bucket:   "warehouse",
     Prefix:   "billing",
     S3Client: s3Client,
-    KeyParts: []string{"charge_period", "customer"},
+    PartitionKeyParts: []string{"charge_period", "customer"},
     PartitionKeyOf: func(r CostRecord) string {
         return fmt.Sprintf("charge_period=%s/customer=%s",
             r.ChargePeriod, r.CustomerID)
@@ -234,7 +234,7 @@ Both `s3parquet` and `s3sql` share one grammar, validated identically:
 | `charge_period=[0-9]/customer=abc` — char class | ✗ |
 | `charge_period={2026,2027}/customer=abc` — alternation | ✗ |
 
-Truncated patterns (fewer segments than `KeyParts`) and mislabelled
+Truncated patterns (fewer segments than `PartitionKeyParts`) and mislabelled
 segments (part name in the wrong position) are also rejected.
 
 ## Access patterns
@@ -353,7 +353,7 @@ type Config[T any] struct {
     // Required
     Bucket     string                     // S3 bucket name
     Prefix     string                     // prefix under which data lives
-    KeyParts   []string                   // ordered Hive partition key names
+    PartitionKeyParts   []string                   // ordered Hive partition key names
     TableAlias string                     // name used in Query SQL
     S3Client   *s3.Client                 // AWS SDK v2 S3 client
 
@@ -363,7 +363,7 @@ type Config[T any] struct {
 
     // SQL-side dedup (used by Read / PollRecords / Query)
     VersionColumn string                  // column to ORDER BY for latest
-    DeduplicateBy []string                // dedup keys (default: KeyParts)
+    DeduplicateBy []string                // dedup keys (default: PartitionKeyParts)
 
     // Stream
     SettleWindow time.Duration            // default: 5s

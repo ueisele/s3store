@@ -131,11 +131,11 @@ func TestBuildDataFilePath(t *testing.T) {
 
 func TestParseDataFileName(t *testing.T) {
 	cases := []struct {
-		name       string
-		in         string
-		wantTs     int64
-		wantShort  string
-		wantErr    bool
+		name      string
+		in        string
+		wantTs    int64
+		wantShort string
+		wantErr   bool
 	}{
 		{
 			name:      "standard",

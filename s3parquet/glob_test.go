@@ -3,7 +3,7 @@ package s3parquet
 import "testing"
 
 func TestBuildReadPlan_ListPrefix(t *testing.T) {
-	keyParts := []string{"period", "customer"}
+	partitionKeyParts := []string{"period", "customer"}
 	const dataPath = "pre/data"
 
 	cases := []struct {
@@ -21,7 +21,7 @@ func TestBuildReadPlan_ListPrefix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan, err := buildReadPlan(tc.pattern, dataPath, keyParts)
+			plan, err := buildReadPlan(tc.pattern, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -34,7 +34,7 @@ func TestBuildReadPlan_ListPrefix(t *testing.T) {
 }
 
 func TestBuildReadPlan_Match(t *testing.T) {
-	keyParts := []string{"period", "customer"}
+	partitionKeyParts := []string{"period", "customer"}
 	const dataPath = "pre/data"
 
 	cases := []struct {
@@ -54,7 +54,7 @@ func TestBuildReadPlan_Match(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan, err := buildReadPlan(tc.pattern, dataPath, keyParts)
+			plan, err := buildReadPlan(tc.pattern, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -67,7 +67,7 @@ func TestBuildReadPlan_Match(t *testing.T) {
 }
 
 func TestBuildReadPlan_RejectsInvalidPattern(t *testing.T) {
-	keyParts := []string{"period", "customer"}
+	partitionKeyParts := []string{"period", "customer"}
 	cases := []string{
 		"period=*-17/customer=abc",      // leading star
 		"period=2026-*-17/customer=abc", // middle star
@@ -76,7 +76,7 @@ func TestBuildReadPlan_RejectsInvalidPattern(t *testing.T) {
 	}
 	for _, p := range cases {
 		t.Run(p, func(t *testing.T) {
-			if _, err := buildReadPlan(p, "pre/data", keyParts); err == nil {
+			if _, err := buildReadPlan(p, "pre/data", partitionKeyParts); err == nil {
 				t.Errorf("buildReadPlan(%q): expected error", p)
 			}
 		})
@@ -85,11 +85,11 @@ func TestBuildReadPlan_RejectsInvalidPattern(t *testing.T) {
 
 func TestHiveKeyOfDataFile(t *testing.T) {
 	cases := []struct {
-		name    string
-		s3Key   string
-		dp      string
-		want    string
-		wantOK  bool
+		name   string
+		s3Key  string
+		dp     string
+		want   string
+		wantOK bool
 	}{
 		{"standard", "pre/data/period=X/customer=Y/abcd1234.parquet",
 			"pre/data", "period=X/customer=Y", true},

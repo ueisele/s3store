@@ -17,10 +17,10 @@ type testRec struct {
 
 func validConfig() Config[testRec] {
 	return Config[testRec]{
-		Bucket:   "b",
-		Prefix:   "p",
-		KeyParts: []string{"period", "customer"},
-		S3Client: &s3.Client{},
+		Bucket:            "b",
+		Prefix:            "p",
+		PartitionKeyParts: []string{"period", "customer"},
+		S3Client:          &s3.Client{},
 	}
 }
 
@@ -33,7 +33,7 @@ func TestNew_Validation(t *testing.T) {
 		{"missing Bucket", func(c *Config[testRec]) { c.Bucket = "" }, "Bucket is required"},
 		{"missing Prefix", func(c *Config[testRec]) { c.Prefix = "" }, "Prefix is required"},
 		{"missing S3Client", func(c *Config[testRec]) { c.S3Client = nil }, "S3Client is required"},
-		{"missing KeyParts", func(c *Config[testRec]) { c.KeyParts = nil }, "KeyParts is required"},
+		{"missing PartitionKeyParts", func(c *Config[testRec]) { c.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -53,7 +53,7 @@ func TestNew_Validation(t *testing.T) {
 
 func TestValidateKey(t *testing.T) {
 	s := &Store[testRec]{cfg: Config[testRec]{
-		KeyParts: []string{"period", "customer"},
+		PartitionKeyParts: []string{"period", "customer"},
 	}}
 	cases := []struct {
 		name    string
@@ -119,7 +119,7 @@ func TestSettleWindowDefault(t *testing.T) {
 // method touches s.s3.
 func TestWriteEmptyRecords(t *testing.T) {
 	s := &Store[testRec]{cfg: Config[testRec]{
-		KeyParts: []string{"period", "customer"},
+		PartitionKeyParts: []string{"period", "customer"},
 		PartitionKeyOf: func(r testRec) string {
 			return "period=" + r.Period + "/customer=" + r.Customer
 		},

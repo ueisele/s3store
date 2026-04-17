@@ -24,9 +24,9 @@ type readPlan struct {
 //
 // Pure Go — no S3 calls; suitable for unit-testing.
 func buildReadPlan(
-	pattern string, dataPath string, keyParts []string,
+	pattern string, dataPath string, partitionKeyParts []string,
 ) (*readPlan, error) {
-	if err := core.ValidateKeyPattern(pattern, keyParts); err != nil {
+	if err := core.ValidateKeyPattern(pattern, partitionKeyParts); err != nil {
 		return nil, err
 	}
 
@@ -46,7 +46,7 @@ func buildReadPlan(
 	// in-memory check.
 	literalEnd := 0
 	for i, seg := range segments {
-		part := keyParts[i]
+		part := partitionKeyParts[i]
 		if seg == "*" {
 			break
 		}
@@ -72,7 +72,7 @@ func buildReadPlan(
 	return &readPlan{
 		ListPrefix: listPrefix,
 		Match: func(hiveKey string) bool {
-			return matchHiveKey(hiveKey, segments, keyParts)
+			return matchHiveKey(hiveKey, segments, partitionKeyParts)
 		},
 	}, nil
 }
@@ -83,7 +83,7 @@ func buildReadPlan(
 // "part=value" where value is a literal or a literal followed
 // by a single trailing "*".
 func matchHiveKey(
-	hiveKey string, patternSegs []string, keyParts []string,
+	hiveKey string, patternSegs []string, partitionKeyParts []string,
 ) bool {
 	keySegs := strings.Split(hiveKey, "/")
 	if len(keySegs) != len(patternSegs) {
@@ -94,7 +94,7 @@ func matchHiveKey(
 			continue
 		}
 		kseg := keySegs[i]
-		part := keyParts[i]
+		part := partitionKeyParts[i]
 		prefix := part + "="
 		if !strings.HasPrefix(kseg, prefix) {
 			return false

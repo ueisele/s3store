@@ -5,14 +5,14 @@ import (
 	"testing"
 )
 
-func TestValidateKeyParts(t *testing.T) {
+func TestValidatePartitionKeyParts(t *testing.T) {
 	cases := []struct {
 		name    string
 		parts   []string
 		wantSub string // empty = want nil
 	}{
 		{"valid", []string{"period", "customer"}, ""},
-		{"empty slice", nil, "KeyParts is required"},
+		{"empty slice", nil, "PartitionKeyParts is required"},
 		{"empty string", []string{"period", ""}, "is empty"},
 		{"contains equals", []string{"period", "cust=bad"}, "must not contain"},
 		{"contains slash", []string{"per/iod", "customer"}, "must not contain"},
@@ -20,7 +20,7 @@ func TestValidateKeyParts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateKeyParts(tc.parts)
+			err := ValidatePartitionKeyParts(tc.parts)
 			if tc.wantSub == "" {
 				if err != nil {
 					t.Errorf("expected nil, got %v", err)
@@ -39,7 +39,7 @@ func TestValidateKeyParts(t *testing.T) {
 }
 
 func TestValidateKeyPattern(t *testing.T) {
-	keyParts := []string{"period", "customer"}
+	partitionKeyParts := []string{"period", "customer"}
 	cases := []struct {
 		name    string
 		pattern string
@@ -65,7 +65,7 @@ func TestValidateKeyPattern(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateKeyPattern(tc.pattern, keyParts)
+			err := ValidateKeyPattern(tc.pattern, partitionKeyParts)
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("expected error for %q, got nil", tc.pattern)

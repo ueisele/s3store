@@ -47,14 +47,14 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 		opts.settleWindow = 10 * time.Millisecond
 	}
 	store, err := New[IntRecord](Config[IntRecord]{
-		Bucket:        f.Bucket,
-		Prefix:        "store",
-		S3Client:      f.S3Client,
-		KeyParts:      []string{"period", "customer"},
-		TableAlias:    "records",
-		VersionColumn: "ts",
-		DeduplicateBy: opts.deduplicateBy,
-		SettleWindow:  opts.settleWindow,
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		TableAlias:        "records",
+		VersionColumn:     "ts",
+		DeduplicateBy:     opts.deduplicateBy,
+		SettleWindow:      opts.settleWindow,
 		PartitionKeyOf: func(r IntRecord) string {
 			return fmt.Sprintf(
 				"period=%s/customer=%s",
@@ -87,7 +87,7 @@ func TestUmbrella_WriteRead(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	// Default dedup scope is DeduplicateBy=KeyParts=(period,
+	// Default dedup scope is DeduplicateBy=PartitionKeyParts=(period,
 	// customer), so each customer-partition keeps exactly one
 	// record — the latest by ts. customer=abc has two records,
 	// the s2/Amount=20 one wins.
@@ -302,12 +302,12 @@ func TestUmbrella_SettleWindow(t *testing.T) {
 func TestUmbrella_Close(t *testing.T) {
 	f := testutil.New(t)
 	store, err := New[IntRecord](Config[IntRecord]{
-		Bucket:        f.Bucket,
-		Prefix:        "store",
-		S3Client:      f.S3Client,
-		KeyParts:      []string{"period", "customer"},
-		TableAlias:    "records",
-		VersionColumn: "ts",
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		TableAlias:        "records",
+		VersionColumn:     "ts",
 		PartitionKeyOf: func(r IntRecord) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)

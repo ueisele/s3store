@@ -74,12 +74,12 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	t.Helper()
 	f := testutil.New(t)
 	w, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:         f.Bucket,
-		Prefix:         "store",
-		S3Client:       f.S3Client,
-		KeyParts:       []string{"period", "customer"},
-		PartitionKeyOf: partitionKeyOfRec,
-		SettleWindow:   10 * time.Millisecond,
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf:    partitionKeyOfRec,
+		SettleWindow:      10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
@@ -87,18 +87,18 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	t.Cleanup(func() { _ = w.Close() })
 
 	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
-		Bucket:         f.Bucket,
-		Prefix:         "store",
-		S3Client:       f.S3Client,
-		KeyParts:       []string{"period", "customer"},
-		ScanFunc:       scanRec,
-		TableAlias:     "records",
-		VersionColumn:  opts.versionColumn,
-		DeduplicateBy:  opts.dedupBy,
-		ColumnAliases:  opts.columnAliases,
-		ColumnDefaults: opts.columnDefaults,
-		SettleWindow:   10 * time.Millisecond,
-		ExtraInitSQL:   f.DuckDBCredentials(),
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		ScanFunc:          scanRec,
+		TableAlias:        "records",
+		VersionColumn:     opts.versionColumn,
+		DeduplicateBy:     opts.dedupBy,
+		ColumnAliases:     opts.columnAliases,
+		ColumnDefaults:    opts.columnDefaults,
+		SettleWindow:      10 * time.Millisecond,
+		ExtraInitSQL:      f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("s3sql.New: %v", err)
@@ -327,10 +327,10 @@ func TestColumnAliasesAndDefaults(t *testing.T) {
 
 	// Old-shape writer + file.
 	wOld, err := s3parquet.New[RecOld](s3parquet.Config[RecOld]{
-		Bucket:   testFix.Bucket,
-		Prefix:   "store",
-		S3Client: testFix.S3Client,
-		KeyParts: []string{"period", "customer"},
+		Bucket:            testFix.Bucket,
+		Prefix:            "store",
+		S3Client:          testFix.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
 		PartitionKeyOf: func(r RecOld) string {
 			return fmt.Sprintf("period=%s/customer=%s", r.Period, r.Customer)
 		},
@@ -349,12 +349,12 @@ func TestColumnAliasesAndDefaults(t *testing.T) {
 
 	// New-shape writer + file.
 	wNew, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:         testFix.Bucket,
-		Prefix:         "store",
-		S3Client:       testFix.S3Client,
-		KeyParts:       []string{"period", "customer"},
-		PartitionKeyOf: partitionKeyOfRec,
-		SettleWindow:   10 * time.Millisecond,
+		Bucket:            testFix.Bucket,
+		Prefix:            "store",
+		S3Client:          testFix.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf:    partitionKeyOfRec,
+		SettleWindow:      10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.New(Rec): %v", err)
@@ -369,13 +369,13 @@ func TestColumnAliasesAndDefaults(t *testing.T) {
 
 	// Reader with alias + default.
 	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
-		Bucket:        testFix.Bucket,
-		Prefix:        "store",
-		S3Client:      testFix.S3Client,
-		KeyParts:      []string{"period", "customer"},
-		ScanFunc:      scanRec,
-		TableAlias:    "records",
-		VersionColumn: "ts",
+		Bucket:            testFix.Bucket,
+		Prefix:            "store",
+		S3Client:          testFix.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		ScanFunc:          scanRec,
+		TableAlias:        "records",
+		VersionColumn:     "ts",
 		ColumnAliases: map[string][]string{
 			"amount": {"old_amount"},
 		},

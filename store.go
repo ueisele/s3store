@@ -20,7 +20,7 @@ import (
 //   - Poll                 → s3parquet (S3 LIST)
 //   - Read, Query,
 //     QueryRow, PollRecords → s3sql (DuckDB-powered, supports
-//                              ColumnAliases / ColumnDefaults)
+//     ColumnAliases / ColumnDefaults)
 //
 // Importing this package transitively pulls in DuckDB (cgo).
 // If you want a cgo-free build, import s3store/s3parquet or
@@ -35,12 +35,12 @@ type Store[T any] struct {
 // umbrella Config.
 func New[T any](cfg Config[T]) (*Store[T], error) {
 	pq, err := s3parquet.New[T](s3parquet.Config[T]{
-		Bucket:         cfg.Bucket,
-		Prefix:         cfg.Prefix,
-		KeyParts:       cfg.KeyParts,
-		S3Client:       cfg.S3Client,
-		PartitionKeyOf: cfg.PartitionKeyOf,
-		SettleWindow:   cfg.SettleWindow,
+		Bucket:            cfg.Bucket,
+		Prefix:            cfg.Prefix,
+		PartitionKeyParts: cfg.PartitionKeyParts,
+		S3Client:          cfg.S3Client,
+		PartitionKeyOf:    cfg.PartitionKeyOf,
+		SettleWindow:      cfg.SettleWindow,
 		// EntityKeyOf / VersionOf deliberately omitted: the
 		// umbrella's Read / PollRecords go through s3sql and use
 		// SQL-side dedup. Users who want pure-Go dedup should
@@ -50,18 +50,18 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		return nil, err
 	}
 	sq, err := s3sql.New[T](s3sql.Config[T]{
-		Bucket:         cfg.Bucket,
-		Prefix:         cfg.Prefix,
-		KeyParts:       cfg.KeyParts,
-		S3Client:       cfg.S3Client,
-		ScanFunc:       cfg.ScanFunc,
-		TableAlias:     cfg.TableAlias,
-		SettleWindow:   cfg.SettleWindow,
-		VersionColumn:  cfg.VersionColumn,
-		DeduplicateBy:  cfg.DeduplicateBy,
-		ColumnDefaults: cfg.ColumnDefaults,
-		ColumnAliases:  cfg.ColumnAliases,
-		ExtraInitSQL:   cfg.ExtraInitSQL,
+		Bucket:            cfg.Bucket,
+		Prefix:            cfg.Prefix,
+		PartitionKeyParts: cfg.PartitionKeyParts,
+		S3Client:          cfg.S3Client,
+		ScanFunc:          cfg.ScanFunc,
+		TableAlias:        cfg.TableAlias,
+		SettleWindow:      cfg.SettleWindow,
+		VersionColumn:     cfg.VersionColumn,
+		DeduplicateBy:     cfg.DeduplicateBy,
+		ColumnDefaults:    cfg.ColumnDefaults,
+		ColumnAliases:     cfg.ColumnAliases,
+		ExtraInitSQL:      cfg.ExtraInitSQL,
 	})
 	if err != nil {
 		_ = pq.Close()

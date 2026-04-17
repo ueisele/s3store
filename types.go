@@ -23,8 +23,8 @@ type Config[T any] struct {
 	// Prefix under which data files are stored.
 	Prefix string
 
-	// KeyParts defines the Hive-partition key segments in order.
-	KeyParts []string
+	// PartitionKeyParts defines the Hive-partition key segments in order.
+	PartitionKeyParts []string
 
 	// S3Client is the AWS S3 client to use. DuckDB's httpfs
 	// settings (endpoint, region, URL style, use_ssl) are
@@ -46,7 +46,7 @@ type Config[T any] struct {
 	VersionColumn string
 
 	// DeduplicateBy defines the columns that identify a unique
-	// record for SQL-side dedup. Defaults to KeyParts.
+	// record for SQL-side dedup. Defaults to PartitionKeyParts.
 	DeduplicateBy []string
 
 	// TableAlias is the name used in SQL queries for the

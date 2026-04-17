@@ -32,16 +32,16 @@ type storeOpts struct {
 }
 
 // newStore builds a fresh s3parquet.Store against a freshly
-// created bucket on the shared MinIO fixture. KeyParts are
+// created bucket on the shared MinIO fixture. PartitionKeyParts are
 // (period, customer) across every test.
 func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 	t.Helper()
 	f := testutil.New(t)
 	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:   f.Bucket,
-		Prefix:   "store",
-		S3Client: f.S3Client,
-		KeyParts: []string{"period", "customer"},
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)

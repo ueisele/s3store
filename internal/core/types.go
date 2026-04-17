@@ -42,8 +42,8 @@ type WriteResult struct {
 // struct, so user-construction syntax stays clean. It exists
 // mainly as documentation of the shared contract.
 type BaseConfig struct {
-	Bucket   string
-	Prefix   string
-	KeyParts []string
-	S3Client *s3.Client
+	Bucket            string
+	Prefix            string
+	PartitionKeyParts []string
+	S3Client          *s3.Client
 }

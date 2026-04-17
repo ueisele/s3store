@@ -47,7 +47,7 @@ func (s *Store[T]) Read(
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	plan, err := buildReadPlan(keyPattern, s.dataPath, s.cfg.KeyParts)
+	plan, err := buildReadPlan(keyPattern, s.dataPath, s.cfg.PartitionKeyParts)
 	if err != nil {
 		return nil, err
 	}

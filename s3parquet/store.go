@@ -22,8 +22,8 @@ type Config[T any] struct {
 	// Prefix under which data files are stored.
 	Prefix string
 
-	// KeyParts defines the Hive-partition key segments in order.
-	KeyParts []string
+	// PartitionKeyParts defines the Hive-partition key segments in order.
+	PartitionKeyParts []string
 
 	// S3Client is the AWS S3 client to use. Its endpoint, region,
 	// credentials, and path-style setting are used as-is.
@@ -31,7 +31,7 @@ type Config[T any] struct {
 
 	// PartitionKeyOf extracts the Hive-partition key from a
 	// record. Required for Write(). The returned string must
-	// conform to the KeyParts layout ("part=value/part=value").
+	// conform to the PartitionKeyParts layout ("part=value/part=value").
 	PartitionKeyOf func(T) string
 
 	// SettleWindow is how far behind the stream tip Poll and
@@ -99,7 +99,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if cfg.S3Client == nil {
 		return nil, fmt.Errorf("s3parquet: S3Client is required")
 	}
-	if err := core.ValidateKeyParts(cfg.KeyParts); err != nil {
+	if err := core.ValidatePartitionKeyParts(cfg.PartitionKeyParts); err != nil {
 		return nil, err
 	}
 	// Default VersionOf when the user asked for dedup

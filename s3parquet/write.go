@@ -149,23 +149,23 @@ func (s *Store[T]) groupByKey(records []T) map[string][]T {
 }
 
 // validateKey enforces that the key is a "/"-delimited sequence
-// of exactly len(KeyParts) Hive-style segments, each in the
-// form "KeyParts[i]=<non-empty value>", in the configured order.
+// of exactly len(PartitionKeyParts) Hive-style segments, each in the
+// form "PartitionKeyParts[i]=<non-empty value>", in the configured order.
 //
 // Values may contain '=' (we split on the first '=' only) but
 // cannot contain '/' or be empty. Catches PartitionKeyOf bugs
 // before they corrupt the S3 layout.
 func (s *Store[T]) validateKey(key string) error {
 	segments := strings.Split(key, "/")
-	if len(segments) != len(s.cfg.KeyParts) {
+	if len(segments) != len(s.cfg.PartitionKeyParts) {
 		return fmt.Errorf(
 			"s3parquet: key %q has %d segments, "+
 				"expected %d (%v)",
 			key, len(segments),
-			len(s.cfg.KeyParts), s.cfg.KeyParts)
+			len(s.cfg.PartitionKeyParts), s.cfg.PartitionKeyParts)
 	}
 	for i, seg := range segments {
-		part := s.cfg.KeyParts[i]
+		part := s.cfg.PartitionKeyParts[i]
 		prefix := part + "="
 		if !strings.HasPrefix(seg, prefix) {
 			return fmt.Errorf(
