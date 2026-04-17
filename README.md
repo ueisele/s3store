@@ -267,18 +267,25 @@ batch is one S3 LIST call over `_stream/refs/`.
 ### Stream — typed records
 
 ```go
-// Default: Kafka compacted-topic semantics — latest-per-key
-// within each batch
+// When dedup is configured, the default is latest-per-key
+// within each batch (Kafka compacted-topic semantics).
 records, newOffset, err := store.PollRecords(ctx, lastOffset, 100)
 
-// Full stream: every record in every referenced file
+// Opt out: every record in every referenced file, in ref order.
 records, newOffset, err = store.PollRecords(ctx, lastOffset, 100,
     s3store.WithHistory())
 ```
 
-Through the umbrella, `PollRecords` runs through DuckDB so dedup and
-schema-evolution transforms match `Read`. `s3parquet.PollRecords` does the
-same in pure Go, using `EntityKeyOf` + `VersionOf` for in-memory dedup.
+Whether dedup actually runs depends on which package you use:
+
+- **Umbrella / `s3sql.PollRecords`** — dedup when `VersionColumn` is set
+  (DuckDB `QUALIFY ROW_NUMBER()`). When `VersionColumn` is empty, every
+  record passes through.
+- **`s3parquet.PollRecords`** — dedup when `EntityKeyOf` is set. If
+  `VersionOf` is nil, it defaults to `DefaultVersionOf` (the file's
+  write time). When `EntityKeyOf` is nil, every record passes through.
+
+`WithHistory()` forces the no-dedup path in every case.
 
 ### Snapshot
 
@@ -286,7 +293,10 @@ same in pure Go, using `EntityKeyOf` + `VersionOf` for in-memory dedup.
 records, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
 ```
 
-Returns the deduplicated latest version of every record matching the glob.
+Returns every record matching the glob, typed via `ScanFunc` (or decoded
+directly into T via parquet-go for `s3parquet`). When dedup is configured
+(see Stream above), the result is the latest version per key; otherwise
+every version comes through.
 
 ### SQL query (umbrella or `s3sql`)
 
@@ -395,6 +405,8 @@ Breaking changes in the package-split refactor:
 
 - **`Config.KeyFunc` → `Config.PartitionKeyOf`** — new name better reflects
   the field's role.
+- **`Config.KeyParts` → `Config.PartitionKeyParts`** — follows the same
+  `PartitionKey*` naming family.
 - **`Config.S3Endpoint` removed** — auto-derived from
   `S3Client.Options().BaseEndpoint`. For MinIO-style setups, just pass the
   full URL (`http://minio:9000`) on your `s3.Options`.
@@ -407,27 +419,39 @@ Breaking changes in the package-split refactor:
 ## Testing
 
 ```
-go test ./...                                # unit tests, no dependencies
-go test -tags integration -timeout 5m ./...  # full round-trip vs. a MinIO
-                                             # container via testcontainers
-CGO_ENABLED=0 go test -short ./s3parquet/... ./internal/...
-                                             # cgo-free subset
+# Unit tests, cgo required (s3sql + umbrella embed DuckDB).
+go test -count=1 ./...
+
+# Unit tests on the cgo-free subset — no C compiler needed.
+CGO_ENABLED=0 go test -count=1 ./s3parquet/... ./internal/...
+
+# Integration tests — full round-trip against a MinIO container.
+# Uses testcontainers; one container is shared across every
+# package in the invocation.
+go test -tags=integration -timeout=10m -count=1 ./...
 ```
 
-Integration tests require Docker and pull `minio/minio:latest` on first run.
+Integration tests require Docker and pull `minio/minio:latest` on first
+run. `-count=1` is the Go idiom for "bypass the test cache" — without it,
+unchanged packages return cached results.
 
 ## Limitations
 
-- **Single-process reads.** DuckDB runs embedded in your Go process.
+- **Single-process reads** (umbrella / `s3sql`). DuckDB runs embedded in
+  your Go process. `s3parquet` has no embedded engine — reads are just
+  parquet-go + S3 calls.
 - **S3 key limit: 1024 bytes.** Long partition values reduce the budget.
 - **Stream latency = poll interval + settle window.** Not real-time.
 - **Upsert-only compacted mode.** There is no tombstone / key-delete
   mechanism — keys can only be updated, not removed.
-- **s3parquet dedup is in-memory.** Large key cardinality can OOM; route
-  those workloads to `s3sql` which streams through DuckDB.
-- **Schema evolution is query-time.** Good for renames, new columns, and
-  column defaults. Type changes, splits, or row-level computed derivations
-  still require a migration tool.
+- **`s3parquet` dedup is in-memory.** Large key cardinality can OOM;
+  route those workloads to `s3sql` which streams through DuckDB.
+- **Schema evolution** differs by package: `s3sql` applies SQL-expression
+  transforms (`ColumnAliases`, `ColumnDefaults`) at query time, good for
+  renames and column defaults. `s3parquet` relies on parquet-go's native
+  schema tolerance (missing fields decode as zero values; unknown fields
+  are ignored) — no SQL rewrites. Type changes, splits, or row-level
+  computed derivations still require a migration tool in both cases.
 
 ## License
 
