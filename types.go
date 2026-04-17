@@ -5,11 +5,17 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// Config defines how a Store is set up. T is the record type.
+// Config defines how the umbrella Store is set up. T is the
+// record type returned by Read and PollRecords.
+//
+// This struct flattens the fields every sub-package
+// (s3parquet, s3sql) needs into one place so users who want the
+// full feature set construct a single config. Users who need
+// only write, only read, or only SQL should import
+// s3store/s3parquet or s3store/s3sql directly.
 type Config[T any] struct {
 	// S3 bucket name.
 	Bucket string
@@ -20,91 +26,54 @@ type Config[T any] struct {
 	// KeyParts defines the Hive-partition key segments in order.
 	KeyParts []string
 
-	// KeyFunc extracts the Hive-partition key from a record.
-	// Used by Write() to group records.
-	KeyFunc func(T) string
+	// S3Client is the AWS S3 client to use. DuckDB's httpfs
+	// settings (endpoint, region, URL style, use_ssl) are
+	// auto-derived from this client's Options() at New() time.
+	S3Client *s3.Client
 
-	// ScanFunc maps a sql.Rows row to a record.
-	// Used by Read() and PollRecords() to return typed []T.
-	//
-	// The column order ScanFunc must read matches this:
-	//
-	//   - base columns from the scanned files, in their
-	//     file-schema order (union_by_name),
-	//   - minus any old-name columns EXCLUDEd by an alias,
-	//   - with ColumnAliases / ColumnDefaults on existing
-	//     columns REPLACEd in their original position,
-	//   - with alias targets whose new name isn't in any file
-	//     yet, and defaults for columns that don't exist at
-	//     all, appended at the end (in sorted-key order).
-	//
-	// When no schema-evolution transforms are configured, the
-	// order is just the file-schema order.
+	// PartitionKeyOf extracts the Hive-partition key from a
+	// record. Required for Write(); used to group records.
+	PartitionKeyOf func(T) string
+
+	// ScanFunc maps a sql.Rows row to a record. Used by Read
+	// and PollRecords (which go through DuckDB) to return
+	// typed []T.
 	ScanFunc func(*sql.Rows) (T, error)
 
-	// VersionColumn is the column name used for deduplication.
-	// Leave empty to disable.
+	// VersionColumn is the column name used for deduplication
+	// in Read / PollRecords / Query. Leave empty to disable
+	// dedup on the SQL path.
 	VersionColumn string
 
 	// DeduplicateBy defines the columns that identify a unique
-	// record. If empty, partitions by all KeyParts.
+	// record for SQL-side dedup. Defaults to KeyParts.
 	DeduplicateBy []string
 
-	// TableAlias is the name used in SQL queries.
+	// TableAlias is the name used in SQL queries for the
+	// wrapper CTE. Required.
 	TableAlias string
 
-	// SettleWindow is how far behind the stream tip the consumer
-	// reads. Default: 5s.
+	// SettleWindow is how far behind the stream tip Poll and
+	// PollRecords read. Default: 5s.
 	SettleWindow time.Duration
 
-	// ColumnDefaults maps column names to default SQL expressions
-	// for files that predate the column.
+	// ColumnDefaults maps column names to SQL default
+	// expressions for files that predate the column.
 	ColumnDefaults map[string]string
 
 	// ColumnAliases maps a new column name to a chain of old
-	// names it should absorb, in priority order. Behavior:
-	//
-	//   - If the new column exists in at least one scanned
-	//     file, the library emits
-	//     SELECT * REPLACE (COALESCE(new, old1, old2, ...) AS new)
-	//     so new files' values take precedence with old files
-	//     falling back to the old names.
-	//   - If the new column doesn't exist in any scanned file
-	//     yet, the library emits the COALESCE as a new
-	//     appended column (useful for preemptive rename
-	//     configuration before any file has the new name).
-	//   - Old-name columns named in the chain are EXCLUDEd
-	//     from the star expansion in both cases, so they
-	//     don't linger next to the aliased column.
-	//   - If neither the new name nor any old name exists in
-	//     any scanned file, a typed NULL is appended under
-	//     the new name so ScanFunc always finds the column.
-	//
-	// The same old-name may appear in multiple aliases;
-	// duplicates in the resulting EXCLUDE list are removed.
+	// names it should absorb, in priority order. See s3sql's
+	// package docs for the full semantics.
 	ColumnAliases map[string][]string
 
-	// S3Client is the AWS S3 client to use.
-	S3Client *s3.Client
-
-	// S3Endpoint overrides the S3 endpoint passed to DuckDB's
-	// httpfs extension (format: "host:port", no scheme).
-	S3Endpoint string
-
-	// ExtraInitSQL are additional DuckDB statements executed
-	// once, after the default init (httpfs, settings, endpoint).
-	// Useful for injecting S3 credentials, disabling SSL for
-	// MinIO / localstack, setting a region, or loading other
-	// DuckDB extensions. Statements run in order.
+	// ExtraInitSQL runs after the auto-derived S3 settings at
+	// DuckDB init. Use for CREATE SECRET, credential overrides,
+	// or additional extension loads.
 	ExtraInitSQL []string
 }
 
-func (c Config[T]) settleWindow() time.Duration {
-	if c.SettleWindow > 0 {
-		return c.SettleWindow
-	}
-	return 5 * time.Second
-}
+// Re-export core types so callers of the umbrella never need
+// to import internal/core directly.
 
 // Offset represents a position in the stream.
 type Offset = core.Offset
@@ -115,80 +84,12 @@ type StreamEntry = core.StreamEntry
 // WriteResult contains metadata about a completed write.
 type WriteResult = core.WriteResult
 
-// QueryOption configures read-path behavior. Shared across
-// Query, QueryRow, and PollRecords so there's one option and
-// one mental model for every read API.
+// QueryOption configures read-path behavior.
 type QueryOption = core.QueryOption
 
 // WithHistory disables latest-per-key deduplication on any
-// read path (Query, QueryRow, PollRecords). Without it, reads
-// are deduped by VersionColumn + DeduplicateBy (defaulting to
-// KeyParts); with it, every version of every record is
-// returned.
-//
-// When VersionColumn is empty, dedup is a no-op regardless of
-// this option — there's no ordering to dedup on.
+// read path. When VersionColumn is empty, dedup is a no-op
+// regardless of this option.
 func WithHistory() QueryOption {
 	return core.WithHistory()
 }
-
-// duckDBSettingsSQL returns the non-extension session settings
-// applied after the httpfs extension is loaded.
-func duckDBSettingsSQL(endpoint string) []string {
-	stmts := []string{
-		"SET s3_url_style='path'",
-		// Cache parquet footers so the introspection LIMIT 0
-		// and the main query don't double-read metadata.
-		"SET enable_object_cache=true",
-	}
-	if endpoint != "" {
-		stmts = append(stmts,
-			"SET s3_endpoint='"+endpoint+"'")
-	}
-	return stmts
-}
-
-// ensureHTTPFS tries LOAD first and falls back to INSTALL only
-// when LOAD fails. This avoids a network roundtrip on every
-// New() once the extension is cached, works in air-gapped
-// environments with pre-installed extensions, and prevents
-// INSTALL from silently upgrading an already-present version.
-func ensureHTTPFS(db *sql.DB) error {
-	if _, err := db.Exec("LOAD httpfs"); err == nil {
-		return nil
-	}
-	if _, err := db.Exec("INSTALL httpfs"); err != nil {
-		return err
-	}
-	_, err := db.Exec("LOAD httpfs")
-	return err
-}
-
-func openDuckDB(endpoint string, extra []string) (*sql.DB, error) {
-	db, err := sql.Open("duckdb", "")
-	if err != nil {
-		return nil, err
-	}
-	if err := ensureHTTPFS(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	for _, stmt := range duckDBSettingsSQL(endpoint) {
-		if _, err := db.Exec(stmt); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	for _, stmt := range extra {
-		if _, err := db.Exec(stmt); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	return db, nil
-}
-
-// queryOpts is kept as an alias of the core type for internal
-// use; methods on the root Store construct it from QueryOption
-// values before passing to DuckDB.
-type queryOpts = core.QueryOpts

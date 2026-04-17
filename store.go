@@ -3,208 +3,139 @@ package s3store
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"strings"
+	"errors"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/ueisele/s3store/internal/core"
+	"github.com/ueisele/s3store/s3parquet"
+	"github.com/ueisele/s3store/s3sql"
 )
 
-// Store provides append-only storage on S3 with Parquet data
-// files, a change stream, and embedded DuckDB for all reads.
+// Store is the umbrella entry point: a thin composer over
+// *s3parquet.Store[T] (pure Go, write + simple read) and
+// *s3sql.Store[T] (cgo, DuckDB-powered queries) that preserves
+// the single-Store ergonomics callers are used to.
+//
+// Method forwarding:
+//
+//   - Write, WriteWithKey  → s3parquet (encode + S3 PUT + ref)
+//   - Poll                 → s3parquet (S3 LIST)
+//   - Read, Query,
+//     QueryRow, PollRecords → s3sql (DuckDB-powered, supports
+//                              ColumnAliases / ColumnDefaults)
+//
+// Importing this package transitively pulls in DuckDB (cgo).
+// If you want a cgo-free build, import s3store/s3parquet or
+// s3store/s3sql directly instead of this umbrella.
 type Store[T any] struct {
-	cfg      Config[T]
-	s3       *s3.Client
-	db       *sql.DB
-	dataPath string
-	refPath  string
+	parquet *s3parquet.Store[T]
+	sql     *s3sql.Store[T]
 }
 
+// New constructs a Store, building both the pure-Go write+read
+// sub-store and the DuckDB-backed SQL sub-store from a single
+// umbrella Config.
 func New[T any](cfg Config[T]) (*Store[T], error) {
-	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("s3store: Bucket is required")
-	}
-	if cfg.Prefix == "" {
-		return nil, fmt.Errorf("s3store: Prefix is required")
-	}
-	if cfg.TableAlias == "" {
-		return nil, fmt.Errorf(
-			"s3store: TableAlias is required")
-	}
-	if cfg.S3Client == nil {
-		return nil, fmt.Errorf(
-			"s3store: S3Client is required")
-	}
-	if err := core.ValidateKeyParts(cfg.KeyParts); err != nil {
+	pq, err := s3parquet.New[T](s3parquet.Config[T]{
+		Bucket:         cfg.Bucket,
+		Prefix:         cfg.Prefix,
+		KeyParts:       cfg.KeyParts,
+		S3Client:       cfg.S3Client,
+		PartitionKeyOf: cfg.PartitionKeyOf,
+		SettleWindow:   cfg.SettleWindow,
+		// EntityKeyOf / VersionOf deliberately omitted: the
+		// umbrella's Read / PollRecords go through s3sql and use
+		// SQL-side dedup. Users who want pure-Go dedup should
+		// import s3parquet directly.
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	db, err := openDuckDB(cfg.S3Endpoint, cfg.ExtraInitSQL)
+	sq, err := s3sql.New[T](s3sql.Config[T]{
+		Bucket:         cfg.Bucket,
+		Prefix:         cfg.Prefix,
+		KeyParts:       cfg.KeyParts,
+		S3Client:       cfg.S3Client,
+		ScanFunc:       cfg.ScanFunc,
+		TableAlias:     cfg.TableAlias,
+		SettleWindow:   cfg.SettleWindow,
+		VersionColumn:  cfg.VersionColumn,
+		DeduplicateBy:  cfg.DeduplicateBy,
+		ColumnDefaults: cfg.ColumnDefaults,
+		ColumnAliases:  cfg.ColumnAliases,
+		ExtraInitSQL:   cfg.ExtraInitSQL,
+	})
 	if err != nil {
-		return nil, fmt.Errorf(
-			"s3store: failed to open DuckDB: %w", err)
+		_ = pq.Close()
+		return nil, err
 	}
-
-	return &Store[T]{
-		cfg:      cfg,
-		s3:       cfg.S3Client,
-		db:       db,
-		dataPath: core.DataPath(cfg.Prefix),
-		refPath:  core.RefPath(cfg.Prefix),
-	}, nil
+	return &Store[T]{parquet: pq, sql: sq}, nil
 }
 
+// Close releases resources from both sub-stores. Returns the
+// first non-nil error observed; the other sub-store is closed
+// regardless.
 func (s *Store[T]) Close() error {
-	return s.db.Close()
+	errParquet := s.parquet.Close()
+	errSQL := s.sql.Close()
+	return errors.Join(errParquet, errSQL)
 }
 
-func (s *Store[T]) s3URI(key string) string {
-	return fmt.Sprintf("s3://%s/%s", s.cfg.Bucket, key)
+// Write delegates to the parquet sub-store.
+func (s *Store[T]) Write(
+	ctx context.Context, records []T,
+) ([]WriteResult, error) {
+	return s.parquet.Write(ctx, records)
 }
 
-// sqlQuote returns a DuckDB single-quoted string literal. Any
-// embedded apostrophe is doubled, which is the SQL standard
-// escape for a single quote inside a string literal. The
-// returned value includes the surrounding quotes and can be
-// concatenated directly into SQL.
-//
-// Used everywhere we embed a user-derived value (parquet URI,
-// error message) into a SQL string, so partition values that
-// contain an apostrophe (e.g. customer=o'brien) can't break
-// the query.
-func sqlQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+// WriteWithKey delegates to the parquet sub-store.
+func (s *Store[T]) WriteWithKey(
+	ctx context.Context, key string, records []T,
+) (*WriteResult, error) {
+	return s.parquet.WriteWithKey(ctx, key, records)
 }
 
-// buildParquetURI compiles a user-supplied key pattern into an
-// S3 glob that matches exactly the intended set of parquet
-// files under Config.Prefix/data.
-//
-// The pattern must have exactly len(KeyParts) "/"-delimited
-// segments, each either
-//
-//   - "{KeyParts[i]}=<value-or-duckdb-glob>", or
-//   - "*" (shorthand; rewritten to "{KeyParts[i]}=*")
-//
-// As a convenience, the literal "*" alone matches every file
-// under the data prefix at any depth.
-//
-// Truncated patterns (fewer segments than KeyParts) and
-// mislabelled segments (part name doesn't match the configured
-// position) are rejected rather than silently returning zero
-// rows.
-func (s *Store[T]) buildParquetURI(
+// Poll delegates to the parquet sub-store (pure S3 LIST; no
+// DuckDB involvement).
+func (s *Store[T]) Poll(
+	ctx context.Context, since Offset, maxEntries int32,
+) ([]StreamEntry, Offset, error) {
+	return s.parquet.Poll(ctx, since, maxEntries)
+}
+
+// Read delegates to the SQL sub-store so schema-evolution
+// transforms (ColumnAliases / ColumnDefaults) apply.
+func (s *Store[T]) Read(
+	ctx context.Context, keyPattern string, opts ...QueryOption,
+) ([]T, error) {
+	return s.sql.Read(ctx, keyPattern, opts...)
+}
+
+// Query delegates to the SQL sub-store.
+func (s *Store[T]) Query(
+	ctx context.Context,
 	keyPattern string,
-) (string, error) {
-	if keyPattern == "" || keyPattern == "*" {
-		return s.s3URI(s.dataPath + "/**/*.parquet"), nil
-	}
-
-	segments := strings.Split(keyPattern, "/")
-	if len(segments) != len(s.cfg.KeyParts) {
-		return "", fmt.Errorf(
-			"s3store: key pattern %q has %d segments, "+
-				"expected %d (%v)",
-			keyPattern, len(segments),
-			len(s.cfg.KeyParts), s.cfg.KeyParts)
-	}
-
-	for i, seg := range segments {
-		part := s.cfg.KeyParts[i]
-		if seg == "*" {
-			segments[i] = part + "=*"
-			continue
-		}
-		if !strings.HasPrefix(seg, part+"=") {
-			return "", fmt.Errorf(
-				"s3store: key pattern %q segment %d is %q, "+
-					"expected %q=... or %q",
-				keyPattern, i, seg, part, "*")
-		}
-	}
-
-	return s.s3URI(
-		s.dataPath + "/" + strings.Join(segments, "/") +
-			"/*.parquet"), nil
+	sqlQuery string,
+	opts ...QueryOption,
+) (*sql.Rows, error) {
+	return s.sql.Query(ctx, keyPattern, sqlQuery, opts...)
 }
 
-func (s *Store[T]) dedupColumns() []string {
-	if len(s.cfg.DeduplicateBy) > 0 {
-		return s.cfg.DeduplicateBy
-	}
-	return s.cfg.KeyParts
+// QueryRow delegates to the SQL sub-store.
+func (s *Store[T]) QueryRow(
+	ctx context.Context,
+	keyPattern string,
+	sqlQuery string,
+	opts ...QueryOption,
+) *sql.Row {
+	return s.sql.QueryRow(ctx, keyPattern, sqlQuery, opts...)
 }
 
-func (s *Store[T]) encodeRefKey(
-	tsMicros int64, shortID string, key string,
-) string {
-	return core.EncodeRefKey(s.refPath, tsMicros, shortID, key)
-}
-
-func (s *Store[T]) parseRefKey(refKey string) (
-	key string, shortID string, err error,
-) {
-	return core.ParseRefKey(refKey)
-}
-
-func (s *Store[T]) buildDataPath(
-	key string, shortID string,
-) string {
-	return core.BuildDataFilePath(s.dataPath, key, shortID)
-}
-
-// introspectColumns returns the set of columns the given base
-// scan expression produces. Used by schema-evolution transforms
-// to decide whether a ColumnAlias/ColumnDefault target already
-// exists in _raw (use REPLACE) or has to be materialized as a
-// new column (append to the star expansion).
-//
-// The query uses LIMIT 0 so no data pages are read — DuckDB
-// only touches parquet footers for the union-by-name schema,
-// which the main query is about to do anyway.
-func (s *Store[T]) introspectColumns(
-	ctx context.Context, scanExpr string,
-) (map[string]bool, error) {
-	rows, err := s.db.QueryContext(ctx,
-		"SELECT * FROM ("+scanExpr+") LIMIT 0")
-	if err != nil {
-		return nil, fmt.Errorf(
-			"s3store: introspect columns: %w", err)
-	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf(
-			"s3store: introspect columns: %w", err)
-	}
-
-	set := make(map[string]bool, len(cols))
-	for _, c := range cols {
-		set[c] = true
-	}
-	return set, nil
-}
-
-// scanAll reads all rows from a DuckDB result set into typed
-// records via ScanFunc.
-func (s *Store[T]) scanAll(rows *sql.Rows) ([]T, error) {
-	if s.cfg.ScanFunc == nil {
-		return nil, fmt.Errorf(
-			"s3store: ScanFunc is required")
-	}
-	var records []T
-	for rows.Next() {
-		r, err := s.cfg.ScanFunc(rows)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"s3store: scan row: %w", err)
-		}
-		records = append(records, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf(
-			"s3store: iterate rows: %w", err)
-	}
-	return records, nil
+// PollRecords delegates to the SQL sub-store so dedup and
+// schema-evolution transforms are consistent with Read.
+func (s *Store[T]) PollRecords(
+	ctx context.Context,
+	since Offset,
+	maxEntries int32,
+	opts ...QueryOption,
+) ([]T, Offset, error) {
+	return s.sql.PollRecords(ctx, since, maxEntries, opts...)
 }

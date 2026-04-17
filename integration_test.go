@@ -112,14 +112,14 @@ func scanIntRecord(rows *sql.Rows) (IntRecord, error) {
 }
 
 // duckDBAuthSettings returns the DuckDB SET statements needed
-// for httpfs to talk to the MinIO test container. Shared by
-// every integration test that builds a Store.
+// for httpfs to talk to the MinIO test container. Endpoint,
+// region, URL style, and use_ssl are now auto-derived from the
+// S3Client's Options(); only credentials still need an explicit
+// SET.
 func duckDBAuthSettings() []string {
 	return []string{
-		"SET s3_use_ssl=false",
 		fmt.Sprintf("SET s3_access_key_id='%s'", minioUser),
 		fmt.Sprintf("SET s3_secret_access_key='%s'", minioPass),
-		"SET s3_region='us-east-1'",
 	}
 }
 
@@ -148,13 +148,12 @@ func newStore(
 		VersionColumn: versionCol,
 		DeduplicateBy: dedupBy,
 		SettleWindow:  10 * time.Millisecond,
-		KeyFunc: func(r IntRecord) string {
+		PartitionKeyOf: func(r IntRecord) string {
 			return fmt.Sprintf(
 				"period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
 		ScanFunc:     scanIntRecord,
-		S3Endpoint:   minioHostPort,
 		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
@@ -433,7 +432,7 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 		S3Client:   s3Client,
 		KeyParts:   []string{"period", "customer"},
 		TableAlias: "t",
-		KeyFunc: func(r v1) string {
+		PartitionKeyOf: func(r v1) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
@@ -441,7 +440,6 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 			var r v1
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Amount, &r.Ts)
 		},
-		S3Endpoint:   minioHostPort,
 		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
@@ -465,7 +463,7 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 		ColumnDefaults: map[string]string{
 			"currency": "'EUR'",
 		},
-		KeyFunc: func(r v2) string {
+		PartitionKeyOf: func(r v2) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
@@ -474,7 +472,6 @@ func TestIntegration_SchemaEvolution_DefaultOnMissingColumn(t *testing.T) {
 			return r, rows.Scan(
 				&r.Period, &r.Customer, &r.Amount, &r.Ts, &r.Currency)
 		},
-		S3Endpoint:   minioHostPort,
 		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
@@ -522,7 +519,7 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 		S3Client:   s3Client,
 		KeyParts:   []string{"period", "customer"},
 		TableAlias: "t",
-		KeyFunc: func(r recOld) string {
+		PartitionKeyOf: func(r recOld) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
@@ -530,7 +527,6 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 			var r recOld
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Value, &r.Ts)
 		},
-		S3Endpoint:   minioHostPort,
 		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
@@ -554,7 +550,7 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 		ColumnAliases: map[string][]string{
 			"amount": {"value"},
 		},
-		KeyFunc: func(r recNew) string {
+		PartitionKeyOf: func(r recNew) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
@@ -562,7 +558,6 @@ func TestIntegration_SchemaEvolution_AliasChain(t *testing.T) {
 			var r recNew
 			return r, rows.Scan(&r.Period, &r.Customer, &r.Ts, &r.Amount)
 		},
-		S3Endpoint:   minioHostPort,
 		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
@@ -826,13 +821,12 @@ func TestIntegration_SettleWindow(t *testing.T) {
 		TableAlias:    "records",
 		VersionColumn: "ts",
 		SettleWindow:  500 * time.Millisecond,
-		KeyFunc: func(r IntRecord) string {
+		PartitionKeyOf: func(r IntRecord) string {
 			return fmt.Sprintf(
 				"period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
 		ScanFunc:     scanIntRecord,
-		S3Endpoint:   minioHostPort,
 		ExtraInitSQL: duckDBAuthSettings(),
 	})
 	if err != nil {
