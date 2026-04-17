@@ -1,0 +1,422 @@
+//go:build integration
+
+package s3parquet_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ueisele/s3store/internal/testutil"
+	"github.com/ueisele/s3store/s3parquet"
+)
+
+// Rec is the record type used across this file's integration
+// tests. Parquet tags exercise both simple primitives (ints,
+// strings) and a timestamp logical type so a regression in the
+// decode path would surface.
+type Rec struct {
+	Period   string    `parquet:"period"`
+	Customer string    `parquet:"customer"`
+	SKU      string    `parquet:"sku"`
+	Value    int64     `parquet:"value"`
+	Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
+}
+
+var (
+	fixture  *testutil.Fixture
+	prefixCt atomic.Int64
+)
+
+func TestMain(m *testing.M) {
+	os.Exit(run(m))
+}
+
+func run(m *testing.M) int {
+	ctx := context.Background()
+	f, err := testutil.Start(ctx, "s3parquet-it")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fixture: %v\n", err)
+		return 1
+	}
+	fixture = f
+	defer func() {
+		if err := fixture.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "fixture close: %v\n", err)
+		}
+	}()
+	return m.Run()
+}
+
+// uniquePrefix returns a new Prefix value isolated from every
+// other sub-test sharing this package's single bucket.
+func uniquePrefix(kind string) string {
+	return fmt.Sprintf("it-%s-%d-%d", kind,
+		time.Now().UnixNano(), prefixCt.Add(1))
+}
+
+// storeOpts lets each test dial in the bits of the dedup
+// contract it cares about while re-using the MinIO fixture.
+type storeOpts struct {
+	entityKeyOf func(Rec) string
+	versionOf   func(Rec, time.Time) int64
+}
+
+// newStore constructs a fresh s3parquet.Store on a unique
+// prefix. KeyParts are (period, customer) across every test.
+func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
+	t.Helper()
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:   fixture.Bucket,
+		Prefix:   uniquePrefix("store"),
+		S3Client: fixture.S3Client,
+		KeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+		EntityKeyOf:  opts.entityKeyOf,
+		VersionOf:    opts.versionOf,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// TestWriteAndRead exercises the basic round-trip through S3.
+// No dedup configured.
+func TestWriteAndRead(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	in := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10, Ts: time.UnixMilli(1000)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "s2", Value: 20, Ts: time.UnixMilli(2000)},
+		{Period: "2026-03-17", Customer: "def", SKU: "s1", Value: 30, Ts: time.UnixMilli(3000)},
+	}
+	if _, err := store.Write(ctx, in); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != len(in) {
+		t.Fatalf("got %d records, want %d", len(got), len(in))
+	}
+}
+
+// TestWriteEmptyNoop guards the empty-slice fast path: Write
+// must return (nil, nil) without touching S3.
+func TestWriteEmptyNoop(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	got, err := store.Write(ctx, nil)
+	if err != nil {
+		t.Errorf("Write(nil): %v", err)
+	}
+	if got != nil {
+		t.Errorf("Write(nil): got %v, want nil", got)
+	}
+}
+
+// TestWriteWithKey covers the explicit-key write path: same
+// semantics as Write for grouping / parquet encoding, but
+// PartitionKeyOf is bypassed and the caller asserts the key.
+func TestWriteWithKey(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	key := "period=2026-03-17/customer=abc"
+	recs := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10, Ts: time.UnixMilli(1)},
+	}
+	result, err := store.WriteWithKey(ctx, key, recs)
+	if err != nil {
+		t.Fatalf("WriteWithKey: %v", err)
+	}
+	if result == nil {
+		t.Fatal("WriteWithKey: nil result")
+	}
+	if result.DataPath == "" || result.RefPath == "" || result.Offset == "" {
+		t.Errorf("incomplete result: %+v", result)
+	}
+
+	// Read back under the exact key so we're not depending on
+	// glob semantics here.
+	got, err := store.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 || got[0].Value != 10 {
+		t.Errorf("got %+v, want one record with Value=10", got)
+	}
+}
+
+// TestReadGlob covers every glob shape the grammar accepts:
+// exact, whole-segment *, trailing * in a value, and "*".
+func TestReadGlob(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	all := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2", Value: 2},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s3", Value: 3},
+		{Period: "2026-04-01", Customer: "abc", SKU: "s4", Value: 4},
+	}
+	if _, err := store.Write(ctx, all); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		pattern string
+		wantN   int
+	}{
+		{"exact single file", "period=2026-03-17/customer=abc", 1},
+		{"whole-segment head", "*/customer=abc", 3},
+		{"whole-segment tail", "period=2026-03-17/*", 2},
+		{"trailing star in value", "period=2026-03-*/customer=abc", 2},
+		{"match all", "*", 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.Read(ctx, tc.pattern)
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if len(got) != tc.wantN {
+				t.Errorf("got %d records, want %d",
+					len(got), tc.wantN)
+			}
+		})
+	}
+}
+
+// TestDedupExplicit exercises user-supplied EntityKeyOf +
+// VersionOf: later writes supersede earlier ones per entity.
+func TestDedupExplicit(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+		versionOf: func(r Rec, _ time.Time) int64 {
+			return r.Ts.UnixNano()
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10, Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 99, Ts: time.UnixMilli(200)},
+	}); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+
+	got, err := store.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1 (deduped)", len(got))
+	}
+	if got[0].Value != 99 {
+		t.Errorf("got Value=%d, want 99 (newer Ts wins)", got[0].Value)
+	}
+}
+
+// TestDedupDefault omits VersionOf: New() populates it with
+// DefaultVersionOf, so dedup falls back to the source file's
+// insertedAt. The second write to the same entity must win
+// because its parquet file has a later tsMicros.
+func TestDedupDefault(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10},
+	}); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	// Nudge the clock forward enough that the second file's
+	// tsMicros is strictly greater than the first's; 2 ms is
+	// orders of magnitude past µs precision.
+	time.Sleep(2 * time.Millisecond)
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 99},
+	}); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+
+	got, err := store.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if got[0].Value != 99 {
+		t.Errorf("got Value=%d, want 99 (later file wins)", got[0].Value)
+	}
+}
+
+// TestReadWithHistory opts out of dedup: every written record
+// must appear in the result.
+func TestReadWithHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string { return r.SKU },
+		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	for i := int64(0); i < 3; i++ {
+		if _, err := store.WriteWithKey(ctx, key, []Rec{
+			{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: i},
+		}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+
+	// No WithHistory → dedup to the max-version record.
+	deduped, err := store.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("Read (deduped): %v", err)
+	}
+	if len(deduped) != 1 {
+		t.Errorf("deduped: got %d, want 1", len(deduped))
+	}
+
+	full, err := store.Read(ctx, key, s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("Read (history): %v", err)
+	}
+	if len(full) != 3 {
+		t.Errorf("history: got %d, want 3", len(full))
+	}
+}
+
+// TestPoll covers the refs-only listing: entries must be
+// chronological by timestamp and carry the expected metadata.
+func TestPoll(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	var lastOffset []string
+	keys := []string{
+		"period=2026-03-17/customer=abc",
+		"period=2026-03-17/customer=def",
+		"period=2026-03-18/customer=abc",
+	}
+	for _, k := range keys {
+		r, err := store.WriteWithKey(ctx, k, []Rec{
+			{Period: "2026-03-17", Customer: "anything", SKU: "s"},
+		})
+		if err != nil {
+			t.Fatalf("Write %s: %v", k, err)
+		}
+		lastOffset = append(lastOffset, string(r.Offset))
+	}
+
+	// Give the settle window time to pass.
+	time.Sleep(30 * time.Millisecond)
+
+	entries, newOffset, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if len(entries) != len(keys) {
+		t.Fatalf("got %d entries, want %d", len(entries), len(keys))
+	}
+	if string(newOffset) == "" {
+		t.Error("newOffset empty after non-empty Poll")
+	}
+
+	// Entries are chronological by tsMicros, not by partition
+	// path. WriteWithKey was sequential; the ref order must
+	// mirror the write order.
+	for i, e := range entries {
+		if string(e.Offset) != lastOffset[i] {
+			t.Errorf("[%d] offset %q != write offset %q",
+				i, e.Offset, lastOffset[i])
+		}
+	}
+
+	// Fresh Poll past the offset returns nothing.
+	gone, off2, err := store.Poll(ctx, newOffset, 100)
+	if err != nil {
+		t.Fatalf("Poll (past offset): %v", err)
+	}
+	if len(gone) != 0 {
+		t.Errorf("got %d entries past offset, want 0", len(gone))
+	}
+	if off2 != newOffset {
+		t.Errorf("offset drifted: %q -> %q", newOffset, off2)
+	}
+}
+
+// TestPollRecords mirrors TestPoll for the typed-record path,
+// with dedup behaviour verified against the same expectations
+// as Read.
+func TestPollRecords(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+		versionOf: func(r Rec, _ time.Time) int64 {
+			return r.Ts.UnixNano()
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1, Ts: time.UnixMilli(10)},
+	}); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 2, Ts: time.UnixMilli(20)},
+	}); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	deduped, off, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords: %v", err)
+	}
+	if len(deduped) != 1 || deduped[0].Value != 2 {
+		t.Errorf("deduped: got %+v, want one record with Value=2", deduped)
+	}
+
+	full, _, err := store.PollRecords(ctx, "", 100, s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("PollRecords history: %v", err)
+	}
+	if len(full) != 2 {
+		t.Errorf("history: got %d, want 2", len(full))
+	}
+	if string(off) == "" {
+		t.Error("offset empty after non-empty PollRecords")
+	}
+}

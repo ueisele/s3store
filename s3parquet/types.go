@@ -1,0 +1,22 @@
+package s3parquet
+
+import "github.com/ueisele/s3store/internal/core"
+
+// Offset represents a position in the stream.
+type Offset = core.Offset
+
+// StreamEntry is a lightweight ref returned by Poll.
+type StreamEntry = core.StreamEntry
+
+// WriteResult contains metadata about a completed write.
+type WriteResult = core.WriteResult
+
+// QueryOption configures read-path behavior.
+type QueryOption = core.QueryOption
+
+// WithHistory disables latest-per-entity deduplication on Read
+// and PollRecords. When EntityKeyOf is nil, dedup is already a
+// no-op regardless of this option.
+func WithHistory() QueryOption {
+	return core.WithHistory()
+}
