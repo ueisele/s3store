@@ -441,3 +441,107 @@ func TestRead_SliceField(t *testing.T) {
 		t.Errorf("Tags: got %v, want %v", got[0].Tags, want)
 	}
 }
+
+// ProcessLog is the nested struct: primitive + int8 enum +
+// map, all inside a list at the outer level. Mirrors a
+// realistic JSONB-style payload ported to native columns.
+// int8/int16 inside nested structs require parquet-go v0.29+
+// (writeRowsFuncOfSmallInt path).
+type ProcessLog struct {
+	Processor  string            `parquet:"processor"`
+	Field      int8              `parquet:"field"`
+	Attributes map[string]string `parquet:"attributes"`
+}
+
+// JobRec is the outer record type; Logs is a LIST<STRUCT<...,
+// MAP<VARCHAR, VARCHAR>>>. Exercises the full composite stack
+// in one field.
+type JobRec struct {
+	Period   string       `parquet:"period"`
+	Customer string       `parquet:"customer"`
+	JobID    string       `parquet:"job_id"`
+	Logs     []ProcessLog `parquet:"logs"`
+	Ts       time.Time    `parquet:"ts,timestamp(millisecond)"`
+}
+
+// TestRead_NestedListOfStructsWithMap round-trips the
+// JSONB-style shape: a list of structs, each with a named-int
+// field and a map-of-string field. Passing means s3store can
+// replace a Postgres JSONB column with a native columnar layout
+// end-to-end — write via s3parquet, read via s3sql, typed
+// decode via the reflection binder + mapstructure.
+func TestRead_NestedListOfStructsWithMap(t *testing.T) {
+	f := testutil.New(t)
+	ctx := context.Background()
+
+	w, err := s3parquet.New[JobRec](s3parquet.Config[JobRec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r JobRec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	in := JobRec{
+		Period:   "2026-03-17",
+		Customer: "abc",
+		JobID:    "job-1",
+		Logs: []ProcessLog{
+			{
+				Processor: "ingest",
+				Field:     int8(1),
+				Attributes: map[string]string{
+					"region": "eu-west-1",
+					"stage":  "raw",
+				},
+			},
+			{
+				Processor: "enrich",
+				Field:     int8(7),
+				Attributes: map[string]string{
+					"model": "v2",
+				},
+			},
+		},
+		Ts: time.UnixMilli(100),
+	}
+
+	if _, err := w.Write(ctx, []JobRec{in}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	s, err := s3sql.New[JobRec](s3sql.Config[JobRec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		TableAlias:        "records",
+		SettleWindow:      10 * time.Millisecond,
+		ExtraInitSQL:      f.DuckDBCredentials(),
+	})
+	if err != nil {
+		t.Fatalf("s3sql.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	got, err := s.Read(ctx, "period=2026-03-17/customer=abc")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if !reflect.DeepEqual(got[0].Logs, in.Logs) {
+		t.Errorf("Logs round-trip mismatch:\n got  %+v\n want %+v",
+			got[0].Logs, in.Logs)
+	}
+}
