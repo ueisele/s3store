@@ -31,26 +31,35 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	os.Exit(runIntegrationTests(m))
+}
+
+// runIntegrationTests owns the MinIO container lifecycle so the
+// deferred TerminateContainer actually runs — os.Exit in TestMain
+// would skip it. Returns the exit code for m.Run().
+func runIntegrationTests(m *testing.M) int {
 	ctx := context.Background()
 
 	// Disable testcontainers' ryuk reaper sidecar — it fails
-	// to bind its port on recent Docker Desktop versions, and
-	// we already clean up the MinIO container via defer below.
+	// to bind its port on recent Docker Desktop versions. We
+	// terminate the MinIO container via defer below instead.
 	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	container, err := tcminio.Run(ctx, "minio/minio:latest")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start MinIO: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer func() {
-		_ = testcontainers.TerminateContainer(container)
+		if err := testcontainers.TerminateContainer(container); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to terminate MinIO: %v\n", err)
+		}
 	}()
 
 	connURL, err := container.ConnectionString(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to get MinIO endpoint: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	minioHostPort = connURL // host:port
 
@@ -65,7 +74,7 @@ func TestMain(m *testing.M) {
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build AWS config: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	s3Client = s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String("http://" + minioHostPort)
@@ -76,10 +85,10 @@ func TestMain(m *testing.M) {
 		Bucket: aws.String(bucketName),
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create bucket: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
-	os.Exit(m.Run())
+	return m.Run()
 }
 
 // IntRecord is the record type used by integration tests.
