@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -150,17 +151,77 @@ func TestWriteEmptyRecords(t *testing.T) {
 	}
 }
 
+// TestDedupEnabled guards that dedup is gated on EntityKeyOf
+// only. New() populates VersionOf with DefaultVersionOf when
+// the user leaves it nil, so by the time dedupEnabled is
+// consulted the gating fact is whether the user asked for
+// dedup at all (by providing an entity key).
 func TestDedupEnabled(t *testing.T) {
 	c := Config[testRec]{}
 	if c.dedupEnabled() {
-		t.Error("dedupEnabled: both nil, want false")
+		t.Error("dedupEnabled: no EntityKeyOf, want false")
 	}
 	c.EntityKeyOf = func(r testRec) string { return r.Customer }
-	if c.dedupEnabled() {
-		t.Error("dedupEnabled: only EntityKeyOf, want false")
-	}
-	c.VersionOf = func(r testRec) int64 { return r.Value }
 	if !c.dedupEnabled() {
-		t.Error("dedupEnabled: both set, want true")
+		t.Error("dedupEnabled: with EntityKeyOf, want true")
+	}
+}
+
+// TestNewPopulatesDefaultVersionOf guards that New assigns
+// DefaultVersionOf when the user set EntityKeyOf but left
+// VersionOf nil — that's the "sensible default" behaviour.
+func TestNewPopulatesDefaultVersionOf(t *testing.T) {
+	cfg := validConfig()
+	cfg.EntityKeyOf = func(r testRec) string { return r.Customer }
+	// VersionOf deliberately nil
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s.cfg.VersionOf == nil {
+		t.Fatal("VersionOf still nil after New; expected DefaultVersionOf")
+	}
+	// Spot-check: DefaultVersionOf returns insertedAt.UnixMicro().
+	ts := time.UnixMicro(1_710_684_000_000_000)
+	if got := s.cfg.VersionOf(testRec{}, ts); got != 1_710_684_000_000_000 {
+		t.Errorf("default VersionOf returned %d, want %d",
+			got, 1_710_684_000_000_000)
+	}
+}
+
+// TestNewLeavesUserVersionOfAlone guards that New does not
+// overwrite a user-supplied VersionOf.
+func TestNewLeavesUserVersionOfAlone(t *testing.T) {
+	cfg := validConfig()
+	cfg.EntityKeyOf = func(r testRec) string { return r.Customer }
+	cfg.VersionOf = func(r testRec, _ time.Time) int64 {
+		return r.Value * 2
+	}
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got := s.cfg.VersionOf(testRec{Value: 21}, time.Time{})
+	if got != 42 {
+		t.Errorf("user VersionOf was replaced; got %d, want 42", got)
+	}
+}
+
+// TestNewSkipsDefaultWhenNoEntityKey guards that New does not
+// assign VersionOf when the user hasn't asked for dedup
+// (EntityKeyOf nil). Unnecessary allocation and a subtle
+// invariant for dedupEnabled.
+func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
+	cfg := validConfig()
+	// both EntityKeyOf and VersionOf left nil
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s.cfg.VersionOf != nil {
+		t.Error("VersionOf set despite no EntityKeyOf")
 	}
 }

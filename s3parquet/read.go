@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -21,9 +23,18 @@ import (
 // need.
 const pollDownloadConcurrency = 8
 
+// versionedRecord carries a decoded record together with the
+// write time of the parquet file it came from. The library
+// passes insertedAt to Config.VersionOf, which can use it as
+// a fallback or ignore it in favor of a domain-level version.
+type versionedRecord[T any] struct {
+	rec        T
+	insertedAt time.Time
+}
+
 // Read returns all records whose data files match the given
 // key pattern, optionally deduplicated to latest-per-entity
-// when EntityKeyOf and VersionOf are configured.
+// when EntityKeyOf is configured.
 //
 // Accepts the same glob grammar as s3sql.Read: whole-segment
 // "*" and a single trailing "*" inside a value.
@@ -49,15 +60,15 @@ func (s *Store[T]) Read(
 		return nil, nil
 	}
 
-	records, err := s.downloadAndDecodeAll(ctx, keys)
+	versioned, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, err
 	}
 
 	if o.IncludeHistory || !s.cfg.dedupEnabled() {
-		return records, nil
+		return stripVersions(versioned), nil
 	}
-	return dedupLatest(records, s.cfg.EntityKeyOf, s.cfg.VersionOf), nil
+	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf), nil
 }
 
 // PollRecords returns a flat slice of typed records from the
@@ -68,10 +79,9 @@ func (s *Store[T]) Read(
 // (consistent with Read). Pass WithHistory() to disable dedup
 // and get every record in ref order.
 //
-// When dedup is disabled (either no EntityKeyOf/VersionOf, or
-// WithHistory()), the returned records follow ref order
-// (= timestamp order) and then parquet-file row order within
-// each ref.
+// When dedup is disabled (no EntityKeyOf, or WithHistory()),
+// the returned records follow ref order (= timestamp order)
+// and then parquet-file row order within each ref.
 func (s *Store[T]) PollRecords(
 	ctx context.Context,
 	since core.Offset,
@@ -94,15 +104,15 @@ func (s *Store[T]) PollRecords(
 		keys[i] = e.DataPath
 	}
 
-	records, err := s.downloadAndDecodeAll(ctx, keys)
+	versioned, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, since, err
 	}
 
 	if o.IncludeHistory || !s.cfg.dedupEnabled() {
-		return records, newOffset, nil
+		return stripVersions(versioned), newOffset, nil
 	}
-	return dedupLatest(records, s.cfg.EntityKeyOf, s.cfg.VersionOf),
+	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf),
 		newOffset, nil
 }
 
@@ -145,16 +155,17 @@ func (s *Store[T]) listMatchingParquet(
 
 // downloadAndDecodeAll fans out a bounded set of parallel
 // downloads, decodes each parquet file into []T, and returns
-// the concatenated result. Preserves the input key order so
-// callers who don't dedup observe a deterministic stream.
+// the concatenated result wrapped with each source file's
+// insertedAt. Preserves the input key order so callers who
+// don't dedup observe a deterministic stream.
 func (s *Store[T]) downloadAndDecodeAll(
 	ctx context.Context, keys []string,
-) ([]T, error) {
+) ([]versionedRecord[T], error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
 
-	results := make([][]T, len(keys))
+	results := make([][]versionedRecord[T], len(keys))
 	errs := make([]error, len(keys))
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -174,6 +185,15 @@ func (s *Store[T]) downloadAndDecodeAll(
 			}
 			defer func() { <-sem }()
 
+			tsMicros, _, err := core.ParseDataFileName(path.Base(key))
+			if err != nil {
+				errs[i] = fmt.Errorf(
+					"s3parquet: parse data filename %s: %w", key, err)
+				cancel()
+				return
+			}
+			insertedAt := time.UnixMicro(tsMicros)
+
 			data, err := s.getObjectBytes(ctx, key)
 			if err != nil {
 				errs[i] = fmt.Errorf(
@@ -188,7 +208,14 @@ func (s *Store[T]) downloadAndDecodeAll(
 				cancel()
 				return
 			}
-			results[i] = recs
+			versioned := make([]versionedRecord[T], len(recs))
+			for j, r := range recs {
+				versioned[j] = versionedRecord[T]{
+					rec:        r,
+					insertedAt: insertedAt,
+				}
+			}
+			results[i] = versioned
 		}(i, key)
 	}
 	wg.Wait()
@@ -208,7 +235,7 @@ func (s *Store[T]) downloadAndDecodeAll(
 	for _, r := range results {
 		total += len(r)
 	}
-	out := make([]T, 0, total)
+	out := make([]versionedRecord[T], 0, total)
 	for _, r := range results {
 		out = append(out, r...)
 	}
@@ -236,18 +263,36 @@ func decodeParquet[T any](data []byte) ([]T, error) {
 	return out[:n], nil
 }
 
+// stripVersions drops the per-record insertedAt metadata when
+// the caller didn't ask for dedup. Works on the already-decoded
+// slice so we don't pay an extra allocation per record.
+func stripVersions[T any](in []versionedRecord[T]) []T {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]T, len(in))
+	for i, v := range in {
+		out[i] = v.rec
+	}
+	return out
+}
+
 // dedupLatest keeps the record with the maximum version per
 // entity, in the order each entity was first seen. Stable under
 // equal versions: earlier occurrences win ties, so callers who
 // rely on first-write semantics aren't surprised by later
 // duplicates.
+//
+// versionOf is invoked with each record and the insertedAt of
+// the source file, so a caller can fall back to file time when
+// the record has no domain-level version.
 func dedupLatest[T any](
-	records []T,
+	records []versionedRecord[T],
 	entityKey func(T) string,
-	version func(T) int64,
+	versionOf func(record T, insertedAt time.Time) int64,
 ) []T {
 	if len(records) == 0 {
-		return records
+		return nil
 	}
 	type slot struct {
 		index   int
@@ -255,9 +300,9 @@ func dedupLatest[T any](
 	}
 	seen := make(map[string]slot, len(records))
 	order := make([]string, 0, len(records))
-	for i, r := range records {
-		k := entityKey(r)
-		v := version(r)
+	for i, vr := range records {
+		k := entityKey(vr.rec)
+		v := versionOf(vr.rec, vr.insertedAt)
 		cur, ok := seen[k]
 		if !ok {
 			seen[k] = slot{index: i, version: v}
@@ -270,7 +315,7 @@ func dedupLatest[T any](
 	}
 	out := make([]T, len(order))
 	for i, k := range order {
-		out[i] = records[seen[k].index]
+		out[i] = records[seen[k].index].rec
 	}
 	return out
 }

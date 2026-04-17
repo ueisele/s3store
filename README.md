@@ -102,11 +102,14 @@ store, err := s3parquet.New[CostRecord](s3parquet.Config[CostRecord]{
         return fmt.Sprintf("charge_period=%s/customer=%s",
             r.ChargePeriod, r.CustomerID)
     },
-    // Optional: enable latest-per-entity dedup on Read / PollRecords
+    // Optional: enable latest-per-entity dedup on Read / PollRecords.
+    // With only EntityKeyOf set, VersionOf defaults to DefaultVersionOf
+    // (wrote-last-wins using the parquet file's write time).
     EntityKeyOf: func(r CostRecord) string {
         return r.CustomerID + "|" + r.SKU
     },
-    VersionOf: func(r CostRecord) int64 {
+    // Optional: override the default with a business timestamp.
+    VersionOf: func(r CostRecord, insertedAt time.Time) int64 {
         return r.CalculatedAt.UnixNano()
     },
 })

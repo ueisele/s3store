@@ -129,6 +129,78 @@ func TestBuildDataFilePath(t *testing.T) {
 	}
 }
 
+func TestParseDataFileName(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         string
+		wantTs     int64
+		wantShort  string
+		wantErr    bool
+	}{
+		{
+			name:      "standard",
+			in:        "1710684000000000-a3f2e1b4.parquet",
+			wantTs:    1710684000000000,
+			wantShort: "a3f2e1b4",
+		},
+		{
+			name:    "missing dash",
+			in:      "a3f2e1b4.parquet",
+			wantErr: true,
+		},
+		{
+			name:    "non-numeric ts",
+			in:      "notanumber-a3f2e1b4.parquet",
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, short, err := ParseDataFileName(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %q, got ts=%d id=%q",
+						tc.in, ts, short)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ts != tc.wantTs {
+				t.Errorf("ts: got %d want %d", ts, tc.wantTs)
+			}
+			if short != tc.wantShort {
+				t.Errorf("shortID: got %q want %q", short, tc.wantShort)
+			}
+		})
+	}
+}
+
+// TestBuildParseDataFileNameRoundTrip guards that
+// ParseDataFileName is the inverse of BuildDataFilePath (for
+// the filename portion).
+func TestBuildParseDataFileNameRoundTrip(t *testing.T) {
+	const (
+		dataPath = "p/data"
+		hiveKey  = "period=X/customer=Y"
+		ts       = int64(1_710_684_000_000_000)
+		shortID  = "a3f2e1b4"
+	)
+	full := BuildDataFilePath(dataPath, hiveKey, ts, shortID)
+	// strip the dataPath + "/" + hiveKey + "/" prefix to get
+	// the filename part.
+	filename := full[len(dataPath)+len(hiveKey)+2:]
+	gotTs, gotID, err := ParseDataFileName(filename)
+	if err != nil {
+		t.Fatalf("ParseDataFileName(%q): %v", filename, err)
+	}
+	if gotTs != ts || gotID != shortID {
+		t.Errorf("round-trip: got (ts=%d, id=%q), want (ts=%d, id=%q)",
+			gotTs, gotID, ts, shortID)
+	}
+}
+
 // TestBuildDataFilePathLexicalOrdering guards that two writes
 // to the same partition key sort chronologically in S3 LIST by
 // filename — the primary reason we embed tsMicros in the data

@@ -39,16 +39,29 @@ type Config[T any] struct {
 	SettleWindow time.Duration
 
 	// EntityKeyOf returns the logical entity identifier for a
-	// record. When non-nil together with VersionOf, Read and
-	// PollRecords deduplicate to the record with the maximum
-	// VersionOf value per entity. When nil, every record is
-	// returned (pure stream semantics).
+	// record. When non-nil, Read and PollRecords deduplicate to
+	// the record with the maximum VersionOf per entity. When
+	// nil, every record is returned (pure stream semantics).
 	EntityKeyOf func(T) string
 
-	// VersionOf returns the monotonic version of a record,
-	// typically derived from a timestamp column (e.g.
-	// u.InsertedAt.UnixNano()). See EntityKeyOf.
-	VersionOf func(T) int64
+	// VersionOf returns the monotonic version of a record for
+	// dedup ordering. The library passes the source file's
+	// write time in insertedAt — useful as a fallback when the
+	// record has no domain-level version, or combine it with a
+	// business timestamp for hybrid strategies.
+	//
+	// Nil defaults to DefaultVersionOf (wrote-last-wins). The
+	// default is assigned inside New() when EntityKeyOf is
+	// also set, so dedupEnabled only checks EntityKeyOf.
+	VersionOf func(record T, insertedAt time.Time) int64
+}
+
+// DefaultVersionOf returns insertedAt in microseconds. Assigned
+// to Config.VersionOf inside New() when that field is nil and
+// EntityKeyOf is set; also exported so users can reference the
+// wrote-last-wins default explicitly in their config.
+func DefaultVersionOf[T any](_ T, insertedAt time.Time) int64 {
+	return insertedAt.UnixMicro()
 }
 
 func (c Config[T]) settleWindow() time.Duration {
@@ -58,10 +71,13 @@ func (c Config[T]) settleWindow() time.Duration {
 	return 5 * time.Second
 }
 
-// dedupEnabled reports whether EntityKeyOf and VersionOf are
-// both configured; only then is latest-per-entity dedup possible.
+// dedupEnabled reports whether latest-per-entity dedup applies.
+// Gated solely on EntityKeyOf: New() populates VersionOf with
+// DefaultVersionOf when the user leaves it nil, so by the time
+// a Store exists the VersionOf field is always callable if
+// EntityKeyOf is set.
 func (c Config[T]) dedupEnabled() bool {
-	return c.EntityKeyOf != nil && c.VersionOf != nil
+	return c.EntityKeyOf != nil
 }
 
 // Store is the pure-Go entry point to an s3store.
@@ -85,6 +101,13 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	}
 	if err := core.ValidateKeyParts(cfg.KeyParts); err != nil {
 		return nil, err
+	}
+	// Default VersionOf when the user asked for dedup
+	// (EntityKeyOf set) but didn't tell us how to compare
+	// versions. Wrote-last-wins is the natural zero-config
+	// behaviour for append-only storage.
+	if cfg.EntityKeyOf != nil && cfg.VersionOf == nil {
+		cfg.VersionOf = DefaultVersionOf[T]
 	}
 	return &Store[T]{
 		cfg:      cfg,

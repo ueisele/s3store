@@ -86,6 +86,25 @@ func BuildDataFilePath(
 		dataPath, hiveKey, tsMicros, shortID)
 }
 
+// ParseDataFileName is the inverse of BuildDataFilePath for the
+// filename portion: it extracts the tsMicros and shortID from
+// the last path segment of a data-file key. Callers typically
+// pass filepath.Base(s3Key) or everything after the last '/'.
+func ParseDataFileName(name string) (tsMicros int64, shortID string, err error) {
+	name = strings.TrimSuffix(name, ".parquet")
+	tsStr, short, ok := strings.Cut(name, "-")
+	if !ok {
+		return 0, "", fmt.Errorf(
+			"s3store: invalid data filename: %s", name)
+	}
+	tsMicros, err = strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf(
+			"s3store: invalid ts in data filename %q: %w", name, err)
+	}
+	return tsMicros, short, nil
+}
+
 // RefCutoff returns the upper-bound refs-prefix for a given
 // settle window. Any ref key whose string-comparison is strictly
 // greater than this cutoff falls within the settle window and
