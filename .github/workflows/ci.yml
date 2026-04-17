@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Verify the cgo-free sub-packages build and test without cgo.
+  # This is the load-bearing guarantee the write/read split
+  # exists for: write-only and simple-read consumers must be
+  # able to build with CGO_ENABLED=0.
+  cgo-free:
+    name: cgo-free build (s3parquet + internal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./s3parquet/... ./internal/...
+      - name: vet
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./s3parquet/... ./internal/...
+      - name: test
+        env:
+          CGO_ENABLED: "0"
+        run: go test -short -count=1 ./s3parquet/... ./internal/...
+      - name: reject forbidden imports in cgo-free paths
+        run: |
+          # s3parquet and internal/core must not transitively
+          # depend on duckdb-go. A stricter check than just the
+          # build tag above, because a future refactor could
+          # sneak the dependency in behind `// +build cgo` and
+          # still pass the build.
+          if go list -deps ./s3parquet/... ./internal/... 2>/dev/null \
+              | grep -qE 'duckdb-go|duckdb-go-bindings'; then
+            echo "ERROR: duckdb-go dependency leaked into cgo-free paths"
+            go list -deps ./s3parquet/... ./internal/... \
+              | grep -E 'duckdb-go|duckdb-go-bindings'
+            exit 1
+          fi
+
+  # Full build + test with cgo (the umbrella package uses
+  # DuckDB). Short-mode tests only; integration tests need
+  # testcontainers and run in a separate job.
+  full:
+    name: full build (umbrella, cgo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test (short)
+        run: go test -short -count=1 ./...
