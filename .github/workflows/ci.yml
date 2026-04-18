@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -73,3 +74,21 @@ jobs:
         run: go build ./...
       - name: test (short)
         run: go test -short -count=1 ./...
+
+  # Integration tests gated on the `integration` build tag. Uses
+  # testcontainers to spin up a shared MinIO per `go test`
+  # invocation (see internal/testutil). Docker is preinstalled on
+  # ubuntu-latest runners. CGO is on because the umbrella and
+  # s3sql tests link DuckDB.
+  integration:
+    name: integration (testcontainers + MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: pre-pull MinIO image
+        run: docker pull minio/minio:latest
+      - name: test (integration)
+        run: go test -tags=integration -count=1 -timeout=15m ./...
