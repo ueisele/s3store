@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/compress"
 	"github.com/ueisele/s3store/internal/core"
 )
 
@@ -77,7 +78,8 @@ func (s *Store[T]) WriteWithKey(
 		return nil, err
 	}
 
-	parquetBytes, err := encodeParquet(records, s.cfg.BloomFilterColumns)
+	parquetBytes, err := encodeParquet(
+		records, s.cfg.BloomFilterColumns, s.compressionCodec)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"s3parquet: parquet encode: %w", err)
@@ -312,16 +314,19 @@ func (s *Store[T]) putMarkersParallel(
 	return nil
 }
 
-// encodeParquet writes records to a parquet byte stream. When
-// bloomFilterColumns is non-empty, per-row-group split-block
-// bloom filters are emitted for those columns. bitsPerValue
-// defaults to bloomFilterBitsPerValue (10) — ~1% false-positive
-// rate.
+// encodeParquet writes records to a parquet byte stream using
+// the given compression codec (never nil — Store.New resolves a
+// snappy default). When bloomFilterColumns is non-empty,
+// per-row-group split-block bloom filters are emitted for those
+// columns at bloomFilterBitsPerValue (10 bits/value ≈ 1%
+// false-positive rate).
 func encodeParquet[T any](
-	records []T, bloomFilterColumns []string,
+	records []T,
+	bloomFilterColumns []string,
+	codec compress.Codec,
 ) ([]byte, error) {
 	var buf bytes.Buffer
-	var opts []parquet.WriterOption
+	opts := []parquet.WriterOption{parquet.Compression(codec)}
 	if len(bloomFilterColumns) > 0 {
 		filters := make(
 			[]parquet.BloomFilterColumn, len(bloomFilterColumns))

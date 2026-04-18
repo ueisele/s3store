@@ -42,6 +42,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		PartitionKeyOf:     cfg.PartitionKeyOf,
 		SettleWindow:       cfg.SettleWindow,
 		BloomFilterColumns: cfg.BloomFilterColumns,
+		Compression:        cfg.Compression,
 		InsertedAtField:    cfg.InsertedAtField,
 		// EntityKeyOf / VersionOf deliberately omitted: the
 		// umbrella's Read / PollRecords go through s3sql and use

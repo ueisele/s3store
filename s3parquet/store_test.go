@@ -90,7 +90,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		{Period: "2026-03-17", Customer: "abc", Value: 2},
 		{Period: "2026-03-17", Customer: "def", Value: 3},
 	}
-	data, err := encodeParquet(in, nil)
+	data, err := encodeParquet(in, nil, &parquet.Snappy)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestEncodeParquet_BloomFilter(t *testing.T) {
 		{Period: "2026-03-17", Customer: "def", Value: 2},
 		{Period: "2026-03-18", Customer: "abc", Value: 3},
 	}
-	data, err := encodeParquet(in, []string{"customer"})
+	data, err := encodeParquet(in, []string{"customer"}, &parquet.Snappy)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}

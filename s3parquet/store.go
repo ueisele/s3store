@@ -7,7 +7,32 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/compress"
 	"github.com/ueisele/s3store/internal/core"
+)
+
+// CompressionCodec selects the parquet-level compression applied
+// to every column on Write. String-valued for easy config/YAML
+// wiring; mapped to the parquet-go codec at Store construction
+// time. Zero value ("") resolves to snappy — the de-facto
+// ecosystem default (Spark, DuckDB's parquet writer, Trino,
+// Athena all emit snappy unless told otherwise).
+type CompressionCodec string
+
+const (
+	// CompressionSnappy: fast encode/decode, ~2-3× ratio,
+	// negligible CPU overhead. Default.
+	CompressionSnappy CompressionCodec = "snappy"
+	// CompressionZstd: better ratios than snappy at higher CPU
+	// cost. Good for cold / archive data.
+	CompressionZstd CompressionCodec = "zstd"
+	// CompressionGzip: widely compatible, moderate CPU, decent
+	// ratio. Mostly a legacy choice today.
+	CompressionGzip CompressionCodec = "gzip"
+	// CompressionUncompressed: no compression. Largest files;
+	// only meaningful when the data is already high-entropy or
+	// the CPU tradeoff matters more than S3 cost.
+	CompressionUncompressed CompressionCodec = "uncompressed"
 )
 
 // Config defines how a Store is set up. T is the record type,
@@ -90,6 +115,16 @@ type Config[T any] struct {
 	// from Poll + StreamEntry.
 	InsertedAtField string
 
+	// Compression selects the parquet compression codec used on
+	// Write. Zero value is snappy — matches the ecosystem default
+	// and produces ~2-3× smaller files than the parquet-go raw
+	// default (uncompressed) for no meaningful CPU cost on
+	// decode. Set to CompressionUncompressed to opt out,
+	// CompressionZstd / CompressionGzip to trade CPU for ratio.
+	// New() validates this value and stores the resolved codec so
+	// the hot-path Write doesn't reparse it.
+	Compression CompressionCodec
+
 	// BloomFilterColumns lists parquet column names (top-level)
 	// that Write should emit per-row-group split-block bloom
 	// filters for. Use this for columns that queries filter on
@@ -145,6 +180,11 @@ type Store[T any] struct {
 	s3       *s3.Client
 	dataPath string
 	refPath  string
+
+	// compressionCodec is Config.Compression resolved to the
+	// parquet-go codec once at New(), so the Write hot path
+	// doesn't re-switch on the string.
+	compressionCodec compress.Codec
 
 	// insertedAtFieldIndex is the reflect struct-field path for
 	// Config.InsertedAtField, resolved once at New() so the hot
@@ -203,13 +243,39 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if err != nil {
 		return nil, err
 	}
+	codec, err := resolveCompression(cfg.Compression)
+	if err != nil {
+		return nil, err
+	}
 	return &Store[T]{
 		cfg:                  cfg,
 		s3:                   cfg.S3Client,
 		dataPath:             core.DataPath(cfg.Prefix),
 		refPath:              core.RefPath(cfg.Prefix),
+		compressionCodec:     codec,
 		insertedAtFieldIndex: insertedAtIdx,
 	}, nil
+}
+
+// resolveCompression maps the user-facing CompressionCodec enum
+// to the parquet-go codec instance used by the Write path.
+// Empty string defaults to snappy — the ecosystem norm — so the
+// Config zero value produces small files instead of
+// parquet-go's raw default (uncompressed).
+func resolveCompression(c CompressionCodec) (compress.Codec, error) {
+	switch c {
+	case "", CompressionSnappy:
+		return &parquet.Snappy, nil
+	case CompressionZstd:
+		return &parquet.Zstd, nil
+	case CompressionGzip:
+		return &parquet.Gzip, nil
+	case CompressionUncompressed:
+		return &parquet.Uncompressed, nil
+	}
+	return nil, fmt.Errorf(
+		"s3parquet: unknown Compression %q (want snappy, "+
+			"zstd, gzip, or uncompressed)", c)
 }
 
 // Close releases resources. Pure-Go Store holds no persistent

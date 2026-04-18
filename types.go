@@ -5,6 +5,20 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/ueisele/s3store/internal/core"
+	"github.com/ueisele/s3store/s3parquet"
+)
+
+// CompressionCodec mirrors s3parquet.CompressionCodec so umbrella
+// users don't have to import the sub-package for the constants.
+type CompressionCodec = s3parquet.CompressionCodec
+
+// Compression codec constants re-exported from s3parquet so
+// umbrella callers stay in one package.
+const (
+	CompressionSnappy       = s3parquet.CompressionSnappy
+	CompressionZstd         = s3parquet.CompressionZstd
+	CompressionGzip         = s3parquet.CompressionGzip
+	CompressionUncompressed = s3parquet.CompressionUncompressed
 )
 
 // Config defines how the umbrella Store is set up. T is the
@@ -64,6 +78,12 @@ type Config[T any] struct {
 	// DuckDB init. Use for CREATE SECRET, credential overrides,
 	// or additional extension loads.
 	ExtraInitSQL []string
+
+	// Compression selects the parquet compression codec used on
+	// Write. Zero value defaults to snappy — the ecosystem
+	// default. Forwarded to the s3parquet sub-store. See
+	// s3parquet.CompressionCodec for the accepted values.
+	Compression s3parquet.CompressionCodec
 
 	// BloomFilterColumns lists parquet column names (top-level)
 	// that Write should emit per-row-group split-block bloom

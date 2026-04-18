@@ -647,6 +647,33 @@ Format times and numbers in your `Of` function, the same way
 `PartitionKeyOf` already does for data paths. Keeps the read
 path a pure round-trip.
 
+## Compression
+
+Write uses snappy by default — same as Spark, DuckDB's parquet writer,
+Trino, and Athena emit out of the box. Snappy cuts file size 2-3× on
+typical data with negligible CPU cost. Change via `Config.Compression`:
+
+```go
+s3store.Config[T]{
+    // ...
+    Compression: s3store.CompressionZstd,
+}
+```
+
+Accepted values:
+
+- `CompressionSnappy` — fast, default.
+- `CompressionZstd` — better ratio, higher CPU; good for cold / archive data.
+- `CompressionGzip` — legacy, moderate CPU and ratio.
+- `CompressionUncompressed` — no compression; only if CPU cost dwarfs S3 cost.
+
+Zero value (empty string) resolves to snappy, so leaving the field unset
+is safe. `New()` rejects any other string.
+
+Readers (s3parquet and DuckDB's httpfs/parquet) auto-detect the codec on
+read, so switching compression per Write doesn't require any read-side
+config.
+
 ## Bloom filters on hot columns
 
 > **Only `s3sql` (DuckDB) consults bloom filters today.** `s3parquet.Read`
@@ -785,6 +812,9 @@ type Config[T any] struct {
     // populate this field on T (must be `time.Time`, tagged
     // `parquet:"-"`) with the source file's write timestamp.
     InsertedAtField string
+
+    // Parquet compression codec (default snappy).
+    Compression CompressionCodec
 
     // DuckDB extras
     ExtraInitSQL []string                 // SET / CREATE SECRET / LOAD
