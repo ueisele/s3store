@@ -3,6 +3,7 @@ package s3sql
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -266,6 +267,66 @@ func TestNew_DedupValidation(t *testing.T) {
 			_, err := New(cfg)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q did not contain %q",
+					err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestNew_FilenameColumnCollision guards the guard: a T with a
+// `parquet:"filename"` field collides with DuckDB's
+// read_parquet(filename=true), which we use for the dedup
+// tie-breaker and the InsertedAtField populate path. New() must
+// reject both configurations up front instead of producing
+// wrong rows (dedup) or silently stealing the user's field
+// value (InsertedAtField) at query time.
+func TestNew_FilenameColumnCollision(t *testing.T) {
+	type recWithFilename struct {
+		Period     string    `parquet:"period"`
+		Customer   string    `parquet:"customer"`
+		Filename   string    `parquet:"filename"`
+		InsertedAt time.Time `parquet:"-"`
+	}
+	mkCfg := func() Config[recWithFilename] {
+		return Config[recWithFilename]{
+			Bucket:            "b",
+			Prefix:            "p",
+			PartitionKeyParts: []string{"period", "customer"},
+			S3Client:          &s3.Client{},
+			TableAlias:        "t",
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*Config[recWithFilename])
+		wantSub string
+	}{
+		{
+			name: "dedup enabled",
+			mutate: func(c *Config[recWithFilename]) {
+				c.EntityKeyColumns = []string{"period"}
+				c.VersionColumn = "customer"
+			},
+			wantSub: "dedup tie-breaker",
+		},
+		{
+			name: "InsertedAtField set",
+			mutate: func(c *Config[recWithFilename]) {
+				c.InsertedAtField = "InsertedAt"
+			},
+			wantSub: "InsertedAtField",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := mkCfg()
+			tc.mutate(&cfg)
+			_, err := New(cfg)
+			if err == nil {
+				t.Fatal("expected error, got nil")
 			}
 			if !strings.Contains(err.Error(), tc.wantSub) {
 				t.Errorf("error %q did not contain %q",

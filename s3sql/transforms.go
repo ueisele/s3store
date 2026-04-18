@@ -23,10 +23,11 @@ import (
 // contain an apostrophe don't break the query at plan time.
 //
 // withFilename adds filename=true to read_parquet so the source
-// object key is exposed as a `filename` column. Used only when
-// the dedup CTE needs a deterministic tie-breaker (see
-// wrapScanExpr); callers compute the flag as
-// !includeHistory && dedupEnabled().
+// object key is exposed as a `filename` column. Two consumers
+// use it — the dedup CTE's tie-breaker on equal VersionColumn
+// values, and the InsertedAtField populate path that parses
+// tsMicros out of the filename on scan. Callers typically
+// compute the flag via needsFilename().
 func (s *Store[T]) scanExprForPattern(
 	key string, withFilename bool,
 ) (string, error) {

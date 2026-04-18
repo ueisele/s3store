@@ -160,6 +160,33 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		return nil, err
 	}
 
+	// Both dedup (filename DESC tie-break) and InsertedAtField
+	// (populate from source tsMicros) rely on DuckDB's
+	// read_parquet(filename=true) helper, which injects a column
+	// literally named "filename". A T that already maps a parquet
+	// column of that name would either lose its binding (scanAll
+	// steals the column) or produce a duplicate-schema error
+	// inside read_parquet. Catch the Go-side case at New() — the
+	// on-disk-parquet-has-"filename" case is still DuckDB's to
+	// reject at query time since we can't see the file schemas
+	// here.
+	if _, ok := b.byName["filename"]; ok {
+		if cfg.dedupEnabled() {
+			return nil, fmt.Errorf(
+				"s3sql: T has a `parquet:\"filename\"` field, " +
+					"which collides with DuckDB's " +
+					"read_parquet(filename=true) used for " +
+					"the dedup tie-breaker; rename the field")
+		}
+		if cfg.InsertedAtField != "" {
+			return nil, fmt.Errorf(
+				"s3sql: T has a `parquet:\"filename\"` field, " +
+					"which collides with DuckDB's " +
+					"read_parquet(filename=true) used to " +
+					"populate InsertedAtField; rename the field")
+		}
+	}
+
 	db, err := openDuckDB(cfg.S3Client, cfg.ExtraInitSQL)
 	if err != nil {
 		return nil, fmt.Errorf(
