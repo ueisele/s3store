@@ -189,8 +189,16 @@ func (s *Store[T]) PollRecordsAll(
 // clock time t: any ref written at or after t sorts >= the
 // returned offset, any ref written before t sorts < it.
 //
-// Pure computation — no S3 call. Pair with WithUntilOffset to
-// read records within a time window.
+// Pure computation — no S3 call. Internally compares in UTC
+// microseconds (offsets are encoded from time.UnixMicro). Pair
+// with WithUntilOffset (or PollRecordsAll's until parameter)
+// to read records within a half-open [since, until) time
+// window — to cover a full day, until is the start of the
+// *next* day:
+//
+//	start := store.OffsetAt(time.Date(y, m, d,   0,0,0,0, loc))
+//	end   := store.OffsetAt(time.Date(y, m, d+1, 0,0,0,0, loc))
+//	records, _ := store.PollRecordsAll(ctx, start, end)
 func (s *Store[T]) OffsetAt(t time.Time) core.Offset {
 	return core.Offset(core.RefCutoff(s.refPath, t, 0))
 }

@@ -291,10 +291,24 @@ The range is half-open `[since, until)`, matching Kafka offset semantics.
 one call, internal batching, no manual paging:
 
 ```go
-records, err := store.PollRecordsAll(ctx,
-    store.OffsetAt(yesterdayStart),
-    store.OffsetAt(yesterdayEnd))
+// All records written on 2026-04-17 (UTC).
+start := store.OffsetAt(time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC))
+end   := store.OffsetAt(time.Date(2026, 4, 18, 0, 0, 0, 0, time.UTC))
+records, err := store.PollRecordsAll(ctx, start, end)
 ```
+
+Half-open boundary semantics:
+
+- A record written at `2026-04-17 23:59:59.999999` — **included** (offset < end).
+- A record written exactly at `2026-04-18 00:00:00.000000` — **excluded** (that instant belongs to the next window).
+- A record written exactly at `2026-04-17 00:00:00.000000` — **included**.
+
+So to cover a full day, `end` is the start of the *next* day.
+
+**Timezone**: `OffsetAt` compares in UTC microseconds internally (offsets
+are encoded from `time.UnixMicro()`). `time.Date(..., time.UTC)` gives
+UTC-day boundaries; `time.Date(..., loc)` gives local-day boundaries —
+both work, as long as `start` and `end` use the same timezone.
 
 Pass `core.Offset("")` for `since` to start at the stream head, or for
 `until` to read to the live tip (settle-window cutoff).
