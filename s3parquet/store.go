@@ -2,6 +2,7 @@ package s3parquet
 
 import (
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -74,6 +75,21 @@ type Config[T any] struct {
 	// for concurrent invocation.
 	OnMissingData func(dataPath string)
 
+	// InsertedAtField names a time.Time field on T that Read and
+	// PollRecords populate with the source parquet file's write
+	// timestamp on decode. The field must be tagged `parquet:"-"`
+	// so parquet-go ignores it on both encode and decode — the
+	// field is library-managed metadata, not a parquet column.
+	// Empty disables the feature; there is no reflection cost when
+	// unset.
+	//
+	// Motivating case: a stream consumer needs per-record "when did
+	// this land in S3" without storing it as an on-disk column.
+	// Before this config, the only options were duplicating the
+	// value into a data column (wasteful) or reconstructing it
+	// from Poll + StreamEntry.
+	InsertedAtField string
+
 	// BloomFilterColumns lists parquet column names (top-level)
 	// that Write should emit per-row-group split-block bloom
 	// filters for. Use this for columns that queries filter on
@@ -130,6 +146,11 @@ type Store[T any] struct {
 	dataPath string
 	refPath  string
 
+	// insertedAtFieldIndex is the reflect struct-field path for
+	// Config.InsertedAtField, resolved once at New() so the hot
+	// path doesn't reparse the type. nil when unset.
+	insertedAtFieldIndex []int
+
 	// indexes is the list of registered secondary indexes that the
 	// write path iterates per record to emit marker objects. Typed
 	// Index[T, K] handles append to this slice via registerIndex
@@ -178,11 +199,16 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if err := validateBloomFilterColumns[T](cfg.BloomFilterColumns); err != nil {
 		return nil, err
 	}
+	insertedAtIdx, err := validateInsertedAtField[T](cfg.InsertedAtField)
+	if err != nil {
+		return nil, err
+	}
 	return &Store[T]{
-		cfg:      cfg,
-		s3:       cfg.S3Client,
-		dataPath: core.DataPath(cfg.Prefix),
-		refPath:  core.RefPath(cfg.Prefix),
+		cfg:                  cfg,
+		s3:                   cfg.S3Client,
+		dataPath:             core.DataPath(cfg.Prefix),
+		refPath:              core.RefPath(cfg.Prefix),
+		insertedAtFieldIndex: insertedAtIdx,
 	}, nil
 }
 
@@ -190,6 +216,42 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 // connections — Close is a no-op but present for API symmetry
 // with s3sql.Store and for future-proofing.
 func (s *Store[T]) Close() error { return nil }
+
+// validateInsertedAtField resolves Config.InsertedAtField to a
+// struct-field index on T. Rejects typos (no such field), wrong
+// type (not time.Time), and — critically — a missing `parquet:"-"`
+// tag, because without it the field would either round-trip
+// through parquet (double bookkeeping) or shadow a real parquet
+// column. Returns nil when name is empty.
+func validateInsertedAtField[T any](name string) ([]int, error) {
+	if name == "" {
+		return nil, nil
+	}
+	rt := reflect.TypeFor[T]()
+	if rt.Kind() != reflect.Struct {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField requires T to be a struct, got %s",
+			rt)
+	}
+	f, ok := rt.FieldByName(name)
+	if !ok {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField %q: no such field on %s",
+			name, rt)
+	}
+	if f.Type != reflect.TypeFor[time.Time]() {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField %q: must be time.Time, got %s",
+			name, f.Type)
+	}
+	if tag := f.Tag.Get("parquet"); tag != "-" {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField %q: must be tagged "+
+				"`parquet:\"-\"` to stay library-managed "+
+				"(got %q)", name, tag)
+	}
+	return f.Index, nil
+}
 
 // validateBloomFilterColumns rejects BloomFilterColumns entries
 // that aren't top-level parquet columns of T, so a typo fails at

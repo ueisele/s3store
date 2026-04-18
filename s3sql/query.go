@@ -21,7 +21,7 @@ func (s *Store[T]) Query(
 	o.Apply(opts...)
 
 	scanExpr, err := s.scanExprForPattern(
-		keyPattern, !o.IncludeHistory && s.cfg.dedupEnabled())
+		keyPattern, s.needsFilename(o.IncludeHistory))
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +43,7 @@ func (s *Store[T]) QueryRow(
 	o.Apply(opts...)
 
 	scanExpr, err := s.scanExprForPattern(
-		keyPattern, !o.IncludeHistory && s.cfg.dedupEnabled())
+		keyPattern, s.needsFilename(o.IncludeHistory))
 	if err != nil {
 		return s.errorRow(ctx, err)
 	}

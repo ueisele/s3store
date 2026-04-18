@@ -69,6 +69,21 @@ type Config[T any] struct {
 	// the object-cache pragma, in order. Use for CREATE SECRET,
 	// credential overrides, or other extension loads.
 	ExtraInitSQL []string
+
+	// InsertedAtField names a time.Time field on T that Read and
+	// PollRecords populate with the source parquet file's write
+	// timestamp on decode. The field must be tagged `parquet:"-"`
+	// so the parquet schema / row binder ignores it — the field is
+	// library-managed metadata, not a parquet column.
+	//
+	// Under the hood: when set, the scan emits `filename=true` so
+	// DuckDB exposes the source object key; the row binder parses
+	// tsMicros from the filename and assigns it to this field. The
+	// helper column is projected through the CTE in this mode so
+	// it's also visible to Query / QueryRow callers — opt-in
+	// behavior whose one side effect is that `SELECT *` surfaces
+	// an extra `filename` column.
+	InsertedAtField string
 }
 
 func (c Config[T]) settleWindow() time.Duration {
@@ -93,6 +108,12 @@ type Store[T any] struct {
 	dataPath string
 	refPath  string
 	binder   *binder
+
+	// insertedAtFieldIndex is the reflect struct-field path for
+	// Config.InsertedAtField, resolved once at New(). nil when
+	// unset — scanAll short-circuits the filename-column lookup in
+	// that case, so there's no hot-path cost.
+	insertedAtFieldIndex []int
 }
 
 // New constructs a Store, opens a DuckDB connection, loads
@@ -129,10 +150,14 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 				"VersionColumn is set")
 	}
 
-	var zero T
-	b, err := buildBinder(reflect.TypeOf(zero))
+	b, err := buildBinder(reflect.TypeFor[T]())
 	if err != nil {
 		return nil, fmt.Errorf("s3sql: %w", err)
+	}
+
+	insertedAtIdx, err := validateInsertedAtField[T](cfg.InsertedAtField)
+	if err != nil {
+		return nil, err
 	}
 
 	db, err := openDuckDB(cfg.S3Client, cfg.ExtraInitSQL)
@@ -142,13 +167,50 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	}
 
 	return &Store[T]{
-		cfg:      cfg,
-		s3:       cfg.S3Client,
-		db:       db,
-		dataPath: core.DataPath(cfg.Prefix),
-		refPath:  core.RefPath(cfg.Prefix),
-		binder:   b,
+		cfg:                  cfg,
+		s3:                   cfg.S3Client,
+		db:                   db,
+		dataPath:             core.DataPath(cfg.Prefix),
+		refPath:              core.RefPath(cfg.Prefix),
+		binder:               b,
+		insertedAtFieldIndex: insertedAtIdx,
 	}, nil
+}
+
+// validateInsertedAtField resolves Config.InsertedAtField to a
+// struct-field index on T. Mirrors s3parquet.validateInsertedAtField:
+// the field must exist, be time.Time, and carry `parquet:"-"` so
+// it stays off the parquet schema and the row binder leaves it
+// alone — we populate it ourselves from the `filename` helper
+// column.
+func validateInsertedAtField[T any](name string) ([]int, error) {
+	if name == "" {
+		return nil, nil
+	}
+	rt := reflect.TypeFor[T]()
+	if rt.Kind() != reflect.Struct {
+		return nil, fmt.Errorf(
+			"s3sql: InsertedAtField requires T to be a struct, got %s",
+			rt)
+	}
+	f, ok := rt.FieldByName(name)
+	if !ok {
+		return nil, fmt.Errorf(
+			"s3sql: InsertedAtField %q: no such field on %s",
+			name, rt)
+	}
+	if f.Type != reflect.TypeFor[time.Time]() {
+		return nil, fmt.Errorf(
+			"s3sql: InsertedAtField %q: must be time.Time, got %s",
+			name, f.Type)
+	}
+	if tag := f.Tag.Get("parquet"); tag != "-" {
+		return nil, fmt.Errorf(
+			"s3sql: InsertedAtField %q: must be tagged "+
+				"`parquet:\"-\"` to stay library-managed "+
+				"(got %q)", name, tag)
+	}
+	return f.Index, nil
 }
 
 // Close releases the DuckDB connection.

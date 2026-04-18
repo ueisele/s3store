@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -442,6 +443,127 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 	if len(gotMissed) != 1 || gotMissed[0] != r1.DataPath {
 		t.Errorf("OnMissingData: got %v, want [%q]",
 			gotMissed, r1.DataPath)
+	}
+}
+
+// TestInsertedAtField_Populate covers the InsertedAtField hook:
+// Read and PollRecords populate a struct field with the source
+// file's write timestamp on decode. The field carries
+// `parquet:"-"` so it's library-managed (parquet-go ignores it
+// on both sides of the round-trip). We assert the populated
+// time is close to the Write wall-clock time for the call.
+func TestInsertedAtField_Populate(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+
+	type RecWithMeta struct {
+		Period     string    `parquet:"period"`
+		Customer   string    `parquet:"customer"`
+		SKU        string    `parquet:"sku"`
+		Ts         time.Time `parquet:"ts,timestamp(millisecond)"`
+		InsertedAt time.Time `parquet:"-"`
+	}
+
+	store, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r RecWithMeta) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow:    10 * time.Millisecond,
+		InsertedAtField: "InsertedAt",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	before := time.Now()
+	if _, err := store.Write(ctx, []RecWithMeta{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	after := time.Now()
+	time.Sleep(30 * time.Millisecond)
+
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	// The populated InsertedAt is the parquet file's write
+	// tsMicros, captured between before and after.
+	ia := got[0].InsertedAt
+	if ia.Before(before.Add(-time.Millisecond)) ||
+		ia.After(after.Add(time.Millisecond)) {
+		t.Errorf("InsertedAt=%v outside [%v, %v]",
+			ia, before, after)
+	}
+
+	// PollRecords goes through the same decode path; same
+	// populated value is expected.
+	polled, _, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords: %v", err)
+	}
+	if len(polled) != 1 {
+		t.Fatalf("PollRecords: got %d, want 1", len(polled))
+	}
+	if !polled[0].InsertedAt.Equal(ia) {
+		t.Errorf("PollRecords InsertedAt=%v, Read=%v "+
+			"(should match, same parquet file)",
+			polled[0].InsertedAt, ia)
+	}
+}
+
+// TestInsertedAtField_Validation covers the New()-time checks
+// that protect users from configuring InsertedAtField wrong: no
+// such field, wrong type, or a missing parquet:"-" tag.
+func TestInsertedAtField_Validation(t *testing.T) {
+	f := testutil.New(t)
+
+	mkCfg := func(field string) s3parquet.Config[Rec] {
+		return s3parquet.Config[Rec]{
+			Bucket:            f.Bucket,
+			Prefix:            "store",
+			S3Client:          f.S3Client,
+			PartitionKeyParts: []string{"period", "customer"},
+			PartitionKeyOf: func(r Rec) string {
+				return "period=p/customer=c"
+			},
+			InsertedAtField: field,
+		}
+	}
+
+	cases := []struct {
+		name     string
+		field    string
+		wantSubs string
+	}{
+		{"no such field", "Nonexistent", "no such field"},
+		// Ts is time.Time but has parquet:"ts,..." tag, not "-".
+		{"wrong parquet tag", "Ts", `must be tagged`},
+		// Period is string, not time.Time.
+		{"wrong type", "Period", "must be time.Time"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s3parquet.New[Rec](mkCfg(tc.field))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantSubs) {
+				t.Errorf("error %q does not contain %q",
+					err, tc.wantSubs)
+			}
+		})
 	}
 }
 

@@ -90,7 +90,7 @@ func (s *Store[T]) PollRecords(
 			"hive_partitioning=true, hive_types_autocast=false, "+
 			"union_by_name=true%s)",
 		strings.Join(uris, ", "),
-		filenameOpt(!o.IncludeHistory && s.cfg.dedupEnabled()))
+		filenameOpt(s.needsFilename(o.IncludeHistory)))
 
 	query := s.wrapScanExpr(scanExpr,
 		"SELECT * FROM "+s.cfg.TableAlias, o.IncludeHistory)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -191,6 +192,17 @@ func (s *Store[T]) downloadAndDecodeAll(
 					"s3parquet: decode %s: %w", key, err)
 				cancel()
 				return
+			}
+			// Populate Config.InsertedAtField if set. Happens on
+			// every Read/PollRecords call — zero reflect cost
+			// when insertedAtFieldIndex is nil.
+			if s.insertedAtFieldIndex != nil {
+				tsVal := reflect.ValueOf(insertedAt)
+				for j := range recs {
+					rv := reflect.ValueOf(&recs[j]).Elem()
+					rv.FieldByIndex(s.insertedAtFieldIndex).
+						Set(tsVal)
+				}
 			}
 			versioned := make([]versionedRecord[T], len(recs))
 			for j, r := range recs {

@@ -380,6 +380,35 @@ on its own. Pick the package whose tie-break matches your retry
 semantics — or make the tie impossible by ensuring `VersionColumn` /
 `VersionOf` strictly increases per write.
 
+### Per-record "when was this inserted"
+
+If a consumer needs the S3 write time of every record without
+storing it as a data column, set `Config.InsertedAtField` to the
+name of a `time.Time` field on `T`. The field must carry
+`parquet:"-"` so it stays off the parquet schema — the library
+populates it on decode from the source file's tsMicros.
+
+```go
+type Event struct {
+    Customer   string    `parquet:"customer"`
+    Amount     float64   `parquet:"amount"`
+    InsertedAt time.Time `parquet:"-"` // populated by the library
+}
+
+s3store.Config[Event]{
+    // ...
+    InsertedAtField: "InsertedAt",
+}
+
+recs, _ := store.Read(ctx, "*")
+// recs[i].InsertedAt is the parquet file's write time
+```
+
+Works on `s3parquet.Read` / `PollRecords` and, for the umbrella,
+`s3sql.Read` / `PollRecords` (via DuckDB's `read_parquet(filename=true)`
+— the helper column is parsed post-scan and never touches the
+parquet schema on disk). Zero reflection cost when unset.
+
 ### Stream — time window
 
 To read only records written within a time window (e.g. "yesterday's
@@ -751,6 +780,11 @@ type Config[T any] struct {
 
     // Stream
     SettleWindow time.Duration            // default: 5s
+
+    // Optional metadata hook: if set, Read / PollRecords
+    // populate this field on T (must be `time.Time`, tagged
+    // `parquet:"-"`) with the source file's write timestamp.
+    InsertedAtField string
 
     // DuckDB extras
     ExtraInitSQL []string                 // SET / CREATE SECRET / LOAD

@@ -73,6 +73,15 @@ type Config[T any] struct {
 	// s3parquet sub-store unchanged. See s3parquet.Config for
 	// full details.
 	BloomFilterColumns []string
+
+	// InsertedAtField names a time.Time field on T that Read and
+	// PollRecords populate with the source parquet file's write
+	// timestamp on decode. The field must be tagged `parquet:"-"`
+	// (validated at New()) so it stays off the parquet schema.
+	// Forwarded to both sub-stores so the umbrella's read paths
+	// — whether routed via s3parquet.PollRecords or s3sql.Read /
+	// PollRecords — populate the field consistently.
+	InsertedAtField string
 }
 
 // Re-export core types so callers of the umbrella never need

@@ -133,6 +133,86 @@ func TestRead_WithDedup(t *testing.T) {
 	}
 }
 
+// TestInsertedAtField_Populate covers the s3sql side of the
+// InsertedAtField hook: Read (which drives Query + scanAll)
+// populates a parquet-untagged time.Time field with the source
+// file's write timestamp, parsed out of DuckDB's `filename`
+// column. Validates the hot-path wiring end-to-end: scan-expr
+// emits filename=true, CTE keeps the column, scanAll routes it
+// through core.ParseDataFileName into the struct field.
+func TestInsertedAtField_Populate(t *testing.T) {
+	type RecWithMeta struct {
+		Period     string    `parquet:"period"`
+		Customer   string    `parquet:"customer"`
+		SKU        string    `parquet:"sku"`
+		Amount     float64   `parquet:"amount"`
+		Ts         time.Time `parquet:"ts,timestamp(millisecond)"`
+		InsertedAt time.Time `parquet:"-"`
+	}
+
+	f := testutil.New(t)
+	w, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r RecWithMeta) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	sq, err := s3sql.New[RecWithMeta](s3sql.Config[RecWithMeta]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		TableAlias:        "records",
+		SettleWindow:      10 * time.Millisecond,
+		ExtraInitSQL:      f.DuckDBCredentials(),
+		InsertedAtField:   "InsertedAt",
+	})
+	if err != nil {
+		t.Fatalf("s3sql.New: %v", err)
+	}
+	t.Cleanup(func() { _ = sq.Close() })
+
+	before := time.Now()
+	if _, err := w.Write(context.Background(), []RecWithMeta{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 10, Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	after := time.Now()
+	time.Sleep(30 * time.Millisecond)
+
+	got, err := sq.Read(context.Background(), "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	ia := got[0].InsertedAt
+	if ia.Before(before.Add(-time.Millisecond)) ||
+		ia.After(after.Add(time.Millisecond)) {
+		t.Errorf("InsertedAt=%v outside [%v, %v]",
+			ia, before, after)
+	}
+	// Data columns still scan through the normal binder —
+	// InsertedAtField plumbing mustn't disrupt them.
+	if got[0].Amount != 10 {
+		t.Errorf("Amount=%v, want 10 (binder regression)",
+			got[0].Amount)
+	}
+}
+
 // TestRead_DedupVersionTieDeterministic covers the edge case
 // where two writes share the exact VersionColumn value — without
 // a secondary tie-break, DuckDB's ROW_NUMBER would pick a winner
