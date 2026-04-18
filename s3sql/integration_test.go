@@ -42,8 +42,8 @@ func partitionKeyOfRec(r Rec) string {
 
 // sqlOpts dials in the dedup config a given test cares about.
 type sqlOpts struct {
-	versionColumn string
-	dedupBy       []string
+	versionColumn    string
+	entityKeyColumns []string
 }
 
 // testFixture bundles the per-test MinIO bucket + a matching
@@ -81,7 +81,7 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 		PartitionKeyParts: []string{"period", "customer"},
 		TableAlias:        "records",
 		VersionColumn:     opts.versionColumn,
-		DeduplicateBy:     opts.dedupBy,
+		EntityKeyColumns:  opts.entityKeyColumns,
 		SettleWindow:      10 * time.Millisecond,
 		ExtraInitSQL:      f.DuckDBCredentials(),
 	})
@@ -106,7 +106,10 @@ func (f *testFixture) writeSome(t *testing.T, recs []Rec) {
 // TestRead_WithDedup exercises the SQL read path end-to-end,
 // including DuckDB's QUALIFY-based dedup via VersionColumn.
 func TestRead_WithDedup(t *testing.T) {
-	f := newFixture(t, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
 
 	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
@@ -131,7 +134,10 @@ func TestRead_WithDedup(t *testing.T) {
 // TestRead_WithHistory verifies every version is returned when
 // WithHistory disables dedup.
 func TestRead_WithHistory(t *testing.T) {
-	f := newFixture(t, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
 
 	for i := int64(0); i < 3; i++ {
 		f.writeSome(t, []Rec{
@@ -154,8 +160,8 @@ func TestRead_WithHistory(t *testing.T) {
 // TestQuery covers the arbitrary-SQL path with an aggregation.
 func TestQuery(t *testing.T) {
 	f := newFixture(t, sqlOpts{
-		versionColumn: "ts",
-		dedupBy:       []string{"period", "customer", "sku"},
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
 	})
 
 	f.writeSome(t, []Rec{
@@ -207,7 +213,10 @@ func TestQuery(t *testing.T) {
 // errorRow path: an invalid key pattern must surface as an
 // error at Scan time (database/sql convention).
 func TestQueryRow(t *testing.T) {
-	f := newFixture(t, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
 
 	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 42, Currency: "USD", Ts: time.UnixMilli(1)},
@@ -237,7 +246,8 @@ func TestQueryRow(t *testing.T) {
 // s3parquet-forwarded version used by the umbrella). Entries
 // must be chronological and the cursor must advance correctly.
 func TestPoll(t *testing.T) {
-	f := newFixture(t, sqlOpts{versionColumn: "ts"})
+	// No dedup config — Poll doesn't exercise dedup.
+	f := newFixture(t, sqlOpts{})
 
 	for i := 0; i < 3; i++ {
 		f.writeSome(t, []Rec{
@@ -271,7 +281,10 @@ func TestPoll(t *testing.T) {
 // TestPollRecords covers the DuckDB-powered PollRecords path,
 // including dedup semantics against a multi-write key.
 func TestPollRecords(t *testing.T) {
-	f := newFixture(t, sqlOpts{versionColumn: "ts"})
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
 
 	f.writeSome(t, []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},

@@ -9,8 +9,8 @@ import (
 
 // Query executes a SQL query scoped to files matching the given
 // key pattern. Glob grammar follows core.ValidateKeyPattern.
-// Deduplicated by VersionColumn+DeduplicateBy by default; pass
-// WithHistory() for all versions.
+// Deduplicated by VersionColumn + EntityKeyColumns when both
+// are configured; pass WithHistory() to opt out.
 func (s *Store[T]) Query(
 	ctx context.Context,
 	keyPattern string,

@@ -410,9 +410,10 @@ type Config[T any] struct {
     // Required for Write
     PartitionKeyOf func(T) string         // derive key from record (Write)
 
-    // SQL-side dedup (used by Read / PollRecords / Query)
-    VersionColumn string                  // column to ORDER BY for latest
-    DeduplicateBy []string                // dedup keys (default: PartitionKeyParts)
+    // SQL-side dedup (used by Read / PollRecords / Query).
+    // Both or neither — explicit opt-in, no default.
+    EntityKeyColumns []string             // columns that identify an entity
+    VersionColumn    string               // column to ORDER BY for latest
 
     // Stream
     SettleWindow time.Duration            // default: 5s
@@ -459,6 +460,12 @@ Breaking changes in the package-split refactor:
   "missing column → Go zero" contract is now built in to both read paths.
   For non-zero defaults, apply them in your app code or use `Query` with
   `COALESCE`. For column renames, rewrite the affected files.
+- **`Config.DeduplicateBy` → `Config.EntityKeyColumns`, no default** —
+  mirrors `s3parquet.Config.EntityKeyOf`: explicit opt-in to latest-per-
+  entity dedup, no silent partition-key default. `VersionColumn` and
+  `EntityKeyColumns` must now be set together (both or neither); `New()`
+  rejects one without the other. If you relied on the old default, set
+  `EntityKeyColumns = PartitionKeyParts` explicitly.
 
 ## Testing
 

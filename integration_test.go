@@ -23,12 +23,12 @@ type IntRecord struct {
 }
 
 // newStore builds an umbrella Store against a fresh bucket on
-// the shared MinIO fixture. Exposes the two knobs individual
-// tests care about (SettleWindow, DeduplicateBy); everything
-// else is the same realistic billing-ish configuration.
+// the shared MinIO fixture. Exposes the knobs individual tests
+// care about; everything else is the same realistic
+// billing-ish configuration.
 type storeOpts struct {
-	settleWindow  time.Duration
-	deduplicateBy []string
+	settleWindow     time.Duration
+	entityKeyColumns []string // dedup key; empty disables dedup
 }
 
 func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
@@ -38,14 +38,20 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 	if opts.settleWindow == 0 {
 		opts.settleWindow = 10 * time.Millisecond
 	}
+	// VersionColumn is paired with EntityKeyColumns: both or
+	// neither, matching New()'s validation.
+	versionColumn := ""
+	if len(opts.entityKeyColumns) > 0 {
+		versionColumn = "ts"
+	}
 	store, err := New[IntRecord](Config[IntRecord]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		TableAlias:        "records",
-		VersionColumn:     "ts",
-		DeduplicateBy:     opts.deduplicateBy,
+		VersionColumn:     versionColumn,
+		EntityKeyColumns:  opts.entityKeyColumns,
 		SettleWindow:      opts.settleWindow,
 		PartitionKeyOf: func(r IntRecord) string {
 			return fmt.Sprintf(
@@ -78,16 +84,14 @@ func TestUmbrella_WriteRead(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	// Default dedup scope is DeduplicateBy=PartitionKeyParts=(period,
-	// customer), so each customer-partition keeps exactly one
-	// record — the latest by ts. customer=abc has two records,
-	// the s2/Amount=20 one wins.
+	// newStore was called without entityKeyColumns, so no dedup:
+	// every written record comes back.
 	got, err := store.Read(ctx, "*")
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %d records, want 2 (one per customer)", len(got))
+	if len(got) != len(in) {
+		t.Fatalf("got %d records, want %d", len(got), len(in))
 	}
 }
 
@@ -139,7 +143,7 @@ func TestUmbrella_WritePoll(t *testing.T) {
 func TestUmbrella_WritePollRecords(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
-		deduplicateBy: []string{"period", "customer", "sku"},
+		entityKeyColumns: []string{"period", "customer", "sku"},
 	})
 
 	key := "period=2026-03-17/customer=abc"
@@ -180,7 +184,7 @@ func TestUmbrella_WritePollRecords(t *testing.T) {
 func TestUmbrella_Query(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
-		deduplicateBy: []string{"period", "customer", "sku"},
+		entityKeyColumns: []string{"period", "customer", "sku"},
 	})
 
 	if _, err := store.Write(ctx, []IntRecord{
@@ -298,7 +302,6 @@ func TestUmbrella_Close(t *testing.T) {
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		TableAlias:        "records",
-		VersionColumn:     "ts",
 		PartitionKeyOf: func(r IntRecord) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)

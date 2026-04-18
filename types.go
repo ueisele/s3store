@@ -40,14 +40,17 @@ type Config[T any] struct {
 	// record. Required for Write(); used to group records.
 	PartitionKeyOf func(T) string
 
-	// VersionColumn is the column name used for deduplication
-	// in Read / PollRecords / Query. Leave empty to disable
-	// dedup on the SQL path.
+	// VersionColumn is the column name that orders versions of
+	// the same entity on the SQL read path: the record with the
+	// greatest VersionColumn value per entity wins. Required
+	// when EntityKeyColumns is set; otherwise ignored.
 	VersionColumn string
 
-	// DeduplicateBy defines the columns that identify a unique
-	// record for SQL-side dedup. Defaults to PartitionKeyParts.
-	DeduplicateBy []string
+	// EntityKeyColumns are the SQL-side columns that identify a
+	// unique entity for latest-per-entity dedup. Leave empty
+	// to disable dedup entirely. Mirrors s3parquet's
+	// EntityKeyOf — explicit opt-in, no default.
+	EntityKeyColumns []string
 
 	// TableAlias is the name used in SQL queries for the
 	// wrapper CTE. Required.

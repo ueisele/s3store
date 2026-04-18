@@ -48,13 +48,22 @@ type Config[T any] struct {
 	// PollRecords read. Default: 5s.
 	SettleWindow time.Duration
 
-	// VersionColumn is the column name used for deduplication.
-	// Leave empty to disable dedup (pure stream semantics).
+	// VersionColumn is the column name that orders versions of
+	// the same entity: the record with the greatest VersionColumn
+	// value per entity wins. Required when EntityKeyColumns is
+	// set; otherwise ignored.
 	VersionColumn string
 
-	// DeduplicateBy defines the columns that identify a unique
-	// record for dedup purposes. Defaults to PartitionKeyParts.
-	DeduplicateBy []string
+	// EntityKeyColumns are the columns that identify a unique
+	// entity for latest-per-entity deduplication. Leave empty
+	// to disable dedup entirely (pure stream semantics).
+	//
+	// Mirrors s3parquet's EntityKeyOf: explicit opt-in. There's
+	// no default — partition layout and entity identity are
+	// different axes, and defaulting one to the other silently
+	// produces wrong results when a partition holds multiple
+	// entities.
+	EntityKeyColumns []string
 
 	// ExtraInitSQL runs after the auto-derived S3 settings and
 	// the object-cache pragma, in order. Use for CREATE SECRET,
@@ -69,11 +78,11 @@ func (c Config[T]) settleWindow() time.Duration {
 	return 5 * time.Second
 }
 
-func (c Config[T]) dedupColumns() []string {
-	if len(c.DeduplicateBy) > 0 {
-		return c.DeduplicateBy
-	}
-	return c.PartitionKeyParts
+// dedupEnabled reports whether the store should emit a dedup
+// CTE for reads. Gated on EntityKeyColumns being non-empty;
+// New() guarantees VersionColumn is also set when this is true.
+func (c Config[T]) dedupEnabled() bool {
+	return len(c.EntityKeyColumns) > 0
 }
 
 // Store is the cgo / DuckDB entry point to an s3store.
@@ -103,6 +112,21 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	}
 	if err := core.ValidatePartitionKeyParts(cfg.PartitionKeyParts); err != nil {
 		return nil, err
+	}
+	// EntityKeyColumns + VersionColumn must be set together or
+	// not at all. Either alone is a misconfiguration that would
+	// silently produce wrong dedup (without VersionColumn,
+	// QUALIFY has nothing to ORDER BY) or a dead config field
+	// (without EntityKeyColumns, VersionColumn is never used).
+	if len(cfg.EntityKeyColumns) > 0 && cfg.VersionColumn == "" {
+		return nil, fmt.Errorf(
+			"s3sql: VersionColumn is required when " +
+				"EntityKeyColumns is set")
+	}
+	if cfg.VersionColumn != "" && len(cfg.EntityKeyColumns) == 0 {
+		return nil, fmt.Errorf(
+			"s3sql: EntityKeyColumns is required when " +
+				"VersionColumn is set")
 	}
 
 	var zero T

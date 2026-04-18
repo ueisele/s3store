@@ -48,8 +48,8 @@ func (s *Store[T]) wrapScanExpr(
 ) string {
 	var sb strings.Builder
 	sb.WriteString("WITH ")
-	if !includeHistory && s.cfg.VersionColumn != "" {
-		dedupCols := strings.Join(s.cfg.dedupColumns(), ", ")
+	if !includeHistory && s.cfg.dedupEnabled() {
+		dedupCols := strings.Join(s.cfg.EntityKeyColumns, ", ")
 		fmt.Fprintf(&sb,
 			"%s AS (\n  %s\n  QUALIFY ROW_NUMBER() OVER "+
 				"(PARTITION BY %s ORDER BY %s DESC"+

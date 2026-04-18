@@ -57,7 +57,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		TableAlias:        cfg.TableAlias,
 		SettleWindow:      cfg.SettleWindow,
 		VersionColumn:     cfg.VersionColumn,
-		DeduplicateBy:     cfg.DeduplicateBy,
+		EntityKeyColumns:  cfg.EntityKeyColumns,
 		ExtraInitSQL:      cfg.ExtraInitSQL,
 	})
 	if err != nil {

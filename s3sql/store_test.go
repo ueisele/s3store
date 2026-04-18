@@ -130,16 +130,56 @@ func TestBuildParquetURI(t *testing.T) {
 	}
 }
 
-func TestDedupColumns(t *testing.T) {
-	c := Config[testRec]{PartitionKeyParts: []string{"period", "customer"}}
-	got := c.dedupColumns()
-	if len(got) != 2 || got[0] != "period" || got[1] != "customer" {
-		t.Errorf("default: got %v", got)
+// TestDedupEnabled guards the dedup gate: explicit opt-in via
+// EntityKeyColumns, no default.
+func TestDedupEnabled(t *testing.T) {
+	var c Config[testRec]
+	if c.dedupEnabled() {
+		t.Error("empty config: dedupEnabled should be false")
 	}
-	c.DeduplicateBy = []string{"customer_id", "sku"}
-	got = c.dedupColumns()
-	if len(got) != 2 || got[0] != "customer_id" || got[1] != "sku" {
-		t.Errorf("override: got %v", got)
+	c.EntityKeyColumns = []string{"customer_id", "sku"}
+	if !c.dedupEnabled() {
+		t.Error("with EntityKeyColumns: dedupEnabled should be true")
+	}
+}
+
+// TestNew_DedupValidation guards the both-or-neither rule: a
+// VersionColumn without EntityKeyColumns (or vice versa) is a
+// misconfiguration New() must reject at construction time.
+func TestNew_DedupValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config[testRec])
+		wantSub string
+	}{
+		{
+			name: "VersionColumn without EntityKeyColumns",
+			mutate: func(c *Config[testRec]) {
+				c.VersionColumn = "ts"
+			},
+			wantSub: "EntityKeyColumns is required",
+		},
+		{
+			name: "EntityKeyColumns without VersionColumn",
+			mutate: func(c *Config[testRec]) {
+				c.EntityKeyColumns = []string{"customer_id"}
+			},
+			wantSub: "VersionColumn is required",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(&cfg)
+			_, err := New(cfg)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q did not contain %q",
+					err.Error(), tc.wantSub)
+			}
+		})
 	}
 }
 
