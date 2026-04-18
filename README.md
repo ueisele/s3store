@@ -281,6 +281,31 @@ Whether dedup actually runs depends on which package you use:
 
 `WithHistory()` forces the no-dedup path in every case.
 
+### Stream — time window
+
+To read only records written within a time window (e.g. "yesterday's
+activity"), use `OffsetAt` to turn a wall-clock time into a stream offset
+and `WithUntilOffset` to bound `Poll` / `PollRecords` from above. The
+range is half-open `[since, until)`, matching Kafka offset semantics:
+
+```go
+start := store.OffsetAt(yesterdayStart)
+end   := store.OffsetAt(yesterdayEnd)
+for {
+    records, next, err := store.PollRecords(ctx, start, 100,
+        s3store.WithUntilOffset(end))
+    if err != nil { return err }
+    if len(records) == 0 { break }
+    // process records
+    start = next
+}
+```
+
+`OffsetAt` is pure computation — no S3 call. `WithUntilOffset` breaks
+the paginator early once offsets reach `until`, so long streams aren't
+scanned past the window of interest. Available on the umbrella,
+`s3parquet`, and `s3sql`.
+
 ### Snapshot
 
 ```go

@@ -13,18 +13,27 @@ import (
 // s3ListMaxKeys is the per-request page-size cap enforced by S3.
 const s3ListMaxKeys int32 = 1000
 
-// Poll returns up to maxEntries stream entries (refs only) after
-// the given offset, up to now - SettleWindow. Issues one or more
-// S3 LIST calls (page size capped at 1000) and no GETs.
+// Poll returns up to maxEntries stream entries (refs only)
+// after the given offset, up to now - SettleWindow. Issues one
+// or more S3 LIST calls (page size capped at 1000) and no GETs.
+//
+// Accepts WithUntilOffset to bound the walk from above: entries
+// with offset >= until are skipped and the paginator breaks
+// early so long streams don't have to be scanned past the
+// window of interest.
 func (s *Store[T]) Poll(
 	ctx context.Context,
 	since core.Offset,
 	maxEntries int32,
+	opts ...core.QueryOption,
 ) ([]core.StreamEntry, core.Offset, error) {
 	if maxEntries <= 0 {
 		return nil, since, fmt.Errorf(
 			"s3parquet: maxEntries must be > 0")
 	}
+
+	var o core.QueryOpts
+	o.Apply(opts...)
 
 	cutoffPrefix := core.RefCutoff(
 		s.refPath, time.Now(), s.cfg.settleWindow())
@@ -67,6 +76,9 @@ outer:
 			if objKey > cutoffPrefix {
 				break outer
 			}
+			if o.Until != "" && objKey >= string(o.Until) {
+				break outer
+			}
 			key, tsMicros, shortID, err := core.ParseRefKey(objKey)
 			if err != nil {
 				return nil, since, err
@@ -107,7 +119,7 @@ func (s *Store[T]) PollRecords(
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	entries, newOffset, err := s.Poll(ctx, since, maxEntries)
+	entries, newOffset, err := s.Poll(ctx, since, maxEntries, opts...)
 	if err != nil {
 		return nil, since, err
 	}
@@ -130,4 +142,19 @@ func (s *Store[T]) PollRecords(
 	}
 	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf),
 		newOffset, nil
+}
+
+// OffsetAt returns the stream offset corresponding to wall-
+// clock time t: any ref written at or after t sorts >= the
+// returned offset, any ref written before t sorts < it.
+//
+// Pure computation — no S3 call. Pair with WithUntilOffset to
+// read records within a time window:
+//
+//	start := store.OffsetAt(from)
+//	end   := store.OffsetAt(to)
+//	records, _, _ := store.PollRecords(ctx, start, 100,
+//	    s3parquet.WithUntilOffset(end))
+func (s *Store[T]) OffsetAt(t time.Time) core.Offset {
+	return core.Offset(core.RefCutoff(s.refPath, t, 0))
 }

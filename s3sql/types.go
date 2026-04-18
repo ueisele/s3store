@@ -23,3 +23,10 @@ type QueryOption = core.QueryOption
 func WithHistory() QueryOption {
 	return core.WithHistory()
 }
+
+// WithUntilOffset bounds Poll / PollRecords from above: only
+// entries with offset < until are returned (half-open range).
+// Pair with Store.OffsetAt to read records in a time window.
+func WithUntilOffset(until Offset) QueryOption {
+	return core.WithUntilOffset(until)
+}

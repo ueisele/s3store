@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 
 	"github.com/ueisele/s3store/s3parquet"
 	"github.com/ueisele/s3store/s3sql"
@@ -93,8 +94,16 @@ func (s *Store[T]) WriteWithKey(
 // DuckDB involvement).
 func (s *Store[T]) Poll(
 	ctx context.Context, since Offset, maxEntries int32,
+	opts ...QueryOption,
 ) ([]StreamEntry, Offset, error) {
-	return s.parquet.Poll(ctx, since, maxEntries)
+	return s.parquet.Poll(ctx, since, maxEntries, opts...)
+}
+
+// OffsetAt returns the stream offset corresponding to wall-
+// clock time t. Pair with WithUntilOffset on Poll/PollRecords
+// to read records within a time window.
+func (s *Store[T]) OffsetAt(t time.Time) Offset {
+	return s.parquet.OffsetAt(t)
 }
 
 // Read delegates to the SQL sub-store so dedup semantics and

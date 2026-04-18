@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/ueisele/s3store/internal/core"
 )
 
 type testRec struct {
@@ -232,6 +233,42 @@ func TestDefaultVersionOf(t *testing.T) {
 	got := DefaultVersionOf(testRec{}, ts)
 	if got != 1_710_684_000_000_000 {
 		t.Errorf("got %d, want %d", got, 1_710_684_000_000_000)
+	}
+}
+
+// TestOffsetAt guards the lex-cursor semantics: a ref encoded
+// before time t must sort strictly less than OffsetAt(t); a ref
+// encoded at exactly time t must sort at or after it. These
+// are the invariants Poll+WithUntilOffset relies on to turn a
+// time window into the correct half-open offset range.
+func TestOffsetAt(t *testing.T) {
+	s := &Store[testRec]{
+		cfg:     validConfig(),
+		refPath: "p/_stream/refs",
+	}
+	anchor := time.UnixMicro(2_000_000_000_000_000)
+	off := s.OffsetAt(anchor)
+
+	earlier := core.EncodeRefKey(
+		s.refPath, anchor.Add(-time.Millisecond).UnixMicro(),
+		"abcd1234", "period=X/customer=y")
+	if earlier >= string(off) {
+		t.Errorf("earlier ref %q should sort before offset %q",
+			earlier, off)
+	}
+	same := core.EncodeRefKey(
+		s.refPath, anchor.UnixMicro(),
+		"abcd1234", "period=X/customer=y")
+	if same < string(off) {
+		t.Errorf("same-time ref %q should sort >= offset %q",
+			same, off)
+	}
+	later := core.EncodeRefKey(
+		s.refPath, anchor.Add(time.Second).UnixMicro(),
+		"abcd1234", "period=X/customer=y")
+	if later <= string(off) {
+		t.Errorf("later ref %q should sort after offset %q",
+			later, off)
 	}
 }
 

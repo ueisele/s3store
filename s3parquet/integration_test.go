@@ -450,6 +450,87 @@ func TestPollRecords(t *testing.T) {
 	}
 }
 
+// TestPollTimeWindow exercises OffsetAt + WithUntilOffset: a
+// series of writes spread across time, then a Poll bounded
+// from both sides pulls only the middle window. Also verifies
+// the paginator stops early and the returned offset lands
+// inside the window.
+func TestPollTimeWindow(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// Three writes separated by small pauses; OffsetAt uses
+	// microsecond precision so 5ms is enough to give each ref a
+	// distinctly-orderable timestamp even on fast hosts.
+	beforeFirst := time.Now()
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=a",
+		[]Rec{{Period: "2026-03-17", Customer: "a", SKU: "s1"}},
+	); err != nil {
+		t.Fatalf("Write 1: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	afterFirst := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=b",
+		[]Rec{{Period: "2026-03-17", Customer: "b", SKU: "s2"}},
+	); err != nil {
+		t.Fatalf("Write 2: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	beforeThird := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=c",
+		[]Rec{{Period: "2026-03-17", Customer: "c", SKU: "s3"}},
+	); err != nil {
+		t.Fatalf("Write 3: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	// Full stream: three entries.
+	all, _, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("baseline: got %d entries, want 3", len(all))
+	}
+
+	// Window [afterFirst, beforeThird) should contain only the
+	// middle write (customer=b).
+	start := store.OffsetAt(afterFirst)
+	end := store.OffsetAt(beforeThird)
+	window, _, err := store.Poll(ctx, start, 100,
+		s3parquet.WithUntilOffset(end))
+	if err != nil {
+		t.Fatalf("Poll window: %v", err)
+	}
+	if len(window) != 1 {
+		t.Fatalf("window: got %d entries, want 1", len(window))
+	}
+	if window[0].Key != "period=2026-03-17/customer=b" {
+		t.Errorf("window[0]: got %q, want customer=b", window[0].Key)
+	}
+
+	// Empty window: before the first write should return zero
+	// entries and not advance the cursor.
+	offZero := store.OffsetAt(beforeFirst.Add(-time.Hour))
+	offEnd := store.OffsetAt(beforeFirst.Add(-time.Minute))
+	empty, off2, err := store.Poll(ctx, offZero, 100,
+		s3parquet.WithUntilOffset(offEnd))
+	if err != nil {
+		t.Fatalf("Poll empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("empty window: got %d entries, want 0", len(empty))
+	}
+	if off2 != offZero {
+		t.Errorf("empty window: offset drifted %q -> %q", offZero, off2)
+	}
+}
+
 // ParquetField is a named int8 enum, mirroring the shape a
 // go-enum generator would produce. Declared at package scope
 // so Store[T] generic instantiation works at integration-test

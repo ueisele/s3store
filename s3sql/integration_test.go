@@ -302,6 +302,91 @@ func TestPollRecords(t *testing.T) {
 	}
 }
 
+// TestPollTimeWindow mirrors the s3parquet time-window test on
+// the SQL side: OffsetAt + WithUntilOffset bound Poll /
+// PollRecords to a half-open [start, end) range. Guards that
+// the underlying ref ordering is identical (shared core codec)
+// and that the SQL package honors Until in both Poll and
+// PollRecords.
+func TestPollTimeWindow(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+	ctx := context.Background()
+
+	beforeFirst := time.Now()
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "a", SKU: "s1",
+			Amount: 1, Currency: "USD", Ts: time.UnixMilli(1)},
+	})
+	time.Sleep(5 * time.Millisecond)
+	afterFirst := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "b", SKU: "s2",
+			Amount: 2, Currency: "USD", Ts: time.UnixMilli(2)},
+	})
+	time.Sleep(5 * time.Millisecond)
+	beforeThird := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "c", SKU: "s3",
+			Amount: 3, Currency: "USD", Ts: time.UnixMilli(3)},
+	})
+
+	// Full stream: three entries.
+	all, _, err := f.sql.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("baseline: got %d entries, want 3", len(all))
+	}
+
+	// Window [afterFirst, beforeThird) — middle write only.
+	start := f.sql.OffsetAt(afterFirst)
+	end := f.sql.OffsetAt(beforeThird)
+	window, _, err := f.sql.Poll(ctx, start, 100,
+		s3sql.WithUntilOffset(end))
+	if err != nil {
+		t.Fatalf("Poll window: %v", err)
+	}
+	if len(window) != 1 {
+		t.Fatalf("window: got %d entries, want 1", len(window))
+	}
+	if window[0].Key != "period=2026-03-17/customer=b" {
+		t.Errorf("window[0]: got %q, want customer=b",
+			window[0].Key)
+	}
+
+	// PollRecords respects Until too — same window should
+	// surface exactly one record.
+	recs, _, err := f.sql.PollRecords(ctx, start, 100,
+		s3sql.WithUntilOffset(end))
+	if err != nil {
+		t.Fatalf("PollRecords window: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Customer != "b" {
+		t.Errorf("PollRecords window: got %+v, want 1 rec customer=b",
+			recs)
+	}
+
+	// Empty-window case — cursor must not drift.
+	offZero := f.sql.OffsetAt(beforeFirst.Add(-time.Hour))
+	offEnd := f.sql.OffsetAt(beforeFirst.Add(-time.Minute))
+	empty, off2, err := f.sql.Poll(ctx, offZero, 100,
+		s3sql.WithUntilOffset(offEnd))
+	if err != nil {
+		t.Fatalf("Poll empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("empty window: got %d entries, want 0",
+			len(empty))
+	}
+	if off2 != offZero {
+		t.Errorf("empty window: offset drifted %q -> %q",
+			offZero, off2)
+	}
+}
+
 // TestRead_MissingColumnZeroFills guards the "added a new
 // column to T" contract on the SQL side: a file missing a
 // column the reader expects must come back with that column as
