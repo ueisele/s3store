@@ -66,6 +66,8 @@ func TestValidateKey(t *testing.T) {
 		{"extra segment", "period=X/customer=Y/extra=Z", true},
 		{"wrong name", "x=X/customer=Y", true},
 		{"empty value", "period=/customer=Y", true},
+		{"double-dot in value", "period=2026..03-17/customer=Y", true},
+		{"double-dot in tail value", "period=X/customer=a..b", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -213,6 +213,42 @@ s3://warehouse/billing/
   the timestamp, a short UUID, and the partition key. `Poll` is a single
   S3 LIST over this prefix — no GETs.
 
+### Partition naming: column or path-only
+
+`PartitionKeyParts` names can either match Parquet column names or be entirely
+separate — both patterns are supported.
+
+**Pattern A — partition name == Parquet column name** (all the examples above).
+The partition key is a real record attribute, and `PartitionKeyOf` reads it
+directly from the struct. On the `s3sql` read path, DuckDB exposes the Hive
+partition column *alongside* the Parquet column of the same name; the
+Hive-derived value wins when they collide. Because `Write` derives the path
+from the same record the Parquet file holds, they always agree, so the
+"hive wins" rule is invisible in normal code. The one way to hit it is to
+call `WriteWithKey` with a key inconsistent with the record's fields —
+don't do that.
+
+**Pattern B — partition name separate from every Parquet column** (classical
+Hive). The partition key is *derived*, not stored as a field:
+
+```go
+// Parquet columns: ts, customer_id, amount — no "year"/"month".
+PartitionKeyParts: []string{"year", "month"},
+PartitionKeyOf: func(r Record) string {
+    y, m, _ := r.Ts.Date()
+    return fmt.Sprintf("year=%d/month=%02d", y, int(m))
+},
+```
+
+Partition values live only in the path, saving storage. `s3sql` still
+surfaces them as columns and you can `SELECT` or `WHERE` on them; the
+reflection-based row binder silently discards them when they have no
+matching struct field. `s3parquet` ignores Hive paths entirely — if you
+need `year`/`month` on the Go-only read path, reconstruct them from `Ts`.
+
+Pick A when the partition is a first-class attribute (customer, tenant);
+pick B when it's a derived time bucket. Mixing within one store is fine.
+
 ## Glob grammar
 
 Both `s3parquet` and `s3sql` share one grammar, validated identically:
@@ -223,6 +259,9 @@ Both `s3parquet` and `s3sql` share one grammar, validated identically:
 | `charge_period=2026-03-17/customer=abc` — exact | ✓ |
 | `charge_period=2026-03-*/customer=abc` — trailing `*` in value | ✓ |
 | `*/customer=abc` — whole-segment `*` | ✓ |
+| `charge_period=2026-03-01..2026-04-01/customer=abc` — range `FROM..TO` | ✓ |
+| `charge_period=2026-03-01../customer=abc` — range, unbounded upper | ✓ |
+| `charge_period=..2026-04-01/customer=abc` — range, unbounded lower | ✓ |
 | `charge_period=*-17/customer=abc` — leading `*` | ✗ |
 | `charge_period=2026-*-17/customer=abc` — middle `*` | ✗ |
 | `charge_period=[0-9]/customer=abc` — char class | ✗ |
@@ -230,6 +269,45 @@ Both `s3parquet` and `s3sql` share one grammar, validated identically:
 
 Truncated patterns (fewer segments than `PartitionKeyParts`) and mislabelled
 segments (part name in the wrong position) are also rejected.
+
+### Partition ranges
+
+`keyPart=FROM..TO` matches any value `v` with `FROM <= v < TO`, lex order
+(half-open, mirroring `WithUntilOffset`). Either side may be empty for an
+unbounded end. Both sides are plain literals — no `*`, no `..`. `..` alone
+is rejected; use `*` to match everything.
+
+Ranges enable partition pruning: both read paths extract the common prefix
+of `FROM` and `TO` as an S3 `LIST` prefix so only potentially-matching keys
+are enumerated. The SQL path additionally pushes the bounds down as a
+`WHERE` predicate on the hive partition column, so DuckDB skips non-matching
+files at plan time.
+
+**Bounds are compared lexicographically** — byte-wise on both read paths
+(`s3parquet` uses Go string compare; `s3sql` runs the `WHERE` against the
+Hive partition column as `VARCHAR`, since we pass `hive_types_autocast=false`
+so DuckDB never reinterprets the value as DATE / INT). That makes the two
+paths agree exactly, but it also means the range matches *characters*, not
+numbers or dates. **Partition values must be chosen so lex order matches
+intent:**
+
+- ISO-8601 timestamps (`2026-03-01T00`, `2026-03-01`) — correct by design.
+- Zero-padded fixed-width numbers (`00042`, not `42`) — correct.
+- Unpadded numbers are a trap: `customer=10..100` validates cleanly, but lex
+  order includes `"2"` (because `"2" > "10"` byte-wise) and excludes `"42"`.
+  The validator catches the fully-reversed case (`42..100` is rejected as
+  `from > to`) but not this subtler one. If your values are numeric, pad
+  them or switch to a string shape that sorts correctly.
+
+**Equal endpoints match nothing.** `FROM..FROM` is valid grammar but yields
+zero rows (half-open `[a, a)` is empty), mirroring `WithUntilOffset` where
+`since == until` returns no records. Use an exact segment (`keyPart=FROM`)
+if that's what you meant.
+
+`..` is reserved: the write path rejects any partition value that contains
+`..` (otherwise a value like `a..b` would be unaddressable — any pattern
+mentioning it would be parsed as a range). Escape / reshape the value on
+the way in if your domain needs literal `..`.
 
 ## Access patterns
 

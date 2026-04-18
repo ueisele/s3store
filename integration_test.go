@@ -229,6 +229,33 @@ func TestUmbrella_Query(t *testing.T) {
 	}
 }
 
+// TestUmbrella_PartitionRange proves the FROM..TO range syntax
+// forwards through the umbrella to the SQL sub-store. Half-open
+// [from, to) bounds on a partition column are the canonical use
+// case the range form was added for.
+func TestUmbrella_PartitionRange(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	if _, err := store.Write(ctx, []IntRecord{
+		{Period: "2026-02-28", Customer: "abc", SKU: "s", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-01", Customer: "abc", SKU: "s", Ts: time.UnixMilli(2)},
+		{Period: "2026-03-15", Customer: "abc", SKU: "s", Ts: time.UnixMilli(3)},
+		{Period: "2026-04-01", Customer: "abc", SKU: "s", Ts: time.UnixMilli(4)},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got, err := store.Read(ctx,
+		"period=2026-03-01..2026-04-01/customer=abc")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d records, want 2 (half-open [from, to))", len(got))
+	}
+}
+
 // TestUmbrella_QueryRowInvalidPattern guards that an invalid
 // key pattern surfaces via *sql.Row at Scan time
 // (database/sql convention), not via a panic or silent zero

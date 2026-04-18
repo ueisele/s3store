@@ -157,6 +157,96 @@ func TestRead_WithHistory(t *testing.T) {
 	}
 }
 
+// TestRead_PartitionRange exercises the FROM..TO range form on
+// the SQL read path: common-prefix glob + WHERE predicate on the
+// hive partition column. Covers inclusive-lower / exclusive-upper,
+// the month-boundary case that partition pruning is most useful
+// for, and the non-prefix-expressible case where the common
+// prefix doesn't fully constrain the glob.
+func TestRead_PartitionRange(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-02-28", Customer: "abc", SKU: "s", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-01", Customer: "abc", SKU: "s", Ts: time.UnixMilli(2)},
+		{Period: "2026-03-15", Customer: "abc", SKU: "s", Ts: time.UnixMilli(3)},
+		{Period: "2026-04-01", Customer: "abc", SKU: "s", Ts: time.UnixMilli(4)},
+		{Period: "2026-04-10", Customer: "abc", SKU: "s", Ts: time.UnixMilli(5)},
+	})
+
+	got, err := f.sql.Read(context.Background(),
+		"period=2026-03-01..2026-04-01/customer=abc")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	// hive_types_autocast=false keeps partition values as VARCHAR,
+	// so Period roundtrips string-for-string — compare exactly.
+	want := []string{"2026-03-01", "2026-03-15"}
+	var periods []string
+	for _, r := range got {
+		periods = append(periods, r.Period)
+	}
+	if !reflect.DeepEqual(periods, want) {
+		t.Errorf("got periods %v, want %v (half-open [from, to))",
+			periods, want)
+	}
+}
+
+// TestRead_PartitionRangeWithHistory proves range filtering and
+// dedup compose in the correct order — the range WHERE runs
+// before the dedup QUALIFY, not after. The distinguishing
+// scenario: the absolute-latest version of an entity lives
+// *outside* the range. Correct order picks the latest
+// *in-range* version; swapping the order would pick the absolute
+// latest, then drop it as out-of-range (0 records).
+func TestRead_PartitionRangeWithHistory(t *testing.T) {
+	// Entity = (customer, sku). Period is NOT part of the entity
+	// key, so one entity can have versions in different period
+	// partitions.
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"customer", "sku"},
+	})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-15", Customer: "abc", SKU: "s1", Amount: 10, Ts: time.UnixMilli(100)},
+	})
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-25", Customer: "abc", SKU: "s1", Amount: 15, Ts: time.UnixMilli(150)},
+	})
+	// Latest by Ts, but out of range:
+	f.writeSome(t, []Rec{
+		{Period: "2026-04-15", Customer: "abc", SKU: "s1", Amount: 20, Ts: time.UnixMilli(200)},
+	})
+
+	const pattern = "period=2026-03-01..2026-04-01/customer=abc"
+	ctx := context.Background()
+
+	deduped, err := f.sql.Read(ctx, pattern)
+	if err != nil {
+		t.Fatalf("Read deduped: %v", err)
+	}
+	if len(deduped) != 1 || deduped[0].Amount != 15 {
+		t.Errorf("deduped: got %+v, want 1 record with Amount=15 "+
+			"(latest in-range; Amount=20 is the absolute latest "+
+			"but out of range)", deduped)
+	}
+
+	full, err := f.sql.Read(ctx, pattern, s3sql.WithHistory())
+	if err != nil {
+		t.Fatalf("Read history: %v", err)
+	}
+	if len(full) != 2 {
+		t.Fatalf("history: got %d records, want 2 "+
+			"(both in-range versions)", len(full))
+	}
+	for _, r := range full {
+		if r.Amount == 20 {
+			t.Errorf("out-of-range record leaked into history result: %+v", r)
+		}
+	}
+}
+
 // TestQuery covers the arbitrary-SQL path with an aggregation.
 func TestQuery(t *testing.T) {
 	f := newFixture(t, sqlOpts{

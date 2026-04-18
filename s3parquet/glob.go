@@ -20,93 +20,103 @@ type readPlan struct {
 // grammar and returns an execution plan. The dataPath is the
 // prefix under which data files live (as returned by
 // core.DataPath); the plan's ListPrefix is rooted at dataPath
-// and extends as far as the longest literal the pattern allows.
+// and extends as far as the longest literal the pattern allows,
+// including the common prefix of a leading range/prefix segment.
 //
 // Pure Go — no S3 calls; suitable for unit-testing.
 func buildReadPlan(
 	pattern string, dataPath string, partitionKeyParts []string,
 ) (*readPlan, error) {
-	if err := core.ValidateKeyPattern(pattern, partitionKeyParts); err != nil {
+	segs, err := core.ParseKeyPattern(pattern, partitionKeyParts)
+	if err != nil {
 		return nil, err
 	}
 
 	// Match-all shortcut.
-	if pattern == "" || pattern == "*" {
+	if segs == nil {
 		return &readPlan{
 			ListPrefix: dataPath + "/",
 			Match:      func(string) bool { return true },
 		}, nil
 	}
 
-	segments := strings.Split(pattern, "/")
-
-	// Walk segments from the front as long as each is fully
-	// literal (no "*", no whole-segment wildcard). That prefix
-	// becomes the S3 LIST prefix; anything beyond it is an
-	// in-memory check.
-	literalEnd := 0
-	for i, seg := range segments {
-		part := partitionKeyParts[i]
-		if seg == "*" {
-			break
-		}
-		value := seg[len(part)+1:] // strip "keyPart="
-		if strings.Contains(value, "*") {
-			break
-		}
-		literalEnd = i + 1
-	}
-
-	var listPrefix string
-	if literalEnd == 0 {
-		listPrefix = dataPath + "/"
-	} else {
-		listPrefix = dataPath + "/" +
-			strings.Join(segments[:literalEnd], "/") + "/"
-	}
-
-	// Match always runs against the full Hive key: we trust the
-	// LIST prefix to narrow the S3 call but the predicate stays
-	// independently correct, so a caller who passes in unrelated
-	// keys still gets the right answer.
 	return &readPlan{
-		ListPrefix: listPrefix,
+		ListPrefix: listPrefixForSegments(dataPath, segs),
 		Match: func(hiveKey string) bool {
-			return matchHiveKey(hiveKey, segments, partitionKeyParts)
+			return matchHiveKey(hiveKey, segs)
 		},
 	}, nil
 }
 
-// matchHiveKey returns true when every segment of hiveKey
-// matches the corresponding pattern segment. Pattern segments
-// can be either "*" (match anything in that slot) or
-// "part=value" where value is a literal or a literal followed
-// by a single trailing "*".
-func matchHiveKey(
-	hiveKey string, patternSegs []string, partitionKeyParts []string,
-) bool {
+// listPrefixForSegments extends dataPath with every leading
+// SegExact segment (full directory narrowing) and — if the first
+// non-exact segment is SegPrefix or SegRange — appends whatever
+// literal prefix that segment carries, even though it doesn't end
+// on a partition-directory boundary. SegWildAll contributes
+// nothing.
+func listPrefixForSegments(
+	dataPath string, segs []core.Segment,
+) string {
+	var exactDirs []string
+	var partial string
+
+	for _, seg := range segs {
+		if seg.Kind == core.SegExact {
+			exactDirs = append(exactDirs, seg.KeyPart+"="+seg.Value)
+			continue
+		}
+		switch seg.Kind {
+		case core.SegPrefix:
+			partial = seg.KeyPart + "=" + seg.Value
+		case core.SegRange:
+			cp := core.CommonPrefix(seg.Value, seg.ToValue)
+			if cp != "" {
+				partial = seg.KeyPart + "=" + cp
+			}
+		}
+		break
+	}
+
+	base := dataPath + "/"
+	if len(exactDirs) > 0 {
+		base += strings.Join(exactDirs, "/") + "/"
+	}
+	return base + partial
+}
+
+// matchHiveKey returns true when every segment of hiveKey matches
+// the corresponding parsed pattern segment.
+func matchHiveKey(hiveKey string, segs []core.Segment) bool {
 	keySegs := strings.Split(hiveKey, "/")
-	if len(keySegs) != len(patternSegs) {
+	if len(keySegs) != len(segs) {
 		return false
 	}
-	for i, pseg := range patternSegs {
-		if pseg == "*" {
+	for i, seg := range segs {
+		if seg.Kind == core.SegWildAll {
 			continue
 		}
 		kseg := keySegs[i]
-		part := partitionKeyParts[i]
-		prefix := part + "="
+		prefix := seg.KeyPart + "="
 		if !strings.HasPrefix(kseg, prefix) {
 			return false
 		}
 		kval := kseg[len(prefix):]
-		pval := pseg[len(prefix):]
-		if strings.HasSuffix(pval, "*") {
-			if !strings.HasPrefix(kval, pval[:len(pval)-1]) {
+		switch seg.Kind {
+		case core.SegExact:
+			if kval != seg.Value {
 				return false
 			}
-		} else if kval != pval {
-			return false
+		case core.SegPrefix:
+			if !strings.HasPrefix(kval, seg.Value) {
+				return false
+			}
+		case core.SegRange:
+			if seg.Value != "" && kval < seg.Value {
+				return false
+			}
+			if seg.ToValue != "" && kval >= seg.ToValue {
+				return false
+			}
 		}
 	}
 	return true

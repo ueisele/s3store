@@ -172,26 +172,84 @@ func sqlQuote(value string) string {
 // S3 glob URI passed directly to DuckDB's httpfs / read_parquet.
 // The pattern is validated against the shared grammar; DuckDB
 // handles expansion of the allowed wildcards natively.
+//
+// Range segments (FROM..TO) become a common-prefix glob here;
+// the exact bounds are enforced by a WHERE clause built in
+// buildRangeWhere, applied over the hive partition column.
 func (s *Store[T]) buildParquetURI(
 	keyPattern string,
 ) (string, error) {
-	if err := core.ValidateKeyPattern(
-		keyPattern, s.cfg.PartitionKeyParts,
-	); err != nil {
+	segs, err := core.ParseKeyPattern(
+		keyPattern, s.cfg.PartitionKeyParts)
+	if err != nil {
 		return "", err
 	}
-
-	if keyPattern == "" || keyPattern == "*" {
+	if segs == nil {
 		return s.s3URI(s.dataPath + "/**/*.parquet"), nil
 	}
 
-	segments := strings.Split(keyPattern, "/")
-	for i, seg := range segments {
-		if seg == "*" {
-			segments[i] = s.cfg.PartitionKeyParts[i] + "=*"
+	globSegs := make([]string, len(segs))
+	for i, seg := range segs {
+		switch seg.Kind {
+		case core.SegWildAll:
+			globSegs[i] = seg.KeyPart + "=*"
+		case core.SegExact:
+			globSegs[i] = seg.KeyPart + "=" + seg.Value
+		case core.SegPrefix:
+			globSegs[i] = seg.KeyPart + "=" + seg.Value + "*"
+		case core.SegRange:
+			cp := core.CommonPrefix(seg.Value, seg.ToValue)
+			if cp == "" {
+				globSegs[i] = seg.KeyPart + "=*"
+			} else {
+				globSegs[i] = seg.KeyPart + "=" + cp + "*"
+			}
 		}
 	}
 	return s.s3URI(
-		s.dataPath + "/" + strings.Join(segments, "/") +
+		s.dataPath + "/" + strings.Join(globSegs, "/") +
 			"/*.parquet"), nil
+}
+
+// buildRangeWhere emits a WHERE-clause body (without the leading
+// "WHERE") enforcing the bounds of every range segment in the
+// pattern against its hive partition column. Returns "" when the
+// pattern has no range segments — the scan is then unfiltered.
+//
+// DuckDB's hive_partitioning=true exposes each PartitionKeyParts
+// entry as a column, and pushes string comparisons on those
+// columns down to file-selection time, so this is effectively
+// partition pruning at the SQL layer.
+func (s *Store[T]) buildRangeWhere(
+	keyPattern string,
+) (string, error) {
+	segs, err := core.ParseKeyPattern(
+		keyPattern, s.cfg.PartitionKeyParts)
+	if err != nil {
+		return "", err
+	}
+	var preds []string
+	for _, seg := range segs {
+		if seg.Kind != core.SegRange {
+			continue
+		}
+		col := sqlIdentifier(seg.KeyPart)
+		if seg.Value != "" {
+			preds = append(preds,
+				col+" >= "+sqlQuote(seg.Value))
+		}
+		if seg.ToValue != "" {
+			preds = append(preds,
+				col+" < "+sqlQuote(seg.ToValue))
+		}
+	}
+	return strings.Join(preds, " AND "), nil
+}
+
+// sqlIdentifier returns a DuckDB double-quoted identifier with
+// embedded double-quotes doubled. Partition-key names are only
+// validated for '=' and '/', so double-quoting defends against
+// arbitrary characters (including SQL keywords) in the name.
+func sqlIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }

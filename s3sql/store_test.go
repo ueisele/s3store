@@ -104,6 +104,18 @@ func TestBuildParquetURI(t *testing.T) {
 			"s3://b/p/data/period=*/customer=abc/*.parquet", false},
 		{"partial value glob", "period=2026-03-*/customer=abc",
 			"s3://b/p/data/period=2026-03-*/customer=abc/*.parquet", false},
+		{"range narrows to common prefix glob",
+			"period=2026-03-01..2026-04-01/customer=abc",
+			"s3://b/p/data/period=2026-0*/customer=abc/*.parquet", false},
+		{"range no common prefix glob",
+			"period=a..z/customer=abc",
+			"s3://b/p/data/period=*/customer=abc/*.parquet", false},
+		{"range unbounded upper glob",
+			"period=2026-03-01../customer=abc",
+			"s3://b/p/data/period=*/customer=abc/*.parquet", false},
+		{"range + prefix same pattern",
+			"period=2026-03-01..2026-04-01/customer=ab*",
+			"s3://b/p/data/period=2026-0*/customer=ab*/*.parquet", false},
 
 		{"truncated", "period=X", "", true},
 		{"extra segment", "period=X/customer=Y/extra=Z", "", true},
@@ -127,6 +139,72 @@ func TestBuildParquetURI(t *testing.T) {
 				t.Errorf("\ngot  %q\nwant %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestBuildRangeWhere covers the WHERE-clause body that
+// scanExprForPattern appends when a pattern contains range
+// segments. No ranges → empty string; each bounded side becomes
+// one predicate; multiple ranges are ANDed.
+func TestBuildRangeWhere(t *testing.T) {
+	s := newTestStore()
+	cases := []struct {
+		name    string
+		pattern string
+		want    string
+	}{
+		{"no range", "period=X/customer=Y", ""},
+		{"match all", "*", ""},
+		{"range both sides",
+			"period=2026-03-01..2026-04-01/customer=abc",
+			`"period" >= '2026-03-01' AND "period" < '2026-04-01'`},
+		{"range unbounded upper",
+			"period=2026-03-01../customer=abc",
+			`"period" >= '2026-03-01'`},
+		{"range unbounded lower",
+			"period=..2026-04-01/customer=abc",
+			`"period" < '2026-04-01'`},
+		{"range both segments",
+			"period=2026-03-01..2026-04-01/customer=a..m",
+			`"period" >= '2026-03-01' AND "period" < '2026-04-01' ` +
+				`AND "customer" >= 'a' AND "customer" < 'm'`},
+		{"range with apostrophe escapes",
+			"period=o'brien..o'connor/customer=abc",
+			`"period" >= 'o''brien' AND "period" < 'o''connor'`},
+		{"range + prefix in same pattern — only the range emits a predicate",
+			"period=2026-03-01..2026-04-01/customer=ab*",
+			`"period" >= '2026-03-01' AND "period" < '2026-04-01'`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := s.buildRangeWhere(tc.pattern)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("\ngot  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScanExprForPattern_Range confirms ranges produce both a
+// common-prefix glob and a WHERE clause in the final scan. This
+// is the composition the dedup CTE wraps.
+func TestScanExprForPattern_Range(t *testing.T) {
+	s := newTestStore()
+	got, err := s.scanExprForPattern(
+		"period=2026-03-01..2026-04-01/customer=abc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const want = `SELECT * FROM read_parquet(` +
+		`'s3://b/p/data/period=2026-0*/customer=abc/*.parquet', ` +
+		`hive_partitioning=true, hive_types_autocast=false, ` +
+		`union_by_name=true) ` +
+		`WHERE "period" >= '2026-03-01' AND "period" < '2026-04-01'`
+	if got != want {
+		t.Errorf("\ngot  %q\nwant %q", got, want)
 	}
 }
 

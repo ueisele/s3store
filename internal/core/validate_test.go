@@ -53,6 +53,12 @@ func TestValidateKeyPattern(t *testing.T) {
 		{"whole-segment star second", "period=X/*", false},
 		{"both whole-segment", "*/*", false},
 
+		{"range both sides", "period=2026-03-01..2026-04-01/customer=abc", false},
+		{"range only lower", "period=2026-03-01../customer=abc", false},
+		{"range only upper", "period=..2026-04-01/customer=abc", false},
+		{"range equal ends", "period=2026-03-01..2026-03-01/customer=abc", false},
+		{"range plus wildcard tail", "period=2026-03-01..2026-04-01/*", false},
+
 		{"wrong segment count", "period=2026-03-17", true},
 		{"extra segment", "period=X/customer=Y/extra=Z", true},
 		{"wrong part name", "ustomer=abc/period=X", true},
@@ -62,6 +68,10 @@ func TestValidateKeyPattern(t *testing.T) {
 		{"char class", "period=[0-9]/customer=abc", true},
 		{"question mark", "period=2026-03-??/customer=abc", true},
 		{"alternation", "period={2026,2027}/customer=abc", true},
+		{"range empty both", "period=../customer=abc", true},
+		{"range reversed", "period=2026-04-01..2026-03-01/customer=abc", true},
+		{"range triple dots", "period=a..b..c/customer=abc", true},
+		{"range star in endpoint", "period=2026-*..2026-04/customer=abc", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -153,6 +153,10 @@ func TestReadGlob(t *testing.T) {
 		{"whole-segment head", "*/customer=abc", 3},
 		{"whole-segment tail", "period=2026-03-17/*", 2},
 		{"trailing star in value", "period=2026-03-*/customer=abc", 2},
+		{"range covers march", "period=2026-03-01..2026-04-01/*", 3},
+		{"range upper exclusive", "period=2026-03-17..2026-03-18/*", 2},
+		{"range unbounded upper", "period=2026-03-18../*", 2},
+		{"range unbounded lower", "period=..2026-03-18/*", 2},
 		{"match all", "*", 4},
 	}
 	for _, tc := range cases {

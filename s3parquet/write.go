@@ -153,8 +153,11 @@ func (s *Store[T]) groupByKey(records []T) map[string][]T {
 // form "PartitionKeyParts[i]=<non-empty value>", in the configured order.
 //
 // Values may contain '=' (we split on the first '=' only) but
-// cannot contain '/' or be empty. Catches PartitionKeyOf bugs
-// before they corrupt the S3 layout.
+// cannot contain '/', be empty, or contain ".." — the latter is
+// reserved by the key-pattern grammar as the range separator
+// (FROM..TO), so a partition value containing ".." would be
+// unaddressable on read. Catches PartitionKeyOf bugs before they
+// corrupt the S3 layout.
 func (s *Store[T]) validateKey(key string) error {
 	segments := strings.Split(key, "/")
 	if len(segments) != len(s.cfg.PartitionKeyParts) {
@@ -173,11 +176,19 @@ func (s *Store[T]) validateKey(key string) error {
 					"expected %q=...",
 				key, i, seg, part)
 		}
-		if seg == prefix {
+		value := seg[len(prefix):]
+		if value == "" {
 			return fmt.Errorf(
 				"s3parquet: key %q segment %d has "+
 					"empty value for %q",
 				key, i, part)
+		}
+		if strings.Contains(value, "..") {
+			return fmt.Errorf(
+				"s3parquet: key %q segment %d value %q "+
+					"contains '..' (reserved by the key-pattern "+
+					"range grammar 'FROM..TO')",
+				key, i, value)
 		}
 	}
 	return nil

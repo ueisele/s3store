@@ -40,15 +40,22 @@ func ValidatePartitionKeyParts(parts []string) error {
 //   - otherwise, pattern has exactly len(partitionKeyParts) segments
 //     separated by '/'
 //   - each segment is either:
-//     "*"            — whole-segment wildcard, or
-//     "<keyPart>=V"  — where V is either a literal (no
-//     wildcards) or a literal ending in
-//     a single trailing '*'
+//     "*"             — whole-segment wildcard, or
+//     "<keyPart>=V"   — where V is either a literal, a literal
+//     ending in a single trailing '*', or a
+//     range "FROM..TO" (half-open, lex order)
+//
+// Range form:
+//   - "FROM..TO" matches any value v with FROM <= v < TO (lex)
+//   - either side may be empty for an unbounded end
+//   - endpoints are plain literals: no '*', no '..'
+//   - "..TO" / "FROM.." are allowed; ".." alone is not (use '*')
 //
 // Rejected:
 //   - leading or middle '*' inside a value ("*-17", "2026-*-17")
 //   - multiple '*' in one value
 //   - char classes "[abc]", alternation "{a,b}", '?'
+//   - more than one '..' in a range value ("a..b..c")
 //
 // Narrower than DuckDB's native glob dialect on purpose, so the
 // pure-Go and SQL read paths accept exactly the same patterns.
@@ -89,7 +96,11 @@ func validatePatternValue(value string) error {
 	if strings.ContainsAny(value, "/?[]{}") {
 		return fmt.Errorf(
 			"value %q contains disallowed character "+
-				"(allowed: literal or trailing '*')", value)
+				"(allowed: literal, trailing '*', or range "+
+				"'FROM..TO')", value)
+	}
+	if strings.Contains(value, "..") {
+		return validateRangeValue(value)
 	}
 	n := strings.Count(value, "*")
 	if n == 0 {
@@ -106,6 +117,37 @@ func validatePatternValue(value string) error {
 			"value %q contains non-trailing '*' "+
 				"(only a single trailing '*' is supported)",
 			value)
+	}
+	return nil
+}
+
+// validateRangeValue enforces the "FROM..TO" grammar. '/', '?',
+// '[]', '{}' are already rejected by the caller.
+func validateRangeValue(value string) error {
+	parts := strings.Split(value, "..")
+	if len(parts) != 2 {
+		return fmt.Errorf(
+			"value %q contains multiple '..' "+
+				"(a range has exactly one 'FROM..TO')", value)
+	}
+	from, to := parts[0], parts[1]
+	if from == "" && to == "" {
+		return fmt.Errorf(
+			"value %q is an empty range "+
+				"(use '*' to match everything)", value)
+	}
+	for _, end := range [2]string{from, to} {
+		if strings.Contains(end, "*") {
+			return fmt.Errorf(
+				"value %q range endpoint %q contains '*' "+
+					"(endpoints must be plain literals)",
+				value, end)
+		}
+	}
+	if from != "" && to != "" && from > to {
+		return fmt.Errorf(
+			"value %q range is reversed: %q > %q",
+			value, from, to)
 	}
 	return nil
 }

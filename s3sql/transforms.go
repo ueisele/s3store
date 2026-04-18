@@ -11,6 +11,10 @@ import (
 // scanExprForPattern returns the base read_parquet scan for a
 // Hive-glob pattern. Shared by Query, QueryRow, Read.
 //
+// Range segments (FROM..TO) in the pattern become a common-prefix
+// S3 glob plus a WHERE clause on the corresponding hive partition
+// column, so DuckDB can prune at file-selection time.
+//
 // The URI is SQL-quoted via sqlQuote so partition values that
 // contain an apostrophe don't break the query at plan time.
 func (s *Store[T]) scanExprForPattern(
@@ -20,10 +24,19 @@ func (s *Store[T]) scanExprForPattern(
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf(
+	where, err := s.buildRangeWhere(key)
+	if err != nil {
+		return "", err
+	}
+	scan := fmt.Sprintf(
 		"SELECT * FROM read_parquet(%s, "+
-			"hive_partitioning=true, union_by_name=true)",
-		sqlQuote(parquetURI)), nil
+			"hive_partitioning=true, hive_types_autocast=false, "+
+			"union_by_name=true)",
+		sqlQuote(parquetURI))
+	if where != "" {
+		scan += " WHERE " + where
+	}
+	return scan, nil
 }
 
 // errorRow returns a *sql.Row that will fail on Scan with the
