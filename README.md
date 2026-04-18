@@ -284,9 +284,23 @@ Whether dedup actually runs depends on which package you use:
 ### Stream — time window
 
 To read only records written within a time window (e.g. "yesterday's
-activity"), use `OffsetAt` to turn a wall-clock time into a stream offset
-and `WithUntilOffset` to bound `Poll` / `PollRecords` from above. The
-range is half-open `[since, until)`, matching Kafka offset semantics:
+activity"), use `OffsetAt` to turn a wall-clock time into a stream offset.
+The range is half-open `[since, until)`, matching Kafka offset semantics.
+
+`PollRecordsAll` is the convenience entry point for bounded windows —
+one call, internal batching, no manual paging:
+
+```go
+records, err := store.PollRecordsAll(ctx,
+    store.OffsetAt(yesterdayStart),
+    store.OffsetAt(yesterdayEnd))
+```
+
+Pass `core.Offset("")` for `since` to start at the stream head, or for
+`until` to read to the live tip (settle-window cutoff).
+
+For streaming (bounded memory on long windows, or processing in batches),
+use `PollRecords` with `WithUntilOffset`:
 
 ```go
 start := store.OffsetAt(yesterdayStart)
@@ -303,7 +317,8 @@ for {
 
 `OffsetAt` is pure computation — no S3 call. `WithUntilOffset` breaks
 the paginator early once offsets reach `until`, so long streams aren't
-scanned past the window of interest. Available on the umbrella,
+scanned past the window of interest. All three APIs — `OffsetAt`,
+`WithUntilOffset`, `PollRecordsAll` — are available on the umbrella,
 `s3parquet`, and `s3sql`.
 
 ### Snapshot

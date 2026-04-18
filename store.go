@@ -144,3 +144,14 @@ func (s *Store[T]) PollRecords(
 ) ([]T, Offset, error) {
 	return s.sql.PollRecords(ctx, since, maxEntries, opts...)
 }
+
+// PollRecordsAll reads every record in [since, until) via
+// repeated PollRecords calls. Convenience wrapper for bounded
+// windows. Pair with OffsetAt for time-based windows.
+func (s *Store[T]) PollRecordsAll(
+	ctx context.Context,
+	since, until Offset,
+	opts ...QueryOption,
+) ([]T, error) {
+	return s.sql.PollRecordsAll(ctx, since, until, opts...)
+}

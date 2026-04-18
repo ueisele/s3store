@@ -387,6 +387,47 @@ func TestPollTimeWindow(t *testing.T) {
 	}
 }
 
+// TestPollRecordsAll exercises the convenience wrapper on the
+// SQL side. Writes several records, then drains the window in
+// one call, asserting the count and bounded-window behavior.
+func TestPollRecordsAll(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+	ctx := context.Background()
+
+	before := time.Now()
+	for i := range 5 {
+		f.writeSome(t, []Rec{{
+			Period:   "2026-03-17",
+			Customer: fmt.Sprintf("c%d", i),
+			SKU:      "s1",
+			Amount:   float64(i),
+			Currency: "USD",
+			Ts:       time.UnixMilli(int64(i + 1)),
+		}})
+	}
+	after := time.Now()
+
+	got, err := f.sql.PollRecordsAll(ctx,
+		f.sql.OffsetAt(before), f.sql.OffsetAt(after))
+	if err != nil {
+		t.Fatalf("PollRecordsAll: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("got %d, want 5", len(got))
+	}
+
+	// Empty window returns nil without error.
+	empty, err := f.sql.PollRecordsAll(ctx,
+		f.sql.OffsetAt(before.Add(-time.Hour)),
+		f.sql.OffsetAt(before.Add(-time.Minute)))
+	if err != nil {
+		t.Fatalf("PollRecordsAll empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("empty: got %d, want 0", len(empty))
+	}
+}
+
 // TestRead_MissingColumnZeroFills guards the "added a new
 // column to T" contract on the SQL side: a file missing a
 // column the reader expects must come back with that column as

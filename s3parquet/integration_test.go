@@ -531,6 +531,58 @@ func TestPollTimeWindow(t *testing.T) {
 	}
 }
 
+// TestPollRecordsAll exercises the convenience wrapper: a
+// small stream of writes, then PollRecordsAll drains the full
+// window in one call with no manual paging. Also checks that a
+// zero until offset "" means "read to live tip".
+func TestPollRecordsAll(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	before := time.Now()
+	for i := range 5 {
+		if _, err := store.WriteWithKey(ctx,
+			fmt.Sprintf("period=2026-03-17/customer=c%d", i),
+			[]Rec{{Period: "2026-03-17", Customer: fmt.Sprintf("c%d", i),
+				SKU: "s1", Value: int64(i)}},
+		); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	after := time.Now()
+
+	// Bounded window: all 5 records.
+	got, err := store.PollRecordsAll(ctx,
+		store.OffsetAt(before), store.OffsetAt(after))
+	if err != nil {
+		t.Fatalf("PollRecordsAll: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("got %d, want 5", len(got))
+	}
+
+	// Open until (zero-value offset) reads to the live tip.
+	open, err := store.PollRecordsAll(ctx, "", "")
+	if err != nil {
+		t.Fatalf("PollRecordsAll open: %v", err)
+	}
+	if len(open) != 5 {
+		t.Errorf("open: got %d, want 5", len(open))
+	}
+
+	// Empty window returns nil without error.
+	empty, err := store.PollRecordsAll(ctx,
+		store.OffsetAt(before.Add(-time.Hour)),
+		store.OffsetAt(before.Add(-time.Minute)))
+	if err != nil {
+		t.Fatalf("PollRecordsAll empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("empty: got %d, want 0", len(empty))
+	}
+}
+
 // ParquetField is a named int8 enum, mirroring the shape a
 // go-enum generator would produce. Declared at package scope
 // so Store[T] generic instantiation works at integration-test

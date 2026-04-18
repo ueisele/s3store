@@ -146,6 +146,45 @@ func (s *Store[T]) PollRecords(
 	return records, newOffset, nil
 }
 
+// pollRecordsAllBatch is the per-iteration batch size used by
+// PollRecordsAll. Tuned for S3 LIST page size (1000).
+const pollRecordsAllBatch int32 = 1000
+
+// PollRecordsAll reads every record in [since, until) in one
+// call. Internally loops PollRecords with a fixed batch size
+// until the window is drained, so memory scales with window
+// size rather than stream length, and any S3 / DuckDB error
+// surfaces from the batch where it happened.
+//
+// Pass core.Offset("") for since to start at the stream head;
+// pass core.Offset("") for until to read to the settle-window
+// cutoff (= live tip). Combine with OffsetAt for time windows.
+//
+// Dedup semantics match PollRecords: per-batch. If you need
+// window-global latest-per-key, pass WithHistory and dedup
+// client-side.
+func (s *Store[T]) PollRecordsAll(
+	ctx context.Context,
+	since, until core.Offset,
+	opts ...core.QueryOption,
+) ([]T, error) {
+	opts = append(opts, core.WithUntilOffset(until))
+
+	var all []T
+	for {
+		batch, next, err := s.PollRecords(
+			ctx, since, pollRecordsAllBatch, opts...)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			return all, nil
+		}
+		all = append(all, batch...)
+		since = next
+	}
+}
+
 // OffsetAt returns the stream offset corresponding to wall-
 // clock time t: any ref written at or after t sorts >= the
 // returned offset, any ref written before t sorts < it.
