@@ -2,10 +2,13 @@ package s3parquet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -173,6 +176,179 @@ func (i *Index[T, K]) entryToValues(entry K) ([]string, error) {
 		out[j] = value
 	}
 	return out, nil
+}
+
+// BackfillStats reports the work Backfill did: how many parquet
+// objects it scanned, how many records it decoded, and how many
+// marker PUTs it issued. Markers is per-object, not globally
+// deduplicated — a marker path produced by N parquet files is
+// counted N times (reflects S3 request cost, not unique marker
+// count). Useful for progress logging in a migration job.
+type BackfillStats struct {
+	DataObjects int
+	Records     int
+	Markers     int
+}
+
+// Backfill scans existing parquet data under pattern and writes
+// index markers for every record already in the store. The normal
+// path is to call NewIndex before the first Write; Backfill is
+// the relief valve for adding an index to a live store or
+// recovering after an index was missed.
+//
+// pattern is evaluated against the Store's PartitionKeyParts
+// (same grammar as Store.Read), NOT against the index's Columns
+// — Backfill LISTs parquet data files, which are keyed by
+// partition. "*" backfills everything. Pattern-scoping lets a
+// migration job parallelize itself across partitions — run one
+// Backfill per shard rather than a single multi-hour call.
+//
+// Safe to run concurrently with Write: S3 PUTs are idempotent, so
+// a marker produced by both paths is just written twice. Safe to
+// retry after a cancel or crash for the same reason: work already
+// done is work already persisted.
+//
+// Processes parquet objects with bounded parallelism
+// (pollDownloadConcurrency), matching the Read path. Within an
+// object, marker PUTs run serially so the net in-flight S3
+// request count stays at roughly pollDownloadConcurrency rather
+// than compounding to concurrency squared. Peak memory is bounded
+// by (concurrency × largest-object size).
+func (i *Index[T, K]) Backfill(
+	ctx context.Context, pattern string,
+) (BackfillStats, error) {
+	var stats BackfillStats
+
+	plan, err := buildReadPlan(
+		pattern, i.store.dataPath, i.store.cfg.PartitionKeyParts)
+	if err != nil {
+		return stats, err
+	}
+
+	keys, err := i.store.listMatchingParquet(ctx, plan)
+	if err != nil {
+		return stats, err
+	}
+	if len(keys) == 0 {
+		return stats, nil
+	}
+	stats.DataObjects = len(keys)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var recordsTotal, markersTotal atomic.Int64
+	errs := make([]error, len(keys))
+	sem := make(chan struct{}, pollDownloadConcurrency)
+	var wg sync.WaitGroup
+
+	for n, key := range keys {
+		wg.Add(1)
+		go func(n int, key string) {
+			defer wg.Done()
+			// Acquire inside the goroutine so a parent-ctx
+			// cancel or sibling failure unblocks waiters
+			// promptly instead of backlogging the queue.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errs[n] = ctx.Err()
+				return
+			}
+			defer func() { <-sem }()
+
+			paths, nRecs, err := i.markerPathsForObject(ctx, key)
+			if err != nil {
+				errs[n] = err
+				cancel()
+				return
+			}
+			recordsTotal.Add(int64(nRecs))
+
+			// Serial PUTs within the object. Across objects we
+			// already run pollDownloadConcurrency-wide, so
+			// per-object fan-out would compound to
+			// concurrency² and overwhelm the SDK connection
+			// pool. Net in-flight ≈ concurrency.
+			for _, p := range paths {
+				if err := i.store.putObject(
+					ctx, p, nil, "application/octet-stream",
+				); err != nil {
+					errs[n] = fmt.Errorf(
+						"s3parquet: backfill index %q: put marker: %w",
+						i.name, err)
+					cancel()
+					return
+				}
+			}
+			markersTotal.Add(int64(len(paths)))
+		}(n, key)
+	}
+	wg.Wait()
+
+	stats.Records = int(recordsTotal.Load())
+	stats.Markers = int(markersTotal.Load())
+
+	// First real error wins; skip cancellations so we report
+	// the root-cause failure rather than the cancel it
+	// triggered in sibling goroutines.
+	for _, e := range errs {
+		if e == nil || errors.Is(e, context.Canceled) {
+			continue
+		}
+		return stats, e
+	}
+	return stats, nil
+}
+
+// markerPathsForObject decodes one parquet data object and
+// returns the deduplicated marker paths its records produce under
+// this index, plus the record count (for stats). Pulled out of
+// Backfill so the dedup map doesn't leak across objects — each
+// file stands on its own, keeping memory bounded by the largest
+// file rather than the full backfill set.
+func (i *Index[T, K]) markerPathsForObject(
+	ctx context.Context, key string,
+) ([]string, int, error) {
+	data, err := i.store.getObjectBytes(ctx, key)
+	if err != nil {
+		return nil, 0, fmt.Errorf(
+			"s3parquet: backfill get %s: %w", key, err)
+	}
+	recs, err := decodeParquet[T](data)
+	if err != nil {
+		return nil, 0, fmt.Errorf(
+			"s3parquet: backfill decode %s: %w", key, err)
+	}
+
+	seen := make(map[string]struct{})
+	for _, rec := range recs {
+		for _, entry := range i.of(rec) {
+			values, err := i.entryToValues(entry)
+			if err != nil {
+				return nil, 0, fmt.Errorf(
+					"s3parquet: backfill index %q on %s: %w",
+					i.name, key, err)
+			}
+			p := core.BuildIndexMarkerPath(
+				i.indexPath, i.columns, values)
+			if len(p) > maxMarkerKeyLen {
+				return nil, 0, fmt.Errorf(
+					"s3parquet: backfill index %q: marker key "+
+						"is %d bytes, exceeds %d",
+					i.name, len(p), maxMarkerKeyLen)
+			}
+			seen[p] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil, len(recs), nil
+	}
+	paths := make([]string, 0, len(seen))
+	for p := range seen {
+		paths = append(paths, p)
+	}
+	return paths, len(recs), nil
 }
 
 // Lookup returns every K whose marker matches the key pattern.

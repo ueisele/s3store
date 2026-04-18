@@ -214,6 +214,138 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 	t.Fatal("marker never became visible past the settle window")
 }
 
+// TestIndex_Backfill covers the relief-valve path: records
+// written before an index was registered don't produce markers,
+// Lookup under-reports, and Backfill brings the index into sync.
+// Also checks that Backfill is idempotent (a second call is a
+// no-op in effect) and that pattern scoping narrows the scan.
+func TestIndex_Backfill(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// Phase 1: write records with no index registered. These are
+	// the "historical" records Backfill will have to recover.
+	historical := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
+		{Period: "2026-03-17", Customer: "def", SKU: "s1", Ts: time.UnixMilli(200)},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s2", Ts: time.UnixMilli(300)},
+		{Period: "2026-04-01", Customer: "abc", SKU: "s3", Ts: time.UnixMilli(400)},
+	}
+	if _, err := store.Write(ctx, historical); err != nil {
+		t.Fatalf("historical Write: %v", err)
+	}
+
+	// Phase 2: register the index. Writes from here on are
+	// self-indexing; historical records are not yet covered.
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	idx, err := s3parquet.NewIndex(store,
+		s3parquet.IndexDef[Rec, Entry]{
+			Name:    "sku_idx",
+			Columns: []string{"sku", "customer"},
+			Of: func(r Rec) []Entry {
+				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+			},
+		})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	// Write a post-registration record so we can verify Backfill
+	// produces the same marker as the live write path (idempotent
+	// overlap).
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-04-01", Customer: "abc", SKU: "s3", Ts: time.UnixMilli(500)},
+	}); err != nil {
+		t.Fatalf("post-registration Write: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// Before Backfill: only the post-registration record is visible.
+	got, err := idx.Lookup(ctx, "sku=*/customer=*")
+	if err != nil {
+		t.Fatalf("pre-backfill Lookup: %v", err)
+	}
+	if len(got) != 1 || got[0].SKU != "s3" || got[0].Customer != "abc" {
+		t.Errorf("pre-backfill: got %v, want just {s3, abc}", got)
+	}
+
+	// Backfill everything.
+	stats, err := idx.Backfill(ctx, "*")
+	if err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	// 5 parquet objects (4 historical writes, each its own
+	// partition-key group under PartitionKeyOf; plus the post-
+	// registration write). 4 distinct (sku, customer) markers
+	// ({s1,abc},{s1,def},{s2,abc},{s3,abc}).
+	if stats.DataObjects != 5 {
+		t.Errorf("DataObjects: got %d, want 5", stats.DataObjects)
+	}
+	if stats.Records != 5 {
+		t.Errorf("Records: got %d, want 5", stats.Records)
+	}
+	// Markers is per-object (not cross-object deduped), so each
+	// object contributes at least one. 5 files × 1 marker each.
+	if stats.Markers != 5 {
+		t.Errorf("Markers: got %d, want 5 (1 per object)",
+			stats.Markers)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// After Backfill: every distinct (sku, customer) is visible.
+	got, err = idx.Lookup(ctx, "sku=*/customer=*")
+	if err != nil {
+		t.Fatalf("post-backfill Lookup: %v", err)
+	}
+	gotSet := make(map[Entry]bool, len(got))
+	for _, e := range got {
+		gotSet[e] = true
+	}
+	want := []Entry{
+		{SKU: "s1", Customer: "abc"},
+		{SKU: "s1", Customer: "def"},
+		{SKU: "s2", Customer: "abc"},
+		{SKU: "s3", Customer: "abc"},
+	}
+	for _, w := range want {
+		if !gotSet[w] {
+			t.Errorf("missing %+v after Backfill", w)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d distinct entries, want %d: %+v",
+			len(got), len(want), got)
+	}
+
+	// Idempotency: a second Backfill re-scans but the PUTs are
+	// no-ops at the semantic level. We only check it doesn't
+	// error and reports the same scan volume.
+	stats2, err := idx.Backfill(ctx, "*")
+	if err != nil {
+		t.Fatalf("second Backfill: %v", err)
+	}
+	if stats2.DataObjects != stats.DataObjects {
+		t.Errorf("second Backfill DataObjects: got %d, want %d",
+			stats2.DataObjects, stats.DataObjects)
+	}
+
+	// Pattern scoping: backfilling only the 2026-03-17 partition
+	// covers 2 of the 5 objects.
+	scoped, err := idx.Backfill(ctx, "period=2026-03-17/customer=*")
+	if err != nil {
+		t.Fatalf("scoped Backfill: %v", err)
+	}
+	if scoped.DataObjects != 2 {
+		t.Errorf("scoped DataObjects: got %d, want 2",
+			scoped.DataObjects)
+	}
+}
+
 // TestWriteAndRead exercises the basic round-trip through S3.
 // No dedup configured.
 func TestWriteAndRead(t *testing.T) {

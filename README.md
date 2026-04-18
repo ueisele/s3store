@@ -536,17 +536,49 @@ matches.
   `LastModified` inside `now - SettleWindow` are hidden, matching
   `Poll`'s guarantees so index and data views agree within the
   window.
+- **Backfill** for indexes registered on a live store (below).
+
+### Backfill
+
+The normal path is to register an index before the first `Write`
+so every record produces markers. When that isn't possible —
+adding an index to a store that already has data, or recovering
+from a missed registration — `Backfill` scans existing parquet
+and emits the markers retroactively:
+
+```go
+stats, err := skuIdx.Backfill(ctx, "*") // or a narrower pattern
+// stats.DataObjects / Records / Markers
+```
+
+The pattern is evaluated against the store's `PartitionKeyParts`
+(same grammar as `Read`), **not** against the index's `Columns`
+— `Backfill` walks parquet data files, which are keyed by
+partition. A migration job can shard itself by partition
+(`period=2026-01-*` on one pod, `period=2026-02-*` on another)
+instead of running a single multi-hour call. `Backfill`
+processes parquet objects with the same bounded parallelism as
+`Read` internally, so single-pod runs already saturate a typical
+S3 connection pool.
+
+Safe to run concurrently with `Write`: S3 PUTs of the same empty
+marker are idempotent. Safe to retry after a cancel or crash for
+the same reason — partial progress is durable, a re-run just
+re-issues the remaining PUTs.
+
+Intended to run from a dedicated migration binary
+(`cmd/backfill-<name>/main.go` in your app repo): because `Index`
+is generic over your record and entry types, there's no
+library-provided CLI. A ~30-line `main` that constructs the store
++ index and calls `Backfill` is the idiomatic shape.
 
 ### Not in v1 (deferred)
 
 - **Delete index** — no general delete path on the store yet.
-- **Repopulate from data** — a future task will read the ref
-  stream chronologically and replay records through an index's
-  `Of` to backfill markers for records written before the index
-  was registered. Until that lands, **register all indexes
-  before the first `Write`** — earlier writes produce no markers
-  for later-registered indexes.
-- **Verification / orphan cleanup tools.**
+- **Verification / orphan cleanup tools** — if `Of` changes
+  semantically, stale markers remain. Backfill only adds
+  missing markers; rebuild (delete-then-re-PUT) is a separate
+  design.
 
 ### Column ordering matters (for performance, not correctness)
 

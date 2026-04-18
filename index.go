@@ -9,6 +9,10 @@ type IndexDef[T any, K comparable] = s3parquet.IndexDef[T, K]
 // Index is the typed query handle returned by NewIndex.
 type Index[T any, K comparable] = s3parquet.Index[T, K]
 
+// BackfillStats mirrors s3parquet.BackfillStats for umbrella
+// callers of Index.Backfill.
+type BackfillStats = s3parquet.BackfillStats
+
 // NewIndex registers a secondary index on the umbrella store.
 // The index lives on the pure-Go s3parquet sub-store (no cgo,
 // no DuckDB), and its markers are written as part of every
