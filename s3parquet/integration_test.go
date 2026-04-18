@@ -5,6 +5,7 @@ package s3parquet_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -447,4 +448,105 @@ func TestPollRecords(t *testing.T) {
 	if string(off) == "" {
 		t.Error("offset empty after non-empty PollRecords")
 	}
+}
+
+// ParquetField is a named int8 enum, mirroring the shape a
+// go-enum generator would produce. Declared at package scope
+// so Store[T] generic instantiation works at integration-test
+// scope.
+type ParquetField int8
+
+const (
+	ParquetFieldUnknown ParquetField = iota
+	ParquetFieldPrimary
+	ParquetFieldSecondary
+)
+
+// ParquetLog is the nested-struct payload: string + named int8
+// enum + map, all carried inside ParquetRec.Logs.
+type ParquetLog struct {
+	Processor string            `parquet:"processor"`
+	Field     ParquetField      `parquet:"field"`
+	Attrs     map[string]string `parquet:"attrs"`
+}
+
+// ParquetRec exercises the nested shape: a list of structs,
+// each with a named int8 enum and a map-of-string. Mirrors the
+// s3sql integration test's JobRec but exercises the pure-Go
+// Write→S3→Read pipeline without DuckDB in the mix.
+type ParquetRec struct {
+	Period   string       `parquet:"period"`
+	Customer string       `parquet:"customer"`
+	Logs     []ParquetLog `parquet:"logs"`
+	Ts       time.Time    `parquet:"ts,timestamp(millisecond)"`
+}
+
+// TestWriteRead_NamedInt8EnumInNestedStruct round-trips the
+// JSONB-style shape through the full s3parquet pipeline —
+// Write encodes + puts to S3, Read lists + gets + decodes back
+// into []ParquetRec. Guards that the parquet-go v0.29 small-int
+// dispatch holds end-to-end for named int8 enums in nested
+// structs, not just in the in-memory encode/decode unit test.
+func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+
+	store, err := s3parquet.New[ParquetRec](s3parquet.Config[ParquetRec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r ParquetRec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	in := []ParquetRec{{
+		Period:   "2026-03-17",
+		Customer: "abc",
+		Ts:       time.UnixMilli(100),
+		Logs: []ParquetLog{
+			{
+				Processor: "ingest",
+				Field:     ParquetFieldPrimary,
+				Attrs:     map[string]string{"stage": "raw"},
+			},
+			{
+				Processor: "enrich",
+				Field:     ParquetFieldSecondary,
+				Attrs:     map[string]string{"model": "v2"},
+			},
+		},
+	}}
+	if _, err := store.Write(ctx, in); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got, err := store.Read(ctx, "period=2026-03-17/customer=abc")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	// Compare Logs explicitly — time.Time round-trips may
+	// introduce monotonic-clock differences across equal values,
+	// so field-by-field on the nested shape is the safe check.
+	if !reflect.DeepEqual(got[0].Logs, in[0].Logs) {
+		t.Errorf("Logs mismatch:\n got  %+v\n want %+v",
+			got[0].Logs, in[0].Logs)
+	}
+	if got[0].Period != in[0].Period ||
+		got[0].Customer != in[0].Customer {
+		t.Errorf("partition fields wrong: got %q/%q, want %q/%q",
+			got[0].Period, got[0].Customer,
+			in[0].Period, in[0].Customer)
+	}
+	_ = ParquetFieldUnknown
 }

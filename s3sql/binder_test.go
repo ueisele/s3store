@@ -215,6 +215,49 @@ func TestCompositeScanner_NestedStruct(t *testing.T) {
 	}
 }
 
+// TestCompositeScanner_NamedInt8InStruct guards the realistic
+// "named int8 enum inside a nested struct inside a list" shape
+// (e.g. ProcessLog.Field where Field is go-enum-generated).
+// End-to-end the write side needs parquet-go v0.29's Kind-based
+// small-int dispatch; the read side relies on mapstructure
+// decoding int64 values into the named int8 field.
+func TestCompositeScanner_NamedInt8InStruct(t *testing.T) {
+	type Field int8
+	const (
+		FieldUnknown Field = iota
+		FieldPrimary
+		FieldSecondary
+	)
+	type Inner struct {
+		Name  string `parquet:"name"`
+		Field Field  `parquet:"field"`
+	}
+	type R struct {
+		Items []Inner `parquet:"items"`
+	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
+	fb := b.byName["items"]
+
+	dest := fb.makeDest()
+	if err := dest.(interface{ Scan(any) error }).Scan([]any{
+		map[string]any{"name": "a", "field": int64(FieldPrimary)},
+		map[string]any{"name": "b", "field": int64(FieldSecondary)},
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var r R
+	rv := reflect.ValueOf(&r).Elem()
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	want := []Inner{
+		{Name: "a", Field: FieldPrimary},
+		{Name: "b", Field: FieldSecondary},
+	}
+	if !reflect.DeepEqual(r.Items, want) {
+		t.Errorf("got %+v, want %+v", r.Items, want)
+	}
+	_ = FieldUnknown
+}
+
 // TestCompositeScanner_NULLLeavesZero guards that a NULL
 // composite leaves the field at Go zero — matching the rest of
 // the binder's contract.

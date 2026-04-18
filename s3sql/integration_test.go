@@ -442,14 +442,24 @@ func TestRead_SliceField(t *testing.T) {
 	}
 }
 
-// ProcessLog is the nested struct: primitive + int8 enum +
-// map, all inside a list at the outer level. Mirrors a
+// ProcessField is a named int8 enum — the shape a go-enum
+// generator typically produces. Testing the named variant (not
+// plain int8) proves both parquet-go's write side and the
+// binder's read side dispatch on reflect.Kind, not exact type.
+type ProcessField int8
+
+const (
+	ProcessFieldUnknown ProcessField = iota
+	ProcessFieldPrimary
+	ProcessFieldSecondary
+)
+
+// ProcessLog is the nested struct: primitive + named int8
+// enum + map, all inside a list at the outer level. Mirrors a
 // realistic JSONB-style payload ported to native columns.
-// int8/int16 inside nested structs require parquet-go v0.29+
-// (writeRowsFuncOfSmallInt path).
 type ProcessLog struct {
 	Processor  string            `parquet:"processor"`
-	Field      int8              `parquet:"field"`
+	Field      ProcessField      `parquet:"field"`
 	Attributes map[string]string `parquet:"attributes"`
 }
 
@@ -497,7 +507,7 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 		Logs: []ProcessLog{
 			{
 				Processor: "ingest",
-				Field:     int8(1),
+				Field:     ProcessFieldPrimary,
 				Attributes: map[string]string{
 					"region": "eu-west-1",
 					"stage":  "raw",
@@ -505,7 +515,7 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 			},
 			{
 				Processor: "enrich",
-				Field:     int8(7),
+				Field:     ProcessFieldSecondary,
 				Attributes: map[string]string{
 					"model": "v2",
 				},

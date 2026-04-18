@@ -1,6 +1,9 @@
 package s3parquet
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // TestGroupByKey guards that groupByKey partitions records by
 // PartitionKeyOf and preserves every record in its group.
@@ -70,4 +73,61 @@ func TestEncodeParquet(t *testing.T) {
 			t.Errorf("row %d: got %+v, want %+v", i, out[i], in[i])
 		}
 	}
+}
+
+// TestEncodeParquet_NamedInt8EnumInNestedStruct guards that a
+// named int8 enum (e.g. go-enum output) inside a nested struct
+// inside a list round-trips cleanly through parquet-go — both
+// the write and read side. Requires parquet-go v0.29+'s
+// Kind-based small-int dispatch. Fast unit-level equivalent of
+// the s3sql integration test for the same shape.
+func TestEncodeParquet_NamedInt8EnumInNestedStruct(t *testing.T) {
+	type Field int8
+	const (
+		FieldUnknown Field = iota
+		FieldPrimary
+		FieldSecondary
+	)
+	type Log struct {
+		Processor string            `parquet:"processor"`
+		Field     Field             `parquet:"field"`
+		Attrs     map[string]string `parquet:"attrs"`
+	}
+	type Rec struct {
+		ID   string `parquet:"id"`
+		Logs []Log  `parquet:"logs"`
+	}
+
+	in := []Rec{{
+		ID: "r1",
+		Logs: []Log{
+			{
+				Processor: "ingest",
+				Field:     FieldPrimary,
+				Attrs:     map[string]string{"stage": "raw"},
+			},
+			{
+				Processor: "enrich",
+				Field:     FieldSecondary,
+				Attrs:     map[string]string{"model": "v2"},
+			},
+		},
+	}}
+
+	data, err := encodeParquet(in)
+	if err != nil {
+		t.Fatalf("encodeParquet: %v", err)
+	}
+	out, err := decodeParquet[Rec](data)
+	if err != nil {
+		t.Fatalf("decodeParquet: %v", err)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("got %d rows, want %d", len(out), len(in))
+	}
+	if !reflect.DeepEqual(out[0], in[0]) {
+		t.Errorf("round-trip mismatch:\n got  %+v\n want %+v",
+			out[0], in[0])
+	}
+	_ = FieldUnknown
 }
