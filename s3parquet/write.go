@@ -205,8 +205,8 @@ func (s *Store[T]) validateKey(key string) error {
 		if !strings.HasPrefix(seg, prefix) {
 			return fmt.Errorf(
 				"s3parquet: key %q segment %d is %q, "+
-					"expected %q=...",
-				key, i, seg, part)
+					"expected prefix %q",
+				key, i, seg, prefix)
 		}
 		value := seg[len(prefix):]
 		if err := core.ValidateHivePartitionValue(value); err != nil {

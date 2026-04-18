@@ -216,7 +216,7 @@ func (s *Store[T]) downloadAndDecodeAll(
 // must be parquet-go-friendly (field-tagged, primitive-backed).
 func decodeParquet[T any](data []byte) ([]T, error) {
 	reader := parquet.NewGenericReader[T](bytes.NewReader(data))
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	total := reader.NumRows()
 	if total == 0 {

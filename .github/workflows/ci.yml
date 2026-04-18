@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  # Lint with the full linter set (staticcheck, errcheck, etc.)
+  # declared in .golangci.yml. Runs once for the whole module;
+  # the CGO_ENABLED split is handled per-target by govet inside
+  # golangci-lint itself, so there's no need for a separate
+  # cgo-free lint pass.
+  lint:
+    name: lint (golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.11.4
+
   # Verify the cgo-free sub-packages build and test without cgo.
   # This is the load-bearing guarantee the write/read split
   # exists for: write-only and simple-read consumers must be
@@ -22,10 +39,6 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go build ./s3parquet/... ./internal/...
-      - name: vet
-        env:
-          CGO_ENABLED: "0"
-        run: go vet ./s3parquet/... ./internal/...
       - name: test
         env:
           CGO_ENABLED: "0"
@@ -58,7 +71,5 @@ jobs:
           go-version-file: go.mod
       - name: build
         run: go build ./...
-      - name: vet
-        run: go vet ./...
       - name: test (short)
         run: go test -short -count=1 ./...

@@ -168,8 +168,8 @@ func ParseIndexMarkerKey(
 		if !strings.HasPrefix(seg, colPrefix) {
 			return nil, fmt.Errorf(
 				"s3store: marker key %q segment %d is %q, "+
-					"expected %q=...",
-				markerKey, i, seg, columns[i])
+					"expected prefix %q",
+				markerKey, i, seg, colPrefix)
 		}
 		out[i] = seg[len(colPrefix):]
 	}
