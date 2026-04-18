@@ -56,6 +56,24 @@ type Config[T any] struct {
 	// also set, so dedupEnabled only checks EntityKeyOf.
 	VersionOf func(record T, insertedAt time.Time) int64
 
+	// OnMissingData is invoked when a data-file GET returns S3
+	// NoSuchKey (404) during Read, PollRecords, or Index.Backfill.
+	// The path is skipped (not treated as an error) and the hook
+	// is called with its S3 key so the caller can log, count, or
+	// alert. Nil disables the hook and retains skip-on-404 behavior.
+	//
+	// Intended to mask two rare but known outcomes of the write
+	// path: (1) the ref PUT "failed" with a lost ack but the ref
+	// is persisted while cleanup deleted the data, leaving a
+	// dangling ref; (2) LIST-to-GET race where an object was
+	// deleted between listing and reading. In both cases failing
+	// the whole read would turn a one-record anomaly into ongoing
+	// breakage; skip-and-notify is the at-least-once posture.
+	//
+	// Called from the S3 download worker goroutine — must be safe
+	// for concurrent invocation.
+	OnMissingData func(dataPath string)
+
 	// BloomFilterColumns lists parquet column names (top-level)
 	// that Write should emit per-row-group split-block bloom
 	// filters for. Use this for columns that queries filter on

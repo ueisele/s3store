@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ueisele/s3store/internal/core"
 )
 
@@ -259,6 +260,18 @@ func (i *Index[T, K]) Backfill(
 
 			paths, nRecs, err := i.markerPathsForObject(ctx, key)
 			if err != nil {
+				// LIST-to-GET race: a data file listed a moment
+				// ago is gone now. Skip-and-notify matches
+				// downloadAndDecodeAll's at-least-once posture —
+				// one missing file shouldn't fail the whole
+				// backfill. Other GET errors remain fatal.
+				var nsk *s3types.NoSuchKey
+				if errors.As(err, &nsk) {
+					if i.store.cfg.OnMissingData != nil {
+						i.store.cfg.OnMissingData(key)
+					}
+					return
+				}
 				errs[n] = err
 				cancel()
 				return

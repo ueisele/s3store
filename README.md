@@ -654,6 +654,66 @@ S3 PUTs aren't globally ordered, so `Poll` reads up to `now - SettleWindow`
 already-read one. This gives you a single monotonic offset with no seen-set
 or dedup bookkeeping.
 
+## Durability guarantees
+
+The contract is **at-least-once** on both sides of the wire.
+
+### Write
+
+If `Write` (or `WriteWithKey`) returns `nil`, every record in
+the batch is durably stored in S3 and will be returned by
+subsequent `Read`, `Poll`, `PollRecords`, and `Index.Lookup` for
+the lifetime of the data. The write path commits in order: data
+PUT → marker PUTs → ref PUT, returning success only after the
+final step lands (or, on a lost PUT ack, after a HEAD confirms
+the object is there).
+
+If `Write` returns an **error**, state is indeterminate — the
+records may or may not be durable. The caller must retry. A
+retry after partial success writes some records twice; dedupe
+those on read via `EntityKeyColumns` + `VersionColumn` (umbrella
+/ `s3sql`) or `EntityKeyOf` + `VersionOf` (`s3parquet`).
+Multi-group `Write` returns `([]WriteResult, error)` — consult
+the slice for records that *did* commit before the error so a
+retry can skip them if needed.
+
+### Read
+
+`Read`, `PollRecords`, and `Index.Backfill` tolerate a missing
+data file (S3 `NoSuchKey`) by skipping it and invoking an
+optional `Config.OnMissingData(dataPath)` hook. This covers two
+rare but real scenarios:
+
+- **Dangling ref from a write-cleanup race.** The ref PUT "failed"
+  with a lost ack, the cleanup HEAD also failed transiently, and
+  the cleanup DELETE removed the data. Ref lives on in S3 pointing
+  at nothing.
+- **LIST-to-GET race.** A data file disappears between a `Read`'s
+  LIST and its GET (e.g. lifecycle deletion).
+
+Failing the entire read on either would turn a single-record
+anomaly into permanent breakage. Every *other* GET error
+(throttle, network, auth, timeout) is still fatal — silently
+dropping records on transient failure is worse than propagating.
+
+```go
+s3parquet.Config[T]{
+    // ...
+    OnMissingData: func(dataPath string) {
+        slog.Warn("s3store: data file missing, skipping",
+            "path", dataPath)
+    },
+}
+```
+
+The hook is called from the download worker pool and must be
+safe for concurrent invocation. `nil` means "skip silently."
+
+> **Limitation.** `OnMissingData` is honored by `s3parquet` only.
+> The umbrella's `Read` / `Query` / `PollRecords` go through
+> `s3sql` (DuckDB's `read_parquet`), where a missing file fails
+> the whole call. See [Limitations](#limitations).
+
 ## Configuration — umbrella
 
 ```go
@@ -794,6 +854,13 @@ rush it.
   mechanism — keys can only be updated, not removed.
 - **`s3parquet` dedup is in-memory.** Large key cardinality can OOM;
   route those workloads to `s3sql` which streams through DuckDB.
+- **Missing-data tolerance only in `s3parquet`.** `OnMissingData`
+  (skip a parquet file whose GET returns `NoSuchKey`) is honored
+  by `s3parquet.Read` / `PollRecords` / `Index.Backfill`. The
+  umbrella's `Read` / `Query` / `PollRecords` go through
+  `s3sql`'s DuckDB path, which treats its input URI list as
+  authoritative — a dangling ref fails the whole call. Use
+  `s3parquet` directly if you need the tolerant read path.
 - **Schema evolution is limited to tolerant reads.** Both packages handle
   "column added to T that isn't in an old file" by returning the Go zero
   value. Renames, splits, type changes, and row-level computed

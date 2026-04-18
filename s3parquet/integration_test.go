@@ -6,9 +6,12 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/ueisele/s3store/internal/testutil"
 	"github.com/ueisele/s3store/s3parquet"
 )
@@ -343,6 +346,102 @@ func TestIndex_Backfill(t *testing.T) {
 	if scoped.DataObjects != 2 {
 		t.Errorf("scoped DataObjects: got %d, want 2",
 			scoped.DataObjects)
+	}
+}
+
+// TestMissingData_SkipAndNotify simulates the dangling-ref
+// failure mode (ref persisted but data deleted) by deleting a
+// parquet object directly from S3 after a successful Write. Read
+// and PollRecords must return the remaining records without
+// error and invoke OnMissingData for the missing path. The
+// alternative — failing on NoSuchKey — would poison every future
+// read of that stream.
+func TestMissingData_SkipAndNotify(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+
+	var (
+		missedMu sync.Mutex
+		missed   []string
+	)
+	store, err := s3parquet.New(s3parquet.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+		OnMissingData: func(p string) {
+			missedMu.Lock()
+			defer missedMu.Unlock()
+			missed = append(missed, p)
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	r1, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=abc", []Rec{
+			{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+				Value: 1, Ts: time.UnixMilli(100)},
+		})
+	if err != nil {
+		t.Fatalf("Write r1: %v", err)
+	}
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=def", []Rec{
+			{Period: "2026-03-17", Customer: "def", SKU: "s1",
+				Value: 2, Ts: time.UnixMilli(200)},
+		}); err != nil {
+		t.Fatalf("Write r2: %v", err)
+	}
+
+	// Delete the first data file directly, leaving its ref in
+	// place — the dangling-ref state that the read path must
+	// tolerate.
+	if _, err := f.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(f.Bucket),
+		Key:    aws.String(r1.DataPath),
+	}); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// Read is LIST-based; its LIST already reflects the
+	// deletion, so it never GETs the missing file and the hook
+	// does not fire. The remaining record still comes back.
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 || got[0].Value != 2 {
+		t.Errorf("Read: got %+v, want single record with Value=2",
+			got)
+	}
+
+	// PollRecords walks the ref-stream. The dangling ref is
+	// what the skip-on-NoSuchKey path must tolerate.
+	pollGot, _, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords: %v", err)
+	}
+	if len(pollGot) != 1 || pollGot[0].Value != 2 {
+		t.Errorf("PollRecords: got %+v, want single record with "+
+			"Value=2", pollGot)
+	}
+
+	missedMu.Lock()
+	gotMissed := append([]string(nil), missed...)
+	missedMu.Unlock()
+	if len(gotMissed) != 1 || gotMissed[0] != r1.DataPath {
+		t.Errorf("OnMissingData: got %v, want [%q]",
+			gotMissed, r1.DataPath)
 	}
 }
 

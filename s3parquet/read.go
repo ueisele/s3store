@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
 )
@@ -166,6 +167,19 @@ func (s *Store[T]) downloadAndDecodeAll(
 
 			data, err := s.getObjectBytes(ctx, key)
 			if err != nil {
+				// A dangling ref or a LIST-to-GET race produces a
+				// NoSuchKey here. Skip-and-notify instead of
+				// failing the whole batch, so one bad ref doesn't
+				// poison every subsequent Poll/Read. Any other
+				// error (throttle, network, auth) is still fatal —
+				// we don't want to silently drop real records.
+				var nsk *s3types.NoSuchKey
+				if errors.As(err, &nsk) {
+					if s.cfg.OnMissingData != nil {
+						s.cfg.OnMissingData(key)
+					}
+					return
+				}
 				errs[i] = fmt.Errorf(
 					"s3parquet: get %s: %w", key, err)
 				cancel()
