@@ -71,51 +71,6 @@ func (s *Store[T]) Read(
 	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf), nil
 }
 
-// PollRecords returns a flat slice of typed records from the
-// files referenced by up to maxEntries refs after the offset.
-// Downloads run in parallel (limit pollDownloadConcurrency).
-//
-// By default applies latest-per-entity dedup within the batch
-// (consistent with Read). Pass WithHistory() to disable dedup
-// and get every record in ref order.
-//
-// When dedup is disabled (no EntityKeyOf, or WithHistory()),
-// the returned records follow ref order (= timestamp order)
-// and then parquet-file row order within each ref.
-func (s *Store[T]) PollRecords(
-	ctx context.Context,
-	since core.Offset,
-	maxEntries int32,
-	opts ...core.QueryOption,
-) ([]T, core.Offset, error) {
-	var o core.QueryOpts
-	o.Apply(opts...)
-
-	entries, newOffset, err := s.Poll(ctx, since, maxEntries)
-	if err != nil {
-		return nil, since, err
-	}
-	if len(entries) == 0 {
-		return nil, since, nil
-	}
-
-	keys := make([]string, len(entries))
-	for i, e := range entries {
-		keys[i] = e.DataPath
-	}
-
-	versioned, err := s.downloadAndDecodeAll(ctx, keys)
-	if err != nil {
-		return nil, since, err
-	}
-
-	if o.IncludeHistory || !s.cfg.dedupEnabled() {
-		return stripVersions(versioned), newOffset, nil
-	}
-	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf),
-		newOffset, nil
-}
-
 // listMatchingParquet lists every parquet object under the
 // plan's ListPrefix and returns the subset whose Hive key
 // matches the plan's predicate. S3 LIST handles pagination; the
