@@ -18,9 +18,24 @@ import (
 )
 
 // pollDownloadConcurrency caps the number of parquet files
-// PollRecords downloads in parallel. Fixed rather than
-// configurable in v1 — revisit only if profiling shows a real
-// need.
+// downloaded + decoded in parallel by Read and PollRecords.
+//
+// 8 is a sweet spot across three constraints:
+//
+//   - Network: ~30–100 ms S3 GET latency per object, so 1 → 8
+//     in parallel is a big throughput win. 8 → 32 is diminishing
+//     returns for small/medium parquet files.
+//   - CPU: parquet decode is CPU-bound. On an 8-core host, 8
+//     concurrent decoders roughly saturate cores; more just
+//     causes contention.
+//   - AWS SDK transport: the default HTTP client's
+//     MaxConnsPerHost is around 10, so 8 avoids connection
+//     churn without needing a custom transport.
+//
+// Fixed rather than configurable in v1. If profiling shows
+// this is the bottleneck (e.g. many small files on a large-
+// core host, or a constrained environment that needs a lower
+// cap), promote to a Config knob — ~5 lines, non-breaking.
 const pollDownloadConcurrency = 8
 
 // versionedRecord carries a decoded record together with the
