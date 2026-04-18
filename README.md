@@ -561,10 +561,18 @@ processes parquet objects with the same bounded parallelism as
 `Read` internally, so single-pod runs already saturate a typical
 S3 connection pool.
 
-Safe to run concurrently with `Write`: S3 PUTs of the same empty
-marker are idempotent. Safe to retry after a cancel or crash for
-the same reason — partial progress is durable, a re-run just
-re-issues the remaining PUTs.
+Idempotent at the S3 level (same empty marker, same key), so a
+retry after cancel or crash is a no-op on work already done.
+Safe to run while other goroutines keep writing records that were
+already visible at `NewIndex` time; coverage of records written
+*across* the registration boundary is not guaranteed — a `Write`
+whose `s.indexes` snapshot predates the new registration may PUT
+parquet that `Backfill`'s LIST also misses. For a clean backfill
+on a live store, quiesce writers around `NewIndex`.
+
+Lookup's SettleWindow applies to backfilled markers too — expect
+up to one SettleWindow of lag before a just-backfilled index
+fully reports.
 
 Intended to run from a dedicated migration binary
 (`cmd/backfill-<name>/main.go` in your app repo): because `Index`
