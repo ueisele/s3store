@@ -4,6 +4,12 @@
 // one MinIO container per `go test` invocation (reused across
 // every package), each test gets its own bucket.
 //
+// Uses the pgsty/minio community fork (AGPLv3) since upstream
+// minio/minio was archived in Feb 2026. The fork tracks the
+// original code and ships the same image format, so the
+// testcontainers MinIO module Just Works when pointed at a
+// pgsty/minio:RELEASE... tag.
+//
 // Gated on the `integration` build tag so the testcontainers
 // dependency never ends up in non-test builds.
 package testutil
@@ -25,7 +31,11 @@ import (
 )
 
 const (
-	minioImage    = "minio/minio:latest"
+	// Pinned to a specific pgsty/minio release so integration-
+	// test behavior doesn't drift. The fork publishes dated
+	// RELEASE.YYYY-MM-DD tags mirroring upstream's scheme; bump
+	// when a newer release lands or you need a relevant fix.
+	minioImage    = "pgsty/minio:RELEASE.2026-04-17T00-00-00Z"
 	minioUsername = "minioadmin"
 	minioPassword = "minioadmin"
 )

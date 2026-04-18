@@ -812,8 +812,9 @@ Breaking changes in the package-split refactor:
 - **`Config.KeyParts` → `Config.PartitionKeyParts`** — follows the same
   `PartitionKey*` naming family.
 - **`Config.S3Endpoint` removed** — auto-derived from
-  `S3Client.Options().BaseEndpoint`. For MinIO-style setups, just pass the
-  full URL (`http://minio:9000`) on your `s3.Options`.
+  `S3Client.Options().BaseEndpoint`. For local S3-compatible setups
+  (MinIO fork, SeaweedFS, etc.), just pass the full URL
+  (`http://localhost:9000`) on your `s3.Options`.
 - **Glob grammar narrowed** — `?`, `[abc]`, `{a,b}` alternation, and
   leading/middle `*` in values are rejected. Only whole-segment `*` and a
   single trailing `*` per value are accepted. If you relied on the richer
@@ -850,9 +851,14 @@ CGO_ENABLED=0 go test -count=1 ./s3parquet/... ./internal/...
 go test -tags=integration -timeout=10m -count=1 ./...
 ```
 
-Integration tests require Docker and pull `minio/minio:latest` on first
-run. `-count=1` is the Go idiom for "bypass the test cache" — without it,
-unchanged packages return cached results.
+Integration tests require Docker and pull a pinned `pgsty/minio`
+release on first run (see
+[`internal/testutil/minio.go`](internal/testutil/minio.go)).
+After upstream `minio/minio` was archived in Feb 2026, the
+community-maintained `pgsty/minio` fork continues the same
+code under AGPLv3; it's a drop-in for the testcontainers MinIO
+module. `-count=1` is the Go idiom for "bypass the test cache"
+— without it, unchanged packages return cached results.
 
 ## Releasing
 
