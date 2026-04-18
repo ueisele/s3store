@@ -1,7 +1,7 @@
 # s3store
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/ueisele/s3store.svg)](https://pkg.go.dev/github.com/ueisele/s3store)
-[![Release](https://img.shields.io/github/v/tag/ueisele/s3store?label=release)](https://github.com/ueisele/s3store/releases)
+[![Release](https://img.shields.io/github/v/tag/ueisele/s3store?sort=semver&label=release)](https://github.com/ueisele/s3store/releases)
 
 Append-only, versioned data storage on S3 with a change stream and optional
 embedded DuckDB queries. No server. No broker. No coordinator. Just a Go
