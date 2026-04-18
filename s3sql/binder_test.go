@@ -11,6 +11,19 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 )
 
+// mustBuildBinder is a test helper that fails fast on a bad
+// binder build, so the rest of the test can safely dereference
+// b.byName[...] without a nil-deref panic masking the real
+// cause.
+func mustBuildBinder(t *testing.T, typ reflect.Type) *binder {
+	t.Helper()
+	b, err := buildBinder(typ)
+	if err != nil {
+		t.Fatalf("buildBinder: %v", err)
+	}
+	return b
+}
+
 // TestBuildBinder_BasicTypes verifies a vanilla struct with a
 // primitive + string + time field binds cleanly and exposes the
 // tag-declaration order via b.columns.
@@ -36,23 +49,24 @@ func TestBuildBinder_BasicTypes(t *testing.T) {
 }
 
 // TestBuildBinder_SkipsUntagged_Unexported_Dash checks the three
-// exclusion rules: no parquet tag, unexported field, and explicit
-// `parquet:"-"`. Only tagged exported fields enter the binder.
+// exclusion rules: no parquet tag, explicit `parquet:"-"`, and
+// unexported fields (even when tagged). Only tagged exported
+// fields enter the binder.
 func TestBuildBinder_SkipsUntagged_Unexported_Dash(t *testing.T) {
 	type R struct {
 		Keep   string `parquet:"keep"`
 		Skip   string // no tag
 		Dashed string `parquet:"-"`
-		hidden string `parquet:"hidden"` //nolint:unused
+		hidden string `parquet:"hidden"` // unexported
 	}
-	b, err := buildBinder(reflect.TypeOf(R{}))
-	if err != nil {
-		t.Fatalf("buildBinder: %v", err)
-	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
 	if len(b.columns) != 1 || b.columns[0] != "keep" {
 		t.Errorf("columns: got %v, want [keep]", b.columns)
 	}
-	_ = R{hidden: ""} // silence unused warning
+	// Reference hidden once so the struct literal below
+	// exercises the field and the struct definition isn't
+	// flagged as a field-only-declared noise by future linters.
+	_ = R{hidden: ""}.hidden
 }
 
 // TestBuildBinder_RejectsNonStruct enforces that T must be a
@@ -126,7 +140,7 @@ func TestCompositeScanner_SliceOfPrimitives(t *testing.T) {
 	type R struct {
 		Tags []string `parquet:"tags"`
 	}
-	b, _ := buildBinder(reflect.TypeOf(R{}))
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
 	fb := b.byName["tags"]
 
 	dest := fb.makeDest()
@@ -151,7 +165,7 @@ func TestCompositeScanner_MapFromOrderedMap(t *testing.T) {
 	type R struct {
 		Attrs map[string]int `parquet:"attrs"`
 	}
-	b, _ := buildBinder(reflect.TypeOf(R{}))
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
 	fb := b.byName["attrs"]
 
 	var om duckdb.OrderedMap
@@ -182,7 +196,7 @@ func TestCompositeScanner_NestedStruct(t *testing.T) {
 	type R struct {
 		Address Addr `parquet:"address"`
 	}
-	b, _ := buildBinder(reflect.TypeOf(R{}))
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
 	fb := b.byName["address"]
 
 	dest := fb.makeDest()
@@ -208,7 +222,7 @@ func TestCompositeScanner_NULLLeavesZero(t *testing.T) {
 	type R struct {
 		Tags []string `parquet:"tags"`
 	}
-	b, _ := buildBinder(reflect.TypeOf(R{}))
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
 	fb := b.byName["tags"]
 
 	dest := fb.makeDest()
@@ -231,7 +245,7 @@ func TestCompositeScanner_TypeMismatchErrors(t *testing.T) {
 	type R struct {
 		Counts []int64 `parquet:"counts"`
 	}
-	b, _ := buildBinder(reflect.TypeOf(R{}))
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
 	fb := b.byName["counts"]
 
 	dest := fb.makeDest()
@@ -322,7 +336,7 @@ func TestBuildBinder_CustomSQLScannerType(t *testing.T) {
 // value contract on user types.
 func TestNullScanner_NULL(t *testing.T) {
 	ts := &testScanner{Text: "preset"}
-	ns := &nullScanner{inner: ts, value: reflect.ValueOf(ts).Elem()}
+	ns := &nullScanner{inner: ts}
 	if err := ns.Scan(nil); err != nil {
 		t.Fatalf("Scan(nil): %v", err)
 	}
@@ -334,25 +348,32 @@ func TestNullScanner_NULL(t *testing.T) {
 	}
 }
 
-// TestFieldScanner_NullableTypes runs each of the supported Go
-// primitive types through a NULL scan and a valued scan, and
+// TestFieldScanner_NullableTypes runs every supported Go
+// primitive type through a NULL scan and a valued scan, and
 // verifies the assign function writes (resp. skips) correctly.
 // This is the comprehensive guard for the Kind-switch in
-// makeFieldScanner.
+// makeFieldScanner. Every integer width is covered because
+// each width has its own closure (and for uint types a
+// different SetUint cast). []byte and time.Time live in their
+// own tests because they take different code paths.
 func TestFieldScanner_NullableTypes(t *testing.T) {
 	type R struct {
-		S  string  `parquet:"s"`
-		I  int64   `parquet:"i"`
-		I8 int8    `parquet:"i8"`
-		U  uint32  `parquet:"u"`
-		F  float64 `parquet:"f"`
-		B  bool    `parquet:"b"`
-		By []byte  `parquet:"by"`
+		S   string  `parquet:"s"`
+		I   int     `parquet:"i"`
+		I8  int8    `parquet:"i8"`
+		I16 int16   `parquet:"i16"`
+		I32 int32   `parquet:"i32"`
+		I64 int64   `parquet:"i64"`
+		U   uint    `parquet:"u"`
+		U8  uint8   `parquet:"u8"`
+		U16 uint16  `parquet:"u16"`
+		U32 uint32  `parquet:"u32"`
+		U64 uint64  `parquet:"u64"`
+		F32 float32 `parquet:"f32"`
+		F64 float64 `parquet:"f64"`
+		B   bool    `parquet:"b"`
 	}
-	b, err := buildBinder(reflect.TypeOf(R{}))
-	if err != nil {
-		t.Fatalf("buildBinder: %v", err)
-	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
 
 	cases := []struct {
 		col  string
@@ -362,27 +383,24 @@ func TestFieldScanner_NullableTypes(t *testing.T) {
 		{"s", "hello", func(r R) bool { return r.S == "hello" }},
 		{"i", int64(42), func(r R) bool { return r.I == 42 }},
 		{"i8", int64(7), func(r R) bool { return r.I8 == 7 }},
-		{"u", int64(99), func(r R) bool { return r.U == 99 }},
-		{"f", 3.14, func(r R) bool { return r.F == 3.14 }},
+		{"i16", int64(300), func(r R) bool { return r.I16 == 300 }},
+		{"i32", int64(70000), func(r R) bool { return r.I32 == 70000 }},
+		{"i64", int64(1 << 40), func(r R) bool { return r.I64 == 1<<40 }},
+		{"u", int64(42), func(r R) bool { return r.U == 42 }},
+		{"u8", int64(200), func(r R) bool { return r.U8 == 200 }},
+		{"u16", int64(40000), func(r R) bool { return r.U16 == 40000 }},
+		{"u32", int64(99), func(r R) bool { return r.U32 == 99 }},
+		{"u64", int64(1 << 40), func(r R) bool { return r.U64 == 1<<40 }},
+		{"f32", 2.5, func(r R) bool { return r.F32 == 2.5 }},
+		{"f64", 3.14, func(r R) bool { return r.F64 == 3.14 }},
 		{"b", true, func(r R) bool { return r.B }},
-		{"by", []byte{1, 2, 3},
-			func(r R) bool {
-				return len(r.By) == 3 && r.By[0] == 1
-			}},
 	}
 	for _, tc := range cases {
 		t.Run("valued_"+tc.col, func(t *testing.T) {
 			fb := b.byName[tc.col]
 			dest := fb.makeDest()
-			// Exercise via sql.Scanner interface.
-			if s, ok := dest.(interface{ Scan(any) error }); ok {
-				if err := s.Scan(tc.val); err != nil {
-					t.Fatalf("Scan: %v", err)
-				}
-			} else if bp, ok := dest.(*[]byte); ok {
-				*bp = tc.val.([]byte)
-			} else {
-				t.Fatalf("dest %T lacks Scan or *[]byte", dest)
+			if err := dest.(interface{ Scan(any) error }).Scan(tc.val); err != nil {
+				t.Fatalf("Scan: %v", err)
 			}
 			var r R
 			rv := reflect.ValueOf(&r).Elem()
@@ -395,12 +413,8 @@ func TestFieldScanner_NullableTypes(t *testing.T) {
 		t.Run("null_"+tc.col, func(t *testing.T) {
 			fb := b.byName[tc.col]
 			dest := fb.makeDest()
-			// NULL path: valid stays false; assign is a no-op
-			// and the field stays at Go zero.
-			if s, ok := dest.(interface{ Scan(any) error }); ok {
-				if err := s.Scan(nil); err != nil {
-					t.Fatalf("Scan(nil): %v", err)
-				}
+			if err := dest.(interface{ Scan(any) error }).Scan(nil); err != nil {
+				t.Fatalf("Scan(nil): %v", err)
 			}
 			var r R
 			rv := reflect.ValueOf(&r).Elem()
@@ -410,5 +424,188 @@ func TestFieldScanner_NullableTypes(t *testing.T) {
 				t.Errorf("NULL left non-zero state: %+v", r)
 			}
 		})
+	}
+}
+
+// TestFieldScanner_Time covers the time.Time special case —
+// it's a struct and would otherwise fall through to the
+// composite path, but makeFieldScanner handles it with a
+// sql.NullTime wrapper. Exercises both valued and NULL.
+func TestFieldScanner_Time(t *testing.T) {
+	type R struct {
+		Ts time.Time `parquet:"ts"`
+	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
+	fb := b.byName["ts"]
+
+	want := time.Date(2026, 3, 17, 10, 0, 0, 0, time.UTC)
+	dest := fb.makeDest()
+	if err := dest.(interface{ Scan(any) error }).Scan(want); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var r R
+	rv := reflect.ValueOf(&r).Elem()
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	if !r.Ts.Equal(want) {
+		t.Errorf("valued: got %v, want %v", r.Ts, want)
+	}
+
+	dest = fb.makeDest()
+	if err := dest.(interface{ Scan(any) error }).Scan(nil); err != nil {
+		t.Fatalf("Scan(nil): %v", err)
+	}
+	r = R{}
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	if !r.Ts.IsZero() {
+		t.Errorf("NULL: got %v, want zero time", r.Ts)
+	}
+}
+
+// TestBuildBinder_PointerInput guards the pointer-dereferencing
+// loop at the top of buildBinder: callers may pass
+// reflect.TypeOf((*T)(nil)) (handy when T is only known via a
+// pointer) and should get the same binder as reflect.TypeOf(T{}).
+func TestBuildBinder_PointerInput(t *testing.T) {
+	type R struct {
+		Keep string `parquet:"keep"`
+	}
+	b := mustBuildBinder(t, reflect.TypeFor[*R]())
+	if _, ok := b.byName["keep"]; !ok {
+		t.Error("byName missing 'keep' after pointer-input unwrap")
+	}
+	// Double pointer must also unwrap.
+	b = mustBuildBinder(t, reflect.TypeFor[**R]())
+	if _, ok := b.byName["keep"]; !ok {
+		t.Error("byName missing 'keep' after double-pointer unwrap")
+	}
+}
+
+// TestCompositeScanner_SliceOfStructs exercises the LIST<STRUCT>
+// shape at the unit level: driver returns []any where each
+// element is map[string]any, and mapstructure recursively
+// decodes into []Inner with the parquet tag naming.
+func TestCompositeScanner_SliceOfStructs(t *testing.T) {
+	type Inner struct {
+		Name  string `parquet:"name"`
+		Count int32  `parquet:"count"`
+	}
+	type R struct {
+		Items []Inner `parquet:"items"`
+	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
+	fb := b.byName["items"]
+
+	dest := fb.makeDest()
+	if err := dest.(interface{ Scan(any) error }).Scan([]any{
+		map[string]any{"name": "alpha", "count": int64(1)},
+		map[string]any{"name": "beta", "count": int64(2)},
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var r R
+	rv := reflect.ValueOf(&r).Elem()
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	want := []Inner{{Name: "alpha", Count: 1}, {Name: "beta", Count: 2}}
+	if !reflect.DeepEqual(r.Items, want) {
+		t.Errorf("Items: got %+v, want %+v", r.Items, want)
+	}
+}
+
+// TestFieldScanner_NamedPrimitive guards that a named
+// primitive type still routes through the Kind-switch path —
+// the switch matches reflect.Kind, not exact Type. int16 here;
+// the int8 enum shape (common for go-enum output) gets its own
+// test below.
+func TestFieldScanner_NamedPrimitive(t *testing.T) {
+	type Status int16
+	type R struct {
+		S Status `parquet:"s"`
+	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
+	fb := b.byName["s"]
+
+	dest := fb.makeDest()
+	if err := dest.(interface{ Scan(any) error }).Scan(int64(7)); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var r R
+	rv := reflect.ValueOf(&r).Elem()
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	if r.S != Status(7) {
+		t.Errorf("got %d, want %d", r.S, 7)
+	}
+}
+
+// TestFieldScanner_Int8Enum mirrors the shape go-enum produces
+// for `//go:generate go tool go-enum --marshal` on a
+// `type Field int8` — a named int8 with named constants. The
+// --marshal variant adds JSON methods but not sql.Scanner on
+// *Field, so the binder falls through to the Kind-switch
+// int8 path (sql.NullInt64 + SetInt). This test guards that
+// common enum usage works without any extra plumbing.
+func TestFieldScanner_Int8Enum(t *testing.T) {
+	type Field int8
+	const (
+		FieldPayingCustomer Field = iota
+		FieldListPrice
+		FieldBasePrice
+		FieldNetPrice
+	)
+	type R struct {
+		F Field `parquet:"f"`
+	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
+	fb := b.byName["f"]
+
+	dest := fb.makeDest()
+	if err := dest.(interface{ Scan(any) error }).Scan(
+		int64(FieldBasePrice),
+	); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var r R
+	rv := reflect.ValueOf(&r).Elem()
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	if r.F != FieldBasePrice {
+		t.Errorf("got %d, want %d (FieldBasePrice)",
+			r.F, FieldBasePrice)
+	}
+
+	// Reference the other constants so the declaration is
+	// meaningful (documents the enum shape) without relying on
+	// a linter-specific silencer.
+	_ = FieldPayingCustomer
+	_ = FieldListPrice
+	_ = FieldNetPrice
+}
+
+// TestFieldScanner_ByteSlice covers the raw *[]byte path that
+// makeFieldScanner uses for []byte fields — no NullXxx wrapper,
+// relies on nil-slice-is-NULL semantics of database/sql.
+func TestFieldScanner_ByteSlice(t *testing.T) {
+	type R struct {
+		By []byte `parquet:"by"`
+	}
+	b := mustBuildBinder(t, reflect.TypeOf(R{}))
+	fb := b.byName["by"]
+
+	// Valued path: a fresh dest, write into the destination
+	// (which is a *[]byte), then assign to the struct field.
+	dest := fb.makeDest()
+	*(dest.(*[]byte)) = []byte{1, 2, 3}
+	var r R
+	rv := reflect.ValueOf(&r).Elem()
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	if len(r.By) != 3 || r.By[0] != 1 {
+		t.Errorf("valued: got %v, want [1 2 3]", r.By)
+	}
+
+	// NULL path: leave *dest at its nil zero; assign is a
+	// no-op and r.By stays nil.
+	dest = fb.makeDest()
+	r = R{}
+	fb.assign(rv.FieldByIndex(fb.fieldIndex), dest)
+	if r.By != nil {
+		t.Errorf("NULL: got %v, want nil", r.By)
 	}
 }

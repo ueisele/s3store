@@ -16,7 +16,6 @@ import (
 // aware Scan destination each row; assign copies from that
 // destination into the struct field if the value wasn't NULL.
 type fieldBinder struct {
-	columnName string
 	fieldIndex []int
 	makeDest   func() any
 	assign     func(dstField reflect.Value, src any)
@@ -64,7 +63,6 @@ func buildBinder(t reflect.Type) (*binder, error) {
 				"field %s (%s): %w", sf.Name, sf.Type, err)
 		}
 		b.byName[name] = &fieldBinder{
-			columnName: name,
 			fieldIndex: sf.Index,
 			makeDest:   makeDest,
 			assign:     assign,
@@ -80,15 +78,13 @@ func buildBinder(t reflect.Type) (*binder, error) {
 	return b, nil
 }
 
-// scannerType is the reflect.Type for sql.Scanner; comparing
-// against a precomputed value avoids recomputing on every
-// makeFieldScanner call.
-var scannerType = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
-
-// timeType is reflect.TypeOf(time.Time{}) — pre-computed because
-// time.Time is a struct and would otherwise fall through the
-// Kind switch below.
-var timeType = reflect.TypeOf(time.Time{})
+// Pre-computed reflect.Types used by makeFieldScanner and the
+// composite decode hook. Avoids recomputing on every call.
+var (
+	scannerType    = reflect.TypeFor[sql.Scanner]()
+	timeType       = reflect.TypeFor[time.Time]()
+	orderedMapType = reflect.TypeFor[duckdb.OrderedMap]()
+)
 
 // makeFieldScanner returns (destination factory, assignment
 // function) for a single Go field type. NULL always maps to
@@ -112,19 +108,18 @@ func makeFieldScanner(
 	}
 	if reflect.PointerTo(t).Implements(scannerType) {
 		return func() any {
-				// reflect.New(t) returns reflect.Value of *T;
-				// Interface() gives us the concrete pointer,
-				// which implements sql.Scanner.
-				ptr := reflect.New(t)
+				// reflect.New(t).Interface() gives us the *T
+				// that satisfies sql.Scanner; Scan mutates the
+				// T behind that pointer, and assign reads it
+				// back via reflect at copy time.
 				return &nullScanner{
-					inner: ptr.Interface().(sql.Scanner),
-					value: ptr.Elem(),
+					inner: reflect.New(t).Interface().(sql.Scanner),
 				}
 			},
 			func(dst reflect.Value, src any) {
 				ns := src.(*nullScanner)
 				if ns.valid {
-					dst.Set(ns.value)
+					dst.Set(reflect.ValueOf(ns.inner).Elem())
 				}
 			}, nil
 	}
@@ -221,10 +216,10 @@ func makeFieldScanner(
 // nullScanner adapts a user sql.Scanner into a NULL-aware Scan
 // destination. On NULL we leave the inner value at its Go zero,
 // so the parent assign step skips the copy and the struct field
-// stays zero.
+// stays zero. The scanned value lives behind inner (a *T); the
+// assign step recovers it via reflect.ValueOf(inner).Elem().
 type nullScanner struct {
 	inner sql.Scanner
-	value reflect.Value // reflect.Value of the T sitting behind inner
 	valid bool
 }
 
@@ -286,7 +281,7 @@ func (c *compositeScanner) Scan(src any) error {
 func orderedMapDecodeHook(
 	from reflect.Type, _ reflect.Type, data any,
 ) (any, error) {
-	if from != reflect.TypeOf(duckdb.OrderedMap{}) {
+	if from != orderedMapType {
 		return data, nil
 	}
 	om := data.(duckdb.OrderedMap)
