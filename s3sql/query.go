@@ -15,7 +15,7 @@ func (s *Store[T]) Query(
 	ctx context.Context,
 	keyPattern string,
 	sqlQuery string,
-	opts ...core.QueryOption,
+	opts ...QueryOption,
 ) (*sql.Rows, error) {
 	var o core.QueryOpts
 	o.Apply(opts...)
@@ -36,7 +36,7 @@ func (s *Store[T]) QueryRow(
 	ctx context.Context,
 	keyPattern string,
 	sqlQuery string,
-	opts ...core.QueryOption,
+	opts ...QueryOption,
 ) *sql.Row {
 	var o core.QueryOpts
 	o.Apply(opts...)

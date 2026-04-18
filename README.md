@@ -388,8 +388,9 @@ are encoded from `time.UnixMicro()`). `time.Date(..., time.UTC)` gives
 UTC-day boundaries; `time.Date(..., loc)` gives local-day boundaries —
 both work, as long as `start` and `end` use the same timezone.
 
-Pass `core.Offset("")` for `since` to start at the stream head, or for
-`until` to read to the live tip (settle-window cutoff).
+Pass `s3store.Offset("")` (or `s3parquet.Offset("")` / `s3sql.Offset("")`
+when using the sub-packages directly) for `since` to start at the stream
+head, or for `until` to read to the live tip (settle-window cutoff).
 
 For streaming (bounded memory on long windows, or processing in batches),
 use `PollRecords` with `WithUntilOffset`:

@@ -31,7 +31,7 @@ const writeCleanupTimeout = 5 * time.Second
 // cases.
 func (s *Store[T]) Write(
 	ctx context.Context, records []T,
-) ([]core.WriteResult, error) {
+) ([]WriteResult, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -46,7 +46,7 @@ func (s *Store[T]) Write(
 	// Sorted key iteration keeps the returned results (and
 	// the sequence of S3 PUTs) deterministic across runs,
 	// instead of following map iteration order.
-	var results []core.WriteResult
+	var results []WriteResult
 	for _, key := range slices.Sorted(maps.Keys(grouped)) {
 		result, err := s.WriteWithKey(ctx, key, grouped[key])
 		if err != nil {
@@ -69,7 +69,7 @@ func (s *Store[T]) Write(
 // includes the orphan data path so the operator can clean up.
 func (s *Store[T]) WriteWithKey(
 	ctx context.Context, key string, records []T,
-) (*core.WriteResult, error) {
+) (*WriteResult, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -134,8 +134,8 @@ func (s *Store[T]) WriteWithKey(
 
 	refKey := core.EncodeRefKey(s.refPath, tsMicros, shortID, key)
 
-	result := &core.WriteResult{
-		Offset:   core.Offset(refKey),
+	result := &WriteResult{
+		Offset:   Offset(refKey),
 		DataPath: dataKey,
 		RefPath:  refKey,
 	}

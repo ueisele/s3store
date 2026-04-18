@@ -57,7 +57,7 @@ type versionedRecord[T any] struct {
 // Memory: all matching records are buffered before dedup/return.
 // For unbounded reads, use PollRecords to stream incrementally.
 func (s *Store[T]) Read(
-	ctx context.Context, keyPattern string, opts ...core.QueryOption,
+	ctx context.Context, keyPattern string, opts ...QueryOption,
 ) ([]T, error) {
 	var o core.QueryOpts
 	o.Apply(opts...)

@@ -1,10 +1,6 @@
 package s3sql
 
-import (
-	"context"
-
-	"github.com/ueisele/s3store/internal/core"
-)
+import "context"
 
 // Read returns the latest version of all records matching the
 // key pattern. Uses DuckDB with union_by_name for schema
@@ -16,7 +12,7 @@ import (
 func (s *Store[T]) Read(
 	ctx context.Context,
 	keyPattern string,
-	opts ...core.QueryOption,
+	opts ...QueryOption,
 ) ([]T, error) {
 	rows, err := s.Query(ctx, keyPattern,
 		"SELECT * FROM "+s.cfg.TableAlias, opts...)
