@@ -58,6 +58,162 @@ func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 	return store
 }
 
+// TestIndex_WriteAndLookup covers the secondary-index feature
+// end-to-end: register an index, Write records, Lookup by an
+// exact partition, Lookup with a range on the first index
+// column, and verify that a pattern with no matches returns an
+// empty slice rather than an error.
+//
+// Index partition: (sku, period). Lookup covers: (customer).
+// Two distinct customers × one SKU × two periods ⇒ the batch
+// deduplicates to 4 markers despite 5 source records.
+func TestIndex_WriteAndLookup(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	type SkuPeriodEntry struct {
+		SKU      string `parquet:"sku"`
+		Period   string `parquet:"period"`
+		Customer string `parquet:"customer"`
+	}
+
+	idx, err := s3parquet.NewIndex(store,
+		s3parquet.IndexDef[Rec, SkuPeriodEntry]{
+			Name:    "sku_period_idx",
+			Columns: []string{"sku", "period", "customer"},
+			Of: func(r Rec) []SkuPeriodEntry {
+				return []SkuPeriodEntry{{
+					SKU: r.SKU, Period: r.Period, Customer: r.Customer,
+				}}
+			},
+		})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	in := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1, Ts: time.UnixMilli(100)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 2, Ts: time.UnixMilli(200)}, // dup marker
+		{Period: "2026-03-17", Customer: "def", SKU: "s1", Value: 3, Ts: time.UnixMilli(300)},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s1", Value: 4, Ts: time.UnixMilli(400)},
+		{Period: "2026-04-01", Customer: "abc", SKU: "s2", Value: 5, Ts: time.UnixMilli(500)},
+	}
+	if _, err := store.Write(ctx, in); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Wait past the settle window so Lookup sees every marker.
+	time.Sleep(60 * time.Millisecond)
+
+	// Exact lookup: one SKU, one period, any customer.
+	got, err := idx.Lookup(ctx,
+		"sku=s1/period=2026-03-17/customer=*")
+	if err != nil {
+		t.Fatalf("Lookup exact: %v", err)
+	}
+	gotCustomers := make(map[string]bool)
+	for _, e := range got {
+		gotCustomers[e.Customer] = true
+	}
+	if !gotCustomers["abc"] || !gotCustomers["def"] {
+		t.Errorf("got customers %v, want both abc and def",
+			gotCustomers)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d entries, want 2 (abc, def)", len(got))
+	}
+
+	// Range on the period column — covers 03-17 and 03-18, not 04-01.
+	got, err = idx.Lookup(ctx,
+		"sku=s1/period=2026-03-01..2026-04-01/customer=*")
+	if err != nil {
+		t.Fatalf("Lookup range: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("range: got %d entries, want 3 "+
+			"(abc/03-17, def/03-17, abc/03-18)", len(got))
+	}
+
+	// Miss — an SKU we never wrote.
+	got, err = idx.Lookup(ctx, "sku=s999/period=*/customer=*")
+	if err != nil {
+		t.Fatalf("Lookup miss: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("miss: got %d entries, want 0", len(got))
+	}
+}
+
+// TestIndex_SettleWindowHidesFresh guards the SettleWindow
+// semantic on Lookup: markers written in the last SettleWindow
+// are hidden (LastModified filter), matching Poll's behavior.
+func TestIndex_SettleWindowHidesFresh(t *testing.T) {
+	ctx := context.Background()
+	// Use a generous SettleWindow so the "fresh" check isn't racy.
+	f := testutil.New(t)
+	store, err := s3parquet.New(s3parquet.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	idx, err := s3parquet.NewIndex(store,
+		s3parquet.IndexDef[Rec, Entry]{
+			Name:    "sku_idx",
+			Columns: []string{"sku", "customer"},
+			Of: func(r Rec) []Entry {
+				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+			},
+		})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1"},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Inside SettleWindow: marker is invisible.
+	got, err := idx.Lookup(ctx, "sku=s1/customer=*")
+	if err != nil {
+		t.Fatalf("Lookup inside window: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("inside window: got %d entries, want 0",
+			len(got))
+	}
+
+	// Wait past SettleWindow; marker becomes visible.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err = idx.Lookup(ctx, "sku=s1/customer=*")
+		if err != nil {
+			t.Fatalf("Lookup waiting: %v", err)
+		}
+		if len(got) > 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("marker never became visible past the settle window")
+}
+
 // TestWriteAndRead exercises the basic round-trip through S3.
 // No dedup configured.
 func TestWriteAndRead(t *testing.T) {

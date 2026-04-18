@@ -105,6 +105,77 @@ func ParseDataFileName(name string) (tsMicros int64, shortID string, err error) 
 	return tsMicros, short, nil
 }
 
+// IndexPath returns the prefix under which markers for the named
+// secondary index are stored, relative to the store's top-level
+// Prefix. Each index lives in its own subtree so multiple indexes
+// on one store don't collide.
+func IndexPath(prefix, name string) string {
+	return prefix + "/_index/" + name
+}
+
+// IndexMarkerFilename is the fixed terminal filename appended to
+// every marker S3 key. The last real path segment is always
+// "col=value"; this constant sits after it so parse code can
+// strip it uniformly and LIST paginators recognise markers.
+const IndexMarkerFilename = "m.idx"
+
+// BuildIndexMarkerPath assembles an S3 object key for an index
+// marker. columns and values are paired by position. Values must
+// pass ValidateHivePartitionValue before calling; this helper
+// does not revalidate.
+func BuildIndexMarkerPath(
+	indexPath string, columns, values []string,
+) string {
+	segs := make([]string, len(columns))
+	for i := range columns {
+		segs[i] = columns[i] + "=" + values[i]
+	}
+	return indexPath + "/" + strings.Join(segs, "/") +
+		"/" + IndexMarkerFilename
+}
+
+// ParseIndexMarkerKey is the inverse of BuildIndexMarkerPath. It
+// extracts the column values from a marker key in the order they
+// appear in columns. Fails if the key doesn't match the shape
+// (wrong prefix, wrong suffix, wrong segment count, wrong
+// column name in a segment).
+func ParseIndexMarkerKey(
+	markerKey, indexPath string, columns []string,
+) ([]string, error) {
+	prefix := indexPath + "/"
+	if !strings.HasPrefix(markerKey, prefix) {
+		return nil, fmt.Errorf(
+			"s3store: marker key %q outside index path %q",
+			markerKey, indexPath)
+	}
+	body := markerKey[len(prefix):]
+	tail := "/" + IndexMarkerFilename
+	if !strings.HasSuffix(body, tail) {
+		return nil, fmt.Errorf(
+			"s3store: marker key %q missing %q suffix",
+			markerKey, IndexMarkerFilename)
+	}
+	body = body[:len(body)-len(tail)]
+	segs := strings.Split(body, "/")
+	if len(segs) != len(columns) {
+		return nil, fmt.Errorf(
+			"s3store: marker key %q has %d segments, want %d",
+			markerKey, len(segs), len(columns))
+	}
+	out := make([]string, len(columns))
+	for i, seg := range segs {
+		colPrefix := columns[i] + "="
+		if !strings.HasPrefix(seg, colPrefix) {
+			return nil, fmt.Errorf(
+				"s3store: marker key %q segment %d is %q, "+
+					"expected %q=...",
+				markerKey, i, seg, columns[i])
+		}
+		out[i] = seg[len(colPrefix):]
+	}
+	return out, nil
+}
+
 // RefCutoff returns the upper-bound refs-prefix for a given
 // settle window. Any ref key whose string-comparison is strictly
 // greater than this cutoff falls within the settle window and

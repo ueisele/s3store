@@ -5,6 +5,31 @@ import (
 	"testing"
 )
 
+func TestValidateHivePartitionValue(t *testing.T) {
+	cases := []struct {
+		name, value string
+		wantErr     bool
+	}{
+		{"plain", "abc", false},
+		{"with equals", "a=b=c", false},
+		{"with dash", "a-b-c", false},
+		{"with underscore", "a_b_c", false},
+		{"unicode", "日本", false},
+		{"empty", "", true},
+		{"slash", "a/b", true},
+		{"double dot", "a..b", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateHivePartitionValue(tc.value)
+			if tc.wantErr != (err != nil) {
+				t.Errorf("value=%q: wantErr=%v got %v",
+					tc.value, tc.wantErr, err)
+			}
+		})
+	}
+}
+
 func TestValidatePartitionKeyParts(t *testing.T) {
 	cases := []struct {
 		name    string

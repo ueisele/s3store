@@ -111,6 +111,29 @@ type Store[T any] struct {
 	s3       *s3.Client
 	dataPath string
 	refPath  string
+
+	// indexes is the list of registered secondary indexes that the
+	// write path iterates per record to emit marker objects. Typed
+	// Index[T, K] handles append to this slice via registerIndex
+	// at NewIndex time; the entry type K is erased at the closure
+	// boundary so the slice can be homogeneous over T.
+	indexes []indexWriter[T]
+}
+
+// indexWriter is the internal, entry-type-erased contract between
+// a typed Index[T, K] and the Store's write path. Given a record,
+// it returns the S3 object keys of the markers that record
+// produces, already validated and ready to PUT.
+type indexWriter[T any] struct {
+	name    string
+	pathsOf func(T) ([]string, error)
+}
+
+// registerIndex appends a typed index's writer to the store's
+// iteration list. Called from NewIndex. Not concurrency-safe:
+// indexes should be registered before the first Write.
+func (s *Store[T]) registerIndex(w indexWriter[T]) {
+	s.indexes = append(s.indexes, w)
 }
 
 // New constructs a Store. Validates required config fields.

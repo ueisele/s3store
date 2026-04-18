@@ -459,6 +459,103 @@ configuration.
 Renames, splits, and row-level computed derivations still require a
 migration tool — rewrite the affected files with the new shape.
 
+## Secondary indexes
+
+When a query filters on a column that's neither a partition key
+nor a good fit for bloom filters (e.g. "list every customer that
+had usage of SKU X in period P"), scanning every data file is
+prohibitive at scale. A secondary index solves this by writing
+one empty S3 *marker* per distinct tuple of the columns you want
+to query. The query is a single LIST under the marker prefix —
+zero parquet reads, no cgo, no DuckDB.
+
+### Shape
+
+You define an index by a typed entry struct (one parquet-tagged
+string field per column) and an `Of` function that emits
+zero-or-more entries per record:
+
+```go
+type SkuPeriodEntry struct {
+    SKUID             string `parquet:"sku_id"`
+    ChargePeriodStart string `parquet:"charge_period_start"`
+    CausingCustomer   string `parquet:"causing_customer"`
+    ChargePeriodEnd   string `parquet:"charge_period_end"`
+}
+
+store, _ := s3store.New[Usage](cfg)
+
+skuIdx, err := s3store.NewIndex[Usage, SkuPeriodEntry](store,
+    s3store.IndexDef[Usage, SkuPeriodEntry]{
+        Name:    "sku_period_idx",
+        Columns: []string{
+            "sku_id", "charge_period_start",
+            "causing_customer", "charge_period_end",
+        },
+        Of: func(u Usage) []SkuPeriodEntry {
+            return []SkuPeriodEntry{{
+                SKUID:             u.SKUID,
+                ChargePeriodStart: u.ChargePeriodStart.Format(time.RFC3339),
+                CausingCustomer:   u.CausingCustomer,
+                ChargePeriodEnd:   u.ChargePeriodEnd.Format(time.RFC3339),
+            }}
+        },
+    })
+```
+
+Every `Write` call iterates each registered index, collects a
+deduplicated set of entries across the batch, and PUTs one empty
+marker per distinct entry under
+`<Prefix>/_index/<name>/<col>=<val>/.../m.idx`. Duplicate writes
+are idempotent (same S3 key, same empty body).
+
+### Lookup
+
+```go
+hits, err := skuIdx.Lookup(ctx,
+    "sku_id=SKU-123/charge_period_start=2026-03-01..2026-04-01/"+
+    "causing_customer=*/charge_period_end=*")
+// hits []SkuPeriodEntry
+```
+
+The pattern grammar is the same one `Read` accepts (exact,
+trailing-`*`, whole-segment `*`, `FROM..TO` range). Results are
+unbounded — narrow the pattern if an index has millions of
+matches.
+
+### What's in scope for v1
+
+- Register + auto-write on `Write` + `Lookup` via the typed handle.
+- SettleWindow applies to Lookup: markers LIST-visible but with
+  `LastModified` inside `now - SettleWindow` are hidden, matching
+  `Poll`'s guarantees so index and data views agree within the
+  window.
+
+### Not in v1 (deferred)
+
+- **Delete index** — no general delete path on the store yet.
+- **Repopulate from data** — a future task will read the ref
+  stream chronologically and replay records through an index's
+  `Of` to backfill markers for records written before the index
+  was registered. Until that lands, **register all indexes
+  before the first `Write`** — earlier writes produce no markers
+  for later-registered indexes.
+- **Verification / orphan cleanup tools.**
+
+### Column ordering matters (for performance, not correctness)
+
+Put columns you typically filter on **first**. They form the
+S3 LIST prefix, so a query that specifies them literally narrows
+the LIST. Trailing columns are always parsed out of the marker
+filename — correct but slower when there's nothing to prune on.
+
+### String-only entry fields
+
+`K`'s fields must be Go `string` (validated at `NewIndex`).
+Format times and numbers in your `Of` function, the same way
+`PartitionKeyOf` already does for data paths. Keeps the read
+path a pure round-trip.
+
 ## Bloom filters on hot columns
 
 > **Only `s3sql` (DuckDB) consults bloom filters today.** `s3parquet.Read`

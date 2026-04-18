@@ -1,6 +1,8 @@
 package core
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -214,6 +216,67 @@ func TestBuildDataFilePathLexicalOrdering(t *testing.T) {
 	later := BuildDataFilePath(dataPath, key, 2_000_000_000_000, "aaaaaaaa")
 	if earlier >= later {
 		t.Errorf("earlier %q should sort before later %q", earlier, later)
+	}
+}
+
+func TestIndexPath(t *testing.T) {
+	got := IndexPath("store", "sku_period_idx")
+	want := "store/_index/sku_period_idx"
+	if got != want {
+		t.Errorf("IndexPath = %q, want %q", got, want)
+	}
+}
+
+func TestBuildAndParseIndexMarkerKey(t *testing.T) {
+	const indexPath = "store/_index/sku_period_idx"
+	columns := []string{
+		"sku_id", "charge_period_start",
+		"causing_customer", "charge_period_end",
+	}
+	values := []string{
+		"SKU-123", "2026-03-01T00",
+		"abc", "2026-04-01T00",
+	}
+
+	key := BuildIndexMarkerPath(indexPath, columns, values)
+
+	if !strings.HasSuffix(key, "/m.idx") {
+		t.Errorf("BuildIndexMarkerPath %q missing /m.idx suffix", key)
+	}
+	if !strings.HasPrefix(key, indexPath+"/") {
+		t.Errorf("BuildIndexMarkerPath %q missing %q prefix",
+			key, indexPath)
+	}
+
+	got, err := ParseIndexMarkerKey(key, indexPath, columns)
+	if err != nil {
+		t.Fatalf("ParseIndexMarkerKey: %v", err)
+	}
+	if !reflect.DeepEqual(got, values) {
+		t.Errorf("round-trip: got %v, want %v", got, values)
+	}
+}
+
+func TestParseIndexMarkerKey_Rejects(t *testing.T) {
+	const indexPath = "store/_index/idx"
+	columns := []string{"a", "b"}
+
+	cases := []struct {
+		name, key string
+	}{
+		{"wrong prefix", "other/_index/idx/a=1/b=2/m.idx"},
+		{"wrong suffix", "store/_index/idx/a=1/b=2/other.txt"},
+		{"wrong segment count", "store/_index/idx/a=1/m.idx"},
+		{"wrong column name", "store/_index/idx/x=1/b=2/m.idx"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseIndexMarkerKey(
+				tc.key, indexPath, columns,
+			); err == nil {
+				t.Errorf("expected error, got nil for %q", tc.key)
+			}
+		})
 	}
 }
 

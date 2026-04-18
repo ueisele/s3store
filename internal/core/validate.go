@@ -33,6 +33,33 @@ func ValidatePartitionKeyParts(parts []string) error {
 	return nil
 }
 
+// ValidateHivePartitionValue rejects values that can't be
+// safely embedded in a "col=value" hive-path segment:
+//
+//   - empty (would produce "col=" which carries no information),
+//   - contains "/" (segment separator — would split the key),
+//   - contains ".." (reserved by the key-pattern range grammar
+//     as the FROM..TO separator; a value containing ".." would
+//     be unaddressable on read).
+//
+// "=" inside the value is allowed because segments split on the
+// first "=" only, matching the data-partition convention.
+func ValidateHivePartitionValue(value string) error {
+	if value == "" {
+		return fmt.Errorf("hive partition value is empty")
+	}
+	if strings.Contains(value, "/") {
+		return fmt.Errorf(
+			"hive partition value %q contains '/'", value)
+	}
+	if strings.Contains(value, "..") {
+		return fmt.Errorf(
+			"hive partition value %q contains '..' "+
+				"(reserved by key-pattern range grammar)", value)
+	}
+	return nil
+}
+
 // ValidateKeyPattern enforces the shared glob grammar across
 // every read path:
 //

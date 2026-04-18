@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -81,6 +82,14 @@ func (s *Store[T]) WriteWithKey(
 			"s3parquet: parquet encode: %w", err)
 	}
 
+	// Compute marker paths up-front so a bad IndexDef.Of fails the
+	// whole Write before we touch S3, matching how validateKey
+	// aborts on a malformed partition key.
+	markerPaths, err := s.collectIndexMarkerPaths(records)
+	if err != nil {
+		return nil, err
+	}
+
 	shortID := uuid.New().String()[:8]
 
 	// Capture the write timestamp before the data PUT so both
@@ -98,6 +107,28 @@ func (s *Store[T]) WriteWithKey(
 	); err != nil {
 		return nil, fmt.Errorf(
 			"s3parquet: put data: %w", err)
+	}
+
+	// Index markers are written after data (so a successful
+	// marker implies the backing data file exists) and before
+	// the ref (so Poll's commit semantics are unchanged). If any
+	// marker PUT fails we delete the orphan data and return —
+	// any markers that landed before the failure stay as
+	// orphans, which Lookup tolerates.
+	if err := s.putMarkersParallel(ctx, markerPaths); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(), writeCleanupTimeout)
+		defer cancel()
+		if delErr := s.deleteObject(
+			cleanupCtx, dataKey,
+		); delErr != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: put index markers: %w "+
+					"(orphan data at %s: %v)",
+				err, dataKey, delErr)
+		}
+		return nil, fmt.Errorf(
+			"s3parquet: put index markers: %w", err)
 	}
 
 	refKey := core.EncodeRefKey(s.refPath, tsMicros, shortID, key)
@@ -177,18 +208,84 @@ func (s *Store[T]) validateKey(key string) error {
 				key, i, seg, part)
 		}
 		value := seg[len(prefix):]
-		if value == "" {
+		if err := core.ValidateHivePartitionValue(value); err != nil {
 			return fmt.Errorf(
-				"s3parquet: key %q segment %d has "+
-					"empty value for %q",
-				key, i, part)
+				"s3parquet: key %q segment %d (%q): %w",
+				key, i, part, err)
 		}
-		if strings.Contains(value, "..") {
-			return fmt.Errorf(
-				"s3parquet: key %q segment %d value %q "+
-					"contains '..' (reserved by the key-pattern "+
-					"range grammar 'FROM..TO')",
-				key, i, value)
+	}
+	return nil
+}
+
+// markerPutConcurrency caps the number of parallel marker PUTs
+// per WriteWithKey. Markers are tiny (empty objects), so request
+// rate rather than bandwidth is the limit. 8 matches the AWS SDK
+// default MaxConnsPerHost, mirroring pollDownloadConcurrency.
+const markerPutConcurrency = 8
+
+// collectIndexMarkerPaths iterates every registered index over
+// every record in the batch and returns the deduplicated set of
+// marker S3 keys. Dedup is via map[string]struct{} on the full
+// path, which is correct because different indexes live under
+// different _index/<name>/ prefixes — no cross-index collisions.
+func (s *Store[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
+	if len(s.indexes) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	for _, idx := range s.indexes {
+		for _, rec := range records {
+			paths, err := idx.pathsOf(rec)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"s3parquet: index %q: %w", idx.name, err)
+			}
+			for _, p := range paths {
+				seen[p] = struct{}{}
+			}
+		}
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// putMarkersParallel issues PUTs for every path with bounded
+// concurrency. Returns the first error observed; remaining PUTs
+// that already started may still complete (their success or
+// failure is discarded). Partial success is an accepted outcome:
+// Lookup tolerates orphan markers.
+func (s *Store[T]) putMarkersParallel(
+	ctx context.Context, paths []string,
+) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, markerPutConcurrency)
+	errs := make([]error, len(paths))
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, p string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = s.putObject(
+				ctx, p, nil, "application/octet-stream")
+		}(i, p)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
