@@ -3,6 +3,7 @@ package s3parquet
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -256,10 +257,11 @@ func (s *Store[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 }
 
 // putMarkersParallel issues PUTs for every path with bounded
-// concurrency. Returns the first error observed; remaining PUTs
-// that already started may still complete (their success or
-// failure is discarded). Partial success is an accepted outcome:
-// Lookup tolerates orphan markers.
+// concurrency and cancel-on-first-error. Returns the earliest
+// real (non-cancellation) error observed; already-started PUTs
+// run to completion, those still blocked on the semaphore see
+// the cancelled context and bail. Partial success is an accepted
+// outcome — Lookup tolerates orphan markers.
 func (s *Store[T]) putMarkersParallel(
 	ctx context.Context, paths []string,
 ) error {
@@ -274,19 +276,38 @@ func (s *Store[T]) putMarkersParallel(
 	var wg sync.WaitGroup
 	for i, p := range paths {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int, p string) {
 			defer wg.Done()
+			// Acquire the semaphore inside the goroutine so a
+			// parent-ctx cancel or sibling-goroutine failure
+			// unblocks us promptly instead of letting the main
+			// loop keep spawning PUTs.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errs[i] = ctx.Err()
+				return
+			}
 			defer func() { <-sem }()
-			errs[i] = s.putObject(
-				ctx, p, nil, "application/octet-stream")
+
+			if err := s.putObject(
+				ctx, p, nil, "application/octet-stream",
+			); err != nil {
+				errs[i] = err
+				cancel()
+			}
 		}(i, p)
 	}
 	wg.Wait()
+
+	// First real error wins; skip cancellations so we report the
+	// root-cause failure instead of the cancellation it triggered
+	// in sibling goroutines.
 	for _, err := range errs {
-		if err != nil {
-			return err
+		if err == nil || errors.Is(err, context.Canceled) {
+			continue
 		}
+		return err
 	}
 	return nil
 }

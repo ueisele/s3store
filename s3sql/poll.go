@@ -123,8 +123,15 @@ func (s *Store[T]) PollRecords(
 		uris[i] = sqlQuote(s.s3URI(e.DataPath))
 	}
 
+	// Match scanExprForPattern's read_parquet options: expose
+	// hive partition columns as VARCHAR (hive_types_autocast=false
+	// prevents DuckDB from re-typing ISO dates as DATE/TIMESTAMP
+	// mid-read, which would diverge from strict lex comparison on
+	// the Go side). Keeps Read and PollRecords seeing the same
+	// shape regardless of which code path surfaced the files.
 	scanExpr := fmt.Sprintf(
 		"SELECT * FROM read_parquet([%s], "+
+			"hive_partitioning=true, hive_types_autocast=false, "+
 			"union_by_name=true)",
 		strings.Join(uris, ", "))
 
