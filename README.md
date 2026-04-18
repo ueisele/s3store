@@ -1,5 +1,8 @@
 # s3store
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/ueisele/s3store.svg)](https://pkg.go.dev/github.com/ueisele/s3store)
+[![Release](https://img.shields.io/github/v/tag/ueisele/s3store?label=release)](https://github.com/ueisele/s3store/releases)
+
 Append-only, versioned data storage on S3 with a change stream and optional
 embedded DuckDB queries. No server. No broker. No coordinator. Just a Go
 library and an S3 bucket.
@@ -32,13 +35,15 @@ same data is accessible through either.
 
 ## Install
 
-```
-go get github.com/ueisele/s3store
+```bash
+go get github.com/ueisele/s3store@latest
 ```
 
-Requires Go 1.26.2+ (declared in [go.mod](go.mod)). DuckDB's httpfs
-extension is auto-installed on first use or pre-installed in air-gapped
-environments.
+s3store is pre-v1 — **minor version bumps (`v0.x.0`) may carry breaking
+API changes**. Pin an exact version in your `go.mod` (or commit your
+`go.sum`) to control when you pick them up. Requires Go 1.26.2+ (declared
+in [go.mod](go.mod)). DuckDB's httpfs extension is auto-installed on first
+use or pre-installed in air-gapped environments.
 
 ## Quick start — full umbrella
 
@@ -698,6 +703,45 @@ go test -tags=integration -timeout=10m -count=1 ./...
 Integration tests require Docker and pull `minio/minio:latest` on first
 run. `-count=1` is the Go idiom for "bypass the test cache" — without it,
 unchanged packages return cached results.
+
+## Releasing
+
+Versions are git tags following SemVer. The README badges auto-update
+from the latest tag and pkg.go.dev — nothing to edit in this file.
+
+```bash
+# From a clean, pushed main:
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
+```
+
+Optionally mint GitHub release notes from the new tag:
+
+```bash
+gh release create v0.2.0 --title "v0.2.0" --generate-notes
+```
+
+`--generate-notes` auto-populates the body with commits since the
+previous tag.
+
+**Version-bump rules while pre-v1:**
+
+- `v0.x.0` → any new feature or API change, however small.
+- `v0.x.y` → bug fixes only, no API surface change.
+
+**Immutability:** tags pushed to the public repo are cached immutably by
+Go's module proxy, so a bad tag can't be replaced — cut `v0.x.(y+1)`
+instead. Only delete a tag if nobody could have pulled it yet:
+
+```bash
+git tag -d v0.2.0
+git push origin :refs/tags/v0.2.0
+```
+
+**Reaching v1.0.0:** when the API feels stable after real-world use, tag
+`v1.0.0`. After that, breaking changes require a `v2.0.0` and a module
+path rename to `github.com/ueisele/s3store/v2` — one-way door, so don't
+rush it.
 
 ## Limitations
 
