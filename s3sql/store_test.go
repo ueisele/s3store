@@ -189,22 +189,36 @@ func TestBuildRangeWhere(t *testing.T) {
 }
 
 // TestScanExprForPattern_Range confirms ranges produce both a
-// common-prefix glob and a WHERE clause in the final scan. This
-// is the composition the dedup CTE wraps.
+// common-prefix glob and a WHERE clause in the final scan, and
+// that the filename option is emitted only when the caller
+// requested it (for dedup tie-breaking).
 func TestScanExprForPattern_Range(t *testing.T) {
 	s := newTestStore()
-	got, err := s.scanExprForPattern(
-		"period=2026-03-01..2026-04-01/customer=abc")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	cases := []struct {
+		name         string
+		withFilename bool
+		wantOpt      string
+	}{
+		{"no filename", false, ""},
+		{"with filename", true, ", filename=true"},
 	}
-	const want = `SELECT * FROM read_parquet(` +
-		`'s3://b/p/data/period=2026-0*/customer=abc/*.parquet', ` +
-		`hive_partitioning=true, hive_types_autocast=false, ` +
-		`union_by_name=true) ` +
-		`WHERE "period" >= '2026-03-01' AND "period" < '2026-04-01'`
-	if got != want {
-		t.Errorf("\ngot  %q\nwant %q", got, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := s.scanExprForPattern(
+				"period=2026-03-01..2026-04-01/customer=abc",
+				tc.withFilename)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := `SELECT * FROM read_parquet(` +
+				`'s3://b/p/data/period=2026-0*/customer=abc/*.parquet', ` +
+				`hive_partitioning=true, hive_types_autocast=false, ` +
+				`union_by_name=true` + tc.wantOpt + `) ` +
+				`WHERE "period" >= '2026-03-01' AND "period" < '2026-04-01'`
+			if got != want {
+				t.Errorf("\ngot  %q\nwant %q", got, want)
+			}
+		})
 	}
 }
 

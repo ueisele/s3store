@@ -364,6 +364,22 @@ Whether dedup actually runs depends on which package you use:
 
 `WithHistory()` forces the no-dedup path in every case.
 
+**Deterministic tie-break on equal versions.** When two writes share the
+same version for the same entity key — common on an at-least-once retry
+that replays a batch with the same domain timestamp — both paths resolve
+the tie deterministically:
+
+- **`s3parquet`**: first write wins (first occurrence, stable across
+  repeated reads).
+- **`s3sql`**: later write wins (secondary `ORDER BY filename DESC` in
+  the dedup CTE; data filenames embed the write tsMicros, so lex-later
+  = wrote-later). Stable across repeated reads.
+
+The two packages differ in *which* record wins, but each is deterministic
+on its own. Pick the package whose tie-break matches your retry
+semantics — or make the tie impossible by ensuring `VersionColumn` /
+`VersionOf` strictly increases per write.
+
 ### Stream — time window
 
 To read only records written within a time window (e.g. "yesterday's

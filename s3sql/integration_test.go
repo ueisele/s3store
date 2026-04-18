@@ -133,6 +133,62 @@ func TestRead_WithDedup(t *testing.T) {
 	}
 }
 
+// TestRead_DedupVersionTieDeterministic covers the edge case
+// where two writes share the exact VersionColumn value — without
+// a secondary tie-break, DuckDB's ROW_NUMBER would pick a winner
+// arbitrarily and re-runs could disagree. The dedup CTE orders
+// by filename DESC as the tie-breaker, so the lexicographically-
+// later data file (= the later Write, since filenames are
+// prefixed with write tsMicros) always wins and the result is
+// stable across repeated reads.
+func TestRead_DedupVersionTieDeterministic(t *testing.T) {
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
+
+	tied := time.UnixMilli(100)
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 10, Currency: "USD", Ts: tied},
+	})
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 99, Currency: "USD", Ts: tied},
+	})
+
+	// Read three times — determinism matters more than which
+	// specific record wins, but we also assert the later Write
+	// wins (its data filename sorts greater on tsMicros, so
+	// filename DESC picks it).
+	ctx := context.Background()
+	var first float64
+	for i := 0; i < 3; i++ {
+		got, err := f.sql.Read(ctx,
+			"period=2026-03-17/customer=abc")
+		if err != nil {
+			t.Fatalf("Read #%d: %v", i, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("Read #%d: got %d records, want 1",
+				i, len(got))
+		}
+		if i == 0 {
+			first = got[0].Amount
+			if first != 99 {
+				t.Errorf("winner Amount: got %v, want 99 "+
+					"(later Write's filename sorts greater)",
+					first)
+			}
+			continue
+		}
+		if got[0].Amount != first {
+			t.Errorf("non-deterministic: Read #%d got %v, "+
+				"first Read got %v", i, got[0].Amount, first)
+		}
+	}
+}
+
 // TestRead_WithHistory verifies every version is returned when
 // WithHistory disables dedup.
 func TestRead_WithHistory(t *testing.T) {

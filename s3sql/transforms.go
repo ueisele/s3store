@@ -17,8 +17,14 @@ import (
 //
 // The URI is SQL-quoted via sqlQuote so partition values that
 // contain an apostrophe don't break the query at plan time.
+//
+// withFilename adds filename=true to read_parquet so the source
+// object key is exposed as a `filename` column. Used only when
+// the dedup CTE needs a deterministic tie-breaker (see
+// wrapScanExpr); callers compute the flag as
+// !includeHistory && dedupEnabled().
 func (s *Store[T]) scanExprForPattern(
-	key string,
+	key string, withFilename bool,
 ) (string, error) {
 	parquetURI, err := s.buildParquetURI(key)
 	if err != nil {
@@ -31,12 +37,23 @@ func (s *Store[T]) scanExprForPattern(
 	scan := fmt.Sprintf(
 		"SELECT * FROM read_parquet(%s, "+
 			"hive_partitioning=true, hive_types_autocast=false, "+
-			"union_by_name=true)",
-		sqlQuote(parquetURI))
+			"union_by_name=true%s)",
+		sqlQuote(parquetURI), filenameOpt(withFilename))
 	if where != "" {
 		scan += " WHERE " + where
 	}
 	return scan, nil
+}
+
+// filenameOpt returns the trailing ", filename=true" fragment if
+// withFilename is set; empty string otherwise. Pulled out so the
+// two read_parquet builders (scanExprForPattern, PollRecords)
+// share the exact option spelling.
+func filenameOpt(withFilename bool) string {
+	if withFilename {
+		return ", filename=true"
+	}
+	return ""
 }
 
 // errorRow returns a *sql.Row that will fail on Scan with the
@@ -54,6 +71,16 @@ func (s *Store[T]) errorRow(
 // wrapScanExpr wraps a base scan expression with an optional
 // dedup CTE and the user's SQL query. Shared by Query, QueryRow,
 // Read, PollRecords.
+//
+// When dedup applies, the CTE resolves version ties with
+// filename DESC (lexicographically later S3 key wins) so two
+// writes at the same VersionColumn value produce a deterministic
+// winner across re-runs. That's only possible when the scan
+// exposes a `filename` column, which happens when callers pass
+// scanExpr built with withFilename=true — same condition this
+// function uses to decide whether to dedup, so the wiring is
+// symmetric. The helper EXCLUDEs the filename column so it
+// doesn't leak into user SQL.
 func (s *Store[T]) wrapScanExpr(
 	scanExpr string,
 	userSQL string,
@@ -64,9 +91,14 @@ func (s *Store[T]) wrapScanExpr(
 	if !includeHistory && s.cfg.dedupEnabled() {
 		dedupCols := strings.Join(s.cfg.EntityKeyColumns, ", ")
 		fmt.Fprintf(&sb,
-			"%s AS (\n  %s\n  QUALIFY ROW_NUMBER() OVER "+
-				"(PARTITION BY %s ORDER BY %s DESC"+
-				") = 1\n)\n",
+			"%s AS (\n"+
+				"  SELECT * EXCLUDE (filename) FROM (\n"+
+				"    %s\n"+
+				"    QUALIFY ROW_NUMBER() OVER "+
+				"(PARTITION BY %s ORDER BY %s DESC, filename DESC"+
+				") = 1\n"+
+				"  )\n"+
+				")\n",
 			s.cfg.TableAlias, scanExpr,
 			dedupCols, s.cfg.VersionColumn)
 	} else {

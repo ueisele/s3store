@@ -81,11 +81,16 @@ func (s *Store[T]) PollRecords(
 	// mid-read, which would diverge from strict lex comparison on
 	// the Go side). Keeps Read and PollRecords seeing the same
 	// shape regardless of which code path surfaced the files.
+	//
+	// filename=true when dedup will apply, so wrapScanExpr's CTE
+	// can break version ties deterministically on the source
+	// object key.
 	scanExpr := fmt.Sprintf(
 		"SELECT * FROM read_parquet([%s], "+
 			"hive_partitioning=true, hive_types_autocast=false, "+
-			"union_by_name=true)",
-		strings.Join(uris, ", "))
+			"union_by_name=true%s)",
+		strings.Join(uris, ", "),
+		filenameOpt(!o.IncludeHistory && s.cfg.dedupEnabled()))
 
 	query := s.wrapScanExpr(scanExpr,
 		"SELECT * FROM "+s.cfg.TableAlias, o.IncludeHistory)
