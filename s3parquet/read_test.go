@@ -171,7 +171,7 @@ func TestDecodeParquet_MissingColumnsZeroFill(t *testing.T) {
 		{Period: "2026-03-17", Customer: "abc", Value: 1},
 		{Period: "2026-03-17", Customer: "def", Value: 2},
 	}
-	data, err := encodeParquet(in)
+	data, err := encodeParquet(in, nil)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}

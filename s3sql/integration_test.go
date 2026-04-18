@@ -42,8 +42,9 @@ func partitionKeyOfRec(r Rec) string {
 
 // sqlOpts dials in the dedup config a given test cares about.
 type sqlOpts struct {
-	versionColumn    string
-	entityKeyColumns []string
+	versionColumn      string
+	entityKeyColumns   []string
+	bloomFilterColumns []string
 }
 
 // testFixture bundles the per-test MinIO bucket + a matching
@@ -62,12 +63,13 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	t.Helper()
 	f := testutil.New(t)
 	w, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf:    partitionKeyOfRec,
-		SettleWindow:      10 * time.Millisecond,
+		Bucket:             f.Bucket,
+		Prefix:             "store",
+		S3Client:           f.S3Client,
+		PartitionKeyParts:  []string{"period", "customer"},
+		PartitionKeyOf:     partitionKeyOfRec,
+		SettleWindow:       10 * time.Millisecond,
+		BloomFilterColumns: opts.bloomFilterColumns,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
@@ -244,6 +246,66 @@ func TestRead_PartitionRangeWithHistory(t *testing.T) {
 		if r.Amount == 20 {
 			t.Errorf("out-of-range record leaked into history result: %+v", r)
 		}
+	}
+}
+
+// TestRead_BloomFilterRoundTrip guards that files written with a
+// bloom filter on "sku" stay fully readable through DuckDB, and
+// that equality filters on the bloomed column return correct
+// rows. Bloom filters are an opt-in perf hint; they must not
+// change semantics regardless of whether DuckDB actually uses
+// them for row-group pruning.
+func TestRead_BloomFilterRoundTrip(t *testing.T) {
+	f := newFixture(t, sqlOpts{
+		bloomFilterColumns: []string{"sku"},
+	})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "s2", Amount: 20, Currency: "USD", Ts: time.UnixMilli(2)},
+	})
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-18", Customer: "abc", SKU: "s3", Amount: 30, Currency: "USD", Ts: time.UnixMilli(3)},
+	})
+
+	ctx := context.Background()
+
+	// Full scan returns every record.
+	all, err := f.sql.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("Read all: got %d records, want 3", len(all))
+	}
+
+	// Equality on the bloomed column: s2 lives in the first file
+	// only. DuckDB may or may not use the bloom for pruning —
+	// either way the result must be the one row.
+	rows, err := f.sql.Query(ctx, "*",
+		"SELECT sku, amount FROM records WHERE sku = 's2'")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close()
+
+	var hits int
+	for rows.Next() {
+		var sku string
+		var amount float64
+		if err := rows.Scan(&sku, &amount); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if sku != "s2" || amount != 20 {
+			t.Errorf("got sku=%q amount=%v, want s2/20", sku, amount)
+		}
+		hits++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	if hits != 1 {
+		t.Errorf("got %d hits for sku=s2, want 1", hits)
 	}
 }
 

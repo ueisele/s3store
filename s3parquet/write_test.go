@@ -51,7 +51,7 @@ func TestEncodeParquet(t *testing.T) {
 		{Period: "p1", Customer: "b", Value: 2},
 		{Period: "p2", Customer: "c", Value: 3},
 	}
-	data, err := encodeParquet(in)
+	data, err := encodeParquet(in, nil)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestEncodeParquet_NamedInt8EnumInNestedStruct(t *testing.T) {
 		},
 	}}
 
-	data, err := encodeParquet(in)
+	data, err := encodeParquet(in, nil)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}

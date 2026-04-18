@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
 )
 
@@ -54,7 +55,31 @@ type Config[T any] struct {
 	// default is assigned inside New() when EntityKeyOf is
 	// also set, so dedupEnabled only checks EntityKeyOf.
 	VersionOf func(record T, insertedAt time.Time) int64
+
+	// BloomFilterColumns lists parquet column names (top-level)
+	// that Write should emit per-row-group split-block bloom
+	// filters for. Use this for columns that queries filter on
+	// with equality (WHERE sku_id = X) and that partition pruning
+	// can't cover.
+	//
+	// IMPORTANT: only DuckDB (s3sql) consults these filters at
+	// read time. The pure-Go s3parquet.Read has no per-column
+	// predicate API and decodes every matching file regardless,
+	// so configuring BloomFilterColumns for a pure-s3parquet
+	// workload adds write cost with no read-side benefit.
+	//
+	// Column names must match the `parquet:"..."` tag on a
+	// top-level struct field of T; New() rejects unknown names
+	// so typos don't silently disable the filter.
+	BloomFilterColumns []string
 }
+
+// bloomFilterBitsPerValue is the bits-per-value for split-block
+// bloom filters emitted for every column in BloomFilterColumns.
+// 10 is parquet-go's recommended default: ~1% false-positive rate
+// at 10 bits/value, scales linearly with N. Not exposed as a knob
+// yet; revisit if users need per-column tuning.
+const bloomFilterBitsPerValue = 10
 
 // DefaultVersionOf returns insertedAt in microseconds. Assigned
 // to Config.VersionOf inside New() when that field is nil and
@@ -109,6 +134,9 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if cfg.EntityKeyOf != nil && cfg.VersionOf == nil {
 		cfg.VersionOf = DefaultVersionOf[T]
 	}
+	if err := validateBloomFilterColumns[T](cfg.BloomFilterColumns); err != nil {
+		return nil, err
+	}
 	return &Store[T]{
 		cfg:      cfg,
 		s3:       cfg.S3Client,
@@ -121,3 +149,26 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 // connections — Close is a no-op but present for API symmetry
 // with s3sql.Store and for future-proofing.
 func (s *Store[T]) Close() error { return nil }
+
+// validateBloomFilterColumns rejects BloomFilterColumns entries
+// that aren't top-level parquet columns of T, so a typo fails at
+// New() instead of silently producing files without the filter.
+func validateBloomFilterColumns[T any](cols []string) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	var zero T
+	schema := parquet.SchemaOf(zero)
+	for _, name := range cols {
+		if name == "" {
+			return fmt.Errorf(
+				"s3parquet: BloomFilterColumns contains an empty name")
+		}
+		if _, ok := schema.Lookup(name); !ok {
+			return fmt.Errorf(
+				"s3parquet: BloomFilterColumns[%q] is not a "+
+					"top-level parquet column of %T", name, zero)
+		}
+	}
+	return nil
+}

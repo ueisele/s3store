@@ -459,6 +459,43 @@ configuration.
 Renames, splits, and row-level computed derivations still require a
 migration tool — rewrite the affected files with the new shape.
 
+## Bloom filters on hot columns
+
+> **Only `s3sql` (DuckDB) consults bloom filters today.** `s3parquet.Read`
+> fetches and decodes every matching file regardless; it has no per-column
+> predicate API. Configuring `BloomFilterColumns` when you only ever read
+> via `s3parquet` adds write-time cost for zero runtime benefit.
+
+When queries filter on a non-partition column by equality (e.g. `WHERE
+sku_id = 'X'`), neither Hive partition pruning nor the range grammar helps
+— DuckDB has to fetch every file in the time window. Add a bloom filter so
+DuckDB skips row groups (and often whole files) where the value isn't
+present, without reading the payload.
+
+Config — both on the umbrella and on `s3parquet`:
+
+```go
+BloomFilterColumns: []string{"sku_id"},
+```
+
+Column names must match a top-level `parquet:"..."` tag on `T`. Typos fail
+at `New()` — no silent no-op. Every row group of every file gets a
+split-block bloom filter with ~1% false-positive rate (10 bits/value).
+Storage overhead is a few KB per row group; write-time CPU cost is small.
+
+Most effective for **selective equality lookups** on **high-cardinality**
+columns (customer IDs, SKUs, trace IDs) read through `s3sql`. Not useful for:
+
+- Queries going through `s3parquet.Read` — the pure-Go read path doesn't
+  consult the filter (files stay readable either way, but no pruning
+  happens).
+- Range predicates (`col > X`, `col BETWEEN ...`) — blooms are
+  equality-only.
+- Columns that hold every value in every file — bloom always says
+  "maybe", so nothing gets pruned.
+- Low-cardinality flags (a few distinct values) — stats-based row-group
+  pruning already does the job.
+
 ## Settle window
 
 ```

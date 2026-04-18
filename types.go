@@ -64,6 +64,15 @@ type Config[T any] struct {
 	// DuckDB init. Use for CREATE SECRET, credential overrides,
 	// or additional extension loads.
 	ExtraInitSQL []string
+
+	// BloomFilterColumns lists parquet column names (top-level)
+	// that Write should emit per-row-group split-block bloom
+	// filters for. Only the SQL read path (DuckDB via s3sql)
+	// consults these filters; the umbrella's Read / PollRecords
+	// go through s3sql so they benefit. Forwarded to the
+	// s3parquet sub-store unchanged. See s3parquet.Config for
+	// full details.
+	BloomFilterColumns []string
 }
 
 // Re-export core types so callers of the umbrella never need

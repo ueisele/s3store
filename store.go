@@ -35,12 +35,13 @@ type Store[T any] struct {
 // umbrella Config.
 func New[T any](cfg Config[T]) (*Store[T], error) {
 	pq, err := s3parquet.New[T](s3parquet.Config[T]{
-		Bucket:            cfg.Bucket,
-		Prefix:            cfg.Prefix,
-		PartitionKeyParts: cfg.PartitionKeyParts,
-		S3Client:          cfg.S3Client,
-		PartitionKeyOf:    cfg.PartitionKeyOf,
-		SettleWindow:      cfg.SettleWindow,
+		Bucket:             cfg.Bucket,
+		Prefix:             cfg.Prefix,
+		PartitionKeyParts:  cfg.PartitionKeyParts,
+		S3Client:           cfg.S3Client,
+		PartitionKeyOf:     cfg.PartitionKeyOf,
+		SettleWindow:       cfg.SettleWindow,
+		BloomFilterColumns: cfg.BloomFilterColumns,
 		// EntityKeyOf / VersionOf deliberately omitted: the
 		// umbrella's Read / PollRecords go through s3sql and use
 		// SQL-side dedup. Users who want pure-Go dedup should

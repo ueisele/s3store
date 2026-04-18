@@ -1,12 +1,14 @@
 package s3parquet
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
 )
 
@@ -88,7 +90,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		{Period: "2026-03-17", Customer: "abc", Value: 2},
 		{Period: "2026-03-17", Customer: "def", Value: 3},
 	}
-	data, err := encodeParquet(in)
+	data, err := encodeParquet(in, nil)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}
@@ -104,6 +106,107 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		if out[i] != in[i] {
 			t.Errorf("row %d: got %+v, want %+v", i, out[i], in[i])
 		}
+	}
+}
+
+// TestEncodeParquet_BloomFilter guards that when
+// BloomFilterColumns is non-empty, encodeParquet emits a
+// per-row-group split-block bloom filter for every requested
+// column. Looks at the raw parquet metadata so the check is
+// independent of any reader-side pruning.
+func TestEncodeParquet_BloomFilter(t *testing.T) {
+	in := []testRec{
+		{Period: "2026-03-17", Customer: "abc", Value: 1},
+		{Period: "2026-03-17", Customer: "def", Value: 2},
+		{Period: "2026-03-18", Customer: "abc", Value: 3},
+	}
+	data, err := encodeParquet(in, []string{"customer"})
+	if err != nil {
+		t.Fatalf("encodeParquet: %v", err)
+	}
+
+	f, err := parquet.OpenFile(
+		bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+
+	// Each row group must carry exactly one bloom filter (on
+	// the requested "customer" column), and that filter must
+	// accept the values we wrote and reject one we didn't.
+	leafNames := leafColumnNames(f.Schema())
+	for rgIdx, rg := range f.RowGroups() {
+		var bfCount int
+		for colIdx, col := range rg.ColumnChunks() {
+			bf := col.BloomFilter()
+			if bf == nil {
+				continue
+			}
+			bfCount++
+			if leafNames[colIdx] != "customer" {
+				t.Errorf("row group %d: bloom filter on %q, want customer",
+					rgIdx, leafNames[colIdx])
+			}
+			for _, want := range []string{"abc", "def"} {
+				ok, err := bf.Check(parquet.ValueOf(want))
+				if err != nil {
+					t.Fatalf("bloom Check(%q): %v", want, err)
+				}
+				if !ok {
+					t.Errorf("bloom filter rejects written value %q", want)
+				}
+			}
+			// A value we never wrote should (with very high
+			// probability) be rejected. 10 bpv → ~1% false
+			// positive; "zzz-not-present" is well outside the
+			// written set.
+			ok, _ := bf.Check(parquet.ValueOf("zzz-not-present"))
+			if ok {
+				t.Logf("false-positive on unseen value (rare but " +
+					"legal for bloom filters)")
+			}
+		}
+		if bfCount != 1 {
+			t.Errorf("row group %d: got %d bloom filters, want 1",
+				rgIdx, bfCount)
+		}
+	}
+}
+
+// leafColumnNames returns the top-level leaf column names in the
+// order they appear in a row group's ColumnChunks().
+func leafColumnNames(s *parquet.Schema) []string {
+	paths := s.Columns()
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = p[len(p)-1]
+	}
+	return out
+}
+
+// TestNew_BloomFilterColumnsValidation guards the typo guard:
+// a column name that doesn't exist on T must fail at New()
+// rather than silently producing files without the filter.
+func TestNew_BloomFilterColumnsValidation(t *testing.T) {
+	cfg := Config[testRec]{
+		Bucket:             "b",
+		Prefix:             "p",
+		S3Client:           &s3.Client{},
+		PartitionKeyParts:  []string{"period", "customer"},
+		BloomFilterColumns: []string{"typo_not_a_column"},
+	}
+	if _, err := New(cfg); err == nil {
+		t.Error("expected error for unknown BloomFilterColumns entry, got nil")
+	}
+
+	cfg.BloomFilterColumns = []string{"customer", ""}
+	if _, err := New(cfg); err == nil {
+		t.Error("expected error for empty BloomFilterColumns entry, got nil")
+	}
+
+	cfg.BloomFilterColumns = []string{"customer"}
+	if _, err := New(cfg); err != nil {
+		t.Errorf("valid BloomFilterColumns: unexpected error: %v", err)
 	}
 }
 

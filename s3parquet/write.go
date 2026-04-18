@@ -75,7 +75,7 @@ func (s *Store[T]) WriteWithKey(
 		return nil, err
 	}
 
-	parquetBytes, err := encodeParquet(records)
+	parquetBytes, err := encodeParquet(records, s.cfg.BloomFilterColumns)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"s3parquet: parquet encode: %w", err)
@@ -194,9 +194,26 @@ func (s *Store[T]) validateKey(key string) error {
 	return nil
 }
 
-func encodeParquet[T any](records []T) ([]byte, error) {
+// encodeParquet writes records to a parquet byte stream. When
+// bloomFilterColumns is non-empty, per-row-group split-block
+// bloom filters are emitted for those columns. bitsPerValue
+// defaults to bloomFilterBitsPerValue (10) — ~1% false-positive
+// rate.
+func encodeParquet[T any](
+	records []T, bloomFilterColumns []string,
+) ([]byte, error) {
 	var buf bytes.Buffer
-	writer := parquet.NewGenericWriter[T](&buf)
+	var opts []parquet.WriterOption
+	if len(bloomFilterColumns) > 0 {
+		filters := make(
+			[]parquet.BloomFilterColumn, len(bloomFilterColumns))
+		for i, col := range bloomFilterColumns {
+			filters[i] = parquet.SplitBlockFilter(
+				bloomFilterBitsPerValue, col)
+		}
+		opts = append(opts, parquet.BloomFilters(filters...))
+	}
+	writer := parquet.NewGenericWriter[T](&buf, opts...)
 	if _, err := writer.Write(records); err != nil {
 		return nil, err
 	}
