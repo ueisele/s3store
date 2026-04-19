@@ -50,10 +50,9 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		DisableRefStream:  cfg.DisableRefStream,
 	}
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[T]{
-		Target:             target,
-		PartitionKeyOf:     cfg.PartitionKeyOf,
-		Compression:        cfg.Compression,
-		BloomFilterColumns: cfg.BloomFilterColumns,
+		Target:         target,
+		PartitionKeyOf: cfg.PartitionKeyOf,
+		Compression:    cfg.Compression,
 	})
 	if err != nil {
 		return nil, err

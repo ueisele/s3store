@@ -79,7 +79,7 @@ func (s *Writer[T]) WriteWithKey(
 	}
 
 	parquetBytes, err := encodeParquet(
-		records, s.cfg.BloomFilterColumns, s.compressionCodec)
+		records, s.compressionCodec)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"s3parquet: parquet encode: %w", err)
@@ -327,27 +327,14 @@ func (s *Writer[T]) putMarkersParallel(
 
 // encodeParquet writes records to a parquet byte stream using
 // the given compression codec (never nil — Store.New resolves a
-// snappy default). When bloomFilterColumns is non-empty,
-// per-row-group split-block bloom filters are emitted for those
-// columns at bloomFilterBitsPerValue (10 bits/value ≈ 1%
-// false-positive rate).
+// snappy default).
 func encodeParquet[T any](
 	records []T,
-	bloomFilterColumns []string,
 	codec compress.Codec,
 ) ([]byte, error) {
 	var buf bytes.Buffer
-	opts := []parquet.WriterOption{parquet.Compression(codec)}
-	if len(bloomFilterColumns) > 0 {
-		filters := make(
-			[]parquet.BloomFilterColumn, len(bloomFilterColumns))
-		for i, col := range bloomFilterColumns {
-			filters[i] = parquet.SplitBlockFilter(
-				bloomFilterBitsPerValue, col)
-		}
-		opts = append(opts, parquet.BloomFilters(filters...))
-	}
-	writer := parquet.NewGenericWriter[T](&buf, opts...)
+	writer := parquet.NewGenericWriter[T](
+		&buf, parquet.Compression(codec))
 	if _, err := writer.Write(records); err != nil {
 		return nil, err
 	}

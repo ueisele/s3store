@@ -142,7 +142,7 @@ w, err := s3parquet.NewWriter[CostRecord](s3parquet.WriterConfig[CostRecord]{
     PartitionKeyOf: func(r CostRecord) string { /* ... */ },
 })
 
-// Read-only service: no PartitionKeyOf / Compression / BloomFilters.
+// Read-only service: no PartitionKeyOf / Compression.
 r, err := s3parquet.NewReader[CostRecord](s3parquet.ReaderConfig[CostRecord]{
     Target:          target,
     InsertedAtField: "InsertedAt",
@@ -636,10 +636,10 @@ migration tool — rewrite the affected files with the new shape.
 
 ## Secondary indexes
 
-When a query filters on a column that's neither a partition key
-nor a good fit for bloom filters (e.g. "list every customer that
-had usage of SKU X in period P"), scanning every data file is
-prohibitive at scale. A secondary index solves this by writing
+When a query filters on a column that isn't a partition key
+(e.g. "list every customer that had usage of SKU X in period
+P"), scanning every data file is prohibitive at scale. A
+secondary index solves this by writing
 one empty S3 *marker* per distinct tuple of the columns you want
 to query. The query is a single LIST under the marker prefix —
 zero parquet reads, no cgo, no DuckDB.
@@ -887,43 +887,6 @@ Readers (s3parquet and DuckDB's httpfs/parquet) auto-detect the codec on
 read, so switching compression per Write doesn't require any read-side
 config.
 
-## Bloom filters on hot columns
-
-> **Only `s3sql` (DuckDB) consults bloom filters today.** `s3parquet.Read`
-> fetches and decodes every matching file regardless; it has no per-column
-> predicate API. Configuring `BloomFilterColumns` when you only ever read
-> via `s3parquet` adds write-time cost for zero runtime benefit.
-
-When queries filter on a non-partition column by equality (e.g. `WHERE
-sku_id = 'X'`), neither Hive partition pruning nor the range grammar helps
-— DuckDB has to fetch every file in the time window. Add a bloom filter so
-DuckDB skips row groups (and often whole files) where the value isn't
-present, without reading the payload.
-
-Config — both on the umbrella and on `s3parquet`:
-
-```go
-BloomFilterColumns: []string{"sku_id"},
-```
-
-Column names must match a top-level `parquet:"..."` tag on `T`. Typos fail
-at `New()` — no silent no-op. Every row group of every file gets a
-split-block bloom filter with ~1% false-positive rate (10 bits/value).
-Storage overhead is a few KB per row group; write-time CPU cost is small.
-
-Most effective for **selective equality lookups** on **high-cardinality**
-columns (customer IDs, SKUs, trace IDs) read through `s3sql`. Not useful for:
-
-- Queries going through `s3parquet.Read` — the pure-Go read path doesn't
-  consult the filter (files stay readable either way, but no pruning
-  happens).
-- Range predicates (`col > X`, `col BETWEEN ...`) — blooms are
-  equality-only.
-- Columns that hold every value in every file — bloom always says
-  "maybe", so nothing gets pruned.
-- Low-cardinality flags (a few distinct values) — stats-based row-group
-  pruning already does the job.
-
 ## Settle window
 
 ```
@@ -1049,6 +1012,19 @@ Configuration for the sub-packages is narrower — see
 the exact fields.
 
 ## Migration from earlier versions
+
+Breaking changes in the bloom-filter removal:
+
+- **`BloomFilterColumns` removed** from `s3parquet.Config`,
+  `s3parquet.WriterConfig`, and umbrella `s3store.Config`. The
+  feature didn't pay off for typical workloads (a single row
+  group per file leaves nothing to prune; partition columns are
+  already pruned at file-selection time). Files written with
+  the old config remain readable on both paths; files written
+  by the new code emit no bloom filters. If your queries
+  actually relied on bloom-filter pruning (multi-row-group
+  files plus equality filters on a non-partition column), pin
+  an older version or open an issue.
 
 Breaking changes in the `s3sql`-as-Reader refactor:
 

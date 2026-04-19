@@ -131,23 +131,6 @@ type Config[T any] struct {
 	// the hot-path Write doesn't reparse it.
 	Compression CompressionCodec
 
-	// BloomFilterColumns lists parquet column names (top-level)
-	// that Write should emit per-row-group split-block bloom
-	// filters for. Use this for columns that queries filter on
-	// with equality (WHERE sku_id = X) and that partition pruning
-	// can't cover.
-	//
-	// IMPORTANT: only DuckDB (s3sql) consults these filters at
-	// read time. The pure-Go s3parquet.Read has no per-column
-	// predicate API and decodes every matching file regardless,
-	// so configuring BloomFilterColumns for a pure-s3parquet
-	// workload adds write cost with no read-side benefit.
-	//
-	// Column names must match the `parquet:"..."` tag on a
-	// top-level struct field of T; New() rejects unknown names
-	// so typos don't silently disable the filter.
-	BloomFilterColumns []string
-
 	// DisableRefStream opts this dataset out of writing stream ref
 	// files. Saves one S3 PUT per distinct partition key touched
 	// by a Write. Poll / PollRecords / PollRecordsAll return
@@ -155,13 +138,6 @@ type Config[T any] struct {
 	// for the full contract.
 	DisableRefStream bool
 }
-
-// bloomFilterBitsPerValue is the bits-per-value for split-block
-// bloom filters emitted for every column in BloomFilterColumns.
-// 10 is parquet-go's recommended default: ~1% false-positive rate
-// at 10 bits/value, scales linearly with N. Not exposed as a knob
-// yet; revisit if users need per-column tuning.
-const bloomFilterBitsPerValue = 10
 
 // DefaultVersionOf returns insertedAt in microseconds. Assigned
 // to Config.VersionOf inside New() when that field is nil and
@@ -234,10 +210,9 @@ func targetFrom[T any](c Config[T]) S3Target {
 // is easy to spot.
 func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 	return WriterConfig[T]{
-		Target:             targetFrom(c),
-		PartitionKeyOf:     c.PartitionKeyOf,
-		Compression:        c.Compression,
-		BloomFilterColumns: c.BloomFilterColumns,
+		Target:         targetFrom(c),
+		PartitionKeyOf: c.PartitionKeyOf,
+		Compression:    c.Compression,
 	}
 }
 
@@ -308,27 +283,4 @@ func validateInsertedAtField[T any](name string) ([]int, error) {
 				"(got %q)", name, tag)
 	}
 	return f.Index, nil
-}
-
-// validateBloomFilterColumns rejects BloomFilterColumns entries
-// that aren't top-level parquet columns of T, so a typo fails at
-// New() instead of silently producing files without the filter.
-func validateBloomFilterColumns[T any](cols []string) error {
-	if len(cols) == 0 {
-		return nil
-	}
-	var zero T
-	schema := parquet.SchemaOf(zero)
-	for _, name := range cols {
-		if name == "" {
-			return fmt.Errorf(
-				"s3parquet: BloomFilterColumns contains an empty name")
-		}
-		if _, ok := schema.Lookup(name); !ok {
-			return fmt.Errorf(
-				"s3parquet: BloomFilterColumns[%q] is not a "+
-					"top-level parquet column of %T", name, zero)
-		}
-	}
-	return nil
 }

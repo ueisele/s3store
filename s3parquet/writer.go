@@ -17,10 +17,9 @@ import (
 // governs marker visibility from Lookup (a read concern) but
 // needs to be expressible at a pure-write call site.
 type WriterConfig[T any] struct {
-	Target             S3Target
-	PartitionKeyOf     func(T) string
-	Compression        CompressionCodec
-	BloomFilterColumns []string
+	Target         S3Target
+	PartitionKeyOf func(T) string
+	Compression    CompressionCodec
 }
 
 // Writer is the write-side half of a Store. Owns the write path
@@ -79,15 +78,11 @@ func (w *Writer[T]) Target() S3Target {
 //
 // Validation mirrors the writer-side half of New: the Target
 // must carry Bucket / Prefix / S3Client / PartitionKeyParts;
-// BloomFilterColumns must map to real parquet columns on T;
 // Compression resolves to a codec (zero value → snappy).
 // PartitionKeyOf is optional at construction — Write errors if
 // called without it, but WriteWithKey works regardless.
 func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err := cfg.Target.Validate(); err != nil {
-		return nil, err
-	}
-	if err := validateBloomFilterColumns[T](cfg.BloomFilterColumns); err != nil {
 		return nil, err
 	}
 	codec, err := resolveCompression(cfg.Compression)

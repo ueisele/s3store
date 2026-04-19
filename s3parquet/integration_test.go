@@ -1818,48 +1818,6 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 	_ = ParquetFieldUnknown
 }
 
-// TestWriteRead_BloomFilterRoundTrip guards the bloom-filter
-// write path end-to-end: a store configured with
-// BloomFilterColumns must still produce files that Read returns
-// intact. The filter is opt-in performance; it must not change
-// observable query semantics.
-func TestWriteRead_BloomFilterRoundTrip(t *testing.T) {
-	ctx := context.Background()
-	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf: func(r Rec) string {
-			return fmt.Sprintf("period=%s/customer=%s",
-				r.Period, r.Customer)
-		},
-		SettleWindow:       10 * time.Millisecond,
-		BloomFilterColumns: []string{"sku"},
-	})
-	if err != nil {
-		t.Fatalf("s3parquet.New: %v", err)
-	}
-
-	in := []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1, Ts: time.UnixMilli(1)},
-		{Period: "2026-03-17", Customer: "abc", SKU: "s2", Value: 2, Ts: time.UnixMilli(2)},
-		{Period: "2026-03-17", Customer: "def", SKU: "s1", Value: 3, Ts: time.UnixMilli(3)},
-	}
-	if _, err := store.Write(ctx, in); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	got, err := store.Read(ctx, "*")
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if len(got) != len(in) {
-		t.Fatalf("got %d records, want %d", len(got), len(in))
-	}
-}
-
 // TestDisableRefStream covers the full contract of the
 // write-side opt-out: no /_stream/refs/ objects land in S3,
 // WriteResult.Offset / RefPath are empty, Read still returns

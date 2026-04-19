@@ -10,8 +10,7 @@ import (
 // ReaderConfig is the narrower Config form for constructing a
 // Reader directly. Holds the S3-wiring bundle (Target) plus
 // read-side-only knobs. Use NewReader(cfg) in read-only services
-// that have no PartitionKeyOf / Compression / BloomFilter config
-// to supply.
+// that have no PartitionKeyOf / Compression config to supply.
 //
 // Target carries Bucket / Prefix / S3Client / PartitionKeyParts /
 // SettleWindow — shared with WriterConfig through the same type,
@@ -75,7 +74,7 @@ func (r *Reader[T]) Target() S3Target {
 
 // NewReader constructs a Reader directly from ReaderConfig.
 // Intended for read-only services that have no write-side config
-// to supply (no PartitionKeyOf / Compression / BloomFilters).
+// to supply (no PartitionKeyOf / Compression).
 //
 // Validates the same read-side invariants New(Config) does:
 // required Target fields, InsertedAtField (if set) must resolve

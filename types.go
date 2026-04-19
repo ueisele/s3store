@@ -85,15 +85,6 @@ type Config[T any] struct {
 	// s3parquet.CompressionCodec for the accepted values.
 	Compression s3parquet.CompressionCodec
 
-	// BloomFilterColumns lists parquet column names (top-level)
-	// that Write should emit per-row-group split-block bloom
-	// filters for. Only the SQL read path (DuckDB via s3sql)
-	// consults these filters; the umbrella's Read / PollRecords
-	// go through s3sql so they benefit. Forwarded to the
-	// s3parquet sub-store unchanged. See s3parquet.Config for
-	// full details.
-	BloomFilterColumns []string
-
 	// InsertedAtField names a time.Time field on T that Read and
 	// PollRecords populate with the source parquet file's write
 	// timestamp on decode. The field must be tagged `parquet:"-"`

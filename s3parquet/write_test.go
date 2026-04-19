@@ -58,7 +58,7 @@ func TestEncodeParquet(t *testing.T) {
 		{Period: "p1", Customer: "b", Value: 2},
 		{Period: "p2", Customer: "c", Value: 3},
 	}
-	data, err := encodeParquet(in, nil, &parquet.Snappy)
+	data, err := encodeParquet(in, &parquet.Snappy)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestEncodeParquet_Compression(t *testing.T) {
 		in[i] = testRec{Period: "p", Customer: "c", Value: 42}
 	}
 
-	uncompressed, err := encodeParquet(in, nil, &parquet.Uncompressed)
+	uncompressed, err := encodeParquet(in, &parquet.Uncompressed)
 	if err != nil {
 		t.Fatalf("uncompressed encode: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestEncodeParquet_Compression(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			data, err := encodeParquet(in, nil, tc.codec)
+			data, err := encodeParquet(in, tc.codec)
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}
@@ -190,7 +190,7 @@ func TestEncodeParquet_NamedInt8EnumInNestedStruct(t *testing.T) {
 		},
 	}}
 
-	data, err := encodeParquet(in, nil, &parquet.Snappy)
+	data, err := encodeParquet(in, &parquet.Snappy)
 	if err != nil {
 		t.Fatalf("encodeParquet: %v", err)
 	}
