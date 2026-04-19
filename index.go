@@ -29,5 +29,5 @@ func NewIndex[T any, K comparable](
 	store *Store[T],
 	def IndexDef[T, K],
 ) (*Index[T, K], error) {
-	return s3parquet.NewIndex(store.parquet, def)
+	return s3parquet.NewIndexFromStore(store.parquet, def)
 }

@@ -126,7 +126,7 @@ func TestBuildIndexBinder_Rejects(t *testing.T) {
 // batch.
 func TestPathsOf_MultipleEntriesPerRecord(t *testing.T) {
 	s := newIndexTestStore(t)
-	_, err := NewIndex(s, IndexDef[testIndexRec, SkuIndexEntry]{
+	_, err := NewIndexFromStore(s, IndexDef[testIndexRec, SkuIndexEntry]{
 		Name:    "multi_idx",
 		Columns: []string{"sku", "period", "customer"},
 		// Each record emits two entries (e.g., a record that
@@ -165,7 +165,7 @@ func TestPathsOf_MultipleEntriesPerRecord(t *testing.T) {
 // surfaces a clear error instead of an opaque S3 InvalidKey.
 func TestPathsOf_RejectsOversizedKey(t *testing.T) {
 	s := newIndexTestStore(t)
-	_, err := NewIndex(s, IndexDef[testIndexRec, SkuIndexEntry]{
+	_, err := NewIndexFromStore(s, IndexDef[testIndexRec, SkuIndexEntry]{
 		Name:    "big_idx",
 		Columns: []string{"sku", "period", "customer"},
 		Of: func(r testIndexRec) []SkuIndexEntry {
@@ -256,7 +256,7 @@ func TestNewIndex_Validation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewIndex(s, tc.def)
+			_, err := NewIndexFromStore(s, tc.def)
 			if err == nil {
 				t.Error("expected error, got nil")
 			}
@@ -281,7 +281,7 @@ func TestNewIndex_Validation(t *testing.T) {
 // marker paths for a batch once the index is registered.
 func TestNewIndex_RegistersWriter(t *testing.T) {
 	s := newIndexTestStore(t)
-	_, err := NewIndex(s, IndexDef[testIndexRec, SkuIndexEntry]{
+	_, err := NewIndexFromStore(s, IndexDef[testIndexRec, SkuIndexEntry]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "period", "customer"},
 		Of: func(r testIndexRec) []SkuIndexEntry {

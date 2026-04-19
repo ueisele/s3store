@@ -75,10 +75,11 @@ type Index[T any, K comparable] struct {
 	of func(T) []K
 }
 
-// NewIndex registers a secondary index on store and returns a
-// typed handle for querying it. Call before the first Write so
-// records aren't missed — writes that precede registration produce
-// no markers (see repopulate-from-data in the backlog).
+// NewIndex registers a secondary index on the given Writer and
+// returns a typed handle for querying it. Call before the first
+// Write so records aren't missed — writes that precede
+// registration produce no markers; use Index.Backfill to cover
+// pre-registration records on a live store.
 //
 // Validation (at registration, not on every write):
 //   - Name non-empty and contains no '/'.
@@ -86,14 +87,52 @@ type Index[T any, K comparable] struct {
 //   - Every entry in Columns corresponds to a parquet-tagged
 //     string field on K; no extra tagged fields on K.
 //   - Of is non-nil.
+//
+// The Index internally constructs a Reader[T] via
+// writer.Reader(ReaderExtras[T]{}) for Backfill's parquet reads.
+// Defaults are fine for Backfill (no dedup, no InsertedAtField,
+// default SettleWindow); services that need to tune the Reader
+// — e.g. OnMissingData during Backfill — should use
+// NewIndexFromStore so the Store's configured Reader is reused.
 func NewIndex[T any, K comparable](
-	store *Store[T],
+	w *Writer[T],
 	def IndexDef[T, K],
 ) (*Index[T, K], error) {
-	if store == nil {
+	if w == nil {
 		return nil, fmt.Errorf(
-			"s3parquet: NewIndex: store is nil")
+			"s3parquet: NewIndex: writer is nil")
 	}
+	r, err := w.Reader(ReaderExtras[T]{})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: NewIndex: build internal reader: %w", err)
+	}
+	return newIndex(w, r, def)
+}
+
+// NewIndexFromStore is NewIndex keyed off a Store[T] — the
+// embedded Writer is used for marker PUTs and Store.Reader is
+// reused for Backfill's parquet reads. This preserves any
+// read-side knobs (OnMissingData, SettleWindow, etc.) the caller
+// configured via the unified Config at Store construction.
+func NewIndexFromStore[T any, K comparable](
+	s *Store[T],
+	def IndexDef[T, K],
+) (*Index[T, K], error) {
+	if s == nil {
+		return nil, fmt.Errorf(
+			"s3parquet: NewIndexFromStore: store is nil")
+	}
+	return newIndex(s.Writer, s.Reader, def)
+}
+
+// newIndex is the shared constructor. Both NewIndex (which
+// synthesizes a default Reader) and NewIndexFromStore (which
+// reuses the Store's Reader) call through here so validation
+// and registration logic stay single-source.
+func newIndex[T any, K comparable](
+	w *Writer[T], r *Reader[T], def IndexDef[T, K],
+) (*Index[T, K], error) {
 	if def.Name == "" {
 		return nil, fmt.Errorf(
 			"s3parquet: NewIndex: Name is required")
@@ -118,11 +157,11 @@ func NewIndex[T any, K comparable](
 			"s3parquet: NewIndex %q: %w", def.Name, err)
 	}
 
-	indexPath := core.IndexPath(store.Writer.cfg.Prefix, def.Name)
+	indexPath := core.IndexPath(w.cfg.Prefix, def.Name)
 
 	idx := &Index[T, K]{
-		writer:       store.Writer,
-		reader:       store.Reader,
+		writer:       w,
+		reader:       r,
 		name:         def.Name,
 		columns:      def.Columns,
 		indexPath:    indexPath,
@@ -130,7 +169,7 @@ func NewIndex[T any, K comparable](
 		of:           def.Of,
 	}
 
-	store.registerIndex(indexWriter[T]{
+	w.registerIndex(indexWriter[T]{
 		name: def.Name,
 		pathsOf: func(rec T) ([]string, error) {
 			entries := idx.of(rec)

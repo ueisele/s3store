@@ -81,7 +81,7 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 		Customer string `parquet:"customer"`
 	}
 
-	idx, err := s3parquet.NewIndex(store,
+	idx, err := s3parquet.NewIndexFromStore(store,
 		s3parquet.IndexDef[Rec, SkuPeriodEntry]{
 			Name:    "sku_period_idx",
 			Columns: []string{"sku", "period", "customer"},
@@ -175,7 +175,7 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	idx, err := s3parquet.NewIndex(store,
+	idx, err := s3parquet.NewIndexFromStore(store,
 		s3parquet.IndexDef[Rec, Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
@@ -245,7 +245,7 @@ func TestIndex_Backfill(t *testing.T) {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	idx, err := s3parquet.NewIndex(store,
+	idx, err := s3parquet.NewIndexFromStore(store,
 		s3parquet.IndexDef[Rec, Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
