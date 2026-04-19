@@ -2008,3 +2008,68 @@ func TestDisableRefStream_IndexLookup(t *testing.T) {
 		t.Errorf("Lookup: got %d entries, want 2", len(got))
 	}
 }
+
+// TestWrite_ParallelResultsSorted guards the invariant that Write
+// returns WriteResults in sorted-key order even when partitions
+// complete out-of-order under parallel fan-out. Without slot-index
+// preservation, the returned slice would leak completion order
+// instead of the deterministic sorted-key order the doc promises.
+func TestWrite_ParallelResultsSorted(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// More partitions than partitionWriteConcurrency (8) to force
+	// semaphore contention and scheduling variance across runs.
+	periods := []string{
+		"2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04",
+		"2026-03-05", "2026-03-06", "2026-03-07", "2026-03-08",
+		"2026-03-09", "2026-03-10",
+	}
+	in := make([]Rec, 0, len(periods))
+	want := make([]string, 0, len(periods))
+	for i, p := range periods {
+		in = append(in, Rec{
+			Period: p, Customer: "abc", SKU: "s1",
+			Value: int64(i),
+		})
+		want = append(want, fmt.Sprintf(
+			"store/data/period=%s/customer=abc/", p))
+	}
+
+	results, err := store.Write(ctx, in)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(results) != len(periods) {
+		t.Fatalf("results: got %d, want %d",
+			len(results), len(periods))
+	}
+	for i, r := range results {
+		if !strings.HasPrefix(r.DataPath, want[i]) {
+			t.Errorf("result[%d] DataPath %q does not start with %q",
+				i, r.DataPath, want[i])
+		}
+	}
+}
+
+// TestWrite_CallerCancelReturnsError guards that a pre-cancelled
+// caller context surfaces as an error from Write rather than being
+// swallowed into a (partial, nil) result. Without the parentCtx.Err()
+// fallback, the cancel-filter would skip every goroutine's error and
+// callers would mistake a no-op for success.
+func TestWrite_CallerCancelReturnsError(t *testing.T) {
+	store := newStore(t, storeOpts{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	in := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2", Value: 2},
+	}
+	_, err := store.Write(ctx, in)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Write with cancelled ctx: got %v, want context.Canceled",
+			err)
+	}
+}

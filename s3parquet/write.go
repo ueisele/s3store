@@ -23,9 +23,23 @@ import (
 // lost ack or removing an orphan parquet.
 const writeCleanupTimeout = 5 * time.Second
 
+// partitionWriteConcurrency caps how many partitions Write fans
+// out in parallel. Each partition runs an independent encode +
+// PUT(data) + PUT(markers…) + PUT(ref) sequence, so the cap
+// bounds in-flight memory (sum of parquet buffers) and outbound
+// S3 request rate. Matches markerPutConcurrency.
+const partitionWriteConcurrency = 8
+
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
-// key. Returns a WriteResult per group.
+// key in parallel (bounded by partitionWriteConcurrency).
+// Returns one WriteResult per partition that completed, in
+// sorted-key order regardless of completion order.
+//
+// On failure, cancels remaining partitions and returns whatever
+// results landed first, with the first real (non-cancel) error.
+// Partial success is the accepted outcome — each partition's
+// data+markers+ref sequence is self-contained.
 //
 // An empty records slice is a no-op: (nil, nil) is returned so
 // callers don't have to guard against batch-pipeline edge
@@ -43,19 +57,69 @@ func (s *Writer[T]) Write(
 	}
 
 	grouped := s.groupByKey(records)
+	keys := slices.Sorted(maps.Keys(grouped))
 
-	// Sorted key iteration keeps the returned results (and
-	// the sequence of S3 PUTs) deterministic across runs,
-	// instead of following map iteration order.
-	var results []WriteResult
-	for _, key := range slices.Sorted(maps.Keys(grouped)) {
-		result, err := s.WriteWithKey(ctx, key, grouped[key])
-		if err != nil {
-			return results, err
-		}
-		results = append(results, *result)
+	// Slot i holds the result for keys[i], so completion order
+	// cannot leak into the returned slice even under parallel
+	// execution.
+	results := make([]*WriteResult, len(keys))
+	errs := make([]error, len(keys))
+
+	parentCtx := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, partitionWriteConcurrency)
+	var wg sync.WaitGroup
+	for i, key := range keys {
+		wg.Add(1)
+		go func(i int, key string) {
+			defer wg.Done()
+			// Acquire inside the goroutine so a sibling failure
+			// or caller cancel unblocks us promptly rather than
+			// letting the main loop dispatch every partition
+			// upfront.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errs[i] = ctx.Err()
+				return
+			}
+			defer func() { <-sem }()
+
+			r, err := s.WriteWithKey(ctx, key, grouped[key])
+			if err != nil {
+				errs[i] = err
+				cancel()
+				return
+			}
+			results[i] = r
+		}(i, key)
 	}
-	return results, nil
+	wg.Wait()
+
+	// Compact successful results in sorted-key order.
+	var out []WriteResult
+	for i := range keys {
+		if results[i] != nil {
+			out = append(out, *results[i])
+		}
+	}
+
+	// Prefer a real failure over the cancel it triggered in
+	// siblings. If no real failure surfaced but the caller's
+	// context was cancelled, report that — otherwise callers
+	// could mistake a partial write for full success.
+	for _, err := range errs {
+		if err == nil || errors.Is(err, context.Canceled) {
+			continue
+		}
+		return out, err
+	}
+	if err := parentCtx.Err(); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 // WriteWithKey encodes records as Parquet, uploads to S3, and
