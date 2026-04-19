@@ -402,13 +402,18 @@ Writes are atomic at the file level: if the ref PUT fails after the data
 PUT succeeded, s3store best-effort deletes the orphan parquet (with a HEAD
 check to detect lost-ack).
 
-`Write` fans out per-partition work in parallel (bounded at 8 concurrent
-partitions), so a single call with many groups completes in roughly the
-time of the slowest group instead of their sum. Each partition is
-self-contained — on error the function cancels still-running partitions
-and returns the results that already committed in sorted-key order,
-alongside the first real error. Callers can retry the failed partitions
-via `WriteWithKey` without re-writing the ones that succeeded.
+`Write` fans out per-partition work in parallel (bounded by
+`PartitionWriteConcurrency`, default 8), so a single call with many
+groups completes in roughly the time of the slowest group instead of
+their sum. Raise the cap for workloads with many small partitions per
+Write (e.g. a DB poll that fans out to dozens of Hive keys at once);
+leave at the default when per-partition parquet buffers are large
+enough that N × buffer-size dominates memory. Each partition is
+self-contained — on error the function cancels still-running
+partitions and returns the results that already committed in
+sorted-key order, alongside the first real error. Callers can retry
+the failed partitions via `WriteWithKey` without re-writing the ones
+that succeeded.
 
 ### Stream — refs only
 

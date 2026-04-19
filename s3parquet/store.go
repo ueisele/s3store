@@ -137,6 +137,12 @@ type Config[T any] struct {
 	// ErrRefStreamDisabled when set. See S3Target.DisableRefStream
 	// for the full contract.
 	DisableRefStream bool
+
+	// PartitionWriteConcurrency caps how many partitions a single
+	// Write fans out in parallel. Zero → default (8). Forwarded
+	// to WriterConfig. See WriterConfig.PartitionWriteConcurrency
+	// for when to tune it.
+	PartitionWriteConcurrency int
 }
 
 // DefaultVersionOf returns insertedAt in microseconds. Assigned
@@ -210,9 +216,10 @@ func targetFrom[T any](c Config[T]) S3Target {
 // is easy to spot.
 func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 	return WriterConfig[T]{
-		Target:         targetFrom(c),
-		PartitionKeyOf: c.PartitionKeyOf,
-		Compression:    c.Compression,
+		Target:                    targetFrom(c),
+		PartitionKeyOf:            c.PartitionKeyOf,
+		Compression:               c.Compression,
+		PartitionWriteConcurrency: c.PartitionWriteConcurrency,
 	}
 }
 

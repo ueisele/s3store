@@ -102,6 +102,12 @@ type Config[T any] struct {
 	// ErrRefStreamDisabled. OffsetAt still works (pure timestamp
 	// encoding). Forwarded to both sub-stores.
 	DisableRefStream bool
+
+	// PartitionWriteConcurrency caps how many partitions a single
+	// Write fans out in parallel. Zero → default (8). See
+	// s3parquet.WriterConfig.PartitionWriteConcurrency for tuning
+	// guidance; forwarded there verbatim.
+	PartitionWriteConcurrency int
 }
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /

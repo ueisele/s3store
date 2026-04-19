@@ -23,18 +23,30 @@ import (
 // lost ack or removing an orphan parquet.
 const writeCleanupTimeout = 5 * time.Second
 
-// partitionWriteConcurrency caps how many partitions Write fans
-// out in parallel. Each partition runs an independent encode +
-// PUT(data) + PUT(markers…) + PUT(ref) sequence, so the cap
-// bounds in-flight memory (sum of parquet buffers) and outbound
-// S3 request rate. Matches markerPutConcurrency.
-const partitionWriteConcurrency = 8
+// defaultPartitionWriteConcurrency is the fallback cap on how
+// many partitions Write fans out in parallel when
+// WriterConfig.PartitionWriteConcurrency is zero. Each partition
+// runs an independent encode + PUT(data) + PUT(markers…) +
+// PUT(ref) sequence, so the cap bounds in-flight memory (sum of
+// parquet buffers) and outbound S3 request rate. Matches
+// markerPutConcurrency.
+const defaultPartitionWriteConcurrency = 8
+
+// partitionConcurrency returns the effective fan-out cap — the
+// user-supplied WriterConfig.PartitionWriteConcurrency when set
+// to a positive value, otherwise the default.
+func (s *Writer[T]) partitionConcurrency() int {
+	if s.cfg.PartitionWriteConcurrency > 0 {
+		return s.cfg.PartitionWriteConcurrency
+	}
+	return defaultPartitionWriteConcurrency
+}
 
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
-// key in parallel (bounded by partitionWriteConcurrency).
-// Returns one WriteResult per partition that completed, in
-// sorted-key order regardless of completion order.
+// key in parallel (bounded by WriterConfig.PartitionWriteConcurrency,
+// default 8). Returns one WriteResult per partition that
+// completed, in sorted-key order regardless of completion order.
 //
 // On failure, cancels remaining partitions and returns whatever
 // results landed first, with the first real (non-cancel) error.
@@ -69,7 +81,7 @@ func (s *Writer[T]) Write(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, partitionWriteConcurrency)
+	sem := make(chan struct{}, s.partitionConcurrency())
 	var wg sync.WaitGroup
 	for i, key := range keys {
 		wg.Add(1)

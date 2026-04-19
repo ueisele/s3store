@@ -270,6 +270,36 @@ func TestOffsetAt(t *testing.T) {
 	}
 }
 
+// TestWriterConfigMirroredInConfig guards the projection from the
+// unified Config onto WriterConfig: every non-Target field on
+// WriterConfig must also appear on Config with the same name and
+// type, so writerConfigFrom can forward it. Target is excluded
+// because Config flattens its fields to the top level. Without
+// this, adding a new write knob to WriterConfig and forgetting
+// Config would silently go unnoticed — umbrella users would see
+// the default, direct NewWriter users the override.
+func TestWriterConfigMirroredInConfig(t *testing.T) {
+	wc := reflect.TypeFor[WriterConfig[testRec]]()
+	c := reflect.TypeFor[Config[testRec]]()
+
+	for i := range wc.NumField() {
+		wf := wc.Field(i)
+		if wf.Name == "Target" {
+			continue
+		}
+		cf, ok := c.FieldByName(wf.Name)
+		if !ok {
+			t.Errorf("WriterConfig field %q missing from Config",
+				wf.Name)
+			continue
+		}
+		if wf.Type != cf.Type {
+			t.Errorf("WriterConfig.%s type %s != Config.%s type %s",
+				wf.Name, wf.Type, cf.Name, cf.Type)
+		}
+	}
+}
+
 // TestReaderExtrasMirrorsReaderConfig guards the drift-guard:
 // every read-side field on ReaderExtras must also appear on
 // ReaderConfig with the same name and type. Without this, adding
@@ -309,5 +339,45 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 	}
 	if s.Reader.cfg.VersionOf != nil {
 		t.Error("VersionOf set despite no EntityKeyOf")
+	}
+}
+
+// TestPartitionConcurrency guards the fan-out cap resolution:
+// positive user values win, zero falls back to the default.
+// Negative is rejected upfront in NewWriter (see
+// TestNewWriterRejectsNegativeConcurrency), so by the time a
+// Writer exists the cfg value is always >= 0.
+func TestPartitionConcurrency(t *testing.T) {
+	cases := []struct {
+		name string
+		set  int
+		want int
+	}{
+		{"zero uses default", 0, defaultPartitionWriteConcurrency},
+		{"positive wins", 32, 32},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &Writer[testRec]{cfg: WriterConfig[testRec]{
+				PartitionWriteConcurrency: tc.set,
+			}}
+			if got := w.partitionConcurrency(); got != tc.want {
+				t.Errorf("partitionConcurrency: got %d, want %d",
+					got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNewWriterRejectsNegativeConcurrency guards that NewWriter
+// fails fast on a negative PartitionWriteConcurrency instead of
+// silently defaulting. A negative value is almost certainly a
+// caller bug (off-by-one, a decrement that underflowed);
+// surfacing it at construction beats swallowing it.
+func TestNewWriterRejectsNegativeConcurrency(t *testing.T) {
+	cfg := writerConfigFrom(validConfig())
+	cfg.PartitionWriteConcurrency = -1
+	if _, err := NewWriter(cfg); err == nil {
+		t.Fatal("NewWriter: expected error, got nil")
 	}
 }
