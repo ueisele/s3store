@@ -815,6 +815,381 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 	}
 }
 
+// TestReadMany_NonCartesian proves ReadMany covers an arbitrary
+// tuple set, not just a Cartesian product. Writing to four
+// (period, customer) tuples and asking for only two of them via
+// a 2-element patterns slice must return just those records —
+// something a single `|`-style pattern couldn't express without
+// over-reading the cross product.
+func TestReadMany_NonCartesian(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	in := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2", Value: 20},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s3", Value: 30},
+		{Period: "2026-03-18", Customer: "def", SKU: "s4", Value: 40},
+	}
+	if _, err := store.Write(ctx, in); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Pick the diagonal: (2026-03-17, abc) and (2026-03-18, def).
+	// A Cartesian pattern would also return the off-diagonal
+	// entries (10 and 40 only wanted; Cartesian would include
+	// 20 and 30).
+	got, err := store.ReadMany(ctx, []string{
+		"period=2026-03-17/customer=abc",
+		"period=2026-03-18/customer=def",
+	})
+	if err != nil {
+		t.Fatalf("ReadMany: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2", len(got))
+	}
+	values := map[int64]bool{}
+	for _, r := range got {
+		values[r.Value] = true
+	}
+	if !values[10] || !values[40] {
+		t.Errorf("got values %v, want {10, 40} only", values)
+	}
+	if values[20] || values[30] {
+		t.Errorf("off-diagonal records leaked: %v", values)
+	}
+}
+
+// TestReadMany_OverlapsDeduped proves overlapping patterns don't
+// cause a parquet file to be fetched + decoded twice. A bare "*"
+// plus a narrower pattern that it subsumes must still yield the
+// single expected record set.
+func TestReadMany_OverlapsDeduped(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2", Value: 2},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got, err := store.ReadMany(ctx, []string{
+		"*",
+		"period=2026-03-17/customer=abc",
+	})
+	if err != nil {
+		t.Fatalf("ReadMany: %v", err)
+	}
+	// 2 records, not 3 — overlap dedup collapses the redundant
+	// listing of abc's parquet file.
+	if len(got) != 2 {
+		t.Errorf("got %d records, want 2 (overlap dedup)", len(got))
+	}
+}
+
+// TestReadMany_EmptyAndBadPattern covers the two edge cases:
+// an empty slice returns (nil, nil) without S3 traffic, and a
+// malformed pattern fails with the offending index in the error.
+func TestReadMany_EmptyAndBadPattern(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	got, err := store.ReadMany(ctx, nil)
+	if err != nil {
+		t.Errorf("ReadMany(nil): %v", err)
+	}
+	if got != nil {
+		t.Errorf("ReadMany(nil): got %v, want nil", got)
+	}
+
+	_, err = store.ReadMany(ctx, []string{
+		"period=2026-03-17/customer=abc",
+		"not-a-valid-pattern", // segment count wrong
+	})
+	if err == nil {
+		t.Fatal("expected error for bad pattern, got nil")
+	}
+	if !strings.Contains(err.Error(), "pattern 1") {
+		t.Errorf("error %q should identify pattern index 1", err)
+	}
+}
+
+// TestReadMany_WithHistory guards that opts pass through to the
+// dedup path: with dedup configured, ReadMany + WithHistory()
+// returns every record, and without WithHistory() returns one
+// per entity. The single-pattern Read already covers this; this
+// test ensures the ReadMany wrapper doesn't swallow opts.
+func TestReadMany_WithHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string { return r.SKU },
+		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	for i := int64(0); i < 3; i++ {
+		if _, err := store.WriteWithKey(ctx, key, []Rec{
+			{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: i},
+		}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+
+	// ReadMany without opts: dedup kicks in → 1 record.
+	deduped, err := store.ReadMany(ctx, []string{key})
+	if err != nil {
+		t.Fatalf("ReadMany (deduped): %v", err)
+	}
+	if len(deduped) != 1 {
+		t.Errorf("deduped: got %d records, want 1", len(deduped))
+	}
+
+	// ReadMany with WithHistory: all 3 records returned.
+	full, err := store.ReadMany(ctx,
+		[]string{key}, s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("ReadMany (history): %v", err)
+	}
+	if len(full) != 3 {
+		t.Errorf("history: got %d, want 3", len(full))
+	}
+}
+
+// TestLookupMany_EmptyAndBadPattern mirrors
+// TestReadMany_EmptyAndBadPattern at the Index layer: empty
+// slice is a no-op, malformed pattern surfaces the offending
+// index.
+func TestLookupMany_EmptyAndBadPattern(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
+		s3parquet.IndexDef[Rec, Entry]{
+			IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+				Name:    "empty_bad_idx",
+				Columns: []string{"sku", "customer"},
+			},
+			Of: func(r Rec) []Entry {
+				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+			},
+		})
+	if err != nil {
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+	}
+
+	got, err := idx.LookupMany(ctx, nil)
+	if err != nil {
+		t.Errorf("LookupMany(nil): %v", err)
+	}
+	if got != nil {
+		t.Errorf("LookupMany(nil): got %v, want nil", got)
+	}
+
+	_, err = idx.LookupMany(ctx, []string{
+		"sku=s1/customer=abc",
+		"not-a-valid-pattern",
+	})
+	if err == nil {
+		t.Fatal("expected error for bad pattern, got nil")
+	}
+	if !strings.Contains(err.Error(), "pattern 1") {
+		t.Errorf("error %q should identify pattern index 1", err)
+	}
+}
+
+// TestBackfillIndexMany_EmptyAndBadPattern covers the matching
+// edge cases for the migration entry point.
+func TestBackfillIndexMany_EmptyAndBadPattern(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	def := s3parquet.IndexDef[Rec, Entry]{
+		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+			Name:    "empty_bad_backfill_idx",
+			Columns: []string{"sku", "customer"},
+		},
+		Of: func(r Rec) []Entry {
+			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+		},
+	}
+	target := store.Target()
+
+	stats, err := s3parquet.BackfillIndexMany(
+		ctx, target, def, nil, s3parquet.Offset(""), nil)
+	if err != nil {
+		t.Errorf("BackfillIndexMany(nil): %v", err)
+	}
+	if stats != (s3parquet.BackfillStats{}) {
+		t.Errorf("BackfillIndexMany(nil): got %+v, want zero stats",
+			stats)
+	}
+
+	_, err = s3parquet.BackfillIndexMany(ctx, target, def, []string{
+		"period=2026-03-17/customer=abc",
+		"not-a-valid-pattern",
+	}, s3parquet.Offset(""), nil)
+	if err == nil {
+		t.Fatal("expected error for bad pattern, got nil")
+	}
+	if !strings.Contains(err.Error(), "pattern 1") {
+		t.Errorf("error %q should identify pattern index 1", err)
+	}
+}
+
+// TestLookupMany_NonCartesian mirrors TestReadMany_NonCartesian
+// at the index layer: pick a non-Cartesian tuple set of
+// (sku, customer) pairs and verify only those markers come back.
+func TestLookupMany_NonCartesian(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
+		s3parquet.IndexDef[Rec, Entry]{
+			IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+				Name:    "sku_customer_idx",
+				Columns: []string{"sku", "customer"},
+			},
+			Of: func(r Rec) []Entry {
+				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+			},
+		})
+	if err != nil {
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+	}
+
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1"},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2"},
+		{Period: "2026-03-17", Customer: "abc", SKU: "s3"},
+		{Period: "2026-03-17", Customer: "def", SKU: "s4"},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	got, err := idx.LookupMany(ctx, []string{
+		"sku=s1/customer=abc",
+		"sku=s4/customer=def",
+	})
+	if err != nil {
+		t.Fatalf("LookupMany: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2", len(got))
+	}
+	set := map[Entry]bool{}
+	for _, e := range got {
+		set[e] = true
+	}
+	want := []Entry{
+		{SKU: "s1", Customer: "abc"},
+		{SKU: "s4", Customer: "def"},
+	}
+	for _, w := range want {
+		if !set[w] {
+			t.Errorf("missing entry %+v", w)
+		}
+	}
+	// Off-diagonal entries must NOT appear.
+	for _, w := range []Entry{
+		{SKU: "s1", Customer: "def"},
+		{SKU: "s4", Customer: "abc"},
+	} {
+		if set[w] {
+			t.Errorf("unexpected off-diagonal entry %+v", w)
+		}
+	}
+}
+
+// TestBackfillIndexMany exercises the multi-pattern migration
+// shape: write records across several partitions, then backfill
+// only the partitions of interest via a patterns slice. The
+// run covers exactly the selected partitions, and the union is
+// deduplicated when patterns overlap.
+func TestBackfillIndexMany(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	historical := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1"},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2"},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s3"},
+		{Period: "2026-04-01", Customer: "abc", SKU: "s4"},
+	}
+	if _, err := store.Write(ctx, historical); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	def := s3parquet.IndexDef[Rec, Entry]{
+		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+			Name:    "many_idx",
+			Columns: []string{"sku", "customer"},
+		},
+		Of: func(r Rec) []Entry {
+			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+		},
+	}
+	idx, err := s3parquet.NewIndexFromStoreWithRegister(store, def)
+	if err != nil {
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+	}
+
+	// Backfill just the two March partitions via explicit patterns.
+	// The April partition should NOT be covered.
+	stats, err := s3parquet.BackfillIndexMany(ctx, store.Target(), def,
+		[]string{
+			"period=2026-03-17/customer=*",
+			"period=2026-03-18/customer=*",
+		},
+		s3parquet.Offset(""), nil)
+	if err != nil {
+		t.Fatalf("BackfillIndexMany: %v", err)
+	}
+	if stats.DataObjects != 3 {
+		t.Errorf("DataObjects: got %d, want 3 (two March-17 + one "+
+			"March-18; April skipped)", stats.DataObjects)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// Sanity: Lookup sees the March markers, NOT April.
+	got, err := idx.Lookup(ctx, "sku=*/customer=*")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	set := map[Entry]bool{}
+	for _, e := range got {
+		set[e] = true
+	}
+	if !set[(Entry{SKU: "s1", Customer: "abc"})] ||
+		!set[(Entry{SKU: "s2", Customer: "def"})] ||
+		!set[(Entry{SKU: "s3", Customer: "abc"})] {
+		t.Errorf("March entries missing: got %v", set)
+	}
+	if set[(Entry{SKU: "s4", Customer: "abc"})] {
+		t.Errorf("April entry (s4) should not be backfilled, got %v", set)
+	}
+}
+
 // TestWriteAndRead exercises the basic round-trip through S3.
 // No dedup configured.
 func TestWriteAndRead(t *testing.T) {

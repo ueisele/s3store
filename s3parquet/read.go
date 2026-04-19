@@ -57,18 +57,63 @@ type versionedRecord[T any] struct {
 //
 // Memory: all matching records are buffered before dedup/return.
 // For unbounded reads, use PollRecords to stream incrementally.
+//
+// Single-pattern sugar over ReadMany — use ReadMany directly
+// when the caller has an arbitrary set of partition tuples
+// (e.g. a non-Cartesian "(period=A, customer=X), (period=B,
+// customer=Y)" selection) that can't be expressed as one
+// pattern.
 func (s *Reader[T]) Read(
 	ctx context.Context, keyPattern string, opts ...QueryOption,
+) ([]T, error) {
+	return s.ReadMany(ctx, []string{keyPattern}, opts...)
+}
+
+// ReadMany runs Read across every pattern in patterns and
+// returns the concatenated result, with dedup applied globally
+// when EntityKeyOf is configured (an entity that appears under
+// two patterns is kept as the latest version across the union,
+// not per-pattern).
+//
+// Each pattern uses the grammar described on Read. Pass more
+// than one when the target set is NOT a Cartesian product of
+// per-segment values — e.g. the tuples (period=A, customer=X)
+// and (period=B, customer=Y) but not the off-diagonal pairs.
+// For a Cartesian "all N × M" shape, pre-expand the list in
+// caller code or use a single pattern with whole-segment "*".
+//
+// LIST calls fan out with the same concurrency cap as GETs
+// (pollDownloadConcurrency), literal-duplicate patterns are
+// dropped up front, and duplicate keys that arise when
+// patterns semantically overlap are collapsed before the GET
+// phase so every parquet file is fetched and decoded at most
+// once. Passing an empty slice is a no-op: (nil, nil).
+//
+// Errors: the first malformed pattern fails the whole call,
+// surfaced with the offending index so the caller can locate
+// it. Any sub-LIST error fails fast and cancels the rest.
+func (s *Reader[T]) ReadMany(
+	ctx context.Context, patterns []string, opts ...QueryOption,
 ) ([]T, error) {
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	plan, err := buildReadPlan(keyPattern, s.dataPath, s.cfg.Target.PartitionKeyParts)
-	if err != nil {
-		return nil, err
+	patterns = dedupePatterns(patterns)
+	if len(patterns) == 0 {
+		return nil, nil
 	}
 
-	keys, err := s.listMatchingParquet(ctx, plan)
+	plans := make([]*readPlan, len(patterns))
+	for i, p := range patterns {
+		plan, err := buildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: ReadMany pattern %d %q: %w", i, p, err)
+		}
+		plans[i] = plan
+	}
+
+	keys, err := s.listAllMatchingParquet(ctx, plans)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +163,129 @@ func (s *Reader[T]) listMatchingParquet(
 		}
 	}
 	return keys, nil
+}
+
+// listAllMatchingParquet runs listMatchingParquet across every
+// plan with bounded concurrency and returns the unioned set of
+// keys, deduplicated (overlapping plans can list the same
+// parquet file, e.g. "period=*" and "period=2026-03" both cover
+// March data). Fast-path: len(plans) == 1 falls through to the
+// single-plan implementation with no goroutine overhead.
+func (s *Reader[T]) listAllMatchingParquet(
+	ctx context.Context, plans []*readPlan,
+) ([]string, error) {
+	return runPlansConcurrent(ctx, plans, s.listMatchingParquet)
+}
+
+// runPlansConcurrent runs listOne across every plan with the
+// shared concurrency cap (pollDownloadConcurrency) and returns
+// the deduplicated union of keys in first-seen order. Used by
+// Reader.ReadMany, Index.LookupMany, and BackfillIndexMany as
+// the single source of truth for the fan-out pattern.
+//
+// Fast path: len(plans) == 1 calls listOne directly, avoiding
+// goroutine / channel overhead for the sugar-wrapper single-
+// pattern case.
+//
+// Error semantics: first real error wins and cancels the rest.
+// context.Canceled entries written by siblings after cancel are
+// filtered out so callers see the root cause, not the fallout.
+func runPlansConcurrent[P any](
+	ctx context.Context,
+	plans []P,
+	listOne func(ctx context.Context, p P) ([]string, error),
+) ([]string, error) {
+	if len(plans) == 1 {
+		return listOne(ctx, plans[0])
+	}
+
+	results := make([][]string, len(plans))
+	errs := make([]error, len(plans))
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, pollDownloadConcurrency)
+	var wg sync.WaitGroup
+	for i, plan := range plans {
+		wg.Add(1)
+		go func(i int, plan P) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errs[i] = ctx.Err()
+				return
+			}
+			defer func() { <-sem }()
+
+			keys, err := listOne(ctx, plan)
+			if err != nil {
+				errs[i] = err
+				cancel()
+				return
+			}
+			results[i] = keys
+		}(i, plan)
+	}
+	wg.Wait()
+
+	for _, e := range errs {
+		if e == nil || errors.Is(e, context.Canceled) {
+			continue
+		}
+		return nil, e
+	}
+	return unionKeys(results), nil
+}
+
+// dedupePatterns removes literal-duplicate entries from a
+// patterns slice, preserving first-seen order. Cheap pre-step
+// for the *Many functions so accidental duplicates (e.g. from
+// a generated list with possible repeats) don't cause duplicate
+// LIST round-trips. Doesn't catch semantic overlap — patterns
+// like "*" and "2026-*" both list overlapping files but aren't
+// string-equal; that case is still handled by unionKeys at the
+// key level, just at the cost of one extra LIST.
+func dedupePatterns(patterns []string) []string {
+	if len(patterns) <= 1 {
+		return patterns
+	}
+	seen := make(map[string]struct{}, len(patterns))
+	out := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+// unionKeys flattens a set of per-plan LIST results into a
+// single deduplicated slice, preserving first-seen order so the
+// downstream GET pipeline is deterministic.
+func unionKeys(perPlan [][]string) []string {
+	total := 0
+	for _, keys := range perPlan {
+		total += len(keys)
+	}
+	if total == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, total)
+	out := make([]string, 0, total)
+	for _, keys := range perPlan {
+		for _, k := range keys {
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // downloadAndDecodeAll fans out a bounded set of parallel

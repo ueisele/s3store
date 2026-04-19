@@ -274,15 +274,49 @@ func (i *Index[K]) markerPath(entry K) (string, error) {
 // whose S3 LastModified timestamp is within now - SettleWindow
 // are hidden, so a caller that writes and immediately Looks Up
 // sees consistent state with PollRecords.
+//
+// Single-pattern sugar over LookupMany — use LookupMany when
+// the caller has an arbitrary set of column tuples (e.g. a
+// non-Cartesian "(sku=A, customer=X), (sku=B, customer=Y)"
+// selection).
 func (i *Index[K]) Lookup(
 	ctx context.Context, pattern string,
 ) ([]K, error) {
-	plan, err := buildReadPlan(pattern, i.indexPath, i.columns)
-	if err != nil {
-		return nil, err
+	return i.LookupMany(ctx, []string{pattern})
+}
+
+// LookupMany runs Lookup across every pattern and returns the
+// unioned set of K values. Overlapping patterns are safe: a
+// marker listed by two plans is counted once, so the returned
+// slice has no duplicate K entries.
+//
+// Each pattern uses the grammar described on Lookup. Pass more
+// than one when the target set isn't a Cartesian product of
+// per-column values. LISTs fan out with the same concurrency
+// cap as Reader's GETs (pollDownloadConcurrency), literal-
+// duplicate patterns are dropped up front. Empty slice → (nil,
+// nil). First malformed pattern fails the whole call with its
+// index.
+func (i *Index[K]) LookupMany(
+	ctx context.Context, patterns []string,
+) ([]K, error) {
+	patterns = dedupePatterns(patterns)
+	if len(patterns) == 0 {
+		return nil, nil
 	}
 
-	keys, err := i.listMatchingMarkers(ctx, plan)
+	plans := make([]*readPlan, len(patterns))
+	for j, p := range patterns {
+		plan, err := buildReadPlan(p, i.indexPath, i.columns)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: index %q LookupMany pattern %d %q: %w",
+				i.name, j, p, err)
+		}
+		plans[j] = plan
+	}
+
+	keys, err := i.listAllMatchingMarkers(ctx, plans)
 	if err != nil {
 		return nil, err
 	}
@@ -350,6 +384,17 @@ func (i *Index[K]) listMatchingMarkers(
 		}
 	}
 	return keys, nil
+}
+
+// listAllMatchingMarkers runs listMatchingMarkers across every
+// plan with bounded concurrency and returns the unioned set of
+// marker keys, deduplicated (overlapping plans can list the
+// same marker, e.g. "sku=*" and "sku=s1" both cover the s1
+// markers).
+func (i *Index[K]) listAllMatchingMarkers(
+	ctx context.Context, plans []*readPlan,
+) ([]string, error) {
+	return runPlansConcurrent(ctx, plans, i.listMatchingMarkers)
 }
 
 // hiveKeyOfMarker returns the "col=val/col=val/..." body of a
@@ -422,6 +467,10 @@ type BackfillStats struct {
 // across objects, serial PUTs within each object so net in-flight
 // S3 requests stay at ≈ concurrency rather than concurrency².
 // Peak memory is bounded by (concurrency × largest-object size).
+//
+// Single-pattern sugar over BackfillIndexMany — use that when a
+// migration needs to cover an arbitrary set of partition tuples
+// that can't be expressed as one Cartesian pattern.
 func BackfillIndex[T any, K comparable](
 	ctx context.Context,
 	target S3Target,
@@ -430,7 +479,32 @@ func BackfillIndex[T any, K comparable](
 	until Offset,
 	onMissingData func(dataPath string),
 ) (BackfillStats, error) {
+	return BackfillIndexMany(
+		ctx, target, def, []string{pattern}, until, onMissingData)
+}
+
+// BackfillIndexMany runs BackfillIndex across every pattern in
+// patterns, LISTing with bounded concurrency and feeding the
+// deduplicated union of data-file keys through a single
+// backfill pipeline. Stats aggregate across patterns: each
+// parquet file is scanned once even if two patterns match it.
+//
+// Empty slice is a no-op: (BackfillStats{}, nil). First
+// malformed pattern fails with its index.
+func BackfillIndexMany[T any, K comparable](
+	ctx context.Context,
+	target S3Target,
+	def IndexDef[T, K],
+	patterns []string,
+	until Offset,
+	onMissingData func(dataPath string),
+) (BackfillStats, error) {
 	var stats BackfillStats
+
+	patterns = dedupePatterns(patterns)
+	if len(patterns) == 0 {
+		return stats, nil
+	}
 
 	// Full Target check — BackfillIndex LISTs partitioned data
 	// files (plan.Match consults PartitionKeyParts), so
@@ -440,7 +514,7 @@ func BackfillIndex[T any, K comparable](
 	}
 	if def.Of == nil {
 		return stats, fmt.Errorf(
-			"s3parquet: BackfillIndex %q: Of is required", def.Name)
+			"s3parquet: BackfillIndexMany %q: Of is required", def.Name)
 	}
 
 	idx, err := buildIndex(target, def.IndexLookupDef)
@@ -449,12 +523,18 @@ func BackfillIndex[T any, K comparable](
 	}
 
 	dataPath := core.DataPath(target.Prefix)
-	plan, err := buildReadPlan(pattern, dataPath, target.PartitionKeyParts)
-	if err != nil {
-		return stats, err
+	plans := make([]*readPlan, len(patterns))
+	for j, p := range patterns {
+		plan, err := buildReadPlan(p, dataPath, target.PartitionKeyParts)
+		if err != nil {
+			return stats, fmt.Errorf(
+				"s3parquet: BackfillIndexMany pattern %d %q: %w",
+				j, p, err)
+		}
+		plans[j] = plan
 	}
 
-	keys, err := listDataFilesBelowUntil(ctx, target, plan, dataPath, until)
+	keys, err := listDataFilesBelowUntil(ctx, target, plans, dataPath, until)
 	if err != nil {
 		return stats, err
 	}
@@ -551,7 +631,7 @@ func BackfillIndex[T any, K comparable](
 func listDataFilesBelowUntil(
 	ctx context.Context,
 	target S3Target,
-	plan *readPlan,
+	plans []*readPlan,
 	dataPath string,
 	until Offset,
 ) ([]string, error) {
@@ -568,6 +648,24 @@ func listDataFilesBelowUntil(
 		filter = true
 	}
 
+	return runPlansConcurrent(ctx, plans,
+		func(ctx context.Context, plan *readPlan) ([]string, error) {
+			return listDataFilesForPlan(
+				ctx, target, plan, dataPath, filter, cutoff)
+		})
+}
+
+// listDataFilesForPlan is the per-plan body extracted so the
+// single-plan and multi-plan paths share one code path for the
+// LIST + filter logic.
+func listDataFilesForPlan(
+	ctx context.Context,
+	target S3Target,
+	plan *readPlan,
+	dataPath string,
+	filter bool,
+	cutoff time.Time,
+) ([]string, error) {
 	paginator := target.list(plan.ListPrefix)
 
 	var keys []string

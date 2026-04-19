@@ -200,6 +200,39 @@ func TestDecodeParquet_MissingColumnsZeroFill(t *testing.T) {
 	}
 }
 
+// TestDedupePatterns guards the literal-duplicate dedup applied
+// before plan construction in the *Many functions. Tests the
+// fast paths (nil, single) and order preservation on duplicates.
+func TestDedupePatterns(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"nil", nil, nil},
+		{"single", []string{"a"}, []string{"a"}},
+		{"distinct", []string{"a", "b", "c"}, []string{"a", "b", "c"}},
+		{"mixed dups", []string{"a", "b", "a", "c", "b"},
+			[]string{"a", "b", "c"}},
+		{"all same", []string{"a", "a", "a"}, []string{"a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dedupePatterns(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v (len %d), want %v (len %d)",
+					got, len(got), tc.want, len(tc.want))
+			}
+			for i, w := range tc.want {
+				if got[i] != w {
+					t.Errorf("got[%d] = %q, want %q",
+						i, got[i], w)
+				}
+			}
+		})
+	}
+}
+
 // TestDedupLatest_TieKeepsFirst documents the
 // stability-on-tie invariant: when two records share the same
 // version, the first occurrence wins. Integration tests can't
