@@ -30,7 +30,7 @@ const writeCleanupTimeout = 5 * time.Second
 // An empty records slice is a no-op: (nil, nil) is returned so
 // callers don't have to guard against batch-pipeline edge
 // cases.
-func (s *Store[T]) Write(
+func (s *writer[T]) Write(
 	ctx context.Context, records []T,
 ) ([]WriteResult, error) {
 	if len(records) == 0 {
@@ -68,7 +68,7 @@ func (s *Store[T]) Write(
 // failure. On a real failure it best-effort deletes the orphan
 // parquet; if that cleanup also fails, the returned error
 // includes the orphan data path so the operator can clean up.
-func (s *Store[T]) WriteWithKey(
+func (s *writer[T]) WriteWithKey(
 	ctx context.Context, key string, records []T,
 ) (*WriteResult, error) {
 	if len(records) == 0 {
@@ -173,7 +173,7 @@ func (s *Store[T]) WriteWithKey(
 	return nil, fmt.Errorf("s3parquet: put ref: %w", putErr)
 }
 
-func (s *Store[T]) groupByKey(records []T) map[string][]T {
+func (s *writer[T]) groupByKey(records []T) map[string][]T {
 	grouped := make(map[string][]T)
 	for _, r := range records {
 		key := s.cfg.PartitionKeyOf(r)
@@ -192,7 +192,7 @@ func (s *Store[T]) groupByKey(records []T) map[string][]T {
 // (FROM..TO), so a partition value containing ".." would be
 // unaddressable on read. Catches PartitionKeyOf bugs before they
 // corrupt the S3 layout.
-func (s *Store[T]) validateKey(key string) error {
+func (s *writer[T]) validateKey(key string) error {
 	segments := strings.Split(key, "/")
 	if len(segments) != len(s.cfg.PartitionKeyParts) {
 		return fmt.Errorf(
@@ -231,7 +231,7 @@ const markerPutConcurrency = 8
 // marker S3 keys. Dedup is via map[string]struct{} on the full
 // path, which is correct because different indexes live under
 // different _index/<name>/ prefixes — no cross-index collisions.
-func (s *Store[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
+func (s *writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 	if len(s.indexes) == 0 {
 		return nil, nil
 	}
@@ -264,7 +264,7 @@ func (s *Store[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 // run to completion, those still blocked on the semaphore see
 // the cancelled context and bail. Partial success is an accepted
 // outcome — Lookup tolerates orphan markers.
-func (s *Store[T]) putMarkersParallel(
+func (s *writer[T]) putMarkersParallel(
 	ctx context.Context, paths []string,
 ) error {
 	if len(paths) == 0 {

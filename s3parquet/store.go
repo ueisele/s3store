@@ -174,48 +174,18 @@ func (c Config[T]) dedupEnabled() bool {
 	return c.EntityKeyOf != nil
 }
 
-// Store is the pure-Go entry point to an s3store.
+// Store is the pure-Go entry point to an s3store. It composes
+// an internal writer + reader (Stage 1 of the Writer/Reader
+// split): the two halves own their own state and methods, Store
+// re-exposes everything via embedding so existing callers keep
+// compiling.
 type Store[T any] struct {
-	cfg      Config[T]
-	s3       *s3.Client
-	dataPath string
-	refPath  string
-
-	// compressionCodec is Config.Compression resolved to the
-	// parquet-go codec once at New(), so the Write hot path
-	// doesn't re-switch on the string.
-	compressionCodec compress.Codec
-
-	// insertedAtFieldIndex is the reflect struct-field path for
-	// Config.InsertedAtField, resolved once at New() so the hot
-	// path doesn't reparse the type. nil when unset.
-	insertedAtFieldIndex []int
-
-	// indexes is the list of registered secondary indexes that the
-	// write path iterates per record to emit marker objects. Typed
-	// Index[T, K] handles append to this slice via registerIndex
-	// at NewIndex time; the entry type K is erased at the closure
-	// boundary so the slice can be homogeneous over T.
-	indexes []indexWriter[T]
+	*writer[T]
+	*reader[T]
 }
 
-// indexWriter is the internal, entry-type-erased contract between
-// a typed Index[T, K] and the Store's write path. Given a record,
-// it returns the S3 object keys of the markers that record
-// produces, already validated and ready to PUT.
-type indexWriter[T any] struct {
-	name    string
-	pathsOf func(T) ([]string, error)
-}
-
-// registerIndex appends a typed index's writer to the store's
-// iteration list. Called from NewIndex. Not concurrency-safe:
-// indexes should be registered before the first Write.
-func (s *Store[T]) registerIndex(w indexWriter[T]) {
-	s.indexes = append(s.indexes, w)
-}
-
-// New constructs a Store. Validates required config fields.
+// New constructs a Store. Validates required config fields and
+// wires an internal writer + reader pair sharing the same Config.
 func New[T any](cfg Config[T]) (*Store[T], error) {
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("s3parquet: Bucket is required")
@@ -247,13 +217,23 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if err != nil {
 		return nil, err
 	}
+	dataPath := core.DataPath(cfg.Prefix)
+	refPath := core.RefPath(cfg.Prefix)
 	return &Store[T]{
-		cfg:                  cfg,
-		s3:                   cfg.S3Client,
-		dataPath:             core.DataPath(cfg.Prefix),
-		refPath:              core.RefPath(cfg.Prefix),
-		compressionCodec:     codec,
-		insertedAtFieldIndex: insertedAtIdx,
+		writer: &writer[T]{
+			cfg:              cfg,
+			s3:               cfg.S3Client,
+			dataPath:         dataPath,
+			refPath:          refPath,
+			compressionCodec: codec,
+		},
+		reader: &reader[T]{
+			cfg:                  cfg,
+			s3:                   cfg.S3Client,
+			dataPath:             dataPath,
+			refPath:              refPath,
+			insertedAtFieldIndex: insertedAtIdx,
+		},
 	}, nil
 }
 

@@ -55,7 +55,7 @@ func TestNew_Validation(t *testing.T) {
 }
 
 func TestValidateKey(t *testing.T) {
-	s := &Store[testRec]{cfg: Config[testRec]{
+	s := &writer[testRec]{cfg: Config[testRec]{
 		PartitionKeyParts: []string{"period", "customer"},
 	}}
 	cases := []struct {
@@ -224,7 +224,7 @@ func TestSettleWindowDefault(t *testing.T) {
 // because the empty-records fast path returns before any
 // method touches s.s3.
 func TestWriteEmptyRecords(t *testing.T) {
-	s := &Store[testRec]{cfg: Config[testRec]{
+	s := &writer[testRec]{cfg: Config[testRec]{
 		PartitionKeyParts: []string{"period", "customer"},
 		PartitionKeyOf: func(r testRec) string {
 			return "period=" + r.Period + "/customer=" + r.Customer
@@ -285,12 +285,12 @@ func TestNewPopulatesDefaultVersionOf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if s.cfg.VersionOf == nil {
+	if s.writer.cfg.VersionOf == nil {
 		t.Fatal("VersionOf still nil after New; expected DefaultVersionOf")
 	}
 	// Spot-check: DefaultVersionOf returns insertedAt.UnixMicro().
 	ts := time.UnixMicro(1_710_684_000_000_000)
-	if got := s.cfg.VersionOf(testRec{}, ts); got != 1_710_684_000_000_000 {
+	if got := s.writer.cfg.VersionOf(testRec{}, ts); got != 1_710_684_000_000_000 {
 		t.Errorf("default VersionOf returned %d, want %d",
 			got, 1_710_684_000_000_000)
 	}
@@ -309,7 +309,7 @@ func TestNewLeavesUserVersionOfAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	got := s.cfg.VersionOf(testRec{Value: 21}, time.Time{})
+	got := s.writer.cfg.VersionOf(testRec{Value: 21}, time.Time{})
 	if got != 42 {
 		t.Errorf("user VersionOf was replaced; got %d, want 42", got)
 	}
@@ -347,7 +347,7 @@ func TestDefaultVersionOf(t *testing.T) {
 // are the invariants Poll+WithUntilOffset relies on to turn a
 // time window into the correct half-open offset range.
 func TestOffsetAt(t *testing.T) {
-	s := &Store[testRec]{
+	s := &reader[testRec]{
 		cfg:     validConfig(),
 		refPath: "p/_stream/refs",
 	}
@@ -389,7 +389,7 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if s.cfg.VersionOf != nil {
+	if s.writer.cfg.VersionOf != nil {
 		t.Error("VersionOf set despite no EntityKeyOf")
 	}
 }

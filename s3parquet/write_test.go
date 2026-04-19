@@ -13,7 +13,7 @@ import (
 // TestGroupByKey guards that groupByKey partitions records by
 // PartitionKeyOf and preserves every record in its group.
 func TestGroupByKey(t *testing.T) {
-	s := &Store[testRec]{cfg: Config[testRec]{
+	s := &writer[testRec]{cfg: Config[testRec]{
 		PartitionKeyParts: []string{"period", "customer"},
 		PartitionKeyOf: func(r testRec) string {
 			return "period=" + r.Period + "/customer=" + r.Customer

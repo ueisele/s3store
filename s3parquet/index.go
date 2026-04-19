@@ -56,8 +56,14 @@ type IndexDef[T any, K comparable] struct {
 // Index is the typed query handle returned by NewIndex. It holds
 // the state needed to serialize K values to marker paths on write
 // and parse marker paths back into K values on read.
+//
+// Indexes straddle the write/read split: they emit markers on
+// Write (via the writer half) and resolve Lookup via S3 LIST plus
+// Backfill via parquet reads (via the reader half). Keep both
+// pointers so the Index is independent of the composing Store.
 type Index[T any, K comparable] struct {
-	store     *Store[T]
+	writer    *writer[T]
+	reader    *reader[T]
 	name      string
 	columns   []string
 	indexPath string
@@ -112,10 +118,11 @@ func NewIndex[T any, K comparable](
 			"s3parquet: NewIndex %q: %w", def.Name, err)
 	}
 
-	indexPath := core.IndexPath(store.cfg.Prefix, def.Name)
+	indexPath := core.IndexPath(store.writer.cfg.Prefix, def.Name)
 
 	idx := &Index[T, K]{
-		store:        store,
+		writer:       store.writer,
+		reader:       store.reader,
 		name:         def.Name,
 		columns:      def.Columns,
 		indexPath:    indexPath,
@@ -221,12 +228,12 @@ func (i *Index[T, K]) Backfill(
 	var stats BackfillStats
 
 	plan, err := buildReadPlan(
-		pattern, i.store.dataPath, i.store.cfg.PartitionKeyParts)
+		pattern, i.reader.dataPath, i.reader.cfg.PartitionKeyParts)
 	if err != nil {
 		return stats, err
 	}
 
-	keys, err := i.store.listMatchingParquet(ctx, plan)
+	keys, err := i.reader.listMatchingParquet(ctx, plan)
 	if err != nil {
 		return stats, err
 	}
@@ -267,8 +274,8 @@ func (i *Index[T, K]) Backfill(
 				// backfill. Other GET errors remain fatal.
 				var nsk *s3types.NoSuchKey
 				if errors.As(err, &nsk) {
-					if i.store.cfg.OnMissingData != nil {
-						i.store.cfg.OnMissingData(key)
+					if i.reader.cfg.OnMissingData != nil {
+						i.reader.cfg.OnMissingData(key)
 					}
 					return
 				}
@@ -284,7 +291,7 @@ func (i *Index[T, K]) Backfill(
 			// concurrency² and overwhelm the SDK connection
 			// pool. Net in-flight ≈ concurrency.
 			for _, p := range paths {
-				if err := i.store.putObject(
+				if err := i.writer.putObject(
 					ctx, p, nil, "application/octet-stream",
 				); err != nil {
 					errs[n] = fmt.Errorf(
@@ -323,7 +330,7 @@ func (i *Index[T, K]) Backfill(
 func (i *Index[T, K]) markerPathsForObject(
 	ctx context.Context, key string,
 ) ([]string, int, error) {
-	data, err := i.store.getObjectBytes(ctx, key)
+	data, err := i.reader.getObjectBytes(ctx, key)
 	if err != nil {
 		return nil, 0, fmt.Errorf(
 			"s3parquet: backfill get %s: %w", key, err)
@@ -422,13 +429,13 @@ func (i *Index[T, K]) valuesToEntry(values []string) K {
 func (i *Index[T, K]) listMatchingMarkers(
 	ctx context.Context, plan *readPlan,
 ) ([]string, error) {
-	cutoff := time.Now().Add(-i.store.cfg.settleWindow())
+	cutoff := time.Now().Add(-i.reader.cfg.settleWindow())
 
 	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(i.store.cfg.Bucket),
+		Bucket: aws.String(i.reader.cfg.Bucket),
 		Prefix: aws.String(plan.ListPrefix),
 	}
-	paginator := s3.NewListObjectsV2Paginator(i.store.s3, input)
+	paginator := s3.NewListObjectsV2Paginator(i.reader.s3, input)
 
 	var keys []string
 	suffix := "/" + core.IndexMarkerFilename
