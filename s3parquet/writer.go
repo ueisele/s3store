@@ -72,6 +72,20 @@ func (w *Writer[T]) Target() S3Target {
 	return w.cfg.Target
 }
 
+// PartitionKey applies the configured PartitionKeyOf to rec and
+// returns the resulting partition key. Intended for callers that
+// want the single-partition WriteWithKey path without having to
+// re-implement the key format at the call site:
+//
+//	_, err := w.WriteWithKey(ctx, w.PartitionKey(recs[0]), recs)
+//
+// Panics if PartitionKeyOf was not set at construction — the same
+// nil-func-call semantics Write gets, just surfaced at a clearer
+// site.
+func (w *Writer[T]) PartitionKey(rec T) string {
+	return w.cfg.PartitionKeyOf(rec)
+}
+
 // NewWriter constructs a Writer directly from WriterConfig. Use
 // this in services that only write; use New(Config) when the
 // same process also reads through a Reader/Store.

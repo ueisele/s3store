@@ -114,6 +114,14 @@ func (s *Store[T]) WriteWithKey(
 	return s.writer.WriteWithKey(ctx, key, records)
 }
 
+// PartitionKey delegates to the Writer. Handy when paired with
+// WriteWithKey for single-partition batches:
+//
+//	_, err := store.WriteWithKey(ctx, store.PartitionKey(recs[0]), recs)
+func (s *Store[T]) PartitionKey(rec T) string {
+	return s.writer.PartitionKey(rec)
+}
+
 // Poll delegates to the Reader (pure S3 LIST; no DuckDB
 // involvement despite living on the cgo-backed half).
 func (s *Store[T]) Poll(
