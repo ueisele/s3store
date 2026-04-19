@@ -316,20 +316,6 @@ func TestNewLeavesUserVersionOfAlone(t *testing.T) {
 	}
 }
 
-// TestStoreClose guards that Close is a clean no-op for the
-// pure-Go Store. Integration tests verify this too, but a unit
-// smoke test catches a regression where Close starts doing
-// something (e.g. closing S3Client) and returning an error.
-func TestStoreClose(t *testing.T) {
-	s, err := New(validConfig())
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if err := s.Close(); err != nil {
-		t.Errorf("Close: %v", err)
-	}
-}
-
 // TestDefaultVersionOf guards that the exported helper returns
 // insertedAt in microseconds, matching what the doc comment
 // promises. Users who reference the helper explicitly rely on

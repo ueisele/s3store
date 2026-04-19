@@ -3,7 +3,6 @@ package s3store
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"time"
 
 	"github.com/ueisele/s3store/s3parquet"
@@ -65,19 +64,16 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		InsertedAtField:   cfg.InsertedAtField,
 	})
 	if err != nil {
-		_ = pq.Close()
 		return nil, err
 	}
 	return &Store[T]{parquet: pq, sql: sq}, nil
 }
 
-// Close releases resources from both sub-stores. Returns the
-// first non-nil error observed; the other sub-store is closed
-// regardless.
+// Close releases resources. Only the SQL sub-store (DuckDB) owns
+// anything that needs explicit release; the parquet sub-store is
+// purely stateless on top of the shared S3 client.
 func (s *Store[T]) Close() error {
-	errParquet := s.parquet.Close()
-	errSQL := s.sql.Close()
-	return errors.Join(errParquet, errSQL)
+	return s.sql.Close()
 }
 
 // Write delegates to the parquet sub-store.

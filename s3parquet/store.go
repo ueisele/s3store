@@ -310,11 +310,6 @@ func resolveCompression(c CompressionCodec) (compress.Codec, error) {
 			"zstd, gzip, or uncompressed)", c)
 }
 
-// Close releases resources. Pure-Go Store holds no persistent
-// connections — Close is a no-op but present for API symmetry
-// with s3sql.Store and for future-proofing.
-func (s *Store[T]) Close() error { return nil }
-
 // validateInsertedAtField resolves Config.InsertedAtField to a
 // struct-field index on T. Rejects typos (no such field), wrong
 // type (not time.Time), and — critically — a missing `parquet:"-"`

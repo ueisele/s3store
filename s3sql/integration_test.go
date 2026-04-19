@@ -74,7 +74,6 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = w.Close() })
 
 	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
 		Bucket:            f.Bucket,
@@ -165,7 +164,6 @@ func TestInsertedAtField_Populate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = w.Close() })
 
 	sq, err := s3sql.New[RecWithMeta](s3sql.Config[RecWithMeta]{
 		Bucket:            f.Bucket,
@@ -752,7 +750,6 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New(RecNarrow): %v", err)
 	}
-	t.Cleanup(func() { _ = wOld.Close() })
 	if _, err := wOld.Write(context.Background(), []RecNarrow{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
 	}); err != nil {
@@ -828,7 +825,6 @@ func TestRead_SliceField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = w.Close() })
 
 	if _, err := w.Write(ctx, []TagRec{
 		{
@@ -925,7 +921,6 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = w.Close() })
 
 	in := JobRec{
 		Period:   "2026-03-17",

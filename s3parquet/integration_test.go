@@ -58,7 +58,6 @@ func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
 
@@ -169,7 +168,6 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 
 	type Entry struct {
 		SKU      string `parquet:"sku"`
@@ -384,7 +382,6 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 
 	r1, err := store.WriteWithKey(ctx,
 		"period=2026-03-17/customer=abc", []Rec{
@@ -479,7 +476,6 @@ func TestInsertedAtField_Populate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 
 	before := time.Now()
 	if _, err := store.Write(ctx, []RecWithMeta{
@@ -610,7 +606,6 @@ func TestView_NarrowReadThroughNewViewFromStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 
 	if _, err := store.Write(ctx, []FullRec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
@@ -955,7 +950,6 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New(RecNarrow): %v", err)
 	}
-	t.Cleanup(func() { _ = wNarrow.Close() })
 
 	if _, err := wNarrow.Write(ctx, []RecNarrow{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
@@ -977,7 +971,6 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New(Rec): %v", err)
 	}
-	t.Cleanup(func() { _ = rWide.Close() })
 
 	got, err := rWide.Read(ctx, "period=2026-03-17/customer=abc")
 	if err != nil {
@@ -1229,7 +1222,6 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 
 	in := []ParquetRec{{
 		Period:   "2026-03-17",
@@ -1298,7 +1290,6 @@ func TestWriteRead_BloomFilterRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 
 	in := []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1, Ts: time.UnixMilli(1)},
