@@ -2073,3 +2073,191 @@ func TestWrite_CallerCancelReturnsError(t *testing.T) {
 			err)
 	}
 }
+
+// TestReadIter_PerPartitionDedup guards the iter contract: when
+// EntityKeyOf is set and WithHistory is not, ReadIter dedups
+// per-partition. Two writes to the same entity in the same
+// partition must yield exactly one record (the newer Value).
+// Mirrors TestDedupExplicit but for the iter path.
+func TestReadIter_PerPartitionDedup(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+		versionOf: func(r Rec, _ time.Time) int64 {
+			return r.Ts.UnixNano()
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10, Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 99, Ts: time.UnixMilli(200)},
+	}); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+
+	var got []Rec
+	for r, err := range store.Reader.ReadIter(ctx, key) {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		got = append(got, r)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1 (deduped)", len(got))
+	}
+	if got[0].Value != 99 {
+		t.Errorf("got Value=%d, want 99 (newer Ts wins)", got[0].Value)
+	}
+}
+
+// TestReadIter_WithHistory_Order guards that WithHistory disables
+// dedup AND yields records in lex/insertion order within each
+// partition. Two writes to the same partition produce two files,
+// the second sorting after the first by tsMicros prefix; we must
+// observe both records, the older write first.
+func TestReadIter_WithHistory_Order(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10},
+	}); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if _, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 99},
+	}); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+
+	var values []int64
+	for r, err := range store.Reader.ReadIter(ctx, key, s3parquet.WithHistory()) {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		values = append(values, r.Value)
+	}
+	if len(values) != 2 {
+		t.Fatalf("got %d records, want 2 (history)", len(values))
+	}
+	if values[0] != 10 || values[1] != 99 {
+		t.Errorf("got values %v, want [10 99] (insertion order)", values)
+	}
+}
+
+// TestReadIter_EarlyBreak proves that breaking out of the
+// for-range loop releases resources cleanly: the iterator's
+// deferred cancel stops in-flight downloads and the next call
+// completes normally. A goroutine leak or hang would surface as
+// the second iteration timing out.
+func TestReadIter_EarlyBreak(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	in := make([]Rec, 30)
+	for i := range in {
+		in[i] = Rec{
+			Period: "2026-03-17", Customer: "abc",
+			SKU: fmt.Sprintf("sku-%02d", i), Value: int64(i),
+		}
+	}
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=abc", in); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	count := 0
+	for r, err := range store.Reader.ReadIter(ctx, "*") {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		count++
+		if r.SKU == "sku-05" {
+			break
+		}
+	}
+	if count == 0 {
+		t.Fatal("got 0 records before break, expected at least 1")
+	}
+
+	// Second iteration must complete — proves the early-break
+	// didn't leak goroutines or wedge S3 client state.
+	count = 0
+	for r, err := range store.Reader.ReadIter(ctx, "*") {
+		if err != nil {
+			t.Fatalf("ReadIter (second pass): %v", err)
+		}
+		_ = r
+		count++
+	}
+	if count != len(in) {
+		t.Errorf("second pass got %d records, want %d", count, len(in))
+	}
+}
+
+// TestReadIter_Empty guards that a pattern matching nothing
+// produces an empty iterator (zero yields, no error) instead of
+// either erroring or yielding a zero-value record.
+func TestReadIter_Empty(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	yields := 0
+	for _, err := range store.Reader.ReadIter(ctx,
+		"period=9999-01-01/customer=missing") {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		yields++
+	}
+	if yields != 0 {
+		t.Errorf("got %d yields on empty match, want 0", yields)
+	}
+}
+
+// TestReadIter_MultiPartition guards that ReadIter visits
+// partitions in lex order and applies dedup per partition. Same
+// (Customer, SKU) entity in two different periods produces two
+// records (different partitions ⇒ different entities under the
+// per-partition contract), in lex order of the partition key.
+func TestReadIter_MultiPartition(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Period + "|" + r.Customer + "|" + r.SKU
+		},
+	})
+
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s1", Value: 2},
+		{Period: "2026-03-19", Customer: "abc", SKU: "s1", Value: 3},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	var periods []string
+	for r, err := range store.Reader.ReadIter(ctx, "*") {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		periods = append(periods, r.Period)
+	}
+	want := []string{"2026-03-17", "2026-03-18", "2026-03-19"}
+	if !reflect.DeepEqual(periods, want) {
+		t.Errorf("partition order: got %v, want %v", periods, want)
+	}
+}

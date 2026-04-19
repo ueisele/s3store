@@ -1349,3 +1349,136 @@ func TestDisableRefStream_s3sql(t *testing.T) {
 		t.Error("OffsetAt: got empty offset, want non-empty")
 	}
 }
+
+// TestReadIter_StreamsViaDuckDB guards the s3sql iter path: a
+// for-range loop must observe the same dedup behavior as Read,
+// while consuming rows one at a time without materialising the
+// full []T.
+func TestReadIter_StreamsViaDuckDB(t *testing.T) {
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
+	})
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 99, Currency: "USD", Ts: time.UnixMilli(200)},
+	})
+
+	var got []Rec
+	for r, err := range f.sql.ReadIter(context.Background(), "*") {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		got = append(got, r)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1 (deduped)", len(got))
+	}
+	if got[0].Amount != 99 {
+		t.Errorf("got Amount=%v, want 99", got[0].Amount)
+	}
+}
+
+// TestReadIter_WithHistory_DuckDB guards that WithHistory disables
+// dedup on the iter path same as on Read.
+func TestReadIter_WithHistory_DuckDB(t *testing.T) {
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
+	})
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 99, Currency: "USD", Ts: time.UnixMilli(200)},
+	})
+
+	count := 0
+	for _, err := range f.sql.ReadIter(
+		context.Background(), "*", s3sql.WithHistory(),
+	) {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		count++
+	}
+	if count != 2 {
+		t.Errorf("got %d records, want 2 (history)", count)
+	}
+}
+
+// TestReadIter_EarlyBreak guards cleanup on early termination:
+// after breaking out of the loop, a fresh ReadIter call must
+// complete normally (no leaked rows handle, no DuckDB session
+// stuck open).
+func TestReadIter_EarlyBreak_DuckDB(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+
+	in := make([]Rec, 30)
+	for i := range in {
+		in[i] = Rec{
+			Period: "2026-03-17", Customer: "abc",
+			SKU: fmt.Sprintf("sku-%02d", i), Amount: float64(i),
+			Currency: "USD", Ts: time.UnixMilli(int64(i)),
+		}
+	}
+	f.writeSome(t, in)
+
+	count := 0
+	for _, err := range f.sql.ReadIter(context.Background(), "*") {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		count++
+		if count == 5 {
+			break
+		}
+	}
+	if count != 5 {
+		t.Fatalf("first pass got %d records, want 5", count)
+	}
+
+	count = 0
+	for _, err := range f.sql.ReadIter(context.Background(), "*") {
+		if err != nil {
+			t.Fatalf("ReadIter (second pass): %v", err)
+		}
+		count++
+	}
+	if count != len(in) {
+		t.Errorf("second pass got %d records, want %d", count, len(in))
+	}
+}
+
+// TestReadManyIter_MultiPattern guards the multi-pattern iter
+// path: passing two non-Cartesian patterns yields the union with
+// dedup applied across them, same contract as ReadMany.
+func TestReadManyIter_MultiPattern(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 1, Currency: "USD", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-18", Customer: "def", SKU: "s2", Amount: 2, Currency: "USD", Ts: time.UnixMilli(2)},
+		{Period: "2026-03-19", Customer: "ghi", SKU: "s3", Amount: 3, Currency: "USD", Ts: time.UnixMilli(3)},
+	})
+
+	patterns := []string{
+		"period=2026-03-17/customer=abc",
+		"period=2026-03-19/customer=ghi",
+	}
+	gotSet := map[float64]bool{}
+	for r, err := range f.sql.ReadManyIter(context.Background(), patterns) {
+		if err != nil {
+			t.Fatalf("ReadManyIter: %v", err)
+		}
+		gotSet[r.Amount] = true
+	}
+	wantSet := map[float64]bool{1: true, 3: true}
+	if !reflect.DeepEqual(gotSet, wantSet) {
+		t.Errorf("got %v, want %v", gotSet, wantSet)
+	}
+}

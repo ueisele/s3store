@@ -3,6 +3,7 @@ package s3store
 import (
 	"context"
 	"database/sql"
+	"iter"
 	"time"
 
 	"github.com/ueisele/s3store/s3parquet"
@@ -154,6 +155,25 @@ func (s *Store[T]) ReadMany(
 	ctx context.Context, patterns []string, opts ...QueryOption,
 ) ([]T, error) {
 	return s.reader.ReadMany(ctx, patterns, opts...)
+}
+
+// ReadIter delegates to the Reader. Streams records via DuckDB's
+// native row iteration so callers don't materialise the full
+// []T. See s3sql.Reader.ReadIter for the contract — note that
+// the umbrella's iter goes through DuckDB, not the
+// per-partition-dedup pure-Go path on s3parquet.Reader.ReadIter.
+func (s *Store[T]) ReadIter(
+	ctx context.Context, pattern string, opts ...QueryOption,
+) iter.Seq2[T, error] {
+	return s.reader.ReadIter(ctx, pattern, opts...)
+}
+
+// ReadManyIter delegates to the Reader. Multi-pattern streaming
+// counterpart to ReadIter; see s3sql.Reader.ReadManyIter.
+func (s *Store[T]) ReadManyIter(
+	ctx context.Context, patterns []string, opts ...QueryOption,
+) iter.Seq2[T, error] {
+	return s.reader.ReadManyIter(ctx, patterns, opts...)
 }
 
 // Query delegates to the Reader.

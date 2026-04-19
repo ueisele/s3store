@@ -612,6 +612,67 @@ the parquet tags (parquet-go for `s3parquet`, the reflection binder for
 `s3sql`). When dedup is configured (see Stream above), the result is the
 latest version per key; otherwise every version comes through.
 
+### Snapshot — streaming (`ReadIter`)
+
+`Read` and `ReadMany` buffer the full result set before returning. For
+month-scale or otherwise unbounded ranges that's a memory problem; use
+`ReadIter` / `ReadManyIter` instead — they yield records one at a time
+via Go 1.23's `iter.Seq2[T, error]`:
+
+```go
+for r, err := range store.ReadIter(ctx, "charge_period=2026-03-*/*") {
+    if err != nil { return err }
+    aggregate(r)            // fold into an aggregation map and forget r
+}
+// breaking out of the loop cancels in-flight downloads — no Close
+```
+
+Three callable surfaces, matching `Read` / `ReadMany` exactly:
+`s3parquet.Reader.ReadIter`, `s3sql.Reader.ReadIter`, and the umbrella
+`s3store.Store.ReadIter` (forwards to s3sql). Same for `*ManyIter`.
+
+**Memory profile** depends on which backend and which dedup mode:
+
+| Path | Default (dedup on) | `WithHistory()` |
+|---|---|---|
+| `s3parquet.Reader.ReadIter` | O(one partition's records) | O(one partition's records) |
+| `s3sql.Reader.ReadIter` | O(DuckDB query plan) | same |
+
+The pure-Go path processes one partition at a time: files inside the
+partition download 8-wide in parallel, the decoded batch is deduped
+(or passed through on `WithHistory()`), records are yielded in
+lex/insertion order, then the batch is dropped before the next
+partition starts. Month-scale reads go from O(month) to O(partition)
+peak memory, which is usually small enough for hourly/daily
+partitioning. If a single partition is large enough that even one
+pre-dedup batch is a problem, file an issue — we can follow up with a
+streaming fold that trades the code simplicity for peak memory
+proportional to unique entities rather than total records.
+
+**Per-partition dedup contract on `s3parquet.Reader.ReadIter`**: differs
+from `Read`'s global dedup. The iter path buffers one partition at a
+time, dedups within that partition, yields, then drops it. **Correct
+only when the partition key strictly determines every component of
+`EntityKeyOf`** — i.e. no entity ever spans two partitions. For layouts
+where entities can move between partitions over time (e.g. a customer
+that switches region), use `Read` (and pay the memory cost) or
+`ReadIter(WithHistory())` and dedup yourself.
+
+For typical time-series shapes (`charge_period_start` leads both
+`PartitionKeyParts` and the entity key) the contract holds and
+`ReadIter` produces the same records as `Read`, just with bounded peak
+memory.
+
+**`s3sql` side has no such caveat** — DuckDB plans across the union of
+files and runs `QUALIFY` over the full result, so dedup is global
+regardless of how rows are streamed back.
+
+**Order**: `s3parquet.Reader.ReadIter` visits partitions in lex order;
+files within a partition in lex order (= write-time order, since data
+filenames start with their `tsMicros`). `s3sql.Reader.ReadIter` returns
+rows in DuckDB's query order — add `ORDER BY` in a custom `Query` call
+if you need stability.
+
 ### SQL query (umbrella or `s3sql`)
 
 ```go

@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
+	"maps"
 	"path"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +135,137 @@ func (s *Reader[T]) ReadMany(
 	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf), nil
 }
 
+// ReadIter returns an iter.Seq2[T, error] yielding records one
+// at a time instead of buffering them like Read does. Use when
+// the result set is large enough that Read's O(records) memory
+// becomes a problem.
+//
+// Dedup behaviour:
+//   - Default (EntityKeyOf set, no WithHistory): per-partition
+//     dedup. Files within each partition download in parallel
+//     (up to pollDownloadConcurrency) into one buffered batch,
+//     dedupLatest picks one record per entity, the batch is
+//     yielded in lex/insertion order (first-seen wins on ties),
+//     then dropped. Memory: O(one partition's pre-dedup
+//     records). Differs from Read's global dedup — correct
+//     only when the partition key strictly determines every
+//     component of EntityKeyOf (no entity spans partitions).
+//     For layouts that don't satisfy this invariant, use Read
+//     instead.
+//   - EntityKeyOf nil OR WithHistory(): no dedup. Files
+//     downloaded one partition at a time; records yielded in
+//     lex/insertion order. Memory: O(one partition's records).
+//     Order guarantee lets WithHistory callers observe per-
+//     entity version order within a partition.
+//
+// Cleanup: breaking out of the for-range loop or panicking
+// inside the consumer cancels in-flight downloads via the
+// iterator's deferred cancel — no manual Close required.
+//
+// Partition order: lex across partitions, lex/insertion order
+// within each partition on both paths.
+func (s *Reader[T]) ReadIter(
+	ctx context.Context, keyPattern string, opts ...QueryOption,
+) iter.Seq2[T, error] {
+	return s.ReadManyIter(ctx, []string{keyPattern}, opts...)
+}
+
+// ReadManyIter is the multi-pattern sibling of ReadIter. Same
+// per-partition dedup contract; passing a non-Cartesian set of
+// tuples (period=A, customer=X) and (period=B, customer=Y)
+// works the same way it does on ReadMany. Empty pattern slice
+// yields nothing.
+func (s *Reader[T]) ReadManyIter(
+	ctx context.Context, patterns []string, opts ...QueryOption,
+) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var o core.QueryOpts
+		o.Apply(opts...)
+
+		patterns = dedupePatterns(patterns)
+		if len(patterns) == 0 {
+			return
+		}
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		plans := make([]*readPlan, len(patterns))
+		for i, p := range patterns {
+			plan, err := buildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+			if err != nil {
+				yield(*new(T), fmt.Errorf(
+					"s3parquet: ReadManyIter pattern %d %q: %w",
+					i, p, err))
+				return
+			}
+			plans[i] = plan
+		}
+
+		keys, err := s.listAllMatchingParquet(ctx, plans)
+		if err != nil {
+			yield(*new(T), err)
+			return
+		}
+		if len(keys) == 0 {
+			return
+		}
+
+		dedup := s.cfg.dedupEnabled() && !o.IncludeHistory
+		s.streamByPartition(ctx, keys, dedup, yield)
+	}
+}
+
+// streamByPartition processes keys one Hive partition at a time
+// in lex order. For each partition:
+//   - downloadAndDecodeAll fans out file downloads under the
+//     existing concurrency cap.
+//   - dedup=true runs dedupLatest over the partition's records,
+//     yielding latest-per-entity in lex/insertion order.
+//   - dedup=false yields every record in lex/insertion order.
+//
+// In either case the partition's record slice goes out of scope
+// at the end of one iteration so GC reclaims it before the next
+// partition's downloads start.
+func (s *Reader[T]) streamByPartition(
+	ctx context.Context, keys []string, dedup bool,
+	yield func(T, error) bool,
+) {
+	byPartition := s.groupKeysByPartition(keys)
+	for _, p := range slices.Sorted(maps.Keys(byPartition)) {
+		files := byPartition[p]
+		// LIST already returns lex-sorted within the prefix, but
+		// belt-and-suspenders: a multi-pattern read can interleave
+		// keys from different LISTs.
+		slices.Sort(files)
+
+		recs, err := s.downloadAndDecodeAll(ctx, files)
+		if err != nil {
+			yield(*new(T), err)
+			return
+		}
+		if len(recs) == 0 {
+			continue
+		}
+
+		if dedup {
+			out := dedupLatest(recs,
+				s.cfg.EntityKeyOf, s.cfg.VersionOf)
+			for _, rec := range out {
+				if !yield(rec, nil) {
+					return
+				}
+			}
+			continue
+		}
+		for _, vr := range recs {
+			if !yield(vr.rec, nil) {
+				return
+			}
+		}
+	}
+}
+
 // listMatchingParquet lists every parquet object under the
 // plan's ListPrefix and returns the subset whose Hive key
 // matches the plan's predicate. S3 LIST handles pagination; the
@@ -225,60 +359,13 @@ func (s *Reader[T]) downloadAndDecodeAll(
 			}
 			defer func() { <-sem }()
 
-			tsMicros, _, err := core.ParseDataFileName(path.Base(key))
+			recs, err := s.downloadAndDecodeOne(ctx, key)
 			if err != nil {
-				errs[i] = fmt.Errorf(
-					"s3parquet: parse data filename %s: %w", key, err)
+				errs[i] = err
 				cancel()
 				return
 			}
-			insertedAt := time.UnixMicro(tsMicros)
-
-			data, err := s.cfg.Target.get(ctx, key)
-			if err != nil {
-				// A dangling ref or a LIST-to-GET race produces a
-				// NoSuchKey here. Skip-and-notify instead of
-				// failing the whole batch, so one bad ref doesn't
-				// poison every subsequent Poll/Read. Any other
-				// error (throttle, network, auth) is still fatal —
-				// we don't want to silently drop real records.
-				if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
-					if s.cfg.OnMissingData != nil {
-						s.cfg.OnMissingData(key)
-					}
-					return
-				}
-				errs[i] = fmt.Errorf(
-					"s3parquet: get %s: %w", key, err)
-				cancel()
-				return
-			}
-			recs, err := decodeParquet[T](data)
-			if err != nil {
-				errs[i] = fmt.Errorf(
-					"s3parquet: decode %s: %w", key, err)
-				cancel()
-				return
-			}
-			// Populate Config.InsertedAtField if set. Happens on
-			// every Read/PollRecords call — zero reflect cost
-			// when insertedAtFieldIndex is nil.
-			if s.insertedAtFieldIndex != nil {
-				tsVal := reflect.ValueOf(insertedAt)
-				for j := range recs {
-					rv := reflect.ValueOf(&recs[j]).Elem()
-					rv.FieldByIndex(s.insertedAtFieldIndex).
-						Set(tsVal)
-				}
-			}
-			versioned := make([]versionedRecord[T], len(recs))
-			for j, r := range recs {
-				versioned[j] = versionedRecord[T]{
-					rec:        r,
-					insertedAt: insertedAt,
-				}
-			}
-			results[i] = versioned
+			results[i] = recs
 		}(i, key)
 	}
 	wg.Wait()
@@ -303,6 +390,78 @@ func (s *Reader[T]) downloadAndDecodeAll(
 		out = append(out, r...)
 	}
 	return out, nil
+}
+
+// downloadAndDecodeOne is the per-file body shared by
+// downloadAndDecodeAll and the iter streaming paths. Pulls one
+// parquet object from S3, decodes it, populates InsertedAtField
+// when configured, and wraps each record with the file's
+// write-time insertedAt.
+//
+// Returns (nil, nil) when the object is missing — a dangling ref
+// or a LIST-to-GET race. The OnMissingData hook is invoked so
+// the caller can log/count without failing the read.
+func (s *Reader[T]) downloadAndDecodeOne(
+	ctx context.Context, key string,
+) ([]versionedRecord[T], error) {
+	tsMicros, _, err := core.ParseDataFileName(path.Base(key))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: parse data filename %s: %w", key, err)
+	}
+	insertedAt := time.UnixMicro(tsMicros)
+
+	data, err := s.cfg.Target.get(ctx, key)
+	if err != nil {
+		if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
+			if s.cfg.OnMissingData != nil {
+				s.cfg.OnMissingData(key)
+			}
+			return nil, nil
+		}
+		return nil, fmt.Errorf("s3parquet: get %s: %w", key, err)
+	}
+	recs, err := decodeParquet[T](data)
+	if err != nil {
+		return nil, fmt.Errorf("s3parquet: decode %s: %w", key, err)
+	}
+	if s.insertedAtFieldIndex != nil {
+		tsVal := reflect.ValueOf(insertedAt)
+		for j := range recs {
+			rv := reflect.ValueOf(&recs[j]).Elem()
+			rv.FieldByIndex(s.insertedAtFieldIndex).Set(tsVal)
+		}
+	}
+	versioned := make([]versionedRecord[T], len(recs))
+	for j, r := range recs {
+		versioned[j] = versionedRecord[T]{
+			rec:        r,
+			insertedAt: insertedAt,
+		}
+	}
+	return versioned, nil
+}
+
+// groupKeysByPartition splits a flat list of data-file S3 keys
+// into one slice per Hive partition (the path between dataPath
+// and the filename). Within each partition the input order is
+// preserved — combined with sorted-key LIST output, that yields
+// lex/time order per partition for free.
+func (s *Reader[T]) groupKeysByPartition(
+	keys []string,
+) map[string][]string {
+	out := make(map[string][]string)
+	for _, k := range keys {
+		hk, ok := hiveKeyOfDataFile(k, s.dataPath)
+		if !ok {
+			// Defensively skip keys that don't parse. List paths
+			// already filtered to .parquet, so reaching here means
+			// a layout corruption — drop, don't error.
+			continue
+		}
+		out[hk] = append(out[hk], k)
+	}
+	return out
 }
 
 // decodeParquet reads all rows of a parquet file into []T. T

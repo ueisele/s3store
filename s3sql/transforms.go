@@ -178,6 +178,86 @@ func (s *Reader[T]) wrapScanExpr(
 	return sb.String()
 }
 
+// rowBinder captures the per-result-set state (column ordering,
+// per-column binders, optional filename routing for
+// InsertedAtField population) so scanAll and the iter readers
+// can share the per-row decode loop without recomputing
+// rows.Columns() and the binder lookup on every row.
+type rowBinder[T any] struct {
+	owner       *Reader[T]
+	cols        []string
+	fbs         []*fieldBinder
+	filenameCol int // -1 when filename routing is not wanted
+}
+
+// newRowBinder resolves rows.Columns() once and returns the
+// per-result-set binder. Mirrors scanAll's old setup block;
+// kept here so the iter path doesn't duplicate it.
+func (s *Reader[T]) newRowBinder(rows *sql.Rows) (*rowBinder[T], error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("s3sql: get columns: %w", err)
+	}
+	fbs := make([]*fieldBinder, len(cols))
+	filenameCol := -1
+	for i, c := range cols {
+		if c == "filename" && s.insertedAtFieldIndex != nil {
+			filenameCol = i
+			continue
+		}
+		fbs[i] = s.binder.byName[c]
+	}
+	return &rowBinder[T]{
+		owner:       s,
+		cols:        cols,
+		fbs:         fbs,
+		filenameCol: filenameCol,
+	}, nil
+}
+
+// bindNext consumes one row from rows (caller must have already
+// confirmed rows.Next() returned true) and writes the decoded
+// record into *out. Reuses the pre-resolved binders; allocates
+// only the per-row dests slice and the filenameDest scratch
+// string.
+func (b *rowBinder[T]) bindNext(rows *sql.Rows, out *T) error {
+	dests := make([]any, len(b.cols))
+	var filenameDest string
+	for i, fb := range b.fbs {
+		if i == b.filenameCol {
+			dests[i] = &filenameDest
+			continue
+		}
+		if fb == nil {
+			dests[i] = new(any)
+			continue
+		}
+		dests[i] = fb.makeDest()
+	}
+	if err := rows.Scan(dests...); err != nil {
+		return fmt.Errorf("s3sql: scan row: %w", err)
+	}
+	rv := reflect.ValueOf(out).Elem()
+	for i, fb := range b.fbs {
+		if fb == nil {
+			continue
+		}
+		fb.assign(rv.FieldByIndex(fb.fieldIndex), dests[i])
+	}
+	if b.filenameCol >= 0 {
+		tsMicros, _, err := core.ParseDataFileName(
+			path.Base(filenameDest))
+		if err != nil {
+			return fmt.Errorf(
+				"s3sql: parse filename %q for InsertedAtField: %w",
+				filenameDest, err)
+		}
+		rv.FieldByIndex(b.owner.insertedAtFieldIndex).Set(
+			reflect.ValueOf(time.UnixMicro(tsMicros)))
+	}
+	return nil
+}
+
 // scanAll reads every row from a DuckDB result set into a []T
 // using the pre-built binder. Column order is taken from the
 // result set (rows.Columns()) so struct field order in T is
@@ -191,69 +271,20 @@ func (s *Reader[T]) wrapScanExpr(
 // InsertedAtField. Any other unmapped column (including filename
 // when InsertedAtField is unset) still gets a discard dest.
 func (s *Reader[T]) scanAll(rows *sql.Rows) ([]T, error) {
-	cols, err := rows.Columns()
+	rb, err := s.newRowBinder(rows)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"s3sql: get columns: %w", err)
+		return nil, err
 	}
-
-	// Pre-resolve per-column binders once; nil means the column
-	// isn't mapped to a T field and gets a discard destination.
-	fbs := make([]*fieldBinder, len(cols))
-	filenameCol := -1
-	for i, c := range cols {
-		if c == "filename" && s.insertedAtFieldIndex != nil {
-			filenameCol = i
-			continue
-		}
-		fbs[i] = s.binder.byName[c]
-	}
-
 	var records []T
 	for rows.Next() {
-		dests := make([]any, len(cols))
-		var filenameDest string
-		for i, fb := range fbs {
-			if i == filenameCol {
-				dests[i] = &filenameDest
-				continue
-			}
-			if fb == nil {
-				dests[i] = new(any)
-				continue
-			}
-			dests[i] = fb.makeDest()
-		}
-		if err := rows.Scan(dests...); err != nil {
-			return nil, fmt.Errorf(
-				"s3sql: scan row: %w", err)
-		}
-
 		var rec T
-		rv := reflect.ValueOf(&rec).Elem()
-		for i, fb := range fbs {
-			if fb == nil {
-				continue
-			}
-			fb.assign(rv.FieldByIndex(fb.fieldIndex), dests[i])
-		}
-		if filenameCol >= 0 {
-			tsMicros, _, err := core.ParseDataFileName(
-				path.Base(filenameDest))
-			if err != nil {
-				return nil, fmt.Errorf(
-					"s3sql: parse filename %q for "+
-						"InsertedAtField: %w",
-					filenameDest, err)
-			}
-			rv.FieldByIndex(s.insertedAtFieldIndex).Set(
-				reflect.ValueOf(time.UnixMicro(tsMicros)))
+		if err := rb.bindNext(rows, &rec); err != nil {
+			return nil, err
 		}
 		records = append(records, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf(
-			"s3sql: iterate rows: %w", err)
+		return nil, fmt.Errorf("s3sql: iterate rows: %w", err)
 	}
 	return records, nil
 }

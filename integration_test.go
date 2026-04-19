@@ -342,3 +342,37 @@ func TestUmbrella_Close(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 }
+
+// TestUmbrella_ReadIter exercises the umbrella's iter forwarder
+// end-to-end. The umbrella routes ReadIter through s3sql.Reader
+// (DuckDB row streaming), so this test mostly proves the
+// forwarder is wired correctly — the s3sql-side iter contract is
+// covered in s3sql/integration_test.go.
+func TestUmbrella_ReadIter(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
+
+	in := []IntRecord{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10, Ts: time.UnixMilli(1)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "s2", Amount: 20, Ts: time.UnixMilli(2)},
+		{Period: "2026-03-17", Customer: "def", SKU: "s1", Amount: 30, Ts: time.UnixMilli(3)},
+	}
+	if _, err := store.Write(ctx, in); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	count := 0
+	for r, err := range store.ReadIter(ctx, "*") {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		_ = r
+		count++
+	}
+	if count != len(in) {
+		t.Errorf("got %d records, want %d", count, len(in))
+	}
+}
