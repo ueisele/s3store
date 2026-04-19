@@ -2103,7 +2103,7 @@ func TestReadIter_PerPartitionDedup(t *testing.T) {
 	}
 
 	var got []Rec
-	for r, err := range store.Reader.ReadIter(ctx, key) {
+	for r, err := range store.ReadIter(ctx, key) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2144,7 +2144,7 @@ func TestReadIter_WithHistory_Order(t *testing.T) {
 	}
 
 	var values []int64
-	for r, err := range store.Reader.ReadIter(ctx, key, s3parquet.WithHistory()) {
+	for r, err := range store.ReadIter(ctx, key, s3parquet.WithHistory()) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2180,7 +2180,7 @@ func TestReadIter_EarlyBreak(t *testing.T) {
 	}
 
 	count := 0
-	for r, err := range store.Reader.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, "*") {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2196,7 +2196,7 @@ func TestReadIter_EarlyBreak(t *testing.T) {
 	// Second iteration must complete — proves the early-break
 	// didn't leak goroutines or wedge S3 client state.
 	count = 0
-	for r, err := range store.Reader.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, "*") {
 		if err != nil {
 			t.Fatalf("ReadIter (second pass): %v", err)
 		}
@@ -2216,7 +2216,7 @@ func TestReadIter_Empty(t *testing.T) {
 	store := newStore(t, storeOpts{})
 
 	yields := 0
-	for _, err := range store.Reader.ReadIter(ctx,
+	for _, err := range store.ReadIter(ctx,
 		"period=9999-01-01/customer=missing") {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
@@ -2250,7 +2250,7 @@ func TestReadIter_MultiPartition(t *testing.T) {
 	}
 
 	var periods []string
-	for r, err := range store.Reader.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, "*") {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
