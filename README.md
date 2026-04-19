@@ -121,6 +121,75 @@ reflection binder built at `New()`. No `ScanFunc` or manual column-order
 bookkeeping on either side. A field whose column is missing from a given
 file lands as Go's zero value.
 
+## Writer / Reader / View (`s3parquet`)
+
+`s3parquet.Store[T]` is a composition of two public halves: a `Writer[T]`
+for the write path and a `Reader[T]` for the read path. Most users keep
+using `New(Config)` and get both through `Store`. Services that only
+write or only read can construct a single half with a narrower config:
+
+```go
+// Write-only service: no read-side knobs in config.
+w, err := s3parquet.NewWriter[CostRecord](s3parquet.WriterConfig[CostRecord]{
+    Bucket: "warehouse", Prefix: "billing", S3Client: s3Client,
+    PartitionKeyParts: []string{"charge_period", "customer"},
+    PartitionKeyOf: func(r CostRecord) string { /* ... */ },
+})
+
+// Read-only service: no PartitionKeyOf / Compression / BloomFilters.
+r, err := s3parquet.NewReader[CostRecord](s3parquet.ReaderConfig[CostRecord]{
+    Bucket: "warehouse", Prefix: "billing", S3Client: s3Client,
+    PartitionKeyParts: []string{"charge_period", "customer"},
+    SettleWindow:    5 * time.Second,
+    InsertedAtField: "InsertedAt",
+})
+```
+
+### Narrow-T reads (View)
+
+When the on-disk record has a heavy write-only column you never read
+(a JSON blob, an audit log, an embedding vector), declare a narrower
+`T'` that omits it and open a `Reader[T']` over the Writer's data.
+parquet-go skips unlisted columns on decode — the heavy bytes stay in
+S3.
+
+```go
+type FullRec struct {
+    Customer   string `parquet:"customer"`
+    Amount     float64 `parquet:"amount"`
+    ProcessLog string `parquet:"process_log"` // huge, write-only
+}
+type NarrowRec struct {
+    Customer string  `parquet:"customer"`
+    Amount   float64 `parquet:"amount"`
+    // ProcessLog deliberately absent.
+}
+
+store, _ := s3parquet.New[FullRec](cfg)
+view, _ := s3parquet.NewViewFromStore[NarrowRec, FullRec](store,
+    s3parquet.ReaderExtras[NarrowRec]{
+        SettleWindow: 5 * time.Second,
+    })
+
+recs, _ := view.Read(ctx, "*") // []NarrowRec — ProcessLog not fetched
+```
+
+`ReaderExtras[T']` carries the read-side knobs that aren't shared with
+the Writer (`SettleWindow`, `EntityKeyOf`, `VersionOf`, `InsertedAtField`,
+`OnMissingData`). Dedup closures are typed over `T'`, so you supply them
+explicitly for the narrow shape when needed.
+
+The relationship between constructors:
+
+| Want | Call |
+|---|---|
+| Both write and read, same `T` | `New(Config[T])` → `*Store[T]` |
+| Write only, narrow config | `NewWriter(WriterConfig[T])` → `*Writer[T]` |
+| Read only, narrow config | `NewReader(ReaderConfig[T])` → `*Reader[T]` |
+| Same-`T` Reader over a Writer | `writer.Reader(extras)` |
+| Narrower-`T'` Reader over a Writer | `NewView[T', U](writer, extras)` |
+| Narrower-`T'` Reader over a Store | `NewViewFromStore[T', U](store, extras)` |
+
 ## Non-trivial Go types (`decimal.Decimal`, UUID wrappers, …)
 
 parquet-go can't encode types like `shopspring/decimal.Decimal` or wrapper
@@ -834,6 +903,18 @@ Configuration for `s3parquet` and `s3sql` directly is narrower — see each
 package's `Config[T]` for the exact fields.
 
 ## Migration from earlier versions
+
+Breaking changes in the Writer/Reader split (s3parquet only):
+
+- **`s3parquet.NewIndex(store, def)` → `s3parquet.NewIndexFromStore(store, def)`.**
+  Indexes are a write-side concern, so the primary `NewIndex` now takes
+  `*Writer[T]`. Keep the convenience `NewIndexFromStore` if you hold a
+  Store — it's a single-word rename. The umbrella `s3store.NewIndex`
+  signature is unchanged.
+- **`s3parquet.Store.Close()` removed.** The method was a documented
+  no-op (pure-Go Store held no resources). Delete the call sites.
+  `s3sql.Store.Close()` and `s3store.Store.Close()` still exist — only
+  the parquet side lost it.
 
 Breaking changes in the package-split refactor:
 
