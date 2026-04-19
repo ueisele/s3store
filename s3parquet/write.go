@@ -134,6 +134,17 @@ func (s *Writer[T]) WriteWithKey(
 			"s3parquet: put index markers: %w", err)
 	}
 
+	// DisableRefStream: skip the ref PUT entirely. Offset and
+	// RefPath go empty so callers can't mistake the returned value
+	// for a Poll-visible stream position.
+	if s.cfg.Target.DisableRefStream {
+		return &WriteResult{
+			Offset:   "",
+			DataPath: dataKey,
+			RefPath:  "",
+		}, nil
+	}
+
 	refKey := core.EncodeRefKey(s.refPath, tsMicros, shortID, key)
 
 	result := &WriteResult{

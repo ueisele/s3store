@@ -43,6 +43,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		BloomFilterColumns: cfg.BloomFilterColumns,
 		Compression:        cfg.Compression,
 		InsertedAtField:    cfg.InsertedAtField,
+		DisableRefStream:   cfg.DisableRefStream,
 		// EntityKeyOf / VersionOf deliberately omitted: the
 		// umbrella's Read / PollRecords go through s3sql and use
 		// SQL-side dedup. Users who want pure-Go dedup should
@@ -62,6 +63,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		EntityKeyColumns:  cfg.EntityKeyColumns,
 		ExtraInitSQL:      cfg.ExtraInitSQL,
 		InsertedAtField:   cfg.InsertedAtField,
+		DisableRefStream:  cfg.DisableRefStream,
 	})
 	if err != nil {
 		return nil, err

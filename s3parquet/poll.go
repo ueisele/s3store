@@ -27,6 +27,10 @@ func (s *Reader[T]) Poll(
 	maxEntries int32,
 	opts ...QueryOption,
 ) ([]StreamEntry, Offset, error) {
+	if s.cfg.Target.DisableRefStream {
+		return nil, since, ErrRefStreamDisabled
+	}
+
 	var o core.QueryOpts
 	o.Apply(opts...)
 

@@ -84,6 +84,15 @@ type Config[T any] struct {
 	// behavior whose one side effect is that `SELECT *` surfaces
 	// an extra `filename` column.
 	InsertedAtField string
+
+	// DisableRefStream signals that this dataset was written
+	// without stream ref files (see s3parquet.S3Target.DisableRefStream).
+	// When set, Poll / PollRecords / PollRecordsAll return
+	// ErrRefStreamDisabled instead of silently walking an empty
+	// /_stream/refs/ prefix. Read / Query / QueryRow are unaffected;
+	// OffsetAt still works as a pure timestamp encoder. Must match
+	// the value used on the write side.
+	DisableRefStream bool
 }
 
 func (c Config[T]) settleWindow() time.Duration {

@@ -536,6 +536,58 @@ scanned past the window of interest. All three APIs — `OffsetAt`,
 `WithUntilOffset`, `PollRecordsAll` — are available on the umbrella,
 `s3parquet`, and `s3sql`.
 
+### Stream — opting out (`DisableRefStream`)
+
+Every `Write` / `WriteWithKey` call issues one extra S3 PUT to
+`_stream/refs/` per distinct partition key it touches. `Write` groups
+records by key and calls `WriteWithKey` once per group, so a batch
+spanning N partitions produces N ref PUTs. For pure batch / analytics
+workloads that never tail the stream, that's pure overhead. Set
+`DisableRefStream: true` on the umbrella `Config`, `s3parquet.Config`,
+or `s3parquet.S3Target` to skip the ref PUT:
+
+```go
+s3store.Config[CostRecord]{
+    // ...
+    DisableRefStream: true,
+}
+```
+
+Effect on each method:
+
+- **`Write` / `WriteWithKey`** — one fewer S3 PUT per call;
+  `WriteResult.Offset` and `WriteResult.RefPath` are empty.
+- **`Read` / `Query` / `QueryRow` / `ReadMany` / `QueryMany` /
+  `QueryRowMany` / `Lookup` / `BackfillIndex`** — unaffected. They
+  LIST `data/` (or `_index/<name>/`) directly and never consult refs.
+- **`Poll` / `PollRecords` / `PollRecordsAll`** — return
+  `s3store.ErrRefStreamDisabled` (shared sentinel, matches
+  `errors.Is` across packages).
+- **`OffsetAt`** — still works. It's pure timestamp encoding with no
+  S3 dependency, so it keeps returning well-formed offsets even
+  though there's no stream to compare them against.
+
+Per-write irreversible: data written with `DisableRefStream: true`
+has no refs, so flipping the flag back does not retroactively make
+`Poll` see the historical writes.
+
+Both sides of the deployment (writer and `s3sql` reader) must agree
+on the flag — set it on the umbrella `Config`, or on both
+`s3parquet.Config` and `s3sql.Config` when wired separately. The
+two failure modes if they drift:
+
+- **Writer disabled + reader enabled** — `Poll` walks an empty
+  `_stream/refs/` prefix and silently returns zero entries with no
+  error. Easy to mistake for "stream is quiet."
+- **Writer enabled + reader disabled** — `Poll` refuses with
+  `ErrRefStreamDisabled` even though refs actually exist in S3.
+  Unset `DisableRefStream` on the reader to recover; no data is
+  lost.
+
+`s3parquet` users constructing a `Store` via `New(Config)` can't
+drift — the flag lives on the shared `S3Target` and both halves
+read the same value.
+
 ### Snapshot
 
 ```go

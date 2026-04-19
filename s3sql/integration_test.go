@@ -5,6 +5,7 @@ package s3sql_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -1338,5 +1339,82 @@ func TestReadMany_CrossPatternDedup(t *testing.T) {
 	if got[0].Amount != 99 {
 		t.Errorf("cross-pattern dedup: got Amount=%v, want 99 "+
 			"(latest Ts across the union)", got[0].Amount)
+	}
+}
+
+// TestDisableRefStream_s3sql covers the read-side half of the
+// DisableRefStream contract: a store configured with the flag
+// refuses Poll / PollRecords / PollRecordsAll with the shared
+// sentinel, while Read and OffsetAt stay fully functional.
+//
+// Data is written through a sibling s3parquet writer also
+// configured with DisableRefStream so the scenario matches a
+// real deployment where both halves agree on "no refs here".
+func TestDisableRefStream_s3sql(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+
+	writer, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf:    partitionKeyOfRec,
+		SettleWindow:      10 * time.Millisecond,
+		DisableRefStream:  true,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		TableAlias:        "records",
+		SettleWindow:      10 * time.Millisecond,
+		ExtraInitSQL:      f.DuckDBCredentials(),
+		DisableRefStream:  true,
+	})
+	if err != nil {
+		t.Fatalf("s3sql.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if _, err := writer.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Read still works — it LISTs /_data/ directly.
+	got, err := s.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("Read: got %d, want 1", len(got))
+	}
+
+	// Stream methods all refuse with the shared sentinel.
+	if _, _, err := s.Poll(ctx, "", 10); !errors.Is(err, s3sql.ErrRefStreamDisabled) {
+		t.Errorf("Poll: got %v, want ErrRefStreamDisabled", err)
+	}
+	if _, _, err := s.PollRecords(ctx, "", 10); !errors.Is(err, s3sql.ErrRefStreamDisabled) {
+		t.Errorf("PollRecords: got %v, want ErrRefStreamDisabled", err)
+	}
+	if _, err := s.PollRecordsAll(ctx, "", ""); !errors.Is(err, s3sql.ErrRefStreamDisabled) {
+		t.Errorf("PollRecordsAll: got %v, want ErrRefStreamDisabled", err)
+	}
+
+	// Sentinel is shared across packages.
+	if !errors.Is(s3sql.ErrRefStreamDisabled, s3parquet.ErrRefStreamDisabled) {
+		t.Error("sentinel mismatch between s3sql and s3parquet")
+	}
+
+	// OffsetAt still works.
+	if s.OffsetAt(time.Now()) == "" {
+		t.Error("OffsetAt: got empty offset, want non-empty")
 	}
 }

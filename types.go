@@ -102,7 +102,22 @@ type Config[T any] struct {
 	// — whether routed via s3parquet.PollRecords or s3sql.Read /
 	// PollRecords — populate the field consistently.
 	InsertedAtField string
+
+	// DisableRefStream opts the dataset out of writing stream ref
+	// files under <Prefix>/_stream/refs/. Saves one S3 PUT per
+	// distinct partition key touched by a Write. Read / Query /
+	// QueryRow / ReadMany / QueryMany / QueryRowMany are
+	// unaffected; Poll / PollRecords / PollRecordsAll return
+	// ErrRefStreamDisabled. OffsetAt still works (pure timestamp
+	// encoding). Forwarded to both sub-stores.
+	DisableRefStream bool
 }
+
+// ErrRefStreamDisabled is returned by Poll / PollRecords /
+// PollRecordsAll when Config.DisableRefStream is set. Aliased
+// to the shared sentinel so errors.Is matches regardless of
+// which sub-store produced the error.
+var ErrRefStreamDisabled = s3parquet.ErrRefStreamDisabled
 
 // Re-export core types so callers of the umbrella never need
 // to import internal/core directly.

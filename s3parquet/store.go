@@ -147,6 +147,13 @@ type Config[T any] struct {
 	// top-level struct field of T; New() rejects unknown names
 	// so typos don't silently disable the filter.
 	BloomFilterColumns []string
+
+	// DisableRefStream opts this dataset out of writing stream ref
+	// files. Saves one S3 PUT per distinct partition key touched
+	// by a Write. Poll / PollRecords / PollRecordsAll return
+	// ErrRefStreamDisabled when set. See S3Target.DisableRefStream
+	// for the full contract.
+	DisableRefStream bool
 }
 
 // bloomFilterBitsPerValue is the bits-per-value for split-block
@@ -218,6 +225,7 @@ func targetFrom[T any](c Config[T]) S3Target {
 		S3Client:          c.S3Client,
 		PartitionKeyParts: c.PartitionKeyParts,
 		SettleWindow:      c.SettleWindow,
+		DisableRefStream:  c.DisableRefStream,
 	}
 }
 

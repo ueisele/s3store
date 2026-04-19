@@ -4,6 +4,7 @@ package s3parquet_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -1856,5 +1857,196 @@ func TestWriteRead_BloomFilterRoundTrip(t *testing.T) {
 	}
 	if len(got) != len(in) {
 		t.Fatalf("got %d records, want %d", len(got), len(in))
+	}
+}
+
+// TestDisableRefStream covers the full contract of the
+// write-side opt-out: no /_stream/refs/ objects land in S3,
+// WriteResult.Offset / RefPath are empty, Read still returns
+// every record, Poll returns the shared sentinel, and OffsetAt
+// still returns a well-formed offset (pure timestamp encoding).
+func TestDisableRefStream(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow:     10 * time.Millisecond,
+		DisableRefStream: true,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+
+	in := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1, Ts: time.UnixMilli(1)},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2", Value: 2, Ts: time.UnixMilli(2)},
+	}
+	results, err := store.Write(ctx, in)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	for i, r := range results {
+		if r.Offset != "" || r.RefPath != "" {
+			t.Errorf("result[%d]: expected empty Offset/RefPath, got %+v",
+				i, r)
+		}
+		if r.DataPath == "" {
+			t.Errorf("result[%d]: DataPath empty", i)
+		}
+	}
+
+	// No ref objects exist under /_stream/refs/.
+	page, err := f.S3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(f.Bucket),
+		Prefix: aws.String("store/_stream/refs/"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2 refs: %v", err)
+	}
+	if len(page.Contents) != 0 {
+		t.Errorf("expected zero ref objects, got %d", len(page.Contents))
+	}
+
+	// Data was actually written — Read returns everything.
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != len(in) {
+		t.Errorf("Read: got %d, want %d", len(got), len(in))
+	}
+
+	// Poll + PollRecords + PollRecordsAll all refuse with the
+	// shared sentinel.
+	if _, _, err := store.Poll(ctx, "", 10); !errors.Is(err, s3parquet.ErrRefStreamDisabled) {
+		t.Errorf("Poll: got %v, want ErrRefStreamDisabled", err)
+	}
+	if _, _, err := store.PollRecords(ctx, "", 10); !errors.Is(err, s3parquet.ErrRefStreamDisabled) {
+		t.Errorf("PollRecords: got %v, want ErrRefStreamDisabled", err)
+	}
+	if _, err := store.PollRecordsAll(ctx, "", ""); !errors.Is(err, s3parquet.ErrRefStreamDisabled) {
+		t.Errorf("PollRecordsAll: got %v, want ErrRefStreamDisabled", err)
+	}
+
+	// OffsetAt stays usable: pure timestamp encoding, no S3
+	// dependency. Encodes relative to the ref prefix as a
+	// logical watermark.
+	if store.OffsetAt(time.Now()) == "" {
+		t.Error("OffsetAt: got empty offset, want non-empty")
+	}
+}
+
+// TestDisableRefStream_WriteWithKey mirrors TestDisableRefStream
+// but through the explicit-key path, since WriteWithKey owns the
+// ref-PUT branch we just gated.
+func TestDisableRefStream_WriteWithKey(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		SettleWindow:      10 * time.Millisecond,
+		DisableRefStream:  true,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+
+	key := "period=2026-03-17/customer=abc"
+	result, err := store.WriteWithKey(ctx, key, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10},
+	})
+	if err != nil {
+		t.Fatalf("WriteWithKey: %v", err)
+	}
+	if result.Offset != "" || result.RefPath != "" {
+		t.Errorf("expected empty Offset/RefPath, got %+v", result)
+	}
+	if result.DataPath == "" {
+		t.Error("DataPath empty")
+	}
+
+	page, err := f.S3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(f.Bucket),
+		Prefix: aws.String("store/_stream/refs/"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2 refs: %v", err)
+	}
+	if len(page.Contents) != 0 {
+		t.Errorf("expected zero ref objects, got %d", len(page.Contents))
+	}
+}
+
+// TestDisableRefStream_IndexLookup guards the claim in
+// S3Target.DisableRefStream's docstring that Lookup is
+// unaffected: markers must still be PUT and Lookup must still
+// return the registered entries, even when ref writes are
+// disabled. Markers live under /_index/<name>/, refs under
+// /_stream/refs/ — orthogonal features, neither implies the
+// other.
+func TestDisableRefStream_IndexLookup(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow:     10 * time.Millisecond,
+		DisableRefStream: true,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+
+	type SkuEntry struct {
+		SKU      string `parquet:"sku"`
+		Period   string `parquet:"period"`
+		Customer string `parquet:"customer"`
+	}
+	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
+		s3parquet.IndexDef[Rec, SkuEntry]{
+			IndexLookupDef: s3parquet.IndexLookupDef[SkuEntry]{
+				Name:    "sku_idx",
+				Columns: []string{"sku", "period", "customer"},
+			},
+			Of: func(r Rec) []SkuEntry {
+				return []SkuEntry{{
+					SKU: r.SKU, Period: r.Period, Customer: r.Customer,
+				}}
+			},
+		})
+	if err != nil {
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+	}
+
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1},
+		{Period: "2026-03-17", Customer: "def", SKU: "s1", Value: 2},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	got, err := idx.Lookup(ctx, "sku=s1/period=2026-03-17/customer=*")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("Lookup: got %d entries, want 2", len(got))
 	}
 }

@@ -47,6 +47,22 @@ type S3Target struct {
 	// consistent with near-tip writers whose refs may not yet be
 	// visible in S3 LIST.
 	SettleWindow time.Duration
+
+	// DisableRefStream opts the dataset out of writing stream ref
+	// files under <Prefix>/_stream/refs/. Saves one S3 PUT per
+	// distinct partition key touched by a Write (Write groups
+	// records by key and calls WriteWithKey once per group, each
+	// of which issues one ref PUT without this flag). Read /
+	// Query / Lookup / BackfillIndex are unaffected; Poll /
+	// PollRecords / PollRecordsAll return ErrRefStreamDisabled.
+	// OffsetAt still works (pure timestamp encoding — no S3
+	// dependency).
+	//
+	// Irreversible per write: data written with this flag set has
+	// no refs, so flipping the flag back does not retroactively
+	// make Poll see historical writes. Set only for datasets that
+	// are read purely via Read / Query.
+	DisableRefStream bool
 }
 
 // NewS3Target constructs an S3Target with required fields. Use

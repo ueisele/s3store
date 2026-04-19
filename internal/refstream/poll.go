@@ -23,6 +23,16 @@ import (
 // s3ListMaxKeys is the per-request page-size cap enforced by S3.
 const s3ListMaxKeys int32 = 1000
 
+// ErrDisabled is the shared sentinel returned by the stream
+// methods (Poll / PollRecords / PollRecordsAll) when the
+// enclosing Store was configured with DisableRefStream. Lives
+// here so both s3parquet and s3sql re-export the same value,
+// letting callers write errors.Is(err, …) without caring which
+// sub-package produced the error.
+var ErrDisabled = errors.New(
+	"ref stream disabled on this Store; " +
+		"Poll/PollRecords/PollRecordsAll unavailable")
+
 // PollAllBatch is the inner batch size used by PollAll. Tuned
 // for S3 LIST page size so the inner paginator does one LIST
 // per iteration at steady state.

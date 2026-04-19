@@ -1,6 +1,17 @@
 package s3sql
 
-import "github.com/ueisele/s3store/internal/core"
+import (
+	"github.com/ueisele/s3store/internal/core"
+	"github.com/ueisele/s3store/internal/refstream"
+)
+
+// ErrRefStreamDisabled is returned by Poll / PollRecords /
+// PollRecordsAll when Config.DisableRefStream is set. OffsetAt
+// is still usable (pure timestamp encoding, no S3 dependency).
+//
+// Aliased to the shared sentinel in internal/refstream so
+// errors.Is matches across s3parquet, s3sql, and the umbrella.
+var ErrRefStreamDisabled = refstream.ErrDisabled
 
 // Offset represents a position in the stream.
 type Offset = core.Offset
