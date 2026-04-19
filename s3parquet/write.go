@@ -104,7 +104,7 @@ func (s *Writer[T]) WriteWithKey(
 	tsMicros := time.Now().UnixMicro()
 
 	dataKey := core.BuildDataFilePath(s.dataPath, key, tsMicros, shortID)
-	if err := s.putObject(
+	if err := s.cfg.Target.put(
 		ctx, dataKey, parquetBytes,
 		"application/octet-stream",
 	); err != nil {
@@ -122,7 +122,7 @@ func (s *Writer[T]) WriteWithKey(
 		cleanupCtx, cancel := context.WithTimeout(
 			context.Background(), writeCleanupTimeout)
 		defer cancel()
-		if delErr := s.deleteObject(
+		if delErr := s.cfg.Target.del(
 			cleanupCtx, dataKey,
 		); delErr != nil {
 			return nil, fmt.Errorf(
@@ -142,7 +142,7 @@ func (s *Writer[T]) WriteWithKey(
 		RefPath:  refKey,
 	}
 
-	putErr := s.putObject(
+	putErr := s.cfg.Target.put(
 		ctx, refKey, []byte{}, "application/octet-stream")
 	if putErr == nil {
 		return result, nil
@@ -155,14 +155,14 @@ func (s *Writer[T]) WriteWithKey(
 		context.Background(), writeCleanupTimeout)
 	defer cancel()
 
-	if exists, headErr := s.objectExists(
+	if exists, headErr := s.cfg.Target.exists(
 		cleanupCtx, refKey,
 	); headErr == nil && exists {
 		// Ref actually got written — we just lost the ack.
 		return result, nil
 	}
 
-	if delErr := s.deleteObject(
+	if delErr := s.cfg.Target.del(
 		cleanupCtx, dataKey,
 	); delErr != nil {
 		return nil, fmt.Errorf(
@@ -194,15 +194,15 @@ func (s *Writer[T]) groupByKey(records []T) map[string][]T {
 // corrupt the S3 layout.
 func (s *Writer[T]) validateKey(key string) error {
 	segments := strings.Split(key, "/")
-	if len(segments) != len(s.cfg.PartitionKeyParts) {
+	if len(segments) != len(s.cfg.Target.PartitionKeyParts) {
 		return fmt.Errorf(
 			"s3parquet: key %q has %d segments, "+
 				"expected %d (%v)",
 			key, len(segments),
-			len(s.cfg.PartitionKeyParts), s.cfg.PartitionKeyParts)
+			len(s.cfg.Target.PartitionKeyParts), s.cfg.Target.PartitionKeyParts)
 	}
 	for i, seg := range segments {
-		part := s.cfg.PartitionKeyParts[i]
+		part := s.cfg.Target.PartitionKeyParts[i]
 		prefix := part + "="
 		if !strings.HasPrefix(seg, prefix) {
 			return fmt.Errorf(
@@ -292,7 +292,7 @@ func (s *Writer[T]) putMarkersParallel(
 			}
 			defer func() { <-sem }()
 
-			if err := s.putObject(
+			if err := s.cfg.Target.put(
 				ctx, p, nil, "application/octet-stream",
 			); err != nil {
 				errs[i] = err

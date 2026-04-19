@@ -6,33 +6,26 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// IndexDef declares a secondary index attached to a Store[T]. On
-// every Write, the store calls Of per record, collects a
-// deduplicated set of K values across the batch, and writes one
-// empty "marker" object per distinct K into the S3 subtree at
-// <Prefix>/_index/<Name>/. Each K's fields become hive-style
-// path segments, so a LIST under a prefix of those segments
-// returns every tuple matching that prefix.
-//
-// This is a cgo-free covering index: the marker filename encodes
-// every lookup column, so Lookup answers its query with LIST
-// only — no parquet reads, no DuckDB. Intended for high-cardinality
-// equality lookups ("which customers had usage of SKU X in
-// period P?") where partition pruning can't help.
-type IndexDef[T any, K comparable] struct {
-	// Name identifies the index under the store's <Prefix>/_index/
-	// subtree. Required. Must be non-empty and free of '/'.
+// IndexLookupDef is the read-side subset of an index definition:
+// Name + Columns, independent of the record type T. Build an
+// Index directly from this when the caller is a read-only
+// service (dashboard, query API) that never writes markers and
+// doesn't need def.Of.
+type IndexLookupDef[K comparable] struct {
+	// Name identifies the index under the target's
+	// <Prefix>/_index/ subtree. Required. Must be non-empty and
+	// free of '/'.
 	Name string
 
 	// Columns lists K's parquet column names in the order they
@@ -42,162 +35,187 @@ type IndexDef[T any, K comparable] struct {
 	// K must carry a `parquet:"..."` tag for every entry in
 	// Columns, and no additional tagged fields.
 	Columns []string
+}
+
+// IndexDef declares a secondary index attached to a dataset. On
+// every Write through a RegisterIndex-wired Writer, the store
+// calls Of per record, collects a deduplicated set of K values
+// across the batch, and writes one empty "marker" object per
+// distinct K into the S3 subtree at <Prefix>/_index/<Name>/.
+// Each K's fields become hive-style path segments, so a LIST
+// under a prefix of those segments returns every tuple matching
+// that prefix.
+//
+// This is a cgo-free covering index: the marker filename encodes
+// every lookup column, so Lookup answers its query with LIST
+// only — no parquet reads, no DuckDB. Intended for high-cardinality
+// equality lookups ("which customers had usage of SKU X in
+// period P?") where partition pruning can't help.
+//
+// IndexDef embeds IndexLookupDef[K], so read-only callers (who
+// only need Name + Columns) can accept the broader IndexDef and
+// read just the read-side fields, but a writing caller still
+// supplies Of.
+type IndexDef[T any, K comparable] struct {
+	IndexLookupDef[K]
 
 	// Of returns the K tuples extracted from a single record. The
-	// store dedups marker paths across the batch via a
+	// writer dedups marker paths across the batch via a
 	// map[string]struct{}, so returning the same K for many
-	// records is cheap — only one PUT happens per distinct path
-	// (which, since the path is a deterministic function of K, is
-	// equivalent to deduping by K). Returning an empty slice is
-	// fine (no marker for that record).
+	// records is cheap — only one PUT happens per distinct path.
+	// Returning an empty slice is fine (no marker for that record).
 	Of func(T) []K
 }
 
-// Index is the typed query handle returned by NewIndex. It holds
-// the state needed to serialize K values to marker paths on write
-// and parse marker paths back into K values on read.
+// Index is the typed read-handle for a secondary index.
+// Pure read-side — Lookup issues LIST only. Built from an
+// S3Target + IndexLookupDef so it carries no T; a single Index
+// can be shared by services that read the index but never touch
+// the underlying record schema.
 //
-// Indexes straddle the write/read split: they emit markers on
-// Write (via the writer half) and resolve Lookup via S3 LIST plus
-// Backfill via parquet reads (via the reader half). Keep both
-// pointers so the Index is independent of the composing Store.
-type Index[T any, K comparable] struct {
-	writer    *Writer[T]
-	reader    *Reader[T]
-	name      string
-	columns   []string
-	indexPath string
-
-	// fieldIndices[i] is the struct-field index on K that carries
-	// the value for columns[i]. Populated once by buildIndexBinder.
+// To build: NewIndex(target, lookupDef) for pure-read callers,
+// NewIndexWithRegister(writer, def) / NewIndexFromStoreWithRegister(store, def)
+// for callers that also want Write to emit markers for this
+// index.
+type Index[K comparable] struct {
+	target       S3Target
+	name         string
+	columns      []string
+	indexPath    string
 	fieldIndices []int
-
-	of func(T) []K
 }
 
-// NewIndex registers a secondary index on the given Writer and
-// returns a typed handle for querying it. Call before the first
-// Write so records aren't missed — writes that precede
-// registration produce no markers; use Index.Backfill to cover
-// pre-registration records on a live store.
+// NewIndex builds a query handle for an index whose markers a
+// writer elsewhere produced. No Writer argument, no marker-
+// emission registration — the live writer is expected to be
+// wired separately (or not needed at all, e.g. for a read-only
+// analytics service).
 //
-// Validation (at registration, not on every write):
-//   - Name non-empty and contains no '/'.
-//   - Columns list passes ValidatePartitionKeyParts.
-//   - Every entry in Columns corresponds to a parquet-tagged
-//     string field on K; no extra tagged fields on K.
-//   - Of is non-nil.
-//
-// The Index internally constructs a Reader[T] via
-// writer.Reader(ReaderExtras[T]{}) for Backfill's parquet reads.
-// Defaults are fine for Backfill (no dedup, no InsertedAtField,
-// default SettleWindow); services that need to tune the Reader
-// — e.g. OnMissingData during Backfill — should use
-// NewIndexFromStore so the Store's configured Reader is reused.
-func NewIndex[T any, K comparable](
-	w *Writer[T],
-	def IndexDef[T, K],
-) (*Index[T, K], error) {
+// Validation matches the write-side register path: Name
+// non-empty and no '/', Columns passes ValidatePartitionKeyParts,
+// every entry in Columns has a matching parquet-tagged string
+// field on K, and no extra tagged fields on K.
+func NewIndex[K comparable](
+	target S3Target, def IndexLookupDef[K],
+) (*Index[K], error) {
+	// Lookup never consults target.PartitionKeyParts — the
+	// index's own Columns drive the LIST path — so we use the
+	// reduced-validation helper instead of the full Target check.
+	if err := target.validateLookup(); err != nil {
+		return nil, err
+	}
+	return buildIndex(target, def)
+}
+
+// NewIndexWithRegister registers def on w so future Write calls
+// emit markers, AND returns an Index[K] read-handle built from
+// w.Target(). Use when a service writes and reads through a
+// Writer but has no Reader/Store.
+func NewIndexWithRegister[T any, K comparable](
+	w *Writer[T], def IndexDef[T, K],
+) (*Index[K], error) {
 	if w == nil {
 		return nil, fmt.Errorf(
-			"s3parquet: NewIndex: writer is nil")
+			"s3parquet: NewIndexWithRegister: writer is nil")
 	}
-	r, err := w.Reader(ReaderExtras[T]{})
-	if err != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: NewIndex: build internal reader: %w", err)
+	if err := RegisterIndex(w, def); err != nil {
+		return nil, err
 	}
-	return newIndex(w, r, def)
+	return NewIndex(w.Target(), def.IndexLookupDef)
 }
 
-// NewIndexFromStore is NewIndex keyed off a Store[T] — the
-// embedded Writer is used for marker PUTs and Store.Reader is
-// reused for Backfill's parquet reads. This preserves any
-// read-side knobs (OnMissingData, SettleWindow, etc.) the caller
-// configured via the unified Config at Store construction.
-func NewIndexFromStore[T any, K comparable](
-	s *Store[T],
-	def IndexDef[T, K],
-) (*Index[T, K], error) {
+// NewIndexFromStoreWithRegister registers def on store.Writer
+// AND returns an Index[K] read-handle built from store.Target().
+// Single-call convenience for the common shape of a process that
+// writes and queries through one Store.
+func NewIndexFromStoreWithRegister[T any, K comparable](
+	s *Store[T], def IndexDef[T, K],
+) (*Index[K], error) {
 	if s == nil {
 		return nil, fmt.Errorf(
-			"s3parquet: NewIndexFromStore: store is nil")
+			"s3parquet: NewIndexFromStoreWithRegister: store is nil")
 	}
-	return newIndex(s.Writer, s.Reader, def)
+	return NewIndexWithRegister(s.Writer, def)
 }
 
-// newIndex is the shared constructor. Both NewIndex (which
-// synthesizes a default Reader) and NewIndexFromStore (which
-// reuses the Store's Reader) call through here so validation
-// and registration logic stay single-source.
-func newIndex[T any, K comparable](
-	w *Writer[T], r *Reader[T], def IndexDef[T, K],
-) (*Index[T, K], error) {
-	if def.Name == "" {
-		return nil, fmt.Errorf(
-			"s3parquet: NewIndex: Name is required")
-	}
-	if strings.Contains(def.Name, "/") {
-		return nil, fmt.Errorf(
-			"s3parquet: NewIndex: Name %q must not contain '/'",
-			def.Name)
-	}
-	if err := core.ValidatePartitionKeyParts(def.Columns); err != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: NewIndex %q: %w", def.Name, err)
+// RegisterIndex wires def onto w so that every subsequent Write
+// emits the markers def.Of produces. Call before the first
+// Write; records written before registration produce no markers
+// for this index (use BackfillIndex to cover those).
+//
+// Not concurrency-safe against Write: registration mutates the
+// writer's index list and should complete at setup time. Safe
+// to call multiple times with different defs to register
+// multiple indexes on one writer.
+func RegisterIndex[T any, K comparable](
+	w *Writer[T], def IndexDef[T, K],
+) error {
+	if w == nil {
+		return fmt.Errorf(
+			"s3parquet: RegisterIndex: writer is nil")
 	}
 	if def.Of == nil {
-		return nil, fmt.Errorf(
-			"s3parquet: NewIndex %q: Of is required", def.Name)
+		return fmt.Errorf(
+			"s3parquet: RegisterIndex %q: Of is required", def.Name)
 	}
-
-	fieldIndices, err := buildIndexBinder[K](def.Columns)
+	idx, err := buildIndex(w.Target(), def.IndexLookupDef)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: NewIndex %q: %w", def.Name, err)
+		return err
 	}
-
-	indexPath := core.IndexPath(w.cfg.Prefix, def.Name)
-
-	idx := &Index[T, K]{
-		writer:       w,
-		reader:       r,
-		name:         def.Name,
-		columns:      def.Columns,
-		indexPath:    indexPath,
-		fieldIndices: fieldIndices,
-		of:           def.Of,
-	}
-
 	w.registerIndex(indexWriter[T]{
 		name: def.Name,
 		pathsOf: func(rec T) ([]string, error) {
-			entries := idx.of(rec)
+			entries := def.Of(rec)
 			if len(entries) == 0 {
 				return nil, nil
 			}
 			paths := make([]string, 0, len(entries))
 			for _, e := range entries {
-				values, err := idx.entryToValues(e)
+				p, err := idx.markerPath(e)
 				if err != nil {
 					return nil, err
-				}
-				p := core.BuildIndexMarkerPath(
-					idx.indexPath, idx.columns, values)
-				if len(p) > maxMarkerKeyLen {
-					return nil, fmt.Errorf(
-						"s3parquet: index %q marker key is "+
-							"%d bytes, exceeds %d (S3 limit is "+
-							"1024; narrow Columns or shorten values)",
-						idx.name, len(p), maxMarkerKeyLen)
 				}
 				paths = append(paths, p)
 			}
 			return paths, nil
 		},
 	})
+	return nil
+}
 
-	return idx, nil
+// buildIndex is the shared constructor behind NewIndex,
+// NewIndexWithRegister, RegisterIndex, and BackfillIndex — they
+// all need identical validation and the same {columns,
+// fieldIndices, indexPath, name} state so marker paths stay
+// byte-identical across call sites.
+func buildIndex[K comparable](
+	target S3Target, def IndexLookupDef[K],
+) (*Index[K], error) {
+	if def.Name == "" {
+		return nil, fmt.Errorf(
+			"s3parquet: index: Name is required")
+	}
+	if strings.Contains(def.Name, "/") {
+		return nil, fmt.Errorf(
+			"s3parquet: index: Name %q must not contain '/'",
+			def.Name)
+	}
+	if err := core.ValidatePartitionKeyParts(def.Columns); err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: index %q: %w", def.Name, err)
+	}
+	fieldIndices, err := buildIndexBinder[K](def.Columns)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: index %q: %w", def.Name, err)
+	}
+	return &Index[K]{
+		target:       target,
+		name:         def.Name,
+		columns:      def.Columns,
+		indexPath:    core.IndexPath(target.Prefix, def.Name),
+		fieldIndices: fieldIndices,
+	}, nil
 }
 
 // maxMarkerKeyLen caps the length of any marker S3 object key.
@@ -210,7 +228,7 @@ const maxMarkerKeyLen = 1000
 // entryToValues extracts the column values from a K in the order
 // declared by columns, and validates each so the caller can
 // safely embed them in an S3 key.
-func (i *Index[T, K]) entryToValues(entry K) ([]string, error) {
+func (i *Index[K]) entryToValues(entry K) ([]string, error) {
 	v := reflect.ValueOf(entry)
 	out := make([]string, len(i.columns))
 	for j, col := range i.columns {
@@ -225,193 +243,27 @@ func (i *Index[T, K]) entryToValues(entry K) ([]string, error) {
 	return out, nil
 }
 
-// BackfillStats reports the work Backfill did: how many parquet
-// objects it scanned, how many records it decoded, and how many
-// marker PUTs it issued. Markers is per-object, not globally
-// deduplicated — a marker path produced by N parquet files is
-// counted N times (reflects S3 request cost, not unique marker
-// count). Useful for progress logging in a migration job.
-type BackfillStats struct {
-	DataObjects int
-	Records     int
-	Markers     int
-}
-
-// Backfill scans existing parquet data under pattern and writes
-// index markers for every record already in the store. The normal
-// path is to call NewIndex before the first Write; Backfill is
-// the relief valve for adding an index to a live store or
-// recovering after an index was missed.
-//
-// pattern is evaluated against the Store's PartitionKeyParts
-// (same grammar as Store.Read), NOT against the index's Columns
-// — Backfill LISTs parquet data files, which are keyed by
-// partition. "*" backfills everything. Pattern-scoping lets a
-// migration job parallelize itself across partitions — run one
-// Backfill per shard rather than a single multi-hour call.
-//
-// Safe to run concurrently with Write: S3 PUTs are idempotent, so
-// a marker produced by both paths is just written twice. Safe to
-// retry after a cancel or crash for the same reason: work already
-// done is work already persisted.
-//
-// Processes parquet objects with bounded parallelism
-// (pollDownloadConcurrency), matching the Read path. Within an
-// object, marker PUTs run serially so the net in-flight S3
-// request count stays at roughly pollDownloadConcurrency rather
-// than compounding to concurrency squared. Peak memory is bounded
-// by (concurrency × largest-object size).
-func (i *Index[T, K]) Backfill(
-	ctx context.Context, pattern string,
-) (BackfillStats, error) {
-	var stats BackfillStats
-
-	plan, err := buildReadPlan(
-		pattern, i.reader.dataPath, i.reader.cfg.PartitionKeyParts)
+// markerPath builds the S3 key for the marker representing K
+// under this index, enforcing the 1000-byte cap so a
+// pathologically long K surfaces a clear error.
+func (i *Index[K]) markerPath(entry K) (string, error) {
+	values, err := i.entryToValues(entry)
 	if err != nil {
-		return stats, err
+		return "", err
 	}
-
-	keys, err := i.reader.listMatchingParquet(ctx, plan)
-	if err != nil {
-		return stats, err
+	p := core.BuildIndexMarkerPath(i.indexPath, i.columns, values)
+	if len(p) > maxMarkerKeyLen {
+		return "", fmt.Errorf(
+			"s3parquet: index %q marker key is "+
+				"%d bytes, exceeds %d (S3 limit is "+
+				"1024; narrow Columns or shorten values)",
+			i.name, len(p), maxMarkerKeyLen)
 	}
-	if len(keys) == 0 {
-		return stats, nil
-	}
-	stats.DataObjects = len(keys)
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var recordsTotal, markersTotal atomic.Int64
-	errs := make([]error, len(keys))
-	sem := make(chan struct{}, pollDownloadConcurrency)
-	var wg sync.WaitGroup
-
-	for n, key := range keys {
-		wg.Add(1)
-		go func(n int, key string) {
-			defer wg.Done()
-			// Acquire inside the goroutine so a parent-ctx
-			// cancel or sibling failure unblocks waiters
-			// promptly instead of backlogging the queue.
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[n] = ctx.Err()
-				return
-			}
-			defer func() { <-sem }()
-
-			paths, nRecs, err := i.markerPathsForObject(ctx, key)
-			if err != nil {
-				// LIST-to-GET race: a data file listed a moment
-				// ago is gone now. Skip-and-notify matches
-				// downloadAndDecodeAll's at-least-once posture —
-				// one missing file shouldn't fail the whole
-				// backfill. Other GET errors remain fatal.
-				var nsk *s3types.NoSuchKey
-				if errors.As(err, &nsk) {
-					if i.reader.cfg.OnMissingData != nil {
-						i.reader.cfg.OnMissingData(key)
-					}
-					return
-				}
-				errs[n] = err
-				cancel()
-				return
-			}
-			recordsTotal.Add(int64(nRecs))
-
-			// Serial PUTs within the object. Across objects we
-			// already run pollDownloadConcurrency-wide, so
-			// per-object fan-out would compound to
-			// concurrency² and overwhelm the SDK connection
-			// pool. Net in-flight ≈ concurrency.
-			for _, p := range paths {
-				if err := i.writer.putObject(
-					ctx, p, nil, "application/octet-stream",
-				); err != nil {
-					errs[n] = fmt.Errorf(
-						"s3parquet: backfill index %q: put marker: %w",
-						i.name, err)
-					cancel()
-					return
-				}
-			}
-			markersTotal.Add(int64(len(paths)))
-		}(n, key)
-	}
-	wg.Wait()
-
-	stats.Records = int(recordsTotal.Load())
-	stats.Markers = int(markersTotal.Load())
-
-	// First real error wins; skip cancellations so we report
-	// the root-cause failure rather than the cancel it
-	// triggered in sibling goroutines.
-	for _, e := range errs {
-		if e == nil || errors.Is(e, context.Canceled) {
-			continue
-		}
-		return stats, e
-	}
-	return stats, nil
-}
-
-// markerPathsForObject decodes one parquet data object and
-// returns the deduplicated marker paths its records produce under
-// this index, plus the record count (for stats). Pulled out of
-// Backfill so the dedup map doesn't leak across objects — each
-// file stands on its own, keeping memory bounded by the largest
-// file rather than the full backfill set.
-func (i *Index[T, K]) markerPathsForObject(
-	ctx context.Context, key string,
-) ([]string, int, error) {
-	data, err := i.reader.getObjectBytes(ctx, key)
-	if err != nil {
-		return nil, 0, fmt.Errorf(
-			"s3parquet: backfill get %s: %w", key, err)
-	}
-	recs, err := decodeParquet[T](data)
-	if err != nil {
-		return nil, 0, fmt.Errorf(
-			"s3parquet: backfill decode %s: %w", key, err)
-	}
-
-	seen := make(map[string]struct{})
-	for _, rec := range recs {
-		for _, entry := range i.of(rec) {
-			values, err := i.entryToValues(entry)
-			if err != nil {
-				return nil, 0, fmt.Errorf(
-					"s3parquet: backfill index %q on %s: %w",
-					i.name, key, err)
-			}
-			p := core.BuildIndexMarkerPath(
-				i.indexPath, i.columns, values)
-			if len(p) > maxMarkerKeyLen {
-				return nil, 0, fmt.Errorf(
-					"s3parquet: backfill index %q: marker key "+
-						"is %d bytes, exceeds %d",
-					i.name, len(p), maxMarkerKeyLen)
-			}
-			seen[p] = struct{}{}
-		}
-	}
-	if len(seen) == 0 {
-		return nil, len(recs), nil
-	}
-	paths := make([]string, 0, len(seen))
-	for p := range seen {
-		paths = append(paths, p)
-	}
-	return paths, len(recs), nil
+	return p, nil
 }
 
 // Lookup returns every K whose marker matches the key pattern.
-// pattern uses the same grammar as Store.Read (see
+// pattern uses the same grammar as Reader.Read (see
 // core.ValidateKeyPattern), evaluated against Columns.
 //
 // Results are unbounded: narrow the pattern if an index has
@@ -422,7 +274,7 @@ func (i *Index[T, K]) markerPathsForObject(
 // whose S3 LastModified timestamp is within now - SettleWindow
 // are hidden, so a caller that writes and immediately Looks Up
 // sees consistent state with PollRecords.
-func (i *Index[T, K]) Lookup(
+func (i *Index[K]) Lookup(
 	ctx context.Context, pattern string,
 ) ([]K, error) {
 	plan, err := buildReadPlan(pattern, i.indexPath, i.columns)
@@ -452,7 +304,7 @@ func (i *Index[T, K]) Lookup(
 // K fields are required to be string type (enforced at
 // buildIndexBinder), so the assignment is a direct SetString and
 // cannot fail.
-func (i *Index[T, K]) valuesToEntry(values []string) K {
+func (i *Index[K]) valuesToEntry(values []string) K {
 	var zero K
 	v := reflect.ValueOf(&zero).Elem()
 	for j := range i.columns {
@@ -465,16 +317,11 @@ func (i *Index[T, K]) valuesToEntry(values []string) K {
 // returns the keys that match plan.Match AND were modified before
 // the settle-window cutoff. S3 handles pagination; filtering runs
 // per-page in memory.
-func (i *Index[T, K]) listMatchingMarkers(
+func (i *Index[K]) listMatchingMarkers(
 	ctx context.Context, plan *readPlan,
 ) ([]string, error) {
-	cutoff := time.Now().Add(-i.reader.cfg.settleWindow())
-
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(i.reader.cfg.Bucket),
-		Prefix: aws.String(plan.ListPrefix),
-	}
-	paginator := s3.NewListObjectsV2Paginator(i.reader.s3, input)
+	cutoff := time.Now().Add(-i.target.settleWindow())
+	paginator := i.target.list(plan.ListPrefix)
 
 	var keys []string
 	suffix := "/" + core.IndexMarkerFilename
@@ -520,6 +367,312 @@ func hiveKeyOfMarker(s3Key, indexPath string) (string, bool) {
 		return "", false
 	}
 	return rest[:len(rest)-len(tail)], true
+}
+
+// BackfillStats reports the work BackfillIndex did: how many
+// parquet objects it scanned, how many records it decoded, and
+// how many marker PUTs it issued. Markers is per-object, not
+// globally deduplicated — a marker path produced by N parquet
+// files is counted N times (reflects S3 request cost, not
+// unique marker count). Useful for progress logging in a
+// migration job.
+type BackfillStats struct {
+	DataObjects int
+	Records     int
+	Markers     int
+}
+
+// BackfillIndex scans existing parquet data under pattern and
+// writes index markers for every record already present. The
+// normal path is to wire RegisterIndex onto the live writer
+// before the first Write; BackfillIndex is the relief valve for
+// records written before that registration.
+//
+// Standalone by design: no Writer / Reader argument, no in-
+// writer registration. The migration job constructs an S3Target
+// pointing at the same dataset the live writer uses; BackfillIndex
+// issues both GETs (parquet data) and PUTs (markers) through
+// target.S3Client.
+//
+// pattern uses the same grammar as Reader.Read and is evaluated
+// against target.PartitionKeyParts (NOT the index's Columns) —
+// backfill LISTs parquet data files, which are keyed by
+// partition. "*" covers everything; shard across partitions to
+// parallelize a migration.
+//
+// until is an exclusive upper bound on data-file LastModified.
+// Typical use: until = OffsetAt(deployTime_of_live_writer), so
+// backfill covers historical gaps (< deploy) while the live
+// writer covers everything from deploy onward. Passing an empty
+// Offset("") disables the bound — backfill covers every file
+// currently present, at the cost of redundant PUTs for data the
+// live writer has already marked (harmless because PUT is
+// idempotent).
+//
+// onMissingData is invoked when a data-file GET returns S3
+// NoSuchKey (dangling ref or LIST-to-GET race); the file is
+// skipped rather than failing the whole backfill. Pass nil to
+// disable the hook — skip-on-NoSuchKey is applied either way.
+//
+// Safe to run concurrently with a live writer that also emits
+// markers on Write (S3 PUT is idempotent; duplicates are
+// harmless). Safe to retry after a crash or cancel.
+//
+// Concurrency model matches Reader.Read: pollDownloadConcurrency
+// across objects, serial PUTs within each object so net in-flight
+// S3 requests stay at ≈ concurrency rather than concurrency².
+// Peak memory is bounded by (concurrency × largest-object size).
+func BackfillIndex[T any, K comparable](
+	ctx context.Context,
+	target S3Target,
+	def IndexDef[T, K],
+	pattern string,
+	until Offset,
+	onMissingData func(dataPath string),
+) (BackfillStats, error) {
+	var stats BackfillStats
+
+	// Full Target check — BackfillIndex LISTs partitioned data
+	// files (plan.Match consults PartitionKeyParts), so
+	// validateLookup's reduced subset isn't enough.
+	if err := target.validate(); err != nil {
+		return stats, err
+	}
+	if def.Of == nil {
+		return stats, fmt.Errorf(
+			"s3parquet: BackfillIndex %q: Of is required", def.Name)
+	}
+
+	idx, err := buildIndex(target, def.IndexLookupDef)
+	if err != nil {
+		return stats, err
+	}
+
+	dataPath := core.DataPath(target.Prefix)
+	plan, err := buildReadPlan(pattern, dataPath, target.PartitionKeyParts)
+	if err != nil {
+		return stats, err
+	}
+
+	keys, err := listDataFilesBelowUntil(ctx, target, plan, dataPath, until)
+	if err != nil {
+		return stats, err
+	}
+	if len(keys) == 0 {
+		return stats, nil
+	}
+	stats.DataObjects = len(keys)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var recordsTotal, markersTotal atomic.Int64
+	errs := make([]error, len(keys))
+	sem := make(chan struct{}, pollDownloadConcurrency)
+	var wg sync.WaitGroup
+
+	for n, key := range keys {
+		wg.Add(1)
+		go func(n int, key string) {
+			defer wg.Done()
+			// Acquire inside the goroutine so a parent-ctx
+			// cancel or sibling failure unblocks waiters
+			// promptly instead of backlogging the queue.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errs[n] = ctx.Err()
+				return
+			}
+			defer func() { <-sem }()
+
+			paths, nRecs, err := backfillMarkersForObject(
+				ctx, target, idx, def.Of, key)
+			if err != nil {
+				// LIST-to-GET race: a data file listed a moment
+				// ago is gone now. Skip-and-notify matches the
+				// read path's at-least-once posture — one missing
+				// file shouldn't fail the whole backfill. Other
+				// GET errors remain fatal.
+				if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
+					if onMissingData != nil {
+						onMissingData(key)
+					}
+					return
+				}
+				errs[n] = err
+				cancel()
+				return
+			}
+			recordsTotal.Add(int64(nRecs))
+
+			// Serial PUTs within the object. Across objects we
+			// already run pollDownloadConcurrency-wide, so per-
+			// object fan-out would compound to concurrency² and
+			// overwhelm the SDK connection pool. Net in-flight ≈
+			// concurrency.
+			for _, p := range paths {
+				if err := target.put(
+					ctx, p, nil, "application/octet-stream",
+				); err != nil {
+					errs[n] = fmt.Errorf(
+						"s3parquet: backfill index %q: put marker: %w",
+						idx.name, err)
+					cancel()
+					return
+				}
+			}
+			markersTotal.Add(int64(len(paths)))
+		}(n, key)
+	}
+	wg.Wait()
+
+	stats.Records = int(recordsTotal.Load())
+	stats.Markers = int(markersTotal.Load())
+
+	// First real error wins; skip cancellations so we report
+	// the root-cause failure rather than the cancel it
+	// triggered in sibling goroutines.
+	for _, e := range errs {
+		if e == nil || errors.Is(e, context.Canceled) {
+			continue
+		}
+		return stats, e
+	}
+	return stats, nil
+}
+
+// listDataFilesBelowUntil LISTs parquet data files matching plan
+// and returns those whose S3 LastModified is strictly before the
+// time encoded in until. An empty until disables the filter.
+// A non-empty but unparseable until is an error — callers should
+// pass Offset("") to mean "no bound" rather than relying on
+// silent fallthrough.
+func listDataFilesBelowUntil(
+	ctx context.Context,
+	target S3Target,
+	plan *readPlan,
+	dataPath string,
+	until Offset,
+) ([]string, error) {
+	var cutoff time.Time
+	filter := false
+	if until != "" {
+		cutoff = parseUntilToTime(until)
+		if cutoff.IsZero() {
+			return nil, fmt.Errorf(
+				"s3parquet: BackfillIndex: until %q is not a "+
+					"valid Offset (use OffsetAt to construct one)",
+				string(until))
+		}
+		filter = true
+	}
+
+	paginator := target.list(plan.ListPrefix)
+
+	var keys []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: backfill list data files: %w", err)
+		}
+		for _, obj := range page.Contents {
+			objKey := aws.ToString(obj.Key)
+			if !strings.HasSuffix(objKey, ".parquet") {
+				continue
+			}
+			hiveKey, ok := hiveKeyOfDataFile(objKey, dataPath)
+			if !ok {
+				continue
+			}
+			if !plan.Match(hiveKey) {
+				continue
+			}
+			if filter && obj.LastModified != nil &&
+				!obj.LastModified.Before(cutoff) {
+				continue
+			}
+			keys = append(keys, objKey)
+		}
+	}
+	return keys, nil
+}
+
+// backfillMarkersForObject decodes one parquet data object and
+// returns the deduplicated marker paths its records produce under
+// this index, plus the record count (for stats). Pulled out of
+// BackfillIndex's main loop so the dedup map doesn't leak across
+// objects — each file stands on its own, keeping memory bounded
+// by the largest file rather than the full backfill set.
+func backfillMarkersForObject[T any, K comparable](
+	ctx context.Context,
+	target S3Target,
+	idx *Index[K],
+	of func(T) []K,
+	key string,
+) ([]string, int, error) {
+	data, err := target.get(ctx, key)
+	if err != nil {
+		return nil, 0, fmt.Errorf(
+			"s3parquet: backfill get %s: %w", key, err)
+	}
+	recs, err := decodeParquet[T](data)
+	if err != nil {
+		return nil, 0, fmt.Errorf(
+			"s3parquet: backfill decode %s: %w", key, err)
+	}
+
+	seen := make(map[string]struct{})
+	for _, rec := range recs {
+		for _, entry := range of(rec) {
+			p, err := idx.markerPath(entry)
+			if err != nil {
+				return nil, 0, fmt.Errorf(
+					"s3parquet: backfill index %q on %s: %w",
+					idx.name, key, err)
+			}
+			seen[p] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil, len(recs), nil
+	}
+	paths := make([]string, 0, len(seen))
+	for p := range seen {
+		paths = append(paths, p)
+	}
+	return paths, len(recs), nil
+}
+
+// parseUntilToTime recovers the time.Time encoded in an Offset.
+// Two shapes are accepted:
+//
+//   - RefCutoff prefix "{refPath}/{tsMicros}" (what OffsetAt
+//     returns) — the intended input.
+//   - Full ref key "{refPath}/{tsMicros}-{shortID}_<hiveKey>.ref"
+//     — a WriteResult.Offset, accepted as a convenience so a
+//     caller can pass the last-written offset directly.
+//
+// Returns a zero time.Time on shapes that don't carry a parseable
+// decimal timestamp so the caller can reject the input.
+func parseUntilToTime(off Offset) time.Time {
+	s := string(off)
+	// Full ref key path first — ParseRefKey accepts the shape.
+	if _, tsMicros, _, err := core.ParseRefKey(s); err == nil {
+		return time.UnixMicro(tsMicros)
+	}
+	// RefCutoff prefix: "{refPath}/{tsMicros}". The last '/'
+	// separator starts the decimal tail.
+	i := strings.LastIndex(s, "/")
+	if i < 0 || i == len(s)-1 {
+		return time.Time{}
+	}
+	tsMicros, err := strconv.ParseInt(s[i+1:], 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.UnixMicro(tsMicros)
 }
 
 // buildIndexBinder reflects on K to produce the field-index map

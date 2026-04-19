@@ -57,7 +57,9 @@ func TestNew_Validation(t *testing.T) {
 
 func TestValidateKey(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		PartitionKeyParts: []string{"period", "customer"},
+		Target: S3Target{
+			PartitionKeyParts: []string{"period", "customer"},
+		},
 	}}
 	cases := []struct {
 		name    string
@@ -212,9 +214,13 @@ func TestNew_BloomFilterColumnsValidation(t *testing.T) {
 }
 
 func TestSettleWindowDefault(t *testing.T) {
-	var c Config[testRec]
-	if got := c.settleWindow(); got.String() != "5s" {
-		t.Errorf("default: got %v, want 5s", got)
+	var target S3Target
+	if got := target.settleWindow(); got.String() != "5s" {
+		t.Errorf("S3Target default: got %v, want 5s", got)
+	}
+	target.SettleWindow = 2 * time.Second
+	if got := target.settleWindow(); got != 2*time.Second {
+		t.Errorf("S3Target explicit: got %v, want 2s", got)
 	}
 }
 
@@ -226,7 +232,9 @@ func TestSettleWindowDefault(t *testing.T) {
 // method touches s.s3.
 func TestWriteEmptyRecords(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		PartitionKeyParts: []string{"period", "customer"},
+		Target: S3Target{
+			PartitionKeyParts: []string{"period", "customer"},
+		},
 		PartitionKeyOf: func(r testRec) string {
 			return "period=" + r.Period + "/customer=" + r.Customer
 		},
@@ -368,7 +376,7 @@ func TestOffsetAt(t *testing.T) {
 // every read-side field on ReaderExtras must also appear on
 // ReaderConfig with the same name and type. Without this, adding
 // a new read knob to one struct and forgetting the other would
-// silently go unnoticed — Writer.Reader / NewView users would
+// silently go unnoticed — NewReaderFromWriter users would
 // see different behavior from direct NewReader users.
 func TestReaderExtrasMirrorsReaderConfig(t *testing.T) {
 	extras := reflect.TypeFor[ReaderExtras[testRec]]()

@@ -3,8 +3,10 @@ package s3parquet
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/ueisele/s3store/internal/core"
 )
 
 // testIndexRec is the record shape the index tests use. Two
@@ -51,7 +53,7 @@ func TestBuildIndexBinder_Valid(t *testing.T) {
 	}
 	// Sanity: field indices point to fields with matching tags.
 	entry := SkuIndexEntry{SKU: "s", Period: "p", Customer: "c"}
-	values, err := (&Index[testIndexRec, SkuIndexEntry]{
+	values, err := (&Index[SkuIndexEntry]{
 		columns:      cols,
 		fieldIndices: fi,
 		name:         "test",
@@ -126,9 +128,11 @@ func TestBuildIndexBinder_Rejects(t *testing.T) {
 // batch.
 func TestPathsOf_MultipleEntriesPerRecord(t *testing.T) {
 	s := newIndexTestStore(t)
-	_, err := NewIndexFromStore(s, IndexDef[testIndexRec, SkuIndexEntry]{
-		Name:    "multi_idx",
-		Columns: []string{"sku", "period", "customer"},
+	_, err := NewIndexFromStoreWithRegister(s, IndexDef[testIndexRec, SkuIndexEntry]{
+		IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+			Name:    "multi_idx",
+			Columns: []string{"sku", "period", "customer"},
+		},
 		// Each record emits two entries (e.g., a record that
 		// touches two SKUs). Record-to-record duplicates collapse
 		// at the batch level.
@@ -140,7 +144,7 @@ func TestPathsOf_MultipleEntriesPerRecord(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
 	}
 
 	// Two records, same (period, customer). Each emits 2 entries,
@@ -165,9 +169,11 @@ func TestPathsOf_MultipleEntriesPerRecord(t *testing.T) {
 // surfaces a clear error instead of an opaque S3 InvalidKey.
 func TestPathsOf_RejectsOversizedKey(t *testing.T) {
 	s := newIndexTestStore(t)
-	_, err := NewIndexFromStore(s, IndexDef[testIndexRec, SkuIndexEntry]{
-		Name:    "big_idx",
-		Columns: []string{"sku", "period", "customer"},
+	_, err := NewIndexFromStoreWithRegister(s, IndexDef[testIndexRec, SkuIndexEntry]{
+		IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+			Name:    "big_idx",
+			Columns: []string{"sku", "period", "customer"},
+		},
 		Of: func(r testIndexRec) []SkuIndexEntry {
 			return []SkuIndexEntry{{
 				SKU:      strings.Repeat("X", 500),
@@ -177,7 +183,7 @@ func TestPathsOf_RejectsOversizedKey(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
 	}
 
 	_, err = s.collectIndexMarkerPaths(
@@ -195,7 +201,7 @@ func TestPathsOf_RejectsOversizedKey(t *testing.T) {
 func TestEntryToValues_ValidatesValues(t *testing.T) {
 	cols := []string{"sku", "period", "customer"}
 	fi, _ := buildIndexBinder[SkuIndexEntry](cols)
-	idx := &Index[testIndexRec, SkuIndexEntry]{
+	idx := &Index[SkuIndexEntry]{
 		columns:      cols,
 		fieldIndices: fi,
 		name:         "test",
@@ -220,7 +226,7 @@ func TestEntryToValues_ValidatesValues(t *testing.T) {
 	}
 }
 
-// TestNewIndex_Validation covers NewIndex's registration-time
+// TestNewIndex_Validation covers the registration-time
 // checks: nil store, empty name, name with '/', bad Columns,
 // missing Of.
 func TestNewIndex_Validation(t *testing.T) {
@@ -232,31 +238,41 @@ func TestNewIndex_Validation(t *testing.T) {
 		def  IndexDef[testIndexRec, SkuIndexEntry]
 	}{
 		{"empty name", IndexDef[testIndexRec, SkuIndexEntry]{
-			Columns: []string{"sku", "period", "customer"},
-			Of:      ofStub,
+			IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+				Columns: []string{"sku", "period", "customer"},
+			},
+			Of: ofStub,
 		}},
 		{"name with slash", IndexDef[testIndexRec, SkuIndexEntry]{
-			Name:    "bad/name",
-			Columns: []string{"sku", "period", "customer"},
-			Of:      ofStub,
+			IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+				Name:    "bad/name",
+				Columns: []string{"sku", "period", "customer"},
+			},
+			Of: ofStub,
 		}},
 		{"empty columns", IndexDef[testIndexRec, SkuIndexEntry]{
-			Name: "idx",
-			Of:   ofStub,
+			IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+				Name: "idx",
+			},
+			Of: ofStub,
 		}},
 		{"duplicate column", IndexDef[testIndexRec, SkuIndexEntry]{
-			Name:    "idx",
-			Columns: []string{"sku", "sku", "customer"},
-			Of:      ofStub,
+			IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+				Name:    "idx",
+				Columns: []string{"sku", "sku", "customer"},
+			},
+			Of: ofStub,
 		}},
 		{"missing Of", IndexDef[testIndexRec, SkuIndexEntry]{
-			Name:    "idx",
-			Columns: []string{"sku", "period", "customer"},
+			IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+				Name:    "idx",
+				Columns: []string{"sku", "period", "customer"},
+			},
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewIndexFromStore(s, tc.def)
+			_, err := NewIndexFromStoreWithRegister(s, tc.def)
 			if err == nil {
 				t.Error("expected error, got nil")
 			}
@@ -264,26 +280,45 @@ func TestNewIndex_Validation(t *testing.T) {
 	}
 
 	t.Run("nil store", func(t *testing.T) {
-		_, err := NewIndex[testIndexRec, SkuIndexEntry](nil,
-			IndexDef[testIndexRec, SkuIndexEntry]{
-				Name:    "idx",
-				Columns: []string{"sku", "period", "customer"},
-				Of:      ofStub,
+		_, err := NewIndexFromStoreWithRegister(
+			nil, IndexDef[testIndexRec, SkuIndexEntry]{
+				IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+					Name:    "idx",
+					Columns: []string{"sku", "period", "customer"},
+				},
+				Of: ofStub,
 			})
 		if err == nil {
 			t.Error("expected error for nil store, got nil")
 		}
 	})
+
+	t.Run("nil writer for RegisterIndex", func(t *testing.T) {
+		err := RegisterIndex(
+			nil, IndexDef[testIndexRec, SkuIndexEntry]{
+				IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+					Name:    "idx",
+					Columns: []string{"sku", "period", "customer"},
+				},
+				Of: ofStub,
+			})
+		if err == nil {
+			t.Error("expected error for nil writer, got nil")
+		}
+	})
 }
 
-// TestNewIndex_RegistersWriter proves NewIndex hooks a writer
-// into the store — collectIndexMarkerPaths produces the expected
-// marker paths for a batch once the index is registered.
+// TestNewIndex_RegistersWriter proves NewIndexFromStoreWithRegister
+// wires a writer into the store — collectIndexMarkerPaths produces
+// the expected marker paths for a batch once the index is
+// registered.
 func TestNewIndex_RegistersWriter(t *testing.T) {
 	s := newIndexTestStore(t)
-	_, err := NewIndexFromStore(s, IndexDef[testIndexRec, SkuIndexEntry]{
-		Name:    "sku_idx",
-		Columns: []string{"sku", "period", "customer"},
+	_, err := NewIndexFromStoreWithRegister(s, IndexDef[testIndexRec, SkuIndexEntry]{
+		IndexLookupDef: IndexLookupDef[SkuIndexEntry]{
+			Name:    "sku_idx",
+			Columns: []string{"sku", "period", "customer"},
+		},
 		Of: func(r testIndexRec) []SkuIndexEntry {
 			return []SkuIndexEntry{{
 				SKU: r.SKU, Period: r.Period, Customer: r.Customer,
@@ -291,7 +326,7 @@ func TestNewIndex_RegistersWriter(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
 	}
 
 	batch := []testIndexRec{
@@ -314,5 +349,77 @@ func TestNewIndex_RegistersWriter(t *testing.T) {
 		if !strings.HasSuffix(p, "/m.idx") {
 			t.Errorf("marker path %q missing /m.idx suffix", p)
 		}
+	}
+}
+
+// TestParseUntilToTime covers both Offset shapes
+// parseUntilToTime accepts — the RefCutoff prefix produced by
+// OffsetAt (the intended input) and a full ref key produced by a
+// WriteResult — plus the rejection path for unparseable inputs.
+// Integration-level tests exercise the RefCutoff path only; this
+// guards the ref-key branch so a WriteResult.Offset passed
+// directly as until still decodes.
+func TestParseUntilToTime(t *testing.T) {
+	const refPath = "store/_stream/refs"
+	anchor := time.UnixMicro(1_800_000_000_000_000)
+
+	// RefCutoff shape: "{refPath}/{tsMicros}". This is what
+	// OffsetAt returns.
+	cutoff := core.RefCutoff(refPath, anchor, 0)
+	got := parseUntilToTime(Offset(cutoff))
+	if !got.Equal(anchor) {
+		t.Errorf("RefCutoff: got %v, want %v", got, anchor)
+	}
+
+	// Full ref-key shape: "{refPath}/{tsMicros}-{shortID}_<hiveKey>.ref".
+	// This is what WriteResult.Offset carries, which a user may
+	// pass directly as until.
+	fullKey := core.EncodeRefKey(
+		refPath, anchor.UnixMicro(), "abcd1234",
+		"period=2026-03-17/customer=abc")
+	got = parseUntilToTime(Offset(fullKey))
+	if !got.Equal(anchor) {
+		t.Errorf("ref key: got %v, want %v", got, anchor)
+	}
+
+	// Rejection: bogus strings with no decimal timestamp tail
+	// return a zero time.Time so callers can error out.
+	cases := []string{
+		"",                       // empty — caller handles specially
+		"not-an-offset",          // no slash
+		"store/_stream/refs/",    // trailing slash, no tail
+		"store/_stream/refs/abc", // non-numeric tail
+	}
+	for _, s := range cases {
+		if got := parseUntilToTime(Offset(s)); !got.IsZero() {
+			t.Errorf("parseUntilToTime(%q) = %v, want zero", s, got)
+		}
+	}
+}
+
+// TestNewIndex_ReadOnly proves that NewIndex builds a handle
+// from a bare S3Target + IndexLookupDef without any Writer.
+// The read handle carries the expected state so Lookup paths
+// would match what a Writer-registered index produces.
+func TestNewIndex_ReadOnly(t *testing.T) {
+	target := S3Target{
+		Bucket:            "b",
+		Prefix:            "p",
+		S3Client:          &s3.Client{},
+		PartitionKeyParts: []string{"period", "customer"},
+	}
+	idx, err := NewIndex(target, IndexLookupDef[SkuIndexEntry]{
+		Name:    "sku_idx",
+		Columns: []string{"sku", "period", "customer"},
+	})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	if idx.name != "sku_idx" {
+		t.Errorf("name: got %q, want sku_idx", idx.name)
+	}
+	if idx.indexPath != "p/_index/sku_idx" {
+		t.Errorf("indexPath: got %q, want p/_index/sku_idx",
+			idx.indexPath)
 	}
 }

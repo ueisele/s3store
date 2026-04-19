@@ -80,10 +80,12 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 		Customer string `parquet:"customer"`
 	}
 
-	idx, err := s3parquet.NewIndexFromStore(store,
+	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
 		s3parquet.IndexDef[Rec, SkuPeriodEntry]{
-			Name:    "sku_period_idx",
-			Columns: []string{"sku", "period", "customer"},
+			IndexLookupDef: s3parquet.IndexLookupDef[SkuPeriodEntry]{
+				Name:    "sku_period_idx",
+				Columns: []string{"sku", "period", "customer"},
+			},
 			Of: func(r Rec) []SkuPeriodEntry {
 				return []SkuPeriodEntry{{
 					SKU: r.SKU, Period: r.Period, Customer: r.Customer,
@@ -91,7 +93,7 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 			},
 		})
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
 	}
 
 	in := []Rec{
@@ -173,16 +175,18 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	idx, err := s3parquet.NewIndexFromStore(store,
+	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
 		s3parquet.IndexDef[Rec, Entry]{
-			Name:    "sku_idx",
-			Columns: []string{"sku", "customer"},
+			IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+				Name:    "sku_idx",
+				Columns: []string{"sku", "customer"},
+			},
 			Of: func(r Rec) []Entry {
 				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
 			},
 		})
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{
@@ -216,17 +220,23 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 	t.Fatal("marker never became visible past the settle window")
 }
 
-// TestIndex_Backfill covers the relief-valve path: records
+// TestBackfillIndex covers the relief-valve path: records
 // written before an index was registered don't produce markers,
-// Lookup under-reports, and Backfill brings the index into sync.
-// Also checks that Backfill is idempotent (a second call is a
-// no-op in effect) and that pattern scoping narrows the scan.
-func TestIndex_Backfill(t *testing.T) {
+// Lookup under-reports, and BackfillIndex brings the index into
+// sync. Also checks idempotence (a second call is semantically a
+// no-op) and that pattern scoping narrows the scan.
+//
+// BackfillIndex is a standalone package function — it takes an
+// S3Target, so a migration job can run it without building a
+// full Writer/Store. The test mirrors that shape: it derives the
+// target from the store but passes it explicitly to the backfill
+// call.
+func TestBackfillIndex(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
 	// Phase 1: write records with no index registered. These are
-	// the "historical" records Backfill will have to recover.
+	// the "historical" records BackfillIndex will have to recover.
 	historical := []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
 		{Period: "2026-03-17", Customer: "def", SKU: "s1", Ts: time.UnixMilli(200)},
@@ -237,27 +247,29 @@ func TestIndex_Backfill(t *testing.T) {
 		t.Fatalf("historical Write: %v", err)
 	}
 
-	// Phase 2: register the index. Writes from here on are
-	// self-indexing; historical records are not yet covered.
+	// Phase 2: register the index so subsequent writes are
+	// self-indexing. Historical records are not yet covered.
 	type Entry struct {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	idx, err := s3parquet.NewIndexFromStore(store,
-		s3parquet.IndexDef[Rec, Entry]{
+	def := s3parquet.IndexDef[Rec, Entry]{
+		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
-			Of: func(r Rec) []Entry {
-				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
-			},
-		})
+		},
+		Of: func(r Rec) []Entry {
+			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+		},
+	}
+	idx, err := s3parquet.NewIndexFromStoreWithRegister(store, def)
 	if err != nil {
-		t.Fatalf("NewIndex: %v", err)
+		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
 	}
 
-	// Write a post-registration record so we can verify Backfill
-	// produces the same marker as the live write path (idempotent
-	// overlap).
+	// Write a post-registration record so we can verify
+	// BackfillIndex produces the same marker as the live write
+	// path (idempotent overlap).
 	if _, err := store.Write(ctx, []Rec{
 		{Period: "2026-04-01", Customer: "abc", SKU: "s3", Ts: time.UnixMilli(500)},
 	}); err != nil {
@@ -266,7 +278,8 @@ func TestIndex_Backfill(t *testing.T) {
 
 	time.Sleep(60 * time.Millisecond)
 
-	// Before Backfill: only the post-registration record is visible.
+	// Before BackfillIndex: only the post-registration record is
+	// visible.
 	got, err := idx.Lookup(ctx, "sku=*/customer=*")
 	if err != nil {
 		t.Fatalf("pre-backfill Lookup: %v", err)
@@ -275,10 +288,13 @@ func TestIndex_Backfill(t *testing.T) {
 		t.Errorf("pre-backfill: got %v, want just {s3, abc}", got)
 	}
 
-	// Backfill everything.
-	stats, err := idx.Backfill(ctx, "*")
+	target := store.Target()
+
+	// BackfillIndex with empty until covers everything.
+	stats, err := s3parquet.BackfillIndex(
+		ctx, target, def, "*", s3parquet.Offset(""), nil)
 	if err != nil {
-		t.Fatalf("Backfill: %v", err)
+		t.Fatalf("BackfillIndex: %v", err)
 	}
 	// 5 parquet objects (4 historical writes, each its own
 	// partition-key group under PartitionKeyOf; plus the post-
@@ -299,7 +315,8 @@ func TestIndex_Backfill(t *testing.T) {
 
 	time.Sleep(60 * time.Millisecond)
 
-	// After Backfill: every distinct (sku, customer) is visible.
+	// After BackfillIndex: every distinct (sku, customer) is
+	// visible.
 	got, err = idx.Lookup(ctx, "sku=*/customer=*")
 	if err != nil {
 		t.Fatalf("post-backfill Lookup: %v", err)
@@ -316,7 +333,7 @@ func TestIndex_Backfill(t *testing.T) {
 	}
 	for _, w := range want {
 		if !gotSet[w] {
-			t.Errorf("missing %+v after Backfill", w)
+			t.Errorf("missing %+v after BackfillIndex", w)
 		}
 	}
 	if len(got) != len(want) {
@@ -324,27 +341,186 @@ func TestIndex_Backfill(t *testing.T) {
 			len(got), len(want), got)
 	}
 
-	// Idempotency: a second Backfill re-scans but the PUTs are
-	// no-ops at the semantic level. We only check it doesn't
+	// Idempotency: a second BackfillIndex re-scans but the PUTs
+	// are no-ops at the semantic level. We only check it doesn't
 	// error and reports the same scan volume.
-	stats2, err := idx.Backfill(ctx, "*")
+	stats2, err := s3parquet.BackfillIndex(
+		ctx, target, def, "*", s3parquet.Offset(""), nil)
 	if err != nil {
-		t.Fatalf("second Backfill: %v", err)
+		t.Fatalf("second BackfillIndex: %v", err)
 	}
 	if stats2.DataObjects != stats.DataObjects {
-		t.Errorf("second Backfill DataObjects: got %d, want %d",
+		t.Errorf("second BackfillIndex DataObjects: got %d, want %d",
 			stats2.DataObjects, stats.DataObjects)
 	}
 
 	// Pattern scoping: backfilling only the 2026-03-17 partition
 	// covers 2 of the 5 objects.
-	scoped, err := idx.Backfill(ctx, "period=2026-03-17/customer=*")
+	scoped, err := s3parquet.BackfillIndex(
+		ctx, target, def,
+		"period=2026-03-17/customer=*",
+		s3parquet.Offset(""), nil)
 	if err != nil {
-		t.Fatalf("scoped Backfill: %v", err)
+		t.Fatalf("scoped BackfillIndex: %v", err)
 	}
 	if scoped.DataObjects != 2 {
 		t.Errorf("scoped DataObjects: got %d, want 2",
 			scoped.DataObjects)
+	}
+}
+
+// TestBackfillIndex_UntilBound verifies the typical migration
+// shape: the live writer "starts" at time T0, backfill covers
+// only files with LastModified < T0 so the live path's markers
+// and the backfill's don't overlap. We write two files with a
+// gap between them, pass OffsetAt(midpoint) as until, and assert
+// that only the earlier file is scanned.
+func TestBackfillIndex_UntilBound(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// Early write — should be covered by the bounded backfill.
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=early",
+		[]Rec{{Period: "2026-03-17", Customer: "early", SKU: "s1",
+			Ts: time.UnixMilli(1)}},
+	); err != nil {
+		t.Fatalf("early Write: %v", err)
+	}
+
+	// Wait so the until cutoff cleanly falls between the two
+	// writes. S3's LastModified has second granularity on most
+	// providers, so 1.1s guarantees a distinct boundary.
+	time.Sleep(1100 * time.Millisecond)
+	midpoint := time.Now()
+	time.Sleep(1100 * time.Millisecond)
+
+	// Late write — should be outside the bounded backfill.
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=late",
+		[]Rec{{Period: "2026-03-17", Customer: "late", SKU: "s2",
+			Ts: time.UnixMilli(2)}},
+	); err != nil {
+		t.Fatalf("late Write: %v", err)
+	}
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	def := s3parquet.IndexDef[Rec, Entry]{
+		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+			Name:    "bounded_idx",
+			Columns: []string{"sku", "customer"},
+		},
+		Of: func(r Rec) []Entry {
+			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+		},
+	}
+
+	target := store.Target()
+	until := store.OffsetAt(midpoint)
+
+	stats, err := s3parquet.BackfillIndex(
+		ctx, target, def, "*", until, nil)
+	if err != nil {
+		t.Fatalf("BackfillIndex: %v", err)
+	}
+	if stats.DataObjects != 1 {
+		t.Errorf("DataObjects: got %d, want 1 (only early write "+
+			"should be below until)", stats.DataObjects)
+	}
+
+	// A bogus until rejects — callers must pass an Offset from
+	// OffsetAt or Offset("") for unbounded.
+	_, err = s3parquet.BackfillIndex(
+		ctx, target, def, "*", s3parquet.Offset("not-an-offset"), nil)
+	if err == nil {
+		t.Error("expected error for malformed until, got nil")
+	}
+}
+
+// TestBackfillIndex_MissingDataTolerant verifies the at-least-
+// once posture when a data file disappears before backfill: the
+// live files still get markers and BackfillIndex does NOT fail.
+//
+// Note on the onMissingData hook: the hook only fires on a
+// LIST-to-GET race. MinIO's LIST is strongly consistent with
+// DELETE, so a pre-delete is fully absent from the subsequent
+// LIST — the race window doesn't exist in this fixture. Same
+// limitation applies to TestMissingData_SkipAndNotify for Read.
+// The hook-firing path is exercised by code review; what this
+// test pins down is that backfill survives the partial-delete
+// scenario without erroring.
+func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// Two writes so one can be deleted (exercising the
+	// after-the-fact skip path) while the other keeps the
+	// backfill work non-trivial.
+	r1, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=gone",
+		[]Rec{{Period: "2026-03-17", Customer: "gone", SKU: "s1"}})
+	if err != nil {
+		t.Fatalf("Write r1: %v", err)
+	}
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=live",
+		[]Rec{{Period: "2026-03-17", Customer: "live", SKU: "s2"}},
+	); err != nil {
+		t.Fatalf("Write r2: %v", err)
+	}
+
+	if _, err := store.Target().S3Client.DeleteObject(ctx,
+		&s3.DeleteObjectInput{
+			Bucket: aws.String(store.Target().Bucket),
+			Key:    aws.String(r1.DataPath),
+		}); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	def := s3parquet.IndexDef[Rec, Entry]{
+		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+			Name:    "missing_idx",
+			Columns: []string{"sku", "customer"},
+		},
+		Of: func(r Rec) []Entry {
+			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+		},
+	}
+
+	// Hook is wired in so a LIST-to-GET race (if one ever
+	// happens in CI) records the missing path rather than
+	// failing. We don't assert it fires — see note above.
+	var (
+		missedMu sync.Mutex
+		missed   []string
+	)
+	stats, err := s3parquet.BackfillIndex(
+		ctx, store.Target(), def, "*", s3parquet.Offset(""),
+		func(p string) {
+			missedMu.Lock()
+			defer missedMu.Unlock()
+			missed = append(missed, p)
+		})
+	if err != nil {
+		t.Fatalf("BackfillIndex: %v", err)
+	}
+
+	// MinIO's LIST reflects the delete, so backfill sees only
+	// the live file. Markers is 1 for that live file.
+	if stats.DataObjects != 1 {
+		t.Errorf("DataObjects: got %d, want 1 (LIST consistent "+
+			"with delete)", stats.DataObjects)
+	}
+	if stats.Markers != 1 {
+		t.Errorf("Markers: got %d, want 1 (live file marker)",
+			stats.Markers)
 	}
 }
 
@@ -563,17 +739,16 @@ func TestInsertedAtField_Validation(t *testing.T) {
 	}
 }
 
-// TestView_NarrowReadThroughNewViewFromStore covers the
-// cross-T View path: a Store is constructed over a full-shape
-// record type (with a heavy write-only column), and
-// NewViewFromStore produces a Reader[NarrowT] that decodes only
-// the fields present on NarrowT. parquet-go's decode naturally
-// skips unlisted columns, so the narrow Reader never even tries
-// to materialise the heavy column. Also proves the shared
-// wiring (Bucket, Prefix, PartitionKeyParts, S3Client) carries
-// from Writer through NewViewFromStore without the caller
-// respecifying anything.
-func TestView_NarrowReadThroughNewViewFromStore(t *testing.T) {
+// TestNewReaderFromStore_NarrowT covers the cross-T read path:
+// a Store is constructed over a full-shape record type (with a
+// heavy write-only column), and NewReaderFromStore produces a
+// Reader[NarrowT] that decodes only the fields present on
+// NarrowT. parquet-go's decode naturally skips unlisted columns,
+// so the narrow Reader never even tries to materialise the heavy
+// column. Also proves the shared wiring (Bucket, Prefix,
+// PartitionKeyParts, S3Client) carries from Writer through
+// NewReaderFromStore without the caller respecifying anything.
+func TestNewReaderFromStore_NarrowT(t *testing.T) {
 	ctx := context.Background()
 
 	type FullRec struct {
@@ -616,10 +791,10 @@ func TestView_NarrowReadThroughNewViewFromStore(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	view, err := s3parquet.NewViewFromStore[NarrowRec, FullRec](
+	view, err := s3parquet.NewReaderFromStore(
 		store, s3parquet.ReaderExtras[NarrowRec]{})
 	if err != nil {
-		t.Fatalf("NewViewFromStore: %v", err)
+		t.Fatalf("NewReaderFromStore: %v", err)
 	}
 
 	got, err := view.Read(ctx, "*")

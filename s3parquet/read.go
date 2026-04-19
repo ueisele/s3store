@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
@@ -64,7 +63,7 @@ func (s *Reader[T]) Read(
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	plan, err := buildReadPlan(keyPattern, s.dataPath, s.cfg.PartitionKeyParts)
+	plan, err := buildReadPlan(keyPattern, s.dataPath, s.cfg.Target.PartitionKeyParts)
 	if err != nil {
 		return nil, err
 	}
@@ -95,11 +94,7 @@ func (s *Reader[T]) Read(
 func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *readPlan,
 ) ([]string, error) {
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.cfg.Bucket),
-		Prefix: aws.String(plan.ListPrefix),
-	}
-	paginator := s3.NewListObjectsV2Paginator(s.s3, input)
+	paginator := s.cfg.Target.list(plan.ListPrefix)
 
 	var keys []string
 	for paginator.HasMorePages() {
@@ -166,7 +161,7 @@ func (s *Reader[T]) downloadAndDecodeAll(
 			}
 			insertedAt := time.UnixMicro(tsMicros)
 
-			data, err := s.getObjectBytes(ctx, key)
+			data, err := s.cfg.Target.get(ctx, key)
 			if err != nil {
 				// A dangling ref or a LIST-to-GET race produces a
 				// NoSuchKey here. Skip-and-notify instead of
@@ -174,8 +169,7 @@ func (s *Reader[T]) downloadAndDecodeAll(
 				// poison every subsequent Poll/Read. Any other
 				// error (throttle, network, auth) is still fatal —
 				// we don't want to silently drop real records.
-				var nsk *s3types.NoSuchKey
-				if errors.As(err, &nsk) {
+				if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
 					if s.cfg.OnMissingData != nil {
 						s.cfg.OnMissingData(key)
 					}

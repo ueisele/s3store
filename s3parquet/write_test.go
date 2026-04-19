@@ -14,7 +14,9 @@ import (
 // PartitionKeyOf and preserves every record in its group.
 func TestGroupByKey(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		PartitionKeyParts: []string{"period", "customer"},
+		Target: S3Target{
+			PartitionKeyParts: []string{"period", "customer"},
+		},
 		PartitionKeyOf: func(r testRec) string {
 			return "period=" + r.Period + "/customer=" + r.Customer
 		},

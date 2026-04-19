@@ -41,6 +41,13 @@ const (
 // decimal.Decimal, custom wrappers) need a companion
 // parquet-layout struct and a translation step in the caller's
 // package.
+//
+// The flat layout is the umbrella ergonomics — fill it in once,
+// every field lives at the top level. Internally New() projects
+// it onto the narrower WriterConfig[T] and ReaderConfig[T] (both
+// of which take an S3Target directly). Advanced users who want
+// just one side can skip this type and call NewWriter /
+// NewReader with a hand-built WriterConfig / ReaderConfig.
 type Config[T any] struct {
 	// Bucket is the S3 bucket name.
 	Bucket string
@@ -82,7 +89,7 @@ type Config[T any] struct {
 	VersionOf func(record T, insertedAt time.Time) int64
 
 	// OnMissingData is invoked when a data-file GET returns S3
-	// NoSuchKey (404) during Read, PollRecords, or Index.Backfill.
+	// NoSuchKey (404) during Read, PollRecords, or BackfillIndex.
 	// The path is skipped (not treated as an error) and the hook
 	// is called with its S3 key so the caller can log, count, or
 	// alert. Nil disables the hook and retains skip-on-404 behavior.
@@ -157,78 +164,12 @@ func DefaultVersionOf[T any](_ T, insertedAt time.Time) int64 {
 	return insertedAt.UnixMicro()
 }
 
-func (c Config[T]) settleWindow() time.Duration {
-	if c.SettleWindow > 0 {
-		return c.SettleWindow
-	}
-	return 5 * time.Second
-}
-
 // dedupEnabled reports whether latest-per-entity dedup applies.
 // Gated solely on EntityKeyOf: New() populates VersionOf with
 // DefaultVersionOf when the user leaves it nil, so by the time
 // a Store exists the VersionOf field is always callable if
 // EntityKeyOf is set.
 func (c Config[T]) dedupEnabled() bool {
-	return c.EntityKeyOf != nil
-}
-
-// WriterConfig is the narrower Config form for constructing a
-// Writer directly (without a Reader). Holds only write-side
-// knobs plus the shared S3 wiring. Use NewWriter(cfg) when a
-// service writes but never reads.
-type WriterConfig[T any] struct {
-	Bucket             string
-	Prefix             string
-	PartitionKeyParts  []string
-	S3Client           *s3.Client
-	PartitionKeyOf     func(T) string
-	Compression        CompressionCodec
-	BloomFilterColumns []string
-}
-
-// ReaderConfig is the narrower Config form for constructing a
-// Reader directly. Holds only read-side knobs plus the shared
-// S3 wiring. Use NewReader(cfg) in read-only services that have
-// no PartitionKeyOf / Compression / BloomFilter config to
-// supply.
-type ReaderConfig[T any] struct {
-	Bucket            string
-	Prefix            string
-	PartitionKeyParts []string
-	S3Client          *s3.Client
-	SettleWindow      time.Duration
-	EntityKeyOf       func(T) string
-	VersionOf         func(T, time.Time) int64
-	InsertedAtField   string
-	OnMissingData     func(dataPath string)
-}
-
-// ReaderExtras carries the read-side knobs that aren't already
-// shared with a Writer. Used by Writer.Reader(extras), NewView,
-// and NewViewFromStore: the shared fields (Bucket, Prefix,
-// S3Client, PartitionKeyParts) come from the Writer; the user
-// supplies just what's Reader-specific here.
-//
-// Drift guard: every field below must also appear on ReaderConfig
-// with an identical name and type (enforced by a reflect-based
-// unit test).
-type ReaderExtras[T any] struct {
-	SettleWindow    time.Duration
-	EntityKeyOf     func(T) string
-	VersionOf       func(T, time.Time) int64
-	InsertedAtField string
-	OnMissingData   func(dataPath string)
-}
-
-func (c ReaderConfig[T]) settleWindow() time.Duration {
-	if c.SettleWindow > 0 {
-		return c.SettleWindow
-	}
-	return 5 * time.Second
-}
-
-func (c ReaderConfig[T]) dedupEnabled() bool {
 	return c.EntityKeyOf != nil
 }
 
@@ -241,21 +182,43 @@ type Store[T any] struct {
 	*Reader[T]
 }
 
+// Target returns the untyped S3Target the Store was built with.
+// The embedded Writer and Reader share a byte-identical Target
+// (both projected from the unified Config at New()), so the
+// forwarding choice is cosmetic — delegating to Reader keeps the
+// picker consistent with NewIndex / BackfillIndex, which read.
+func (s *Store[T]) Target() S3Target {
+	return s.Reader.Target()
+}
+
 // New constructs a Store by projecting Config onto WriterConfig
 // and ReaderConfig, then delegating to NewWriter + NewReader.
 // The unified Config[T] is kept as a back-compat entry point;
 // new code that only writes or only reads should prefer
 // NewWriter / NewReader directly.
 func New[T any](cfg Config[T]) (*Store[T], error) {
-	w, err := NewWriter[T](writerConfigFrom(cfg))
+	w, err := NewWriter(writerConfigFrom(cfg))
 	if err != nil {
 		return nil, err
 	}
-	r, err := NewReader[T](readerConfigFrom(cfg))
+	r, err := NewReader(readerConfigFrom(cfg))
 	if err != nil {
 		return nil, err
 	}
 	return &Store[T]{Writer: w, Reader: r}, nil
+}
+
+// targetFrom lifts the five S3-wiring fields off a unified
+// Config[T] into an S3Target. Called by both projection helpers
+// so the two halves see a byte-identical Target.
+func targetFrom[T any](c Config[T]) S3Target {
+	return S3Target{
+		Bucket:            c.Bucket,
+		Prefix:            c.Prefix,
+		S3Client:          c.S3Client,
+		PartitionKeyParts: c.PartitionKeyParts,
+		SettleWindow:      c.SettleWindow,
+	}
 }
 
 // writerConfigFrom projects a unified Config[T] onto the narrower
@@ -263,10 +226,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 // is easy to spot.
 func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 	return WriterConfig[T]{
-		Bucket:             c.Bucket,
-		Prefix:             c.Prefix,
-		PartitionKeyParts:  c.PartitionKeyParts,
-		S3Client:           c.S3Client,
+		Target:             targetFrom(c),
 		PartitionKeyOf:     c.PartitionKeyOf,
 		Compression:        c.Compression,
 		BloomFilterColumns: c.BloomFilterColumns,
@@ -277,15 +237,11 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 // ReaderConfig[T].
 func readerConfigFrom[T any](c Config[T]) ReaderConfig[T] {
 	return ReaderConfig[T]{
-		Bucket:            c.Bucket,
-		Prefix:            c.Prefix,
-		PartitionKeyParts: c.PartitionKeyParts,
-		S3Client:          c.S3Client,
-		SettleWindow:      c.SettleWindow,
-		EntityKeyOf:       c.EntityKeyOf,
-		VersionOf:         c.VersionOf,
-		InsertedAtField:   c.InsertedAtField,
-		OnMissingData:     c.OnMissingData,
+		Target:          targetFrom(c),
+		EntityKeyOf:     c.EntityKeyOf,
+		VersionOf:       c.VersionOf,
+		InsertedAtField: c.InsertedAtField,
+		OnMissingData:   c.OnMissingData,
 	}
 }
 

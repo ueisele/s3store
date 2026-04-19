@@ -30,15 +30,15 @@ func (s *Reader[T]) Poll(
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	entries, offset, err := refstream.Poll(ctx, s.s3,
+	entries, offset, err := refstream.Poll(ctx, s.cfg.Target.S3Client,
 		refstream.PollOpts{
-			Bucket:       s.cfg.Bucket,
+			Bucket:       s.cfg.Target.Bucket,
 			RefPath:      s.refPath,
 			DataPath:     s.dataPath,
 			Since:        since,
 			MaxEntries:   maxEntries,
 			Until:        o.Until,
-			SettleWindow: s.cfg.settleWindow(),
+			SettleWindow: s.cfg.Target.settleWindow(),
 		})
 	if err != nil {
 		return nil, since, fmt.Errorf("s3parquet: %w", err)

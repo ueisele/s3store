@@ -129,23 +129,27 @@ using `New(Config)` and get both through `Store`. Services that only
 write or only read can construct a single half with a narrower config:
 
 ```go
+// Build the shared S3 wiring once — Target is the untyped handle
+// Writer, Reader, Index, and BackfillIndex all speak.
+target := s3parquet.NewS3Target(
+    "warehouse", "billing", s3Client,
+    []string{"charge_period", "customer"},
+)
+
 // Write-only service: no read-side knobs in config.
 w, err := s3parquet.NewWriter[CostRecord](s3parquet.WriterConfig[CostRecord]{
-    Bucket: "warehouse", Prefix: "billing", S3Client: s3Client,
-    PartitionKeyParts: []string{"charge_period", "customer"},
+    Target:         target,
     PartitionKeyOf: func(r CostRecord) string { /* ... */ },
 })
 
 // Read-only service: no PartitionKeyOf / Compression / BloomFilters.
 r, err := s3parquet.NewReader[CostRecord](s3parquet.ReaderConfig[CostRecord]{
-    Bucket: "warehouse", Prefix: "billing", S3Client: s3Client,
-    PartitionKeyParts: []string{"charge_period", "customer"},
-    SettleWindow:    5 * time.Second,
+    Target:          target,
     InsertedAtField: "InsertedAt",
 })
 ```
 
-### Narrow-T reads (View)
+### Narrow-T reads
 
 When the on-disk record has a heavy write-only column you never read
 (a JSON blob, an audit log, an embedding vector), declare a narrower
@@ -166,17 +170,17 @@ type NarrowRec struct {
 }
 
 store, _ := s3parquet.New[FullRec](cfg)
-view, _ := s3parquet.NewViewFromStore[NarrowRec, FullRec](store,
-    s3parquet.ReaderExtras[NarrowRec]{
-        SettleWindow: 5 * time.Second,
-    })
+view, _ := s3parquet.NewReaderFromStore[NarrowRec, FullRec](store,
+    s3parquet.ReaderExtras[NarrowRec]{})
 
 recs, _ := view.Read(ctx, "*") // []NarrowRec — ProcessLog not fetched
 ```
 
-`ReaderExtras[T']` carries the read-side knobs that aren't shared with
-the Writer (`SettleWindow`, `EntityKeyOf`, `VersionOf`, `InsertedAtField`,
-`OnMissingData`). Dedup closures are typed over `T'`, so you supply them
+`ReaderExtras[T']` carries the read-side knobs that aren't shared
+with the Writer (`EntityKeyOf`, `VersionOf`, `InsertedAtField`,
+`OnMissingData`). `SettleWindow` is inherited from the Writer
+(and its `S3Target`), so the view sees the same window as the
+source. Dedup closures are typed over `T'`, so you supply them
 explicitly for the narrow shape when needed.
 
 The relationship between constructors:
@@ -186,9 +190,8 @@ The relationship between constructors:
 | Both write and read, same `T` | `New(Config[T])` → `*Store[T]` |
 | Write only, narrow config | `NewWriter(WriterConfig[T])` → `*Writer[T]` |
 | Read only, narrow config | `NewReader(ReaderConfig[T])` → `*Reader[T]` |
-| Same-`T` Reader over a Writer | `writer.Reader(extras)` |
-| Narrower-`T'` Reader over a Writer | `NewView[T', U](writer, extras)` |
-| Narrower-`T'` Reader over a Store | `NewViewFromStore[T', U](store, extras)` |
+| Same-/narrower-`T'` Reader over a Writer | `NewReaderFromWriter[T', U](writer, extras)` |
+| Same-/narrower-`T'` Reader over a Store | `NewReaderFromStore[T', U](store, extras)` |
 
 ## Non-trivial Go types (`decimal.Decimal`, UUID wrappers, …)
 
@@ -607,10 +610,12 @@ store, _ := s3store.New[Usage](cfg)
 
 skuIdx, err := s3store.NewIndex[Usage, SkuPeriodEntry](store,
     s3store.IndexDef[Usage, SkuPeriodEntry]{
-        Name:    "sku_period_idx",
-        Columns: []string{
-            "sku_id", "charge_period_start",
-            "causing_customer", "charge_period_end",
+        IndexLookupDef: s3store.IndexLookupDef[SkuPeriodEntry]{
+            Name:    "sku_period_idx",
+            Columns: []string{
+                "sku_id", "charge_period_start",
+                "causing_customer", "charge_period_end",
+            },
         },
         Of: func(u Usage) []SkuPeriodEntry {
             return []SkuPeriodEntry{{
@@ -621,7 +626,14 @@ skuIdx, err := s3store.NewIndex[Usage, SkuPeriodEntry](store,
             }}
         },
     })
+// skuIdx is *s3store.Index[SkuPeriodEntry] — T-free, so a
+// read-only service can share the same handle type.
 ```
+
+The returned `Index[K]` is T-free. `IndexDef[T, K]` embeds
+`IndexLookupDef[K]` (just `Name` + `Columns`); read-only callers
+that don't need `Of` can build an `Index[K]` directly from an
+`S3Target` + `IndexLookupDef[K]` via `s3parquet.NewIndex`.
 
 Every `Write` call iterates each registered index, collects a
 deduplicated set of entries across the batch, and PUTs one empty
@@ -650,49 +662,64 @@ matches.
   `LastModified` inside `now - SettleWindow` are hidden, matching
   `Poll`'s guarantees so index and data views agree within the
   window.
-- **Backfill** for indexes registered on a live store (below).
+- **Backfill** as a standalone package function (below).
 
 ### Backfill
 
 The normal path is to register an index before the first `Write`
 so every record produces markers. When that isn't possible —
-adding an index to a store that already has data, or recovering
-from a missed registration — `Backfill` scans existing parquet
-and emits the markers retroactively:
+adding an index to a store that already has data — the typical
+shape is:
+
+1. Deploy the live app with the index registered (`NewIndex`);
+   every new `Write` emits markers from time T0 onward.
+2. Capture `until := store.OffsetAt(T0)` — the watermark before
+   which historical data is uncovered.
+3. Run a **one-off migration job** using the package-level
+   `s3store.BackfillIndex` that scans files with `LastModified <
+   until` and PUTs the retroactive markers.
 
 ```go
-stats, err := skuIdx.Backfill(ctx, "*") // or a narrower pattern
+stats, err := s3store.BackfillIndex(ctx,
+    store.Target(), // or construct via s3parquet.NewS3Target
+    def,            // the same IndexDef the live app registered
+    "*",            // pattern (PartitionKeyParts grammar)
+    until,          // exclusive upper bound on LastModified
+    func(path string) { slog.Warn("missing data", "path", path) },
+)
 // stats.DataObjects / Records / Markers
 ```
 
-The pattern is evaluated against the store's `PartitionKeyParts`
+`BackfillIndex` is deliberately standalone — no `Writer` /
+`Reader` argument — so the migration job doesn't need the live
+app's full config. It runs through the same `S3Target`
+abstraction used by `NewIndex`, issuing both parquet GETs and
+marker PUTs via `target.S3Client`. Typically invoked from a
+dedicated binary (`cmd/backfill-<name>/main.go` in your repo): a
+~30-line `main` that builds an S3 client + `S3Target` + `def`
+and calls `BackfillIndex` is the idiomatic shape.
+
+The pattern is evaluated against the target's `PartitionKeyParts`
 (same grammar as `Read`), **not** against the index's `Columns`
-— `Backfill` walks parquet data files, which are keyed by
+— backfill walks parquet data files, which are keyed by
 partition. A migration job can shard itself by partition
 (`period=2026-01-*` on one pod, `period=2026-02-*` on another)
-instead of running a single multi-hour call. `Backfill`
-processes parquet objects with the same bounded parallelism as
-`Read` internally, so single-pod runs already saturate a typical
-S3 connection pool.
+instead of running a single multi-hour call. The `until` bound
+lets the live writer and the migration job cooperate without
+overlap: live markers for everything from T0, backfill markers
+for everything before. Pass `s3store.Offset("")` to disable the
+bound (covers every file currently present — harmless but
+redundant if the live writer has been up for a while, since PUT
+is idempotent).
 
 Idempotent at the S3 level (same empty marker, same key), so a
-retry after cancel or crash is a no-op on work already done.
-Safe to run while other goroutines keep writing records that were
-already visible at `NewIndex` time; coverage of records written
-*across* the registration boundary is not guaranteed — a `Write`
-whose `s.indexes` snapshot predates the new registration may PUT
-parquet that `Backfill`'s LIST also misses. For a clean backfill
-on a live store, quiesce writers around `NewIndex`.
+retry after cancel or crash is a no-op on work already done. Safe
+to run while the live writer keeps emitting markers for fresh
+records.
 
 Lookup's SettleWindow applies to backfilled markers too — expect
 up to one SettleWindow of lag before a just-backfilled index
 fully reports.
-
-Intended to run from a dedicated migration binary
-(`cmd/backfill-<name>/main.go` in your app repo): because `Index`
-is generic over your record and entry types, there's no
-library-provided CLI. A ~30-line `main` that constructs the store
-+ index and calls `Backfill` is the idiomatic shape.
 
 ### Not in v1 (deferred)
 
@@ -820,7 +847,7 @@ retry can skip them if needed.
 
 ### Read
 
-`Read`, `PollRecords`, and `Index.Backfill` tolerate a missing
+`Read`, `PollRecords`, and `BackfillIndex` tolerate a missing
 data file (S3 `NoSuchKey`) by skipping it and invoking an
 optional `Config.OnMissingData(dataPath)` hook. This covers two
 rare but real scenarios:
@@ -904,17 +931,52 @@ package's `Config[T]` for the exact fields.
 
 ## Migration from earlier versions
 
-Breaking changes in the Writer/Reader split (s3parquet only):
+Breaking changes in the Index refactor (s3parquet only; umbrella
+`s3store.NewIndex` still bundles register + handle in one call):
 
-- **`s3parquet.NewIndex(store, def)` → `s3parquet.NewIndexFromStore(store, def)`.**
-  Indexes are a write-side concern, so the primary `NewIndex` now takes
-  `*Writer[T]`. Keep the convenience `NewIndexFromStore` if you hold a
-  Store — it's a single-word rename. The umbrella `s3store.NewIndex`
-  signature is unchanged.
+- **`Index[T, K]` → `Index[K]`.** Lookup never touches T, so the
+  query handle is now T-free. A read-only service (dashboard,
+  query API) can share one `Index[K]` across any `T` that
+  produced the markers.
+- **`IndexDef` split.** `IndexLookupDef[K]` holds the read-side
+  `Name` + `Columns`; `IndexDef[T, K]` embeds it and adds `Of`.
+  Existing struct literals need an extra layer:
+
+  ```go
+  s3parquet.IndexDef[T, K]{
+      IndexLookupDef: s3parquet.IndexLookupDef[K]{
+          Name:    "...",
+          Columns: []string{"..."},
+      },
+      Of: func(T) []K { ... },
+  }
+  ```
+
+- **`s3parquet.NewIndex` re-signed.** The primary `NewIndex` now
+  takes an untyped `S3Target` + `IndexLookupDef[K]` — pure-read
+  flow, no writer registration, no `T` on the call site. For the
+  old "register + handle" shape use
+  `s3parquet.NewIndexWithRegister(writer, def)` or
+  `s3parquet.NewIndexFromStoreWithRegister(store, def)`.
+- **`Index.Backfill` removed; use the package-level
+  `s3parquet.BackfillIndex` / `s3store.BackfillIndex`.** The new
+  function takes an `S3Target` + `IndexDef` + `pattern` + `until
+  Offset` + `onMissingData` hook, with no writer/reader argument.
+  The common shape is a standalone migration job; see the
+  [Backfill](#backfill) section for the expected flow.
 - **`s3parquet.Store.Close()` removed.** The method was a documented
   no-op (pure-Go Store held no resources). Delete the call sites.
   `s3sql.Store.Close()` and `s3store.Store.Close()` still exist — only
   the parquet side lost it.
+- **`WriterConfig` / `ReaderConfig` restructured.** The five
+  S3-wiring fields (`Bucket`, `Prefix`, `S3Client`,
+  `PartitionKeyParts`, `SettleWindow`) moved under a single
+  `Target s3parquet.S3Target` field. Move those fields into a
+  `Target: s3parquet.S3Target{...}` literal, or build the target
+  once via `s3parquet.NewS3Target(...)` and reuse it between
+  `WriterConfig` and `ReaderConfig`. The unified umbrella
+  `s3store.Config[T]` is unchanged — its flat layout still
+  projects onto the narrower configs internally.
 
 Breaking changes in the package-split refactor:
 
@@ -1023,7 +1085,7 @@ rush it.
   route those workloads to `s3sql` which streams through DuckDB.
 - **Missing-data tolerance only in `s3parquet`.** `OnMissingData`
   (skip a parquet file whose GET returns `NoSuchKey`) is honored
-  by `s3parquet.Read` / `PollRecords` / `Index.Backfill`. The
+  by `s3parquet.Read` / `PollRecords` / `BackfillIndex`. The
   umbrella's `Read` / `Query` / `PollRecords` go through
   `s3sql`'s DuckDB path, which treats its input URI list as
   authoritative — a dangling ref fails the whole call. Use
