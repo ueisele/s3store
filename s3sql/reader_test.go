@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/ueisele/s3store/s3parquet"
 )
 
 type testRec struct {
@@ -14,33 +15,39 @@ type testRec struct {
 	Value    int64  `parquet:"value"`
 }
 
-func validConfig() Config[testRec] {
-	return Config[testRec]{
+func validTarget() s3parquet.S3Target {
+	return s3parquet.S3Target{
 		Bucket:            "b",
 		Prefix:            "p",
 		PartitionKeyParts: []string{"period", "customer"},
 		S3Client:          &s3.Client{},
-		TableAlias:        "t",
 	}
 }
 
-func TestNew_Validation(t *testing.T) {
+func validConfig() ReaderConfig[testRec] {
+	return ReaderConfig[testRec]{
+		Target:     validTarget(),
+		TableAlias: "t",
+	}
+}
+
+func TestNewReader_Validation(t *testing.T) {
 	cases := []struct {
 		name    string
-		mutate  func(*Config[testRec])
+		mutate  func(*ReaderConfig[testRec])
 		wantSub string
 	}{
-		{"missing Bucket", func(c *Config[testRec]) { c.Bucket = "" }, "Bucket is required"},
-		{"missing Prefix", func(c *Config[testRec]) { c.Prefix = "" }, "Prefix is required"},
-		{"missing TableAlias", func(c *Config[testRec]) { c.TableAlias = "" }, "TableAlias is required"},
-		{"missing S3Client", func(c *Config[testRec]) { c.S3Client = nil }, "S3Client is required"},
-		{"missing PartitionKeyParts", func(c *Config[testRec]) { c.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
+		{"missing Bucket", func(c *ReaderConfig[testRec]) { c.Target.Bucket = "" }, "Bucket is required"},
+		{"missing Prefix", func(c *ReaderConfig[testRec]) { c.Target.Prefix = "" }, "Prefix is required"},
+		{"missing TableAlias", func(c *ReaderConfig[testRec]) { c.TableAlias = "" }, "TableAlias is required"},
+		{"missing S3Client", func(c *ReaderConfig[testRec]) { c.Target.S3Client = nil }, "S3Client is required"},
+		{"missing PartitionKeyParts", func(c *ReaderConfig[testRec]) { c.Target.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
 			tc.mutate(&cfg)
-			_, err := New(cfg)
+			_, err := NewReader(cfg)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -52,15 +59,15 @@ func TestNew_Validation(t *testing.T) {
 	}
 }
 
-// newTestStore builds a Store without going through New(): no
-// DuckDB connection, no S3. Used for unit tests that only
+// newTestReader builds a Reader without going through NewReader:
+// no DuckDB connection, no S3. Used for unit tests that only
 // exercise pure helpers.
-func newTestStore() *Store[testRec] {
+func newTestReader() *Reader[testRec] {
 	cfg := validConfig()
-	return &Store[testRec]{
+	return &Reader[testRec]{
 		cfg:      cfg,
-		dataPath: cfg.Prefix + "/data",
-		refPath:  cfg.Prefix + "/_stream/refs",
+		dataPath: cfg.Target.Prefix + "/data",
+		refPath:  cfg.Target.Prefix + "/_stream/refs",
 	}
 }
 
@@ -86,7 +93,7 @@ func TestSQLQuote(t *testing.T) {
 }
 
 func TestBuildParquetURI(t *testing.T) {
-	s := newTestStore()
+	s := newTestReader()
 	cases := []struct {
 		name    string
 		pattern string
@@ -148,7 +155,7 @@ func TestBuildParquetURI(t *testing.T) {
 // segments. No ranges → empty string; each bounded side becomes
 // one predicate; multiple ranges are ANDed.
 func TestBuildRangeWhere(t *testing.T) {
-	s := newTestStore()
+	s := newTestReader()
 	cases := []struct {
 		name    string
 		pattern string
@@ -194,7 +201,7 @@ func TestBuildRangeWhere(t *testing.T) {
 // that the filename option is emitted only when the caller
 // requested it (for dedup tie-breaking).
 func TestScanExprForPattern_Range(t *testing.T) {
-	s := newTestStore()
+	s := newTestReader()
 	cases := []struct {
 		name         string
 		withFilename bool
@@ -226,7 +233,7 @@ func TestScanExprForPattern_Range(t *testing.T) {
 // TestDedupEnabled guards the dedup gate: explicit opt-in via
 // EntityKeyColumns, no default.
 func TestDedupEnabled(t *testing.T) {
-	var c Config[testRec]
+	var c ReaderConfig[testRec]
 	if c.dedupEnabled() {
 		t.Error("empty config: dedupEnabled should be false")
 	}
@@ -236,25 +243,25 @@ func TestDedupEnabled(t *testing.T) {
 	}
 }
 
-// TestNew_DedupValidation guards the both-or-neither rule: a
-// VersionColumn without EntityKeyColumns (or vice versa) is a
-// misconfiguration New() must reject at construction time.
-func TestNew_DedupValidation(t *testing.T) {
+// TestNewReader_DedupValidation guards the both-or-neither rule:
+// a VersionColumn without EntityKeyColumns (or vice versa) is a
+// misconfiguration NewReader must reject at construction time.
+func TestNewReader_DedupValidation(t *testing.T) {
 	cases := []struct {
 		name    string
-		mutate  func(*Config[testRec])
+		mutate  func(*ReaderConfig[testRec])
 		wantSub string
 	}{
 		{
 			name: "VersionColumn without EntityKeyColumns",
-			mutate: func(c *Config[testRec]) {
+			mutate: func(c *ReaderConfig[testRec]) {
 				c.VersionColumn = "ts"
 			},
 			wantSub: "EntityKeyColumns is required",
 		},
 		{
 			name: "EntityKeyColumns without VersionColumn",
-			mutate: func(c *Config[testRec]) {
+			mutate: func(c *ReaderConfig[testRec]) {
 				c.EntityKeyColumns = []string{"customer_id"}
 			},
 			wantSub: "VersionColumn is required",
@@ -264,7 +271,7 @@ func TestNew_DedupValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
 			tc.mutate(&cfg)
-			_, err := New(cfg)
+			_, err := NewReader(cfg)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -276,37 +283,34 @@ func TestNew_DedupValidation(t *testing.T) {
 	}
 }
 
-// TestNew_FilenameColumnCollision guards the guard: a T with a
-// `parquet:"filename"` field collides with DuckDB's
+// TestNewReader_FilenameColumnCollision guards the guard: a T
+// with a `parquet:"filename"` field collides with DuckDB's
 // read_parquet(filename=true), which we use for the dedup
-// tie-breaker and the InsertedAtField populate path. New() must
-// reject both configurations up front instead of producing
+// tie-breaker and the InsertedAtField populate path. NewReader
+// must reject both configurations up front instead of producing
 // wrong rows (dedup) or silently stealing the user's field
 // value (InsertedAtField) at query time.
-func TestNew_FilenameColumnCollision(t *testing.T) {
+func TestNewReader_FilenameColumnCollision(t *testing.T) {
 	type recWithFilename struct {
 		Period     string    `parquet:"period"`
 		Customer   string    `parquet:"customer"`
 		Filename   string    `parquet:"filename"`
 		InsertedAt time.Time `parquet:"-"`
 	}
-	mkCfg := func() Config[recWithFilename] {
-		return Config[recWithFilename]{
-			Bucket:            "b",
-			Prefix:            "p",
-			PartitionKeyParts: []string{"period", "customer"},
-			S3Client:          &s3.Client{},
-			TableAlias:        "t",
+	mkCfg := func() ReaderConfig[recWithFilename] {
+		return ReaderConfig[recWithFilename]{
+			Target:     validTarget(),
+			TableAlias: "t",
 		}
 	}
 	cases := []struct {
 		name    string
-		mutate  func(*Config[recWithFilename])
+		mutate  func(*ReaderConfig[recWithFilename])
 		wantSub string
 	}{
 		{
 			name: "dedup enabled",
-			mutate: func(c *Config[recWithFilename]) {
+			mutate: func(c *ReaderConfig[recWithFilename]) {
 				c.EntityKeyColumns = []string{"period"}
 				c.VersionColumn = "customer"
 			},
@@ -314,7 +318,7 @@ func TestNew_FilenameColumnCollision(t *testing.T) {
 		},
 		{
 			name: "InsertedAtField set",
-			mutate: func(c *Config[recWithFilename]) {
+			mutate: func(c *ReaderConfig[recWithFilename]) {
 				c.InsertedAtField = "InsertedAt"
 			},
 			wantSub: "InsertedAtField",
@@ -324,7 +328,7 @@ func TestNew_FilenameColumnCollision(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := mkCfg()
 			tc.mutate(&cfg)
-			_, err := New(cfg)
+			_, err := NewReader(cfg)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -336,10 +340,12 @@ func TestNew_FilenameColumnCollision(t *testing.T) {
 	}
 }
 
-// TestSettleWindowDefault guards the 5s default.
+// TestSettleWindowDefault guards the 5s default propagated via
+// the Target. Redundant with s3parquet's own test for
+// EffectiveSettleWindow, but locks the cross-package contract.
 func TestSettleWindowDefault(t *testing.T) {
-	var c Config[testRec]
-	if got := c.settleWindow(); got.String() != "5s" {
+	var target s3parquet.S3Target
+	if got := target.EffectiveSettleWindow(); got.String() != "5s" {
 		t.Errorf("default: got %v", got)
 	}
 }

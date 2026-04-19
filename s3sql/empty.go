@@ -37,12 +37,12 @@ func isNoFilesMatchedError(err error) bool {
 // for-rows.Next loop see a clean empty iteration; callers that
 // inspect rows.Columns() see a single synthetic NULL column —
 // document this if anyone ever leans on the column list.
-func (s *Store[T]) emptyRows(ctx context.Context) (*sql.Rows, error) {
+func (s *Reader[T]) emptyRows(ctx context.Context) (*sql.Rows, error) {
 	return s.db.QueryContext(ctx, "SELECT NULL WHERE 1=0")
 }
 
 // emptyRow returns a *sql.Row whose Scan returns sql.ErrNoRows,
 // matching database/sql's standard "no rows" contract.
-func (s *Store[T]) emptyRow(ctx context.Context) *sql.Row {
+func (s *Reader[T]) emptyRow(ctx context.Context) *sql.Row {
 	return s.db.QueryRowContext(ctx, "SELECT NULL WHERE 1=0")
 }

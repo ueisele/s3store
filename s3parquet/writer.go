@@ -84,7 +84,7 @@ func (w *Writer[T]) Target() S3Target {
 // PartitionKeyOf is optional at construction — Write errors if
 // called without it, but WriteWithKey works regardless.
 func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
-	if err := cfg.Target.validate(); err != nil {
+	if err := cfg.Target.Validate(); err != nil {
 		return nil, err
 	}
 	if err := validateBloomFilterColumns[T](cfg.BloomFilterColumns); err != nil {

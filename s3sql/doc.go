@@ -1,11 +1,18 @@
-// Package s3sql provides SQL-based access to an s3store using
-// embedded DuckDB as the query engine. Requires cgo.
+// Package s3sql provides SQL-based read access to an s3store
+// using embedded DuckDB as the query engine. Requires cgo.
+//
+// The package is read-only. Writes go through
+// github.com/ueisele/s3store/s3parquet.Writer; s3sql.Reader
+// queries the parquet files the Writer produced. Construct via
+// NewReader, passing the same s3parquet.S3Target value the
+// Writer was built with so the two halves can't drift on
+// Bucket / Prefix / SettleWindow / DisableRefStream.
 //
 // The target record type T drives both the SQL result shape and
 // the per-row binding: s3sql reflects over T's parquet struct
-// tags at New() time and builds a NULL-safe row binder that
-// populates T directly from the result set. Columns absent from
-// the parquet file land as the field's Go zero value; user
+// tags at NewReader() time and builds a NULL-safe row binder
+// that populates T directly from the result set. Columns absent
+// from the parquet file land as the field's Go zero value; user
 // types implementing sql.Scanner are supported (e.g.
 // shopspring/decimal.Decimal).
 //

@@ -16,7 +16,7 @@ import (
 // DuckDB's "No files found" error propagates. Use QueryMany (or
 // check isNoFilesMatchedError in caller code) if you want empty
 // treated as a successful zero-row iteration.
-func (s *Store[T]) Query(
+func (s *Reader[T]) Query(
 	ctx context.Context,
 	keyPattern string,
 	sqlQuery string,
@@ -54,7 +54,7 @@ func (s *Store[T]) Query(
 // empty *sql.Rows. The synthetic empty cursor carries a single
 // NULL column; callers iterating via the standard
 // for-rows.Next-rows.Scan loop see a clean empty iteration.
-func (s *Store[T]) QueryMany(
+func (s *Reader[T]) QueryMany(
 	ctx context.Context,
 	patterns []string,
 	sqlQuery string,
@@ -100,7 +100,7 @@ func (s *Store[T]) QueryMany(
 // Does not normalize "zero files match" — DuckDB's error
 // propagates via Scan. Use QueryRowMany if you want the
 // standard sql.ErrNoRows contract on empty matches.
-func (s *Store[T]) QueryRow(
+func (s *Reader[T]) QueryRow(
 	ctx context.Context,
 	keyPattern string,
 	sqlQuery string,
@@ -131,7 +131,7 @@ func (s *Store[T]) QueryRow(
 // knowing the match set up front; the extra S3 LIST is the
 // same one DuckDB would issue internally, so net latency is
 // unchanged.
-func (s *Store[T]) QueryRowMany(
+func (s *Reader[T]) QueryRowMany(
 	ctx context.Context,
 	patterns []string,
 	sqlQuery string,

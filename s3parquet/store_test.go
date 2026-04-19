@@ -215,11 +215,11 @@ func TestNew_BloomFilterColumnsValidation(t *testing.T) {
 
 func TestSettleWindowDefault(t *testing.T) {
 	var target S3Target
-	if got := target.settleWindow(); got.String() != "5s" {
+	if got := target.EffectiveSettleWindow(); got.String() != "5s" {
 		t.Errorf("S3Target default: got %v, want 5s", got)
 	}
 	target.SettleWindow = 2 * time.Second
-	if got := target.settleWindow(); got != 2*time.Second {
+	if got := target.EffectiveSettleWindow(); got != 2*time.Second {
 		t.Errorf("S3Target explicit: got %v, want 2s", got)
 	}
 }

@@ -23,8 +23,8 @@ needs:
 | Package | cgo | Import path | Capabilities |
 |---|---|---|---|
 | `s3parquet` | **no** | `github.com/ueisele/s3store/s3parquet` | Write, WriteWithKey, Read, Poll, PollRecords. Pure Go / parquet-go; in-memory dedup. |
-| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | Read, Query, QueryRow, Poll, PollRecords. Embedded DuckDB; SQL. |
-| `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Forwards to `s3parquet` for writes/poll, `s3sql` for typed reads. |
+| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | **Read-only.** Read, Query, QueryRow, Poll, PollRecords via embedded DuckDB. Construct with `NewReader(ReaderConfig)`; share the same `s3parquet.S3Target` with the Writer so the two halves can't drift. |
+| `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Composes `s3parquet.Writer` + `s3sql.Reader`; both halves share one `S3Target` so they can't drift on S3 wiring. |
 
 Binary size: DuckDB bundles a ~50 MB C++ library. `CGO_ENABLED=0 go build
 ./s3parquet/...` produces a small static binary with none of it. The
@@ -572,9 +572,9 @@ has no refs, so flipping the flag back does not retroactively make
 `Poll` see the historical writes.
 
 Both sides of the deployment (writer and `s3sql` reader) must agree
-on the flag — set it on the umbrella `Config`, or on both
-`s3parquet.Config` and `s3sql.Config` when wired separately. The
-two failure modes if they drift:
+on the flag — set it on the umbrella `Config`, or on the
+`s3parquet.S3Target` shared by `s3parquet.Writer` and
+`s3sql.Reader`. The two failure modes if they drift:
 
 - **Writer disabled + reader enabled** — `Poll` walks an empty
   `_stream/refs/` prefix and silently returns zero entries with no
@@ -719,8 +719,8 @@ read paths and the index layer:
 
 | Entry point | Where |
 |---|---|
-| `Reader.ReadMany` | `s3parquet`, `s3sql`, umbrella |
-| `Store.QueryMany` / `QueryRowMany` | `s3sql`, umbrella |
+| `Reader.ReadMany` | `s3parquet.Reader`, `s3sql.Reader`, umbrella |
+| `Reader.QueryMany` / `QueryRowMany` | `s3sql.Reader`, umbrella |
 | `Index.LookupMany` | `s3parquet`, umbrella |
 | `BackfillIndexMany` | `s3parquet`, umbrella |
 
@@ -1043,10 +1043,35 @@ Credentials are not auto-derived (they can rotate); pass them via
 roles, use `CREATE SECRET ... PROVIDER credential_chain` so DuckDB
 resolves them itself and stays fresh.
 
-Configuration for `s3parquet` and `s3sql` directly is narrower — see each
-package's `Config[T]` for the exact fields.
+Configuration for the sub-packages is narrower — see
+`s3parquet.Config[T]`, `s3parquet.WriterConfig[T]`,
+`s3parquet.ReaderConfig[T]`, and `s3sql.ReaderConfig[T]` for
+the exact fields.
 
 ## Migration from earlier versions
+
+Breaking changes in the `s3sql`-as-Reader refactor:
+
+- **`s3sql.Store[T]` → `s3sql.Reader[T]`.** The type only ever
+  read; the rename makes that contract explicit.
+- **`s3sql.Config[T]` → `s3sql.ReaderConfig[T]`.** The S3-wiring
+  fields (`Bucket`, `Prefix`, `S3Client`, `PartitionKeyParts`,
+  `SettleWindow`, `DisableRefStream`) moved under a single
+  `Target s3parquet.S3Target` field. Build the target once and
+  share it between `s3parquet.WriterConfig` and
+  `s3sql.ReaderConfig` so the two halves can't drift.
+- **`s3sql.New` → `s3sql.NewReader`.**
+- **Umbrella `s3store.Store[T]` internals recomposed** around
+  `s3parquet.Writer[T]` + `s3sql.Reader[T]` (was `s3parquet.Store[T]`
+  + `s3sql.Store[T]`). `s3store.Config[T]` is unchanged; the
+  umbrella now exposes `.Writer()` and `.Reader()` accessors if
+  a caller needs the underlying halves.
+- **`s3parquet.S3Target.settleWindow()` → `EffectiveSettleWindow()`
+  and `validate()/validateLookup()` → `Validate()/ValidateLookup()`.**
+  Internal-only methods promoted so `s3sql.NewReader` can reuse
+  them without duplicating validation logic.
+
+
 
 Breaking changes in the Index refactor (s3parquet only; umbrella
 `s3store.NewIndex` still bundles register + handle in one call):
@@ -1083,7 +1108,7 @@ Breaking changes in the Index refactor (s3parquet only; umbrella
   [Backfill](#backfill) section for the expected flow.
 - **`s3parquet.Store.Close()` removed.** The method was a documented
   no-op (pure-Go Store held no resources). Delete the call sites.
-  `s3sql.Store.Close()` and `s3store.Store.Close()` still exist — only
+  `s3sql.Reader.Close()` and `s3store.Store.Close()` still exist — only
   the parquet side lost it.
 - **`WriterConfig` / `ReaderConfig` restructured.** The five
   S3-wiring fields (`Bucket`, `Prefix`, `S3Client`,

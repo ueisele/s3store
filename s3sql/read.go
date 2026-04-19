@@ -25,7 +25,7 @@ import (
 // (e.g. a non-Cartesian "(period=A, customer=X), (period=B,
 // customer=Y)" selection) that can't be expressed as one
 // pattern.
-func (s *Store[T]) Read(
+func (s *Reader[T]) Read(
 	ctx context.Context,
 	keyPattern string,
 	opts ...QueryOption,
@@ -62,7 +62,7 @@ func (s *Store[T]) Read(
 //
 // Empty slice → (nil, nil). Zero file matches → (nil, nil).
 // First malformed pattern fails with its index.
-func (s *Store[T]) ReadMany(
+func (s *Reader[T]) ReadMany(
 	ctx context.Context,
 	patterns []string,
 	opts ...QueryOption,

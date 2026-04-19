@@ -51,45 +51,44 @@ type sqlOpts struct {
 
 // testFixture bundles the per-test MinIO bucket + a matching
 // s3parquet writer + an s3sql reader pointed at the same
-// Bucket/Prefix.
+// S3Target.
 type testFixture struct {
 	bucket string
-	writer *s3parquet.Store[Rec]
-	sql    *s3sql.Store[Rec]
+	writer *s3parquet.Writer[Rec]
+	sql    *s3sql.Reader[Rec]
 }
 
 // newFixture creates a fresh bucket on the shared MinIO,
-// constructs a matching writer (s3parquet) and reader
-// (s3sql) against it, and wires cleanup.
+// constructs a matching Writer and Reader against a shared
+// S3Target, and wires cleanup.
 func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	t.Helper()
 	f := testutil.New(t)
-	w, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
-		Bucket:             f.Bucket,
-		Prefix:             "store",
-		S3Client:           f.S3Client,
-		PartitionKeyParts:  []string{"period", "customer"},
-		PartitionKeyOf:     partitionKeyOfRec,
-		SettleWindow:       10 * time.Millisecond,
-		BloomFilterColumns: opts.bloomFilterColumns,
-	})
-	if err != nil {
-		t.Fatalf("s3parquet.New: %v", err)
-	}
-
-	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
+	target := s3parquet.S3Target{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		TableAlias:        "records",
-		VersionColumn:     opts.versionColumn,
-		EntityKeyColumns:  opts.entityKeyColumns,
 		SettleWindow:      10 * time.Millisecond,
-		ExtraInitSQL:      f.DuckDBCredentials(),
+	}
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
+		Target:             target,
+		PartitionKeyOf:     partitionKeyOfRec,
+		BloomFilterColumns: opts.bloomFilterColumns,
 	})
 	if err != nil {
-		t.Fatalf("s3sql.New: %v", err)
+		t.Fatalf("s3parquet.NewWriter: %v", err)
+	}
+
+	s, err := s3sql.NewReader(s3sql.ReaderConfig[Rec]{
+		Target:           target,
+		TableAlias:       "records",
+		VersionColumn:    opts.versionColumn,
+		EntityKeyColumns: opts.entityKeyColumns,
+		ExtraInitSQL:     f.DuckDBCredentials(),
+	})
+	if err != nil {
+		t.Fatalf("s3sql.NewReader: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -152,33 +151,32 @@ func TestInsertedAtField_Populate(t *testing.T) {
 	}
 
 	f := testutil.New(t)
-	w, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
+	target := s3parquet.S3Target{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
+		SettleWindow:      10 * time.Millisecond,
+	}
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecWithMeta]{
+		Target: target,
 		PartitionKeyOf: func(r RecWithMeta) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 10 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("s3parquet.New: %v", err)
+		t.Fatalf("s3parquet.NewWriter: %v", err)
 	}
 
-	sq, err := s3sql.New[RecWithMeta](s3sql.Config[RecWithMeta]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		TableAlias:        "records",
-		SettleWindow:      10 * time.Millisecond,
-		ExtraInitSQL:      f.DuckDBCredentials(),
-		InsertedAtField:   "InsertedAt",
+	sq, err := s3sql.NewReader(s3sql.ReaderConfig[RecWithMeta]{
+		Target:          target,
+		TableAlias:      "records",
+		ExtraInitSQL:    f.DuckDBCredentials(),
+		InsertedAtField: "InsertedAt",
 	})
 	if err != nil {
-		t.Fatalf("s3sql.New: %v", err)
+		t.Fatalf("s3sql.NewReader: %v", err)
 	}
 	t.Cleanup(func() { _ = sq.Close() })
 
@@ -738,19 +736,22 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	testFix := testutil.New(t)
 
 	// Old-shape file: no Amount, no Currency.
-	wOld, err := s3parquet.New[RecNarrow](s3parquet.Config[RecNarrow]{
+	target := s3parquet.S3Target{
 		Bucket:            testFix.Bucket,
 		Prefix:            "store",
 		S3Client:          testFix.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
+		SettleWindow:      10 * time.Millisecond,
+	}
+	wOld, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecNarrow]{
+		Target: target,
 		PartitionKeyOf: func(r RecNarrow) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 10 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("s3parquet.New(RecNarrow): %v", err)
+		t.Fatalf("s3parquet.NewWriter(RecNarrow): %v", err)
 	}
 	if _, err := wOld.Write(context.Background(), []RecNarrow{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
@@ -760,17 +761,13 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	// Reader scans into Rec (which has Amount + Currency).
-	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
-		Bucket:            testFix.Bucket,
-		Prefix:            "store",
-		S3Client:          testFix.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		TableAlias:        "records",
-		SettleWindow:      10 * time.Millisecond,
-		ExtraInitSQL:      testFix.DuckDBCredentials(),
+	s, err := s3sql.NewReader(s3sql.ReaderConfig[Rec]{
+		Target:       target,
+		TableAlias:   "records",
+		ExtraInitSQL: testFix.DuckDBCredentials(),
 	})
 	if err != nil {
-		t.Fatalf("s3sql.New: %v", err)
+		t.Fatalf("s3sql.NewReader: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -813,19 +810,22 @@ func TestRead_SliceField(t *testing.T) {
 	f := testutil.New(t)
 	ctx := context.Background()
 
-	w, err := s3parquet.New[TagRec](s3parquet.Config[TagRec]{
+	target := s3parquet.S3Target{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
+		SettleWindow:      10 * time.Millisecond,
+	}
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[TagRec]{
+		Target: target,
 		PartitionKeyOf: func(r TagRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 10 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("s3parquet.New: %v", err)
+		t.Fatalf("s3parquet.NewWriter: %v", err)
 	}
 
 	if _, err := w.Write(ctx, []TagRec{
@@ -840,17 +840,13 @@ func TestRead_SliceField(t *testing.T) {
 	}
 	time.Sleep(30 * time.Millisecond)
 
-	s, err := s3sql.New[TagRec](s3sql.Config[TagRec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		TableAlias:        "records",
-		SettleWindow:      10 * time.Millisecond,
-		ExtraInitSQL:      f.DuckDBCredentials(),
+	s, err := s3sql.NewReader(s3sql.ReaderConfig[TagRec]{
+		Target:       target,
+		TableAlias:   "records",
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
-		t.Fatalf("s3sql.New: %v", err)
+		t.Fatalf("s3sql.NewReader: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -909,19 +905,22 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 	f := testutil.New(t)
 	ctx := context.Background()
 
-	w, err := s3parquet.New[JobRec](s3parquet.Config[JobRec]{
+	target := s3parquet.S3Target{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
+		SettleWindow:      10 * time.Millisecond,
+	}
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[JobRec]{
+		Target: target,
 		PartitionKeyOf: func(r JobRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 10 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("s3parquet.New: %v", err)
+		t.Fatalf("s3parquet.NewWriter: %v", err)
 	}
 
 	in := JobRec{
@@ -953,17 +952,13 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 	}
 	time.Sleep(30 * time.Millisecond)
 
-	s, err := s3sql.New[JobRec](s3sql.Config[JobRec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		TableAlias:        "records",
-		SettleWindow:      10 * time.Millisecond,
-		ExtraInitSQL:      f.DuckDBCredentials(),
+	s, err := s3sql.NewReader(s3sql.ReaderConfig[JobRec]{
+		Target:       target,
+		TableAlias:   "records",
+		ExtraInitSQL: f.DuckDBCredentials(),
 	})
 	if err != nil {
-		t.Fatalf("s3sql.New: %v", err)
+		t.Fatalf("s3sql.NewReader: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -1354,30 +1349,28 @@ func TestDisableRefStream_s3sql(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
 
-	writer, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
+	target := s3parquet.S3Target{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf:    partitionKeyOfRec,
 		SettleWindow:      10 * time.Millisecond,
 		DisableRefStream:  true,
-	})
-	if err != nil {
-		t.Fatalf("s3parquet.New: %v", err)
 	}
-	s, err := s3sql.New[Rec](s3sql.Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		TableAlias:        "records",
-		SettleWindow:      10 * time.Millisecond,
-		ExtraInitSQL:      f.DuckDBCredentials(),
-		DisableRefStream:  true,
+	writer, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
+		Target:         target,
+		PartitionKeyOf: partitionKeyOfRec,
 	})
 	if err != nil {
-		t.Fatalf("s3sql.New: %v", err)
+		t.Fatalf("s3parquet.NewWriter: %v", err)
+	}
+	s, err := s3sql.NewReader(s3sql.ReaderConfig[Rec]{
+		Target:       target,
+		TableAlias:   "records",
+		ExtraInitSQL: f.DuckDBCredentials(),
+	})
+	if err != nil {
+		t.Fatalf("s3sql.NewReader: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 

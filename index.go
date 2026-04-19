@@ -43,7 +43,7 @@ func NewIndex[T any, K comparable](
 	store *Store[T],
 	def IndexDef[T, K],
 ) (*Index[K], error) {
-	return s3parquet.NewIndexFromStoreWithRegister(store.parquet, def)
+	return s3parquet.NewIndexWithRegister(store.writer, def)
 }
 
 // BackfillIndex scans existing parquet data under pattern (with

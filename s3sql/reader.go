@@ -7,46 +7,40 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/ueisele/s3store/internal/core"
+	"github.com/ueisele/s3store/s3parquet"
 )
 
-// Config defines how an s3sql Store is set up. T is the record
-// type returned by Read and PollRecords; arbitrary SQL queries
-// via Query / QueryRow return *sql.Rows / *sql.Row directly.
+// ReaderConfig defines how an s3sql Reader is set up. T is the
+// record type returned by Read and PollRecords; arbitrary SQL
+// queries via Query / QueryRow return *sql.Rows / *sql.Row
+// directly.
 //
 // T must be a struct whose exported fields carry parquet struct
 // tags (e.g. `parquet:"customer"`). s3sql builds a reflection-
-// based row binder once at New() from those tags; the binder
-// drives both the SELECT column list and the per-row Scan into
-// typed records. Columns absent from the parquet file land as
-// the field's Go zero value; user types implementing
+// based row binder once at NewReader() from those tags; the
+// binder drives both the SELECT column list and the per-row Scan
+// into typed records. Columns absent from the parquet file land
+// as the field's Go zero value; user types implementing
 // sql.Scanner are supported.
-type Config[T any] struct {
-	// Bucket is the S3 bucket name.
-	Bucket string
-
-	// Prefix under which data files are stored.
-	Prefix string
-
-	// PartitionKeyParts defines the Hive-partition key segments in order.
-	PartitionKeyParts []string
-
-	// S3Client is the AWS S3 client used for ref listing (Poll).
-	// DuckDB's httpfs extension uses its own S3 client for actual
-	// parquet reads; its settings are auto-derived from this
-	// client's Options() (endpoint, region, URL style,
-	// use_ssl). Override via ExtraInitSQL if needed.
-	S3Client *s3.Client
+//
+// The S3-wiring bundle (Bucket, Prefix, S3Client,
+// PartitionKeyParts, SettleWindow, DisableRefStream) is carried
+// through a shared s3parquet.S3Target so a Writer and a Reader
+// built against the same dataset cannot drift on those fields.
+// A service that writes and reads in the same process can build
+// the Target once and pass the same value to both
+// s3parquet.WriterConfig.Target and ReaderConfig.Target.
+type ReaderConfig[T any] struct {
+	// Target carries the dataset's S3 wiring and partitioning
+	// metadata. Required; same S3Target the writing
+	// s3parquet.Writer was built with.
+	Target s3parquet.S3Target
 
 	// TableAlias is the name used in SQL queries for the CTE
 	// that wraps the base parquet scan. Required.
 	TableAlias string
-
-	// SettleWindow is how far behind the stream tip Poll and
-	// PollRecords read. Default: 5s.
-	SettleWindow time.Duration
 
 	// VersionColumn is the column name that orders versions of
 	// the same entity: the record with the greatest VersionColumn
@@ -84,64 +78,41 @@ type Config[T any] struct {
 	// behavior whose one side effect is that `SELECT *` surfaces
 	// an extra `filename` column.
 	InsertedAtField string
-
-	// DisableRefStream signals that this dataset was written
-	// without stream ref files (see s3parquet.S3Target.DisableRefStream).
-	// When set, Poll / PollRecords / PollRecordsAll return
-	// ErrRefStreamDisabled instead of silently walking an empty
-	// /_stream/refs/ prefix. Read / Query / QueryRow are unaffected;
-	// OffsetAt still works as a pure timestamp encoder. Must match
-	// the value used on the write side.
-	DisableRefStream bool
 }
 
-func (c Config[T]) settleWindow() time.Duration {
-	if c.SettleWindow > 0 {
-		return c.SettleWindow
-	}
-	return 5 * time.Second
-}
-
-// dedupEnabled reports whether the store should emit a dedup
+// dedupEnabled reports whether the reader should emit a dedup
 // CTE for reads. Gated on EntityKeyColumns being non-empty;
-// New() guarantees VersionColumn is also set when this is true.
-func (c Config[T]) dedupEnabled() bool {
+// NewReader guarantees VersionColumn is also set when this is true.
+func (c ReaderConfig[T]) dedupEnabled() bool {
 	return len(c.EntityKeyColumns) > 0
 }
 
-// Store is the cgo / DuckDB entry point to an s3store.
-type Store[T any] struct {
-	cfg      Config[T]
-	s3       *s3.Client
+// Reader is the cgo / DuckDB entry point to an s3store dataset.
+// Read-only: the write path lives in s3parquet.Writer.
+type Reader[T any] struct {
+	cfg      ReaderConfig[T]
 	db       *sql.DB
 	dataPath string
 	refPath  string
 	binder   *binder
 
 	// insertedAtFieldIndex is the reflect struct-field path for
-	// Config.InsertedAtField, resolved once at New(). nil when
-	// unset — scanAll short-circuits the filename-column lookup in
-	// that case, so there's no hot-path cost.
+	// Config.InsertedAtField, resolved once at NewReader(). nil
+	// when unset — scanAll short-circuits the filename-column
+	// lookup in that case, so there's no hot-path cost.
 	insertedAtFieldIndex []int
 }
 
-// New constructs a Store, opens a DuckDB connection, loads
-// httpfs, and applies auto-derived + user-supplied settings.
-func New[T any](cfg Config[T]) (*Store[T], error) {
-	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("s3sql: Bucket is required")
-	}
-	if cfg.Prefix == "" {
-		return nil, fmt.Errorf("s3sql: Prefix is required")
+// NewReader constructs a Reader, opens a DuckDB connection,
+// loads httpfs, and applies auto-derived + user-supplied
+// settings. The Target is validated as a partitioned-data target
+// (Bucket / Prefix / S3Client / PartitionKeyParts required).
+func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
+	if err := cfg.Target.Validate(); err != nil {
+		return nil, fmt.Errorf("s3sql: %w", err)
 	}
 	if cfg.TableAlias == "" {
 		return nil, fmt.Errorf("s3sql: TableAlias is required")
-	}
-	if cfg.S3Client == nil {
-		return nil, fmt.Errorf("s3sql: S3Client is required")
-	}
-	if err := core.ValidatePartitionKeyParts(cfg.PartitionKeyParts); err != nil {
-		return nil, err
 	}
 	// EntityKeyColumns + VersionColumn must be set together or
 	// not at all. Either alone is a misconfiguration that would
@@ -175,9 +146,9 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	// literally named "filename". A T that already maps a parquet
 	// column of that name would either lose its binding (scanAll
 	// steals the column) or produce a duplicate-schema error
-	// inside read_parquet. Catch the Go-side case at New() — the
-	// on-disk-parquet-has-"filename" case is still DuckDB's to
-	// reject at query time since we can't see the file schemas
+	// inside read_parquet. Catch the Go-side case at NewReader —
+	// the on-disk-parquet-has-"filename" case is still DuckDB's
+	// to reject at query time since we can't see the file schemas
 	// here.
 	if _, ok := b.byName["filename"]; ok {
 		if cfg.dedupEnabled() {
@@ -196,18 +167,17 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		}
 	}
 
-	db, err := openDuckDB(cfg.S3Client, cfg.ExtraInitSQL)
+	db, err := openDuckDB(cfg.Target.S3Client, cfg.ExtraInitSQL)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"s3sql: failed to open DuckDB: %w", err)
 	}
 
-	return &Store[T]{
+	return &Reader[T]{
 		cfg:                  cfg,
-		s3:                   cfg.S3Client,
 		db:                   db,
-		dataPath:             core.DataPath(cfg.Prefix),
-		refPath:              core.RefPath(cfg.Prefix),
+		dataPath:             core.DataPath(cfg.Target.Prefix),
+		refPath:              core.RefPath(cfg.Target.Prefix),
 		binder:               b,
 		insertedAtFieldIndex: insertedAtIdx,
 	}, nil
@@ -249,14 +219,22 @@ func validateInsertedAtField[T any](name string) ([]int, error) {
 	return f.Index, nil
 }
 
+// Target returns the S3Target this Reader is bound to. Useful
+// for tooling that constructs other read-only handles (indexes,
+// backfill) against the same dataset without reaching back into
+// the Config.
+func (s *Reader[T]) Target() s3parquet.S3Target {
+	return s.cfg.Target
+}
+
 // Close releases the DuckDB connection.
-func (s *Store[T]) Close() error {
+func (s *Reader[T]) Close() error {
 	return s.db.Close()
 }
 
-// s3URI returns the s3:// URI for a key in the store's bucket.
-func (s *Store[T]) s3URI(key string) string {
-	return fmt.Sprintf("s3://%s/%s", s.cfg.Bucket, key)
+// s3URI returns the s3:// URI for a key in the reader's bucket.
+func (s *Reader[T]) s3URI(key string) string {
+	return fmt.Sprintf("s3://%s/%s", s.cfg.Target.Bucket, key)
 }
 
 // sqlQuote returns a DuckDB single-quoted string literal with
@@ -274,11 +252,11 @@ func sqlQuote(value string) string {
 // Range segments (FROM..TO) become a common-prefix glob here;
 // the exact bounds are enforced by a WHERE clause built in
 // buildRangeWhere, applied over the hive partition column.
-func (s *Store[T]) buildParquetURI(
+func (s *Reader[T]) buildParquetURI(
 	keyPattern string,
 ) (string, error) {
 	segs, err := core.ParseKeyPattern(
-		keyPattern, s.cfg.PartitionKeyParts)
+		keyPattern, s.cfg.Target.PartitionKeyParts)
 	if err != nil {
 		return "", err
 	}
@@ -318,11 +296,11 @@ func (s *Store[T]) buildParquetURI(
 // entry as a column, and pushes string comparisons on those
 // columns down to file-selection time, so this is effectively
 // partition pruning at the SQL layer.
-func (s *Store[T]) buildRangeWhere(
+func (s *Reader[T]) buildRangeWhere(
 	keyPattern string,
 ) (string, error) {
 	segs, err := core.ParseKeyPattern(
-		keyPattern, s.cfg.PartitionKeyParts)
+		keyPattern, s.cfg.Target.PartitionKeyParts)
 	if err != nil {
 		return "", err
 	}

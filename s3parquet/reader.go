@@ -82,7 +82,7 @@ func (r *Reader[T]) Target() S3Target {
 // on T, and a default VersionOf is assigned when EntityKeyOf is
 // set but VersionOf is nil (wrote-last-wins).
 func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
-	if err := cfg.Target.validate(); err != nil {
+	if err := cfg.Target.Validate(); err != nil {
 		return nil, err
 	}
 	if cfg.EntityKeyOf != nil && cfg.VersionOf == nil {

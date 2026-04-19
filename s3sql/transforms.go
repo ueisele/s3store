@@ -28,7 +28,7 @@ import (
 // values, and the InsertedAtField populate path that parses
 // tsMicros out of the filename on scan. Callers typically
 // compute the flag via needsFilename().
-func (s *Store[T]) scanExprForPattern(
+func (s *Reader[T]) scanExprForPattern(
 	key string, withFilename bool,
 ) (string, error) {
 	parquetURI, err := s.buildParquetURI(key)
@@ -61,7 +61,7 @@ func (s *Store[T]) scanExprForPattern(
 // QueryRowMany. The single-pattern path still goes through
 // scanExprForPattern so DuckDB keeps its plan-time partition
 // pruning and the glob-expansion round-trip.
-func (s *Store[T]) scanExprForURIs(
+func (s *Reader[T]) scanExprForURIs(
 	uris []string, withFilename bool,
 ) string {
 	quoted := make([]string, len(uris))
@@ -94,7 +94,7 @@ func filenameOpt(withFilename bool) string {
 // scan-expr builders and wrapScanExpr both consult this so the
 // scan / CTE / post-scan binder agree on whether filename is
 // present.
-func (s *Store[T]) needsFilename(includeHistory bool) bool {
+func (s *Reader[T]) needsFilename(includeHistory bool) bool {
 	return (!includeHistory && s.cfg.dedupEnabled()) ||
 		s.cfg.InsertedAtField != ""
 }
@@ -104,7 +104,7 @@ func (s *Store[T]) needsFilename(includeHistory bool) bool {
 // call that raises at execution time, so the error surfaces
 // through the standard database/sql Row API without requiring
 // a signature change on QueryRow.
-func (s *Store[T]) errorRow(
+func (s *Reader[T]) errorRow(
 	ctx context.Context, err error,
 ) *sql.Row {
 	return s.db.QueryRowContext(ctx,
@@ -131,7 +131,7 @@ func (s *Store[T]) errorRow(
 // Either knob requires scanExpr to have been built with
 // filename=true; the caller computes that flag from the same
 // condition this function uses, keeping the two sides in sync.
-func (s *Store[T]) wrapScanExpr(
+func (s *Reader[T]) wrapScanExpr(
 	scanExpr string,
 	userSQL string,
 	includeHistory bool,
@@ -190,7 +190,7 @@ func (s *Store[T]) wrapScanExpr(
 // segment, and writes the resulting time.Time into the user's
 // InsertedAtField. Any other unmapped column (including filename
 // when InsertedAtField is unset) still gets a discard dest.
-func (s *Store[T]) scanAll(rows *sql.Rows) ([]T, error) {
+func (s *Reader[T]) scanAll(rows *sql.Rows) ([]T, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, fmt.Errorf(

@@ -101,7 +101,7 @@ func NewIndex[K comparable](
 	// Lookup never consults target.PartitionKeyParts — the
 	// index's own Columns drive the LIST path — so we use the
 	// reduced-validation helper instead of the full Target check.
-	if err := target.validateLookup(); err != nil {
+	if err := target.ValidateLookup(); err != nil {
 		return nil, err
 	}
 	return buildIndex(target, def)
@@ -354,7 +354,7 @@ func (i *Index[K]) valuesToEntry(values []string) K {
 func (i *Index[K]) listMatchingMarkers(
 	ctx context.Context, plan *readPlan,
 ) ([]string, error) {
-	cutoff := time.Now().Add(-i.target.settleWindow())
+	cutoff := time.Now().Add(-i.target.EffectiveSettleWindow())
 	paginator := i.target.list(plan.ListPrefix)
 
 	var keys []string
@@ -509,7 +509,7 @@ func BackfillIndexMany[T any, K comparable](
 	// Full Target check — BackfillIndex LISTs partitioned data
 	// files (plan.Match consults PartitionKeyParts), so
 	// validateLookup's reduced subset isn't enough.
-	if err := target.validate(); err != nil {
+	if err := target.Validate(); err != nil {
 		return stats, err
 	}
 	if def.Of == nil {

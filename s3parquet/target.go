@@ -83,25 +83,28 @@ func NewS3Target(
 	}
 }
 
-// validate runs the full check for constructors that operate on
+// Validate runs the full check for constructors that operate on
 // partitioned data: Bucket, Prefix, S3Client, PartitionKeyParts.
-// Used by NewWriter, NewReader, and BackfillIndex — anything that
-// reads/writes data files keyed by partition.
-func (t S3Target) validate() error {
-	if err := t.validateLookup(); err != nil {
+// Used by NewWriter, NewReader, BackfillIndex, and the s3sql
+// reader — anything that reads/writes data files keyed by
+// partition. Exported so s3sql's NewReader can reuse the same
+// check without duplicating the messages.
+func (t S3Target) Validate() error {
+	if err := t.ValidateLookup(); err != nil {
 		return err
 	}
 	return core.ValidatePartitionKeyParts(t.PartitionKeyParts)
 }
 
-// validateLookup is the reduced check for constructors that only
-// LIST / GET / PUT under a known prefix (no partition-key
+// ValidateLookup is the reduced check for constructors that
+// only LIST / GET / PUT under a known prefix (no partition-key
 // predicates): Bucket, Prefix, S3Client. Used by NewIndex —
 // Lookup walks the <Prefix>/_index/<name>/ subtree, which is
 // keyed by the index's own Columns, not the Target's
 // PartitionKeyParts. A read-only analytics service can pass a
 // minimally-populated S3Target and still build a working Index.
-func (t S3Target) validateLookup() error {
+// Exported alongside Validate for symmetry.
+func (t S3Target) ValidateLookup() error {
 	if t.Bucket == "" {
 		return fmt.Errorf("s3parquet: Bucket is required")
 	}
@@ -114,10 +117,11 @@ func (t S3Target) validateLookup() error {
 	return nil
 }
 
-// settleWindow returns the effective window, defaulting the zero
-// value to 5s so near-tip readers don't race writers that haven't
-// yet shown up in LIST.
-func (t S3Target) settleWindow() time.Duration {
+// EffectiveSettleWindow returns the resolved window, defaulting
+// the zero value to 5s so near-tip readers don't race writers
+// that haven't yet shown up in LIST. Exported so both s3parquet
+// and s3sql read the same resolved value from a shared S3Target.
+func (t S3Target) EffectiveSettleWindow() time.Duration {
 	if t.SettleWindow > 0 {
 		return t.SettleWindow
 	}

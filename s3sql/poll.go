@@ -21,28 +21,28 @@ import (
 // The paginator + cutoff logic lives in internal/refstream — it's
 // byte-identical with s3parquet.Poll and shares this one
 // implementation.
-func (s *Store[T]) Poll(
+func (s *Reader[T]) Poll(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
 	opts ...QueryOption,
 ) ([]StreamEntry, Offset, error) {
-	if s.cfg.DisableRefStream {
+	if s.cfg.Target.DisableRefStream {
 		return nil, since, ErrRefStreamDisabled
 	}
 
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	entries, offset, err := refstream.Poll(ctx, s.s3,
+	entries, offset, err := refstream.Poll(ctx, s.cfg.Target.S3Client,
 		refstream.PollOpts{
-			Bucket:       s.cfg.Bucket,
+			Bucket:       s.cfg.Target.Bucket,
 			RefPath:      s.refPath,
 			DataPath:     s.dataPath,
 			Since:        since,
 			MaxEntries:   maxEntries,
 			Until:        o.Until,
-			SettleWindow: s.cfg.settleWindow(),
+			SettleWindow: s.cfg.Target.EffectiveSettleWindow(),
 		})
 	if err != nil {
 		return nil, since, fmt.Errorf("s3sql: %w", err)
@@ -57,7 +57,7 @@ func (s *Store[T]) Poll(
 //
 // Dedup applies by default (latest-per-key by VersionColumn);
 // pass WithHistory() to disable.
-func (s *Store[T]) PollRecords(
+func (s *Reader[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
@@ -127,7 +127,7 @@ func (s *Store[T]) PollRecords(
 // Dedup semantics match PollRecords: per-batch. If you need
 // window-global latest-per-key, pass WithHistory and dedup
 // client-side.
-func (s *Store[T]) PollRecordsAll(
+func (s *Reader[T]) PollRecordsAll(
 	ctx context.Context,
 	since, until Offset,
 	opts ...QueryOption,
@@ -150,6 +150,6 @@ func (s *Store[T]) PollRecordsAll(
 //	start := store.OffsetAt(time.Date(y, m, d,   0,0,0,0, loc))
 //	end   := store.OffsetAt(time.Date(y, m, d+1, 0,0,0,0, loc))
 //	records, _ := store.PollRecordsAll(ctx, start, end)
-func (s *Store[T]) OffsetAt(t time.Time) Offset {
+func (s *Reader[T]) OffsetAt(t time.Time) Offset {
 	return refstream.OffsetAt(s.refPath, t)
 }

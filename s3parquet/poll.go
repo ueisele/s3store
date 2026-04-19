@@ -42,7 +42,7 @@ func (s *Reader[T]) Poll(
 			Since:        since,
 			MaxEntries:   maxEntries,
 			Until:        o.Until,
-			SettleWindow: s.cfg.Target.settleWindow(),
+			SettleWindow: s.cfg.Target.EffectiveSettleWindow(),
 		})
 	if err != nil {
 		return nil, since, fmt.Errorf("s3parquet: %w", err)

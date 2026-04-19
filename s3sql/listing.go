@@ -26,12 +26,12 @@ const listFanOutConcurrency = 8
 // pattern becomes one plan, each plan gets one LIST, and the
 // resulting file URIs go into a single read_parquet([...]) call
 // so DuckDB plans once over the full set.
-func (s *Store[T]) listMatchingParquet(
+func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *core.ReadPlan,
 ) ([]string, error) {
-	paginator := s3.NewListObjectsV2Paginator(s.s3,
+	paginator := s3.NewListObjectsV2Paginator(s.cfg.Target.S3Client,
 		&s3.ListObjectsV2Input{
-			Bucket: aws.String(s.cfg.Bucket),
+			Bucket: aws.String(s.cfg.Target.Bucket),
 			Prefix: aws.String(plan.ListPrefix),
 		})
 
@@ -70,13 +70,13 @@ func (s *Store[T]) listMatchingParquet(
 // point in the message. Callers should already have dropped
 // literal-duplicate patterns via core.DedupePatterns — this
 // function doesn't repeat that work.
-func (s *Store[T]) listAllMatchingURIs(
+func (s *Reader[T]) listAllMatchingURIs(
 	ctx context.Context, patterns []string, method string,
 ) ([]string, error) {
 	plans := make([]*core.ReadPlan, len(patterns))
 	for i, p := range patterns {
 		plan, err := core.BuildReadPlan(
-			p, s.dataPath, s.cfg.PartitionKeyParts)
+			p, s.dataPath, s.cfg.Target.PartitionKeyParts)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3sql: %s pattern %d %q: %w",
