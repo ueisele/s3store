@@ -50,6 +50,32 @@ func (s *Store[T]) scanExprForPattern(
 	return scan, nil
 }
 
+// scanExprForURIs is the multi-pattern sibling of
+// scanExprForPattern: given a pre-computed, deduplicated list of
+// exact file URIs (from listAllMatchingURIs), it emits the same
+// read_parquet(...) shape but with the URI list in place of a
+// glob and no range-WHERE clause (row-level filtering already
+// happened in Go via plan.Match).
+//
+// Used by the multi-pattern path of ReadMany / QueryMany /
+// QueryRowMany. The single-pattern path still goes through
+// scanExprForPattern so DuckDB keeps its plan-time partition
+// pruning and the glob-expansion round-trip.
+func (s *Store[T]) scanExprForURIs(
+	uris []string, withFilename bool,
+) string {
+	quoted := make([]string, len(uris))
+	for i, u := range uris {
+		quoted[i] = sqlQuote(u)
+	}
+	list := "[" + strings.Join(quoted, ", ") + "]"
+	return fmt.Sprintf(
+		"SELECT * FROM read_parquet(%s, "+
+			"hive_partitioning=true, hive_types_autocast=false, "+
+			"union_by_name=true%s)",
+		list, filenameOpt(withFilename))
+}
+
 // filenameOpt returns the trailing ", filename=true" fragment if
 // withFilename is set; empty string otherwise. Pulled out so the
 // two read_parquet builders (scanExprForPattern, PollRecords)

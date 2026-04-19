@@ -4,6 +4,7 @@ package s3sql_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
 	"testing"
@@ -975,5 +976,367 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 	if !reflect.DeepEqual(got[0].Logs, in.Logs) {
 		t.Errorf("Logs round-trip mismatch:\n got  %+v\n want %+v",
 			got[0].Logs, in.Logs)
+	}
+}
+
+// TestReadMany_NonCartesian proves the multi-pattern fast path:
+// ReadMany covers an arbitrary tuple set that a single Cartesian
+// pattern can't express without over-reading.
+func TestReadMany_NonCartesian(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10,
+			Currency: "USD", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2", Amount: 20,
+			Currency: "USD", Ts: time.UnixMilli(2)},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s3", Amount: 30,
+			Currency: "USD", Ts: time.UnixMilli(3)},
+		{Period: "2026-03-18", Customer: "def", SKU: "s4", Amount: 40,
+			Currency: "USD", Ts: time.UnixMilli(4)},
+	})
+
+	got, err := f.sql.ReadMany(context.Background(), []string{
+		"period=2026-03-17/customer=abc",
+		"period=2026-03-18/customer=def",
+	})
+	if err != nil {
+		t.Fatalf("ReadMany: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2: %+v", len(got), got)
+	}
+	amounts := map[float64]bool{}
+	for _, r := range got {
+		amounts[r.Amount] = true
+	}
+	if !amounts[10] || !amounts[40] {
+		t.Errorf("got %v, want {10, 40}", amounts)
+	}
+	if amounts[20] || amounts[30] {
+		t.Errorf("off-diagonal leaked: %v", amounts)
+	}
+}
+
+// TestQueryMany_AggregationAcrossPatterns is the killer use
+// case: one DuckDB query with GROUP BY runs over the unioned
+// file list, so aggregation is global. N separate Query calls
+// would force the caller to aggregate in Go across N result
+// sets.
+func TestQueryMany_AggregationAcrossPatterns(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10,
+			Currency: "USD", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "s2", Amount: 20,
+			Currency: "USD", Ts: time.UnixMilli(2)},
+		{Period: "2026-03-18", Customer: "def", SKU: "s3", Amount: 100,
+			Currency: "USD", Ts: time.UnixMilli(3)},
+		// Excluded from the query: period=2026-03-18/customer=abc.
+		{Period: "2026-03-18", Customer: "abc", SKU: "s4", Amount: 999,
+			Currency: "USD", Ts: time.UnixMilli(4)},
+	})
+
+	ctx := context.Background()
+	rows, err := f.sql.QueryMany(ctx, []string{
+		"period=2026-03-17/customer=abc",
+		"period=2026-03-18/customer=def",
+	},
+		"SELECT SUM(amount) AS total FROM records")
+	if err != nil {
+		t.Fatalf("QueryMany: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("QueryMany: no rows")
+	}
+	var total float64
+	if err := rows.Scan(&total); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	// 10 + 20 + 100 = 130. The off-diagonal 999 must NOT be
+	// included.
+	if total != 130 {
+		t.Errorf("total = %v, want 130", total)
+	}
+}
+
+// TestQueryRowMany covers the single-row sibling on a matching
+// pair of patterns + an aggregation.
+func TestQueryRowMany(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 10,
+			Currency: "USD", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-18", Customer: "def", SKU: "s2", Amount: 20,
+			Currency: "USD", Ts: time.UnixMilli(2)},
+	})
+
+	var total float64
+	err := f.sql.QueryRowMany(context.Background(), []string{
+		"period=2026-03-17/customer=abc",
+		"period=2026-03-18/customer=def",
+	},
+		"SELECT SUM(amount) FROM records").Scan(&total)
+	if err != nil {
+		t.Fatalf("QueryRowMany: %v", err)
+	}
+	if total != 30 {
+		t.Errorf("total = %v, want 30", total)
+	}
+}
+
+// TestReadMany_Overlap covers the case where two patterns match
+// the same file (wide pattern + narrow subset). The file must
+// be scanned once and produce one copy of each record in the
+// result.
+func TestReadMany_Overlap(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Amount: 1,
+			Currency: "USD", Ts: time.UnixMilli(1)},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2", Amount: 2,
+			Currency: "USD", Ts: time.UnixMilli(2)},
+	})
+
+	got, err := f.sql.ReadMany(context.Background(), []string{
+		"*",
+		"period=2026-03-17/customer=abc",
+	})
+	if err != nil {
+		t.Fatalf("ReadMany: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d, want 2 (overlap must not double-count)",
+			len(got))
+	}
+}
+
+// TestReadMany_Empty covers the empty-slice contract: every
+// *Many method normalises "no input" to an empty result rather
+// than propagating DuckDB's "No files found" error.
+func TestReadMany_Empty(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+	ctx := context.Background()
+
+	got, err := f.sql.ReadMany(ctx, nil)
+	if err != nil {
+		t.Errorf("ReadMany(nil): %v", err)
+	}
+	if got != nil {
+		t.Errorf("ReadMany(nil): got %v, want nil", got)
+	}
+
+	rows, err := f.sql.QueryMany(ctx, nil, "SELECT 1 FROM records")
+	if err != nil {
+		t.Errorf("QueryMany(nil): %v", err)
+	} else {
+		if rows.Next() {
+			t.Error("QueryMany(nil).Next(): got true, want false")
+		}
+		if err := rows.Err(); err != nil {
+			t.Errorf("QueryMany(nil).Err(): %v", err)
+		}
+		_ = rows.Close()
+	}
+
+	var x int
+	err = f.sql.QueryRowMany(ctx, nil,
+		"SELECT 1 FROM records").Scan(&x)
+	if err != sql.ErrNoRows {
+		t.Errorf("QueryRowMany(nil).Scan: got %v, want sql.ErrNoRows",
+			err)
+	}
+}
+
+// TestReadMany_NoFilesMatched covers Fix 1: a pattern that
+// matches zero files returns an empty result, not an error.
+// Previously DuckDB's "No files found" propagated through
+// single-pattern Read; ReadMany / QueryMany / QueryRowMany all
+// normalise that to empty now.
+func TestReadMany_NoFilesMatched(t *testing.T) {
+	f := newFixture(t, sqlOpts{})
+	ctx := context.Background()
+
+	// Write one record so the store isn't empty, but query a
+	// partition that has nothing.
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 1, Currency: "USD", Ts: time.UnixMilli(1)},
+	})
+
+	// Single-pattern Read, zero matches.
+	got, err := f.sql.Read(ctx,
+		"period=does-not-exist/customer=also-missing")
+	if err != nil {
+		t.Errorf("Read (no files): %v", err)
+	}
+	if got != nil {
+		t.Errorf("Read (no files): got %v, want nil", got)
+	}
+
+	// Single-pattern ReadMany, zero matches — takes the
+	// fast-path branch that catches DuckDB's error.
+	got, err = f.sql.ReadMany(ctx, []string{
+		"period=does-not-exist/customer=also-missing",
+	})
+	if err != nil {
+		t.Errorf("ReadMany single (no files): %v", err)
+	}
+	if got != nil {
+		t.Errorf("ReadMany single (no files): got %v, want nil", got)
+	}
+
+	// Multi-pattern ReadMany, zero matches — takes the
+	// pre-LIST branch that checks the URI list size.
+	got, err = f.sql.ReadMany(ctx, []string{
+		"period=nope/customer=nada",
+		"period=neither/customer=nope",
+	})
+	if err != nil {
+		t.Errorf("ReadMany multi (no files): %v", err)
+	}
+	if got != nil {
+		t.Errorf("ReadMany multi (no files): got %v, want nil", got)
+	}
+
+	// QueryMany single + multi — both produce an empty *sql.Rows.
+	for _, patterns := range [][]string{
+		{"period=nope/customer=nada"},
+		{"period=nope/customer=nada", "period=nix/customer=none"},
+	} {
+		rows, err := f.sql.QueryMany(ctx, patterns,
+			"SELECT 1 FROM records")
+		if err != nil {
+			t.Errorf("QueryMany %v: %v", patterns, err)
+			continue
+		}
+		if rows.Next() {
+			t.Errorf("QueryMany %v: Next() true, want false",
+				patterns)
+		}
+		_ = rows.Close()
+	}
+
+	// QueryRowMany: Scan returns sql.ErrNoRows.
+	var x int
+	err = f.sql.QueryRowMany(ctx,
+		[]string{"period=nope/customer=nada"},
+		"SELECT 1 FROM records").Scan(&x)
+	if err != sql.ErrNoRows {
+		t.Errorf("QueryRowMany single (no files).Scan: got %v, "+
+			"want sql.ErrNoRows", err)
+	}
+}
+
+// TestReadMany_WithHistory guards that opts pass through to the
+// dedup path: with dedup configured, ReadMany + WithHistory()
+// returns every record, without WithHistory() returns latest
+// per entity. Covers both the single-pattern fast path and the
+// multi-pattern pre-LIST branch.
+func TestReadMany_WithHistory(t *testing.T) {
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
+	ctx := context.Background()
+
+	// Same (period, customer, sku) written twice at different
+	// timestamps — dedup should keep the latest.
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 1, Currency: "USD", Ts: time.UnixMilli(100)},
+	})
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 99, Currency: "USD", Ts: time.UnixMilli(200)},
+	})
+
+	// Single-pattern ReadMany, default dedup → 1 record, latest.
+	got, err := f.sql.ReadMany(ctx, []string{
+		"period=2026-03-17/customer=abc",
+	})
+	if err != nil {
+		t.Fatalf("ReadMany: %v", err)
+	}
+	if len(got) != 1 || got[0].Amount != 99 {
+		t.Errorf("dedup: got %+v, want one record with Amount=99",
+			got)
+	}
+
+	// Single-pattern ReadMany + WithHistory → both records.
+	got, err = f.sql.ReadMany(ctx, []string{
+		"period=2026-03-17/customer=abc",
+	}, s3sql.WithHistory())
+	if err != nil {
+		t.Fatalf("ReadMany history: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("history: got %d records, want 2", len(got))
+	}
+
+	// Multi-pattern ReadMany + WithHistory via two patterns
+	// that overlap on the same file. Exercises the pre-LIST
+	// branch and proves unionKeys dedups + opts still pass
+	// through to the scan.
+	got, err = f.sql.ReadMany(ctx, []string{
+		"period=2026-03-17/customer=abc",
+		"*",
+	}, s3sql.WithHistory())
+	if err != nil {
+		t.Fatalf("ReadMany multi history: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("multi history: got %d records, want 2 "+
+			"(dedup by file URI, not by row)", len(got))
+	}
+}
+
+// TestReadMany_CrossPatternDedup proves dedup runs globally
+// across the union: one entity appearing under two different
+// partition tuples is collapsed to the latest version, not
+// deduped per-pattern. The dedup CTE runs over the unioned
+// scan so this works automatically — the test locks it in.
+//
+// The EntityKey here (SKU alone) is deliberately orthogonal to
+// the partition columns (period, customer), so one entity can
+// legitimately appear under two different (period, customer)
+// tuples.
+func TestReadMany_CrossPatternDedup(t *testing.T) {
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"sku"},
+	})
+	ctx := context.Background()
+
+	// Same SKU in two different partitions, different
+	// timestamps. Cross-pattern dedup should keep the Ts=200
+	// row.
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
+	})
+	f.writeSome(t, []Rec{
+		{Period: "2026-03-18", Customer: "def", SKU: "s1",
+			Amount: 99, Currency: "USD", Ts: time.UnixMilli(200)},
+	})
+
+	got, err := f.sql.ReadMany(ctx, []string{
+		"period=2026-03-17/customer=abc",
+		"period=2026-03-18/customer=def",
+	})
+	if err != nil {
+		t.Fatalf("ReadMany: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("cross-pattern dedup: got %d records, want 1: "+
+			"%+v", len(got), got)
+	}
+	if got[0].Amount != 99 {
+		t.Errorf("cross-pattern dedup: got Amount=%v, want 99 "+
+			"(latest Ts across the union)", got[0].Amount)
 	}
 }

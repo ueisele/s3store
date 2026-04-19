@@ -114,6 +114,15 @@ func (s *Store[T]) Read(
 	return s.sql.Read(ctx, keyPattern, opts...)
 }
 
+// ReadMany delegates to the SQL sub-store. Runs a single DuckDB
+// query over the deduplicated union of files matching every
+// pattern; see s3sql.Store.ReadMany for the full contract.
+func (s *Store[T]) ReadMany(
+	ctx context.Context, patterns []string, opts ...QueryOption,
+) ([]T, error) {
+	return s.sql.ReadMany(ctx, patterns, opts...)
+}
+
 // Query delegates to the SQL sub-store.
 func (s *Store[T]) Query(
 	ctx context.Context,
@@ -124,6 +133,18 @@ func (s *Store[T]) Query(
 	return s.sql.Query(ctx, keyPattern, sqlQuery, opts...)
 }
 
+// QueryMany delegates to the SQL sub-store. Use when a
+// SQL-level aggregation or join needs to span a non-Cartesian
+// tuple set; see s3sql.Store.QueryMany for the full contract.
+func (s *Store[T]) QueryMany(
+	ctx context.Context,
+	patterns []string,
+	sqlQuery string,
+	opts ...QueryOption,
+) (*sql.Rows, error) {
+	return s.sql.QueryMany(ctx, patterns, sqlQuery, opts...)
+}
+
 // QueryRow delegates to the SQL sub-store.
 func (s *Store[T]) QueryRow(
 	ctx context.Context,
@@ -132,6 +153,17 @@ func (s *Store[T]) QueryRow(
 	opts ...QueryOption,
 ) *sql.Row {
 	return s.sql.QueryRow(ctx, keyPattern, sqlQuery, opts...)
+}
+
+// QueryRowMany delegates to the SQL sub-store. See
+// s3sql.Store.QueryRowMany for the full contract.
+func (s *Store[T]) QueryRowMany(
+	ctx context.Context,
+	patterns []string,
+	sqlQuery string,
+	opts ...QueryOption,
+) *sql.Row {
+	return s.sql.QueryRowMany(ctx, patterns, sqlQuery, opts...)
 }
 
 // PollRecords delegates to the SQL sub-store so dedup and

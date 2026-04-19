@@ -655,57 +655,70 @@ trailing-`*`, whole-segment `*`, `FROM..TO` range). Results are
 unbounded — narrow the pattern if an index has millions of
 matches.
 
-### Multi-pattern reads (`ReadMany` / `LookupMany` / `BackfillIndexMany`)
+### Multi-pattern reads
 
 The single-pattern grammar is Cartesian per segment — `period=*`
 combined with `customer=abc` matches the cross product of all
 periods × abc. When the caller has an arbitrary **set of tuples**
 (e.g. `(period=2026-03, customer=abc), (period=2026-04,
 customer=def)` but *not* the off-diagonal combinations), pass
-them as a slice instead:
+them as a slice instead. The full family is available on both
+read paths and the index layer:
+
+| Entry point | Where |
+|---|---|
+| `Reader.ReadMany` | `s3parquet`, `s3sql`, umbrella |
+| `Store.QueryMany` / `QueryRowMany` | `s3sql`, umbrella |
+| `Index.LookupMany` | `s3parquet`, umbrella |
+| `BackfillIndexMany` | `s3parquet`, umbrella |
 
 ```go
-recs, _ := reader.ReadMany(ctx, []string{
+// Pure-Go read across non-Cartesian tuples.
+recs, _ := store.ReadMany(ctx, []string{
     "period=2026-03-17/customer=abc",
     "period=2026-03-18/customer=def",
 })
 
+// DuckDB aggregation across the union — one query, global
+// GROUP BY / SUM / join across the tuple set.
+rows, _ := store.QueryMany(ctx, []string{
+    "period=2026-03-17/customer=abc",
+    "period=2026-03-18/customer=def",
+}, "SELECT customer, SUM(amount) FROM records GROUP BY customer")
+
+// Index lookup over an arbitrary set of (col, col) tuples.
 entries, _ := idx.LookupMany(ctx, []string{
     "sku=s1/customer=abc",
     "sku=s4/customer=def",
 })
 
+// One-off migration across several partitions.
 stats, _ := s3store.BackfillIndexMany(ctx, target, def,
     []string{"period=2026-03-*/customer=*", "period=2026-04-01/customer=*"},
     until, nil)
 ```
 
-LISTs fan out across patterns with the same concurrency cap as
-GETs (`pollDownloadConcurrency` = 8), and overlapping patterns
-are deduplicated at the key level so every parquet file (or
-marker, for Lookup) is fetched at most once. Dedup on the read
-side runs globally across the union — an entity that appears
-under two patterns is kept as the latest version across both,
-not per-pattern.
+**Execution model (s3parquet path):** LIST calls fan out across
+patterns with a bounded 8-wide concurrency cap, overlapping
+patterns are deduplicated at the key level, the GET+decode pool
+runs over the unioned set, and dedup (if configured) applies
+globally — an entity appearing under two patterns is kept as
+the latest version across the union, not per-pattern.
 
-Single-pattern `Read` / `Lookup` / `BackfillIndex` are one-line
-sugar over their `-Many` counterparts and stay unchanged.
+**Execution model (s3sql path):** single-pattern fast-paths stay
+on DuckDB's glob + plan-time partition pruning. Multi-pattern
+pre-LISTs in Go with the same 8-wide cap to produce the exact
+file URI list, then runs **one** `read_parquet([...])` so
+DuckDB plans once over the whole set — the analytical win
+(`SUM` / `GROUP BY` / joins across non-Cartesian tuples) that N
+separate `Query` calls would force the caller to do in Go.
 
-> **Umbrella limitation.** `s3store.Store.Read` goes through
-> `s3sql` (DuckDB), which doesn't yet have a `ReadMany`
-> counterpart. Callers on the umbrella who need multi-pattern
-> reads build a pure-Go Reader with the same Target:
->
-> ```go
-> r, _ := s3parquet.NewReader(s3parquet.ReaderConfig[T]{
->     Target: store.Target(),
->     // dedup / InsertedAtField / OnMissingData as needed
-> })
-> recs, _ := r.ReadMany(ctx, patterns)
-> ```
->
-> `Index.LookupMany` and `BackfillIndexMany` are fully wired
-> through the umbrella — the gap is `Read` only.
+Single-pattern `Read` / `Query` / `QueryRow` / `Lookup` /
+`BackfillIndex` are one-line sugar over their `-Many`
+counterparts and stay unchanged. Passing a one-element slice to
+a `-Many` method takes the same fast path as calling the
+single-pattern form directly — no Go-side LIST, no extra
+machinery.
 
 ### What's in scope for v1
 
