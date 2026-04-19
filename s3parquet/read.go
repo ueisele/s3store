@@ -58,7 +58,7 @@ type versionedRecord[T any] struct {
 //
 // Memory: all matching records are buffered before dedup/return.
 // For unbounded reads, use PollRecords to stream incrementally.
-func (s *reader[T]) Read(
+func (s *Reader[T]) Read(
 	ctx context.Context, keyPattern string, opts ...QueryOption,
 ) ([]T, error) {
 	var o core.QueryOpts
@@ -92,7 +92,7 @@ func (s *reader[T]) Read(
 // plan's ListPrefix and returns the subset whose Hive key
 // matches the plan's predicate. S3 LIST handles pagination; the
 // predicate runs in memory per key.
-func (s *reader[T]) listMatchingParquet(
+func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *readPlan,
 ) ([]string, error) {
 	input := &s3.ListObjectsV2Input{
@@ -130,7 +130,7 @@ func (s *reader[T]) listMatchingParquet(
 // the concatenated result wrapped with each source file's
 // insertedAt. Preserves the input key order so callers who
 // don't dedup observe a deterministic stream.
-func (s *reader[T]) downloadAndDecodeAll(
+func (s *Reader[T]) downloadAndDecodeAll(
 	ctx context.Context, keys []string,
 ) ([]versionedRecord[T], error) {
 	if len(keys) == 0 {

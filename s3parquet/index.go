@@ -62,8 +62,8 @@ type IndexDef[T any, K comparable] struct {
 // Backfill via parquet reads (via the reader half). Keep both
 // pointers so the Index is independent of the composing Store.
 type Index[T any, K comparable] struct {
-	writer    *writer[T]
-	reader    *reader[T]
+	writer    *Writer[T]
+	reader    *Reader[T]
 	name      string
 	columns   []string
 	indexPath string
@@ -118,11 +118,11 @@ func NewIndex[T any, K comparable](
 			"s3parquet: NewIndex %q: %w", def.Name, err)
 	}
 
-	indexPath := core.IndexPath(store.writer.cfg.Prefix, def.Name)
+	indexPath := core.IndexPath(store.Writer.cfg.Prefix, def.Name)
 
 	idx := &Index[T, K]{
-		writer:       store.writer,
-		reader:       store.reader,
+		writer:       store.Writer,
+		reader:       store.Reader,
 		name:         def.Name,
 		columns:      def.Columns,
 		indexPath:    indexPath,

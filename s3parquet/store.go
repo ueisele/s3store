@@ -8,7 +8,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // CompressionCodec selects the parquet-level compression applied
@@ -174,67 +173,120 @@ func (c Config[T]) dedupEnabled() bool {
 	return c.EntityKeyOf != nil
 }
 
-// Store is the pure-Go entry point to an s3store. It composes
-// an internal writer + reader (Stage 1 of the Writer/Reader
-// split): the two halves own their own state and methods, Store
-// re-exposes everything via embedding so existing callers keep
-// compiling.
-type Store[T any] struct {
-	*writer[T]
-	*reader[T]
+// WriterConfig is the narrower Config form for constructing a
+// Writer directly (without a Reader). Holds only write-side
+// knobs plus the shared S3 wiring. Use NewWriter(cfg) when a
+// service writes but never reads.
+type WriterConfig[T any] struct {
+	Bucket             string
+	Prefix             string
+	PartitionKeyParts  []string
+	S3Client           *s3.Client
+	PartitionKeyOf     func(T) string
+	Compression        CompressionCodec
+	BloomFilterColumns []string
 }
 
-// New constructs a Store. Validates required config fields and
-// wires an internal writer + reader pair sharing the same Config.
+// ReaderConfig is the narrower Config form for constructing a
+// Reader directly. Holds only read-side knobs plus the shared
+// S3 wiring. Use NewReader(cfg) in read-only services that have
+// no PartitionKeyOf / Compression / BloomFilter config to
+// supply.
+type ReaderConfig[T any] struct {
+	Bucket            string
+	Prefix            string
+	PartitionKeyParts []string
+	S3Client          *s3.Client
+	SettleWindow      time.Duration
+	EntityKeyOf       func(T) string
+	VersionOf         func(T, time.Time) int64
+	InsertedAtField   string
+	OnMissingData     func(dataPath string)
+}
+
+// ReaderExtras carries the read-side knobs that aren't already
+// shared with a Writer. Used by Writer.Reader(extras), NewView,
+// and NewViewFromStore: the shared fields (Bucket, Prefix,
+// S3Client, PartitionKeyParts) come from the Writer; the user
+// supplies just what's Reader-specific here.
+//
+// Drift guard: every field below must also appear on ReaderConfig
+// with an identical name and type (enforced by a reflect-based
+// unit test).
+type ReaderExtras[T any] struct {
+	SettleWindow    time.Duration
+	EntityKeyOf     func(T) string
+	VersionOf       func(T, time.Time) int64
+	InsertedAtField string
+	OnMissingData   func(dataPath string)
+}
+
+func (c ReaderConfig[T]) settleWindow() time.Duration {
+	if c.SettleWindow > 0 {
+		return c.SettleWindow
+	}
+	return 5 * time.Second
+}
+
+func (c ReaderConfig[T]) dedupEnabled() bool {
+	return c.EntityKeyOf != nil
+}
+
+// Store is the pure-Go entry point to an s3store. It composes
+// an internal Writer + Reader: the two halves own their own
+// state and methods, Store re-exposes everything via embedding
+// so existing "one Store does both" callers keep working.
+type Store[T any] struct {
+	*Writer[T]
+	*Reader[T]
+}
+
+// New constructs a Store by projecting Config onto WriterConfig
+// and ReaderConfig, then delegating to NewWriter + NewReader.
+// The unified Config[T] is kept as a back-compat entry point;
+// new code that only writes or only reads should prefer
+// NewWriter / NewReader directly.
 func New[T any](cfg Config[T]) (*Store[T], error) {
-	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("s3parquet: Bucket is required")
-	}
-	if cfg.Prefix == "" {
-		return nil, fmt.Errorf("s3parquet: Prefix is required")
-	}
-	if cfg.S3Client == nil {
-		return nil, fmt.Errorf("s3parquet: S3Client is required")
-	}
-	if err := core.ValidatePartitionKeyParts(cfg.PartitionKeyParts); err != nil {
-		return nil, err
-	}
-	// Default VersionOf when the user asked for dedup
-	// (EntityKeyOf set) but didn't tell us how to compare
-	// versions. Wrote-last-wins is the natural zero-config
-	// behaviour for append-only storage.
-	if cfg.EntityKeyOf != nil && cfg.VersionOf == nil {
-		cfg.VersionOf = DefaultVersionOf[T]
-	}
-	if err := validateBloomFilterColumns[T](cfg.BloomFilterColumns); err != nil {
-		return nil, err
-	}
-	insertedAtIdx, err := validateInsertedAtField[T](cfg.InsertedAtField)
+	w, err := NewWriter[T](writerConfigFrom(cfg))
 	if err != nil {
 		return nil, err
 	}
-	codec, err := resolveCompression(cfg.Compression)
+	r, err := NewReader[T](readerConfigFrom(cfg))
 	if err != nil {
 		return nil, err
 	}
-	dataPath := core.DataPath(cfg.Prefix)
-	refPath := core.RefPath(cfg.Prefix)
-	return &Store[T]{
-		writer: &writer[T]{
-			cfg:              cfg,
-			s3:               cfg.S3Client,
-			dataPath:         dataPath,
-			refPath:          refPath,
-			compressionCodec: codec,
-		},
-		reader: &reader[T]{
-			cfg:                  cfg,
-			s3:                   cfg.S3Client,
-			dataPath:             dataPath,
-			refPath:              refPath,
-			insertedAtFieldIndex: insertedAtIdx,
-		},
-	}, nil
+	return &Store[T]{Writer: w, Reader: r}, nil
+}
+
+// writerConfigFrom projects a unified Config[T] onto the narrower
+// WriterConfig[T]. Central place so drift between the two types
+// is easy to spot.
+func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
+	return WriterConfig[T]{
+		Bucket:             c.Bucket,
+		Prefix:             c.Prefix,
+		PartitionKeyParts:  c.PartitionKeyParts,
+		S3Client:           c.S3Client,
+		PartitionKeyOf:     c.PartitionKeyOf,
+		Compression:        c.Compression,
+		BloomFilterColumns: c.BloomFilterColumns,
+	}
+}
+
+// readerConfigFrom projects a unified Config[T] onto the narrower
+// ReaderConfig[T].
+func readerConfigFrom[T any](c Config[T]) ReaderConfig[T] {
+	return ReaderConfig[T]{
+		Bucket:            c.Bucket,
+		Prefix:            c.Prefix,
+		PartitionKeyParts: c.PartitionKeyParts,
+		S3Client:          c.S3Client,
+		SettleWindow:      c.SettleWindow,
+		EntityKeyOf:       c.EntityKeyOf,
+		VersionOf:         c.VersionOf,
+		InsertedAtField:   c.InsertedAtField,
+		OnMissingData:     c.OnMissingData,
+	}
 }
 
 // resolveCompression maps the user-facing CompressionCodec enum

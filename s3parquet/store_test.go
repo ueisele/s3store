@@ -3,6 +3,7 @@ package s3parquet
 import (
 	"bytes"
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +56,7 @@ func TestNew_Validation(t *testing.T) {
 }
 
 func TestValidateKey(t *testing.T) {
-	s := &writer[testRec]{cfg: Config[testRec]{
+	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
 		PartitionKeyParts: []string{"period", "customer"},
 	}}
 	cases := []struct {
@@ -224,7 +225,7 @@ func TestSettleWindowDefault(t *testing.T) {
 // because the empty-records fast path returns before any
 // method touches s.s3.
 func TestWriteEmptyRecords(t *testing.T) {
-	s := &writer[testRec]{cfg: Config[testRec]{
+	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
 		PartitionKeyParts: []string{"period", "customer"},
 		PartitionKeyOf: func(r testRec) string {
 			return "period=" + r.Period + "/customer=" + r.Customer
@@ -285,12 +286,12 @@ func TestNewPopulatesDefaultVersionOf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if s.writer.cfg.VersionOf == nil {
+	if s.Reader.cfg.VersionOf == nil {
 		t.Fatal("VersionOf still nil after New; expected DefaultVersionOf")
 	}
 	// Spot-check: DefaultVersionOf returns insertedAt.UnixMicro().
 	ts := time.UnixMicro(1_710_684_000_000_000)
-	if got := s.writer.cfg.VersionOf(testRec{}, ts); got != 1_710_684_000_000_000 {
+	if got := s.Reader.cfg.VersionOf(testRec{}, ts); got != 1_710_684_000_000_000 {
 		t.Errorf("default VersionOf returned %d, want %d",
 			got, 1_710_684_000_000_000)
 	}
@@ -309,7 +310,7 @@ func TestNewLeavesUserVersionOfAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	got := s.writer.cfg.VersionOf(testRec{Value: 21}, time.Time{})
+	got := s.Reader.cfg.VersionOf(testRec{Value: 21}, time.Time{})
 	if got != 42 {
 		t.Errorf("user VersionOf was replaced; got %d, want 42", got)
 	}
@@ -347,8 +348,8 @@ func TestDefaultVersionOf(t *testing.T) {
 // are the invariants Poll+WithUntilOffset relies on to turn a
 // time window into the correct half-open offset range.
 func TestOffsetAt(t *testing.T) {
-	s := &reader[testRec]{
-		cfg:     validConfig(),
+	s := &Reader[testRec]{
+		cfg:     readerConfigFrom(validConfig()),
 		refPath: "p/_stream/refs",
 	}
 	anchor := time.UnixMicro(2_000_000_000_000_000)
@@ -377,6 +378,31 @@ func TestOffsetAt(t *testing.T) {
 	}
 }
 
+// TestReaderExtrasMirrorsReaderConfig guards the drift-guard:
+// every read-side field on ReaderExtras must also appear on
+// ReaderConfig with the same name and type. Without this, adding
+// a new read knob to one struct and forgetting the other would
+// silently go unnoticed — Writer.Reader / NewView users would
+// see different behavior from direct NewReader users.
+func TestReaderExtrasMirrorsReaderConfig(t *testing.T) {
+	extras := reflect.TypeFor[ReaderExtras[testRec]]()
+	cfg := reflect.TypeFor[ReaderConfig[testRec]]()
+
+	for i := range extras.NumField() {
+		ef := extras.Field(i)
+		cf, ok := cfg.FieldByName(ef.Name)
+		if !ok {
+			t.Errorf("ReaderExtras field %q missing from ReaderConfig",
+				ef.Name)
+			continue
+		}
+		if ef.Type != cf.Type {
+			t.Errorf("ReaderExtras.%s type %s != ReaderConfig.%s type %s",
+				ef.Name, ef.Type, cf.Name, cf.Type)
+		}
+	}
+}
+
 // TestNewSkipsDefaultWhenNoEntityKey guards that New does not
 // assign VersionOf when the user hasn't asked for dedup
 // (EntityKeyOf nil). Unnecessary allocation and a subtle
@@ -389,7 +415,7 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if s.writer.cfg.VersionOf != nil {
+	if s.Reader.cfg.VersionOf != nil {
 		t.Error("VersionOf set despite no EntityKeyOf")
 	}
 }

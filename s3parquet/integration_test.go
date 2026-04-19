@@ -567,6 +567,84 @@ func TestInsertedAtField_Validation(t *testing.T) {
 	}
 }
 
+// TestView_NarrowReadThroughNewViewFromStore covers the
+// cross-T View path: a Store is constructed over a full-shape
+// record type (with a heavy write-only column), and
+// NewViewFromStore produces a Reader[NarrowT] that decodes only
+// the fields present on NarrowT. parquet-go's decode naturally
+// skips unlisted columns, so the narrow Reader never even tries
+// to materialise the heavy column. Also proves the shared
+// wiring (Bucket, Prefix, PartitionKeyParts, S3Client) carries
+// from Writer through NewViewFromStore without the caller
+// respecifying anything.
+func TestView_NarrowReadThroughNewViewFromStore(t *testing.T) {
+	ctx := context.Background()
+
+	type FullRec struct {
+		Period     string `parquet:"period"`
+		Customer   string `parquet:"customer"`
+		SKU        string `parquet:"sku"`
+		Value      int64  `parquet:"value"`
+		ProcessLog string `parquet:"process_log"` // heavy, write-only
+	}
+	type NarrowRec struct {
+		Period   string `parquet:"period"`
+		Customer string `parquet:"customer"`
+		SKU      string `parquet:"sku"`
+		Value    int64  `parquet:"value"`
+		// ProcessLog deliberately absent — parquet-go skips it.
+	}
+
+	f := testutil.New(t)
+	store, err := s3parquet.New[FullRec](s3parquet.Config[FullRec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r FullRec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, err := store.Write(ctx, []FullRec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Value: 10, ProcessLog: "..heavy JSON blob.."},
+		{Period: "2026-03-17", Customer: "def", SKU: "s2",
+			Value: 20, ProcessLog: "..another blob.."},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	view, err := s3parquet.NewViewFromStore[NarrowRec, FullRec](
+		store, s3parquet.ReaderExtras[NarrowRec]{})
+	if err != nil {
+		t.Fatalf("NewViewFromStore: %v", err)
+	}
+
+	got, err := view.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("view.Read: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("view.Read: got %d records, want 2", len(got))
+	}
+	// Sanity: narrow fields present, heavy column absent from T.
+	seen := map[string]int64{}
+	for _, r := range got {
+		seen[r.SKU] = r.Value
+	}
+	if seen["s1"] != 10 || seen["s2"] != 20 {
+		t.Errorf("view.Read values: got %v, want map[s1:10 s2:20]",
+			seen)
+	}
+}
+
 // TestWriteAndRead exercises the basic round-trip through S3.
 // No dedup configured.
 func TestWriteAndRead(t *testing.T) {

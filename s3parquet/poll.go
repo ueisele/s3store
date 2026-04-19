@@ -21,7 +21,7 @@ import (
 // The paginator + cutoff logic lives in internal/refstream — it's
 // byte-identical with s3sql.Poll and shares this one
 // implementation.
-func (s *reader[T]) Poll(
+func (s *Reader[T]) Poll(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
@@ -57,7 +57,7 @@ func (s *reader[T]) Poll(
 // When dedup is disabled (no EntityKeyOf, or WithHistory()), the
 // returned records follow ref order (= timestamp order) and then
 // parquet-file row order within each ref.
-func (s *reader[T]) PollRecords(
+func (s *Reader[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
@@ -104,7 +104,7 @@ func (s *reader[T]) PollRecords(
 // Dedup semantics match PollRecords: per-batch. If you need
 // window-global latest-per-entity, pass WithHistory and dedup
 // client-side.
-func (s *reader[T]) PollRecordsAll(
+func (s *Reader[T]) PollRecordsAll(
 	ctx context.Context,
 	since, until Offset,
 	opts ...QueryOption,
@@ -130,6 +130,6 @@ func (s *reader[T]) PollRecordsAll(
 //	start := store.OffsetAt(time.Date(y, m, d,   0,0,0,0, loc))
 //	end   := store.OffsetAt(time.Date(y, m, d+1, 0,0,0,0, loc))
 //	records, _ := store.PollRecordsAll(ctx, start, end)
-func (s *reader[T]) OffsetAt(t time.Time) Offset {
+func (s *Reader[T]) OffsetAt(t time.Time) Offset {
 	return refstream.OffsetAt(s.refPath, t)
 }
