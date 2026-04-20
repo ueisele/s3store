@@ -67,7 +67,25 @@ func (s *Writer[T]) Write(
 			"s3parquet: PartitionKeyOf is required for Write; " +
 				"use WriteWithKey for explicit keys")
 	}
+	return s.writeGroupedFanOut(ctx, records,
+		func(ctx context.Context, key string, recs []T) (*WriteResult, error) {
+			return s.WriteWithKey(ctx, key, recs)
+		})
+}
 
+// writeGroupedFanOut is the partition-level fan-out shared by
+// Write and WriteRowGroupsBy. Groups records by PartitionKeyOf,
+// spawns up to partitionConcurrency() goroutines, each invoking
+// perPartition with its key and records. Returns results in
+// sorted-key order regardless of completion order; first real
+// (non-cancel) failure wins; caller-cancel surfaces as an error
+// even when no real failure occurred.
+func (s *Writer[T]) writeGroupedFanOut(
+	ctx context.Context, records []T,
+	perPartition func(
+		ctx context.Context, key string, recs []T,
+	) (*WriteResult, error),
+) ([]WriteResult, error) {
 	grouped := s.groupByKey(records)
 	keys := slices.Sorted(maps.Keys(grouped))
 
@@ -99,7 +117,7 @@ func (s *Writer[T]) Write(
 			}
 			defer func() { <-sem }()
 
-			r, err := s.WriteWithKey(ctx, key, grouped[key])
+			r, err := perPartition(ctx, key, grouped[key])
 			if err != nil {
 				errs[i] = err
 				cancel()
@@ -160,7 +178,19 @@ func (s *Writer[T]) WriteWithKey(
 		return nil, fmt.Errorf(
 			"s3parquet: parquet encode: %w", err)
 	}
+	return s.writeEncodedPayload(ctx, key, records, parquetBytes)
+}
 
+// writeEncodedPayload is the post-encode tail shared between
+// WriteWithKey and WriteWithKeyRowGroupsBy: collect marker paths,
+// PUT data, PUT markers in parallel, PUT ref (unless
+// DisableRefStream), and run cleanup on failure. Keeping this
+// factored ensures the two write entry points can't drift on
+// ordering guarantees (data before ref, markers before ref,
+// orphan cleanup on ref-PUT failure).
+func (s *Writer[T]) writeEncodedPayload(
+	ctx context.Context, key string, records []T, parquetBytes []byte,
+) (*WriteResult, error) {
 	// Compute marker paths up-front so a bad IndexDef.Of fails the
 	// whole Write before we touch S3, matching how validateKey
 	// aborts on a malformed partition key.

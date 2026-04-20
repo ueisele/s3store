@@ -116,6 +116,28 @@ func (s *Store[T]) WriteWithKey(
 	return s.writer.WriteWithKey(ctx, key, records)
 }
 
+// WriteWithKeyRowGroupsBy delegates to the Writer. See
+// s3parquet.Writer.WriteWithKeyRowGroupsBy for the full contract —
+// produces one row group per distinct flushKeyOf value so a
+// later ReadIterWhere can prune via chunk-level stats.
+func (s *Store[T]) WriteWithKeyRowGroupsBy(
+	ctx context.Context, key string, records []T,
+	flushKeyOf func(T) string,
+) (*WriteResult, error) {
+	return s.writer.WriteWithKeyRowGroupsBy(ctx, key, records, flushKeyOf)
+}
+
+// WriteRowGroupsBy delegates to the Writer. Auto-keyed sibling
+// of WriteWithKeyRowGroupsBy: groups records by PartitionKeyOf,
+// and within each partition produces one row group per distinct
+// flushKeyOf value.
+func (s *Store[T]) WriteRowGroupsBy(
+	ctx context.Context, records []T,
+	flushKeyOf func(T) string,
+) ([]WriteResult, error) {
+	return s.writer.WriteRowGroupsBy(ctx, records, flushKeyOf)
+}
+
 // PartitionKey delegates to the Writer. Handy when paired with
 // WriteWithKey for single-partition batches:
 //

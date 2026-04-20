@@ -184,6 +184,45 @@ func (t S3Target) del(ctx context.Context, key string) error {
 	return err
 }
 
+// size returns the object's content length. Used by the
+// row-group-filtered read path to size the io.ReaderAt parquet-
+// go opens the file through.
+func (t S3Target) size(ctx context.Context, key string) (int64, error) {
+	resp, err := t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(t.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return 0, err
+	}
+	if resp.ContentLength == nil {
+		return 0, fmt.Errorf(
+			"s3parquet: HEAD %s returned no ContentLength", key)
+	}
+	return *resp.ContentLength, nil
+}
+
+// getRange issues a ranged GET for bytes [start, end) of key.
+// Returns the body bytes. Used as the ReadAt transport for the
+// row-group-filtered parquet reader.
+func (t S3Target) getRange(
+	ctx context.Context, key string, start, end int64,
+) ([]byte, error) {
+	if end <= start {
+		return nil, nil
+	}
+	resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(t.Bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end-1)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
 // list returns a paginator over objects under a prefix. Callers
 // iterate via HasMorePages + NextPage; no in-memory accumulation
 // here — large prefixes must stream.
