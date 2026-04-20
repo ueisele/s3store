@@ -144,3 +144,13 @@ func WithHistory() QueryOption {
 func WithUntilOffset(until Offset) QueryOption {
 	return core.WithUntilOffset(until)
 }
+
+// WithReadAheadPartitions tells partition-streaming readers
+// (currently s3parquet.Reader.ReadIter / ReadManyIter) to
+// prefetch n partitions ahead of the yield position. Default
+// is 0 (strict-serial). Accepted on the umbrella for API
+// symmetry; the umbrella's ReadIter forwards to s3sql which
+// ignores the option.
+func WithReadAheadPartitions(n int) QueryOption {
+	return core.WithReadAheadPartitions(n)
+}

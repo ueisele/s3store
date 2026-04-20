@@ -41,3 +41,11 @@ func WithHistory() QueryOption {
 func WithUntilOffset(until Offset) QueryOption {
 	return core.WithUntilOffset(until)
 }
+
+// WithReadAheadPartitions is accepted for API symmetry with
+// s3parquet and the umbrella, but is a no-op on the s3sql read
+// paths — DuckDB streams rows across the full file union natively
+// and does not process one Hive partition at a time.
+func WithReadAheadPartitions(n int) QueryOption {
+	return core.WithReadAheadPartitions(n)
+}

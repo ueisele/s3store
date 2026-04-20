@@ -39,3 +39,11 @@ func WithHistory() QueryOption {
 func WithUntilOffset(until Offset) QueryOption {
 	return core.WithUntilOffset(until)
 }
+
+// WithReadAheadPartitions tells ReadIter / ReadManyIter to
+// prefetch n partitions ahead of the yield position. Default
+// (n == 0) is strict-serial. See core.WithReadAheadPartitions
+// for the full contract.
+func WithReadAheadPartitions(n int) QueryOption {
+	return core.WithReadAheadPartitions(n)
+}

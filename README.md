@@ -649,6 +649,28 @@ pre-dedup batch is a problem, file an issue — we can follow up with a
 streaming fold that trades the code simplicity for peak memory
 proportional to unique entities rather than total records.
 
+**Prefetch with `WithReadAheadPartitions(n)`**: by default, the next
+partition's download only starts after the current partition's yield
+loop finishes. For layouts with many small partitions where S3
+round-trip latency dominates, pass `WithReadAheadPartitions(n)` to
+run a background producer that keeps up to `n` partitions prefetched
+ahead of the yield position:
+
+```go
+for r, err := range store.ReadIter(ctx, "*",
+    s3parquet.WithReadAheadPartitions(4)) {
+    // ... consumer work overlaps with downloads of the next 4 partitions
+}
+```
+
+Trade-off: memory grows to at most `n + 2` partitions' worth of
+records (one being yielded, `n` buffered, one in the producer's hand
+while waiting to send). Speed-up is bounded by how much of your
+per-partition yield time would otherwise sit idle waiting for
+downloads. Default `0` preserves strict-serial semantics — existing
+callers see no change. No-op on the s3sql / umbrella read paths since
+DuckDB already streams rows across the full file union.
+
 **Per-partition dedup contract on `s3parquet.Reader.ReadIter`**: differs
 from `Read`'s global dedup. The iter path buffers one partition at a
 time, dedups within that partition, yields, then drops it. **Correct

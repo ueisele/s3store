@@ -164,6 +164,13 @@ func (s *Reader[T]) ReadMany(
 //
 // Partition order: lex across partitions, lex/insertion order
 // within each partition on both paths.
+//
+// Prefetch: WithReadAheadPartitions(n) runs a background
+// producer that downloads up to n partitions ahead of the yield
+// position. Default 0 = strict-serial. Useful when the consumer
+// does non-trivial per-record work — hides the next partition's
+// S3 round trips behind the current partition's yield loop at
+// O((n+1) partitions) peak memory.
 func (s *Reader[T]) ReadIter(
 	ctx context.Context, keyPattern string, opts ...QueryOption,
 ) iter.Seq2[T, error] {
@@ -212,58 +219,121 @@ func (s *Reader[T]) ReadManyIter(
 		}
 
 		dedup := s.cfg.dedupEnabled() && !o.IncludeHistory
-		s.streamByPartition(ctx, keys, dedup, yield)
+		readAhead := o.ReadAheadPartitions
+		if readAhead < 0 {
+			readAhead = 0
+		}
+		s.streamByPartition(ctx, keys, dedup, readAhead, yield)
 	}
 }
 
+// partitionBatch is one partition's download result, passed from
+// the background producer to the yield loop over the pipeline
+// channel in the readAhead>0 path.
+type partitionBatch[T any] struct {
+	recs []versionedRecord[T]
+	err  error
+}
+
 // streamByPartition processes keys one Hive partition at a time
-// in lex order. For each partition:
-//   - downloadAndDecodeAll fans out file downloads under the
-//     existing concurrency cap.
-//   - dedup=true runs dedupLatest over the partition's records,
-//     yielding latest-per-entity in lex/insertion order.
-//   - dedup=false yields every record in lex/insertion order.
+// in lex order. Two execution modes:
 //
-// In either case the partition's record slice goes out of scope
-// at the end of one iteration so GC reclaims it before the next
-// partition's downloads start.
+//   - readAhead == 0 (default): strict-serial. Download the
+//     current partition's files, yield every record, move on.
+//     Memory: O(one partition's records).
+//   - readAhead > 0: pipelined. A background producer downloads
+//     partitions sequentially and pushes each decoded batch onto
+//     a buffered channel (size readAhead); the yield loop pulls
+//     one batch at a time. Consumer work on partition N overlaps
+//     with downloads for N+1 … N+readAhead, hiding S3 round-trip
+//     latency when the consumer does real work per record.
+//     Memory: up to readAhead + 2 partitions worth of records
+//     (one being yielded, readAhead buffered in the channel, one
+//     in the producer's hand while its send is blocked).
+//
+// Dedup/no-dedup handling is identical across both modes and
+// lives in emitPartition.
 func (s *Reader[T]) streamByPartition(
-	ctx context.Context, keys []string, dedup bool,
+	ctx context.Context, keys []string, dedup bool, readAhead int,
 	yield func(T, error) bool,
 ) {
 	byPartition := s.groupKeysByPartition(keys)
-	for _, p := range slices.Sorted(maps.Keys(byPartition)) {
-		files := byPartition[p]
-		// LIST already returns lex-sorted within the prefix, but
-		// belt-and-suspenders: a multi-pattern read can interleave
-		// keys from different LISTs.
-		slices.Sort(files)
+	partitions := slices.Sorted(maps.Keys(byPartition))
 
-		recs, err := s.downloadAndDecodeAll(ctx, files)
-		if err != nil {
-			yield(*new(T), err)
-			return
-		}
-		if len(recs) == 0 {
-			continue
-		}
-
-		if dedup {
-			out := dedupLatest(recs,
-				s.cfg.EntityKeyOf, s.cfg.VersionOf)
-			for _, rec := range out {
-				if !yield(rec, nil) {
-					return
-				}
+	if readAhead <= 0 {
+		for _, p := range partitions {
+			files := byPartition[p]
+			slices.Sort(files)
+			recs, err := s.downloadAndDecodeAll(ctx, files)
+			if err != nil {
+				yield(*new(T), err)
+				return
 			}
-			continue
-		}
-		for _, vr := range recs {
-			if !yield(vr.rec, nil) {
+			if !s.emitPartition(recs, dedup, yield) {
 				return
 			}
 		}
+		return
 	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	pipeline := make(chan partitionBatch[T], readAhead)
+	go func() {
+		defer close(pipeline)
+		for _, p := range partitions {
+			files := byPartition[p]
+			slices.Sort(files)
+			recs, err := s.downloadAndDecodeAll(ctx, files)
+			select {
+			case pipeline <- partitionBatch[T]{recs: recs, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for b := range pipeline {
+		if b.err != nil {
+			yield(*new(T), b.err)
+			return
+		}
+		if !s.emitPartition(b.recs, dedup, yield) {
+			return
+		}
+	}
+}
+
+// emitPartition yields one partition's records to the consumer,
+// applying per-partition dedup when requested. Returns false when
+// the consumer asked to stop (yield returned false), so the outer
+// loop can break cleanly.
+func (s *Reader[T]) emitPartition(
+	recs []versionedRecord[T], dedup bool,
+	yield func(T, error) bool,
+) bool {
+	if len(recs) == 0 {
+		return true
+	}
+	if dedup {
+		for _, rec := range dedupLatest(recs,
+			s.cfg.EntityKeyOf, s.cfg.VersionOf) {
+			if !yield(rec, nil) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, vr := range recs {
+		if !yield(vr.rec, nil) {
+			return false
+		}
+	}
+	return true
 }
 
 // listMatchingParquet lists every parquet object under the

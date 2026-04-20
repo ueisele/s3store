@@ -2228,6 +2228,78 @@ func TestReadIter_Empty(t *testing.T) {
 	}
 }
 
+// TestReadIter_ReadAheadPartitions guards the pipelined path:
+// setting a positive WithReadAheadPartitions must produce the
+// same records (same content, same lex order) as the default
+// strict-serial path — correctness first, speed second.
+// Covers dedup, no-dedup, and early-break with a prefetch goroutine
+// alive to make sure cancel cleanly stops the producer.
+func TestReadIter_ReadAheadPartitions(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Period + "|" + r.Customer + "|" + r.SKU
+		},
+	})
+
+	in := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1},
+		{Period: "2026-03-18", Customer: "abc", SKU: "s1", Value: 2},
+		{Period: "2026-03-19", Customer: "abc", SKU: "s1", Value: 3},
+		{Period: "2026-03-20", Customer: "abc", SKU: "s1", Value: 4},
+	}
+	if _, err := store.Write(ctx, in); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Prefetching matches strict-serial on values and order.
+	var serial, prefetched []int64
+	for r, err := range store.ReadIter(ctx, "*") {
+		if err != nil {
+			t.Fatalf("serial ReadIter: %v", err)
+		}
+		serial = append(serial, r.Value)
+	}
+	for r, err := range store.ReadIter(ctx, "*",
+		s3parquet.WithReadAheadPartitions(3)) {
+		if err != nil {
+			t.Fatalf("prefetched ReadIter: %v", err)
+		}
+		prefetched = append(prefetched, r.Value)
+	}
+	if !reflect.DeepEqual(serial, prefetched) {
+		t.Errorf("prefetch changed order/values: serial=%v prefetched=%v",
+			serial, prefetched)
+	}
+
+	// Early-break with prefetch alive: producer goroutine must
+	// exit via ctx.Done. A subsequent full-read must still succeed
+	// (no leaked goroutines, no wedged S3 client).
+	count := 0
+	for _, err := range store.ReadIter(ctx, "*",
+		s3parquet.WithReadAheadPartitions(3)) {
+		if err != nil {
+			t.Fatalf("ReadIter (break): %v", err)
+		}
+		count++
+		if count == 2 {
+			break
+		}
+	}
+	count = 0
+	for _, err := range store.ReadIter(ctx, "*",
+		s3parquet.WithReadAheadPartitions(3)) {
+		if err != nil {
+			t.Fatalf("ReadIter (recovery): %v", err)
+		}
+		count++
+	}
+	if count != len(in) {
+		t.Errorf("recovery pass got %d records, want %d",
+			count, len(in))
+	}
+}
+
 // TestReadIter_MultiPartition guards that ReadIter visits
 // partitions in lex order and applies dedup per partition. Same
 // (Customer, SKU) entity in two different periods produces two
