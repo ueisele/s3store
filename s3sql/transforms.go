@@ -4,12 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"path"
 	"reflect"
 	"strings"
-	"time"
-
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // scanExprForPattern returns the base read_parquet scan for a
@@ -23,11 +19,9 @@ import (
 // contain an apostrophe don't break the query at plan time.
 //
 // withFilename adds filename=true to read_parquet so the source
-// object key is exposed as a `filename` column. Two consumers
-// use it — the dedup CTE's tie-breaker on equal VersionColumn
-// values, and the InsertedAtField populate path that parses
-// tsMicros out of the filename on scan. Callers typically
-// compute the flag via needsFilename().
+// object key is exposed as a `filename` column — used by the
+// dedup CTE as a tie-breaker on equal VersionColumn values.
+// Callers typically compute the flag via needsFilename().
 func (s *Reader[T]) scanExprForPattern(
 	key string, withFilename bool,
 ) (string, error) {
@@ -88,15 +82,12 @@ func filenameOpt(withFilename bool) string {
 }
 
 // needsFilename reports whether read_parquet must be invoked with
-// filename=true for this query. Two consumers need the column:
-// the dedup CTE (tie-breaker on equal VersionColumn values) and
-// the InsertedAtField populate path (source tsMicros). The
+// filename=true for this query. Only the dedup CTE needs the
+// column (as a tie-breaker on equal VersionColumn values). The
 // scan-expr builders and wrapScanExpr both consult this so the
-// scan / CTE / post-scan binder agree on whether filename is
-// present.
+// scan and the CTE agree on whether filename is present.
 func (s *Reader[T]) needsFilename(includeHistory bool) bool {
-	return (!includeHistory && s.cfg.dedupEnabled()) ||
-		s.cfg.InsertedAtField != ""
+	return !includeHistory && s.cfg.dedupEnabled()
 }
 
 // errorRow returns a *sql.Row that will fail on Scan with the
@@ -115,45 +106,26 @@ func (s *Reader[T]) errorRow(
 // dedup CTE and the user's SQL query. Shared by Query, QueryRow,
 // Read, PollRecords.
 //
-// Two knobs interact here, set by the caller through scanExpr
-// and the Config:
+// When dedup applies (!includeHistory && dedupEnabled), the CTE
+// uses filename DESC as the tie-breaker on equal VersionColumn
+// so a retry with the same domain timestamp has a deterministic
+// winner, and then EXCLUDEs `filename` so the helper column
+// doesn't leak into user SQL. When dedup is off the CTE is just
+// the scan.
 //
-//   - Dedup CTE (applied when !includeHistory && dedupEnabled).
-//     Uses filename DESC as the tie-breaker on equal
-//     VersionColumn so a retry with the same domain timestamp
-//     has a deterministic winner.
-//   - InsertedAtField populate path. When configured, the CTE
-//     keeps the `filename` column in its output so scanAll can
-//     parse tsMicros from it and populate the user's struct
-//     field. Without it, the dedup-only case EXCLUDEs `filename`
-//     so nothing leaks into user SQL.
-//
-// Either knob requires scanExpr to have been built with
-// filename=true; the caller computes that flag from the same
-// condition this function uses, keeping the two sides in sync.
+// Dedup requires scanExpr to have been built with filename=true;
+// the caller computes that flag via needsFilename, keeping the
+// two sides in sync.
 func (s *Reader[T]) wrapScanExpr(
 	scanExpr string,
 	userSQL string,
 	includeHistory bool,
 ) string {
 	dedup := !includeHistory && s.cfg.dedupEnabled()
-	keepFilename := s.cfg.InsertedAtField != ""
 
 	var sb strings.Builder
 	sb.WriteString("WITH ")
-	switch {
-	case dedup && keepFilename:
-		dedupCols := strings.Join(s.cfg.EntityKeyColumns, ", ")
-		fmt.Fprintf(&sb,
-			"%s AS (\n"+
-				"  %s\n"+
-				"  QUALIFY ROW_NUMBER() OVER "+
-				"(PARTITION BY %s ORDER BY %s DESC, filename DESC"+
-				") = 1\n"+
-				")\n",
-			s.cfg.TableAlias, scanExpr,
-			dedupCols, s.cfg.VersionColumn)
-	case dedup && !keepFilename:
+	if dedup {
 		dedupCols := strings.Join(s.cfg.EntityKeyColumns, ", ")
 		fmt.Fprintf(&sb,
 			"%s AS (\n"+
@@ -166,10 +138,7 @@ func (s *Reader[T]) wrapScanExpr(
 				")\n",
 			s.cfg.TableAlias, scanExpr,
 			dedupCols, s.cfg.VersionColumn)
-	default:
-		// Either no dedup at all, or dedup-off with
-		// InsertedAtField set. Either way the CTE is just the
-		// scan; filename (if present) flows through.
+	} else {
 		fmt.Fprintf(&sb,
 			"%s AS (\n  %s\n)\n",
 			s.cfg.TableAlias, scanExpr)
@@ -179,15 +148,12 @@ func (s *Reader[T]) wrapScanExpr(
 }
 
 // rowBinder captures the per-result-set state (column ordering,
-// per-column binders, optional filename routing for
-// InsertedAtField population) so scanAll and the iter readers
-// can share the per-row decode loop without recomputing
-// rows.Columns() and the binder lookup on every row.
+// per-column binders) so scanAll and the iter readers share the
+// per-row decode loop without recomputing rows.Columns() and the
+// binder lookup on every row.
 type rowBinder[T any] struct {
-	owner       *Reader[T]
-	cols        []string
-	fbs         []*fieldBinder
-	filenameCol int // -1 when filename routing is not wanted
+	cols []string
+	fbs  []*fieldBinder
 }
 
 // newRowBinder resolves rows.Columns() once and returns the
@@ -199,35 +165,22 @@ func (s *Reader[T]) newRowBinder(rows *sql.Rows) (*rowBinder[T], error) {
 		return nil, fmt.Errorf("s3sql: get columns: %w", err)
 	}
 	fbs := make([]*fieldBinder, len(cols))
-	filenameCol := -1
 	for i, c := range cols {
-		if c == "filename" && s.insertedAtFieldIndex != nil {
-			filenameCol = i
-			continue
-		}
 		fbs[i] = s.binder.byName[c]
 	}
 	return &rowBinder[T]{
-		owner:       s,
-		cols:        cols,
-		fbs:         fbs,
-		filenameCol: filenameCol,
+		cols: cols,
+		fbs:  fbs,
 	}, nil
 }
 
 // bindNext consumes one row from rows (caller must have already
 // confirmed rows.Next() returned true) and writes the decoded
 // record into *out. Reuses the pre-resolved binders; allocates
-// only the per-row dests slice and the filenameDest scratch
-// string.
+// only the per-row dests slice.
 func (b *rowBinder[T]) bindNext(rows *sql.Rows, out *T) error {
 	dests := make([]any, len(b.cols))
-	var filenameDest string
 	for i, fb := range b.fbs {
-		if i == b.filenameCol {
-			dests[i] = &filenameDest
-			continue
-		}
 		if fb == nil {
 			dests[i] = new(any)
 			continue
@@ -244,32 +197,15 @@ func (b *rowBinder[T]) bindNext(rows *sql.Rows, out *T) error {
 		}
 		fb.assign(rv.FieldByIndex(fb.fieldIndex), dests[i])
 	}
-	if b.filenameCol >= 0 {
-		tsMicros, _, err := core.ParseDataFileName(
-			path.Base(filenameDest))
-		if err != nil {
-			return fmt.Errorf(
-				"s3sql: parse filename %q for InsertedAtField: %w",
-				filenameDest, err)
-		}
-		rv.FieldByIndex(b.owner.insertedAtFieldIndex).Set(
-			reflect.ValueOf(time.UnixMicro(tsMicros)))
-	}
 	return nil
 }
 
 // scanAll reads every row from a DuckDB result set into a []T
 // using the pre-built binder. Column order is taken from the
 // result set (rows.Columns()) so struct field order in T is
-// independent of the parquet file's column order.
-//
-// When Config.InsertedAtField is set AND the result set carries
-// a `filename` column (DuckDB's read_parquet(filename=true)
-// helper), scanAll routes filename into a string destination,
-// parses the source file's tsMicros out of its last path
-// segment, and writes the resulting time.Time into the user's
-// InsertedAtField. Any other unmapped column (including filename
-// when InsertedAtField is unset) still gets a discard dest.
+// independent of the parquet file's column order. Any unmapped
+// column (including read_parquet's `filename` helper when it
+// leaks through a non-dedup path) still gets a discard dest.
 func (s *Reader[T]) scanAll(rows *sql.Rows) ([]T, error) {
 	rb, err := s.newRowBinder(rows)
 	if err != nil {

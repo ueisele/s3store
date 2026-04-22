@@ -64,19 +64,16 @@ type ReaderConfig[T any] struct {
 	// credential overrides, or other extension loads.
 	ExtraInitSQL []string
 
-	// InsertedAtField names a time.Time field on T that Read and
-	// PollRecords populate with the source parquet file's write
-	// timestamp on decode. The field must be tagged `parquet:"-"`
-	// so the parquet schema / row binder ignores it — the field is
-	// library-managed metadata, not a parquet column.
+	// InsertedAtField names a time.Time field on T populated by
+	// the writer (s3parquet.WriterConfig.InsertedAtField) as a real
+	// parquet column. The field must carry a non-empty, non-"-"
+	// parquet tag (e.g. `parquet:"inserted_at"`) — DuckDB decodes
+	// the column natively via SELECT *, so no filename-routing
+	// plumbing is involved on this read path.
 	//
-	// Under the hood: when set, the scan emits `filename=true` so
-	// DuckDB exposes the source object key; the row binder parses
-	// tsMicros from the filename and assigns it to this field. The
-	// helper column is projected through the CTE in this mode so
-	// it's also visible to Query / QueryRow callers — opt-in
-	// behavior whose one side effect is that `SELECT *` surfaces
-	// an extra `filename` column.
+	// Empty disables the feature. Paired with the writer's
+	// InsertedAtField: the value round-trips through the parquet
+	// file, identical at every read path.
 	InsertedAtField string
 }
 
@@ -140,31 +137,21 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 		return nil, err
 	}
 
-	// Both dedup (filename DESC tie-break) and InsertedAtField
-	// (populate from source tsMicros) rely on DuckDB's
+	// The dedup CTE's filename DESC tie-breaker relies on DuckDB's
 	// read_parquet(filename=true) helper, which injects a column
 	// literally named "filename". A T that already maps a parquet
-	// column of that name would either lose its binding (scanAll
-	// steals the column) or produce a duplicate-schema error
-	// inside read_parquet. Catch the Go-side case at NewReader —
-	// the on-disk-parquet-has-"filename" case is still DuckDB's
-	// to reject at query time since we can't see the file schemas
+	// column of that name would either lose its binding (the CTE
+	// would EXCLUDE it) or produce a duplicate-schema error inside
+	// read_parquet. Catch the Go-side case at NewReader — the
+	// on-disk-parquet-has-"filename" case is still DuckDB's to
+	// reject at query time since we can't see the file schemas
 	// here.
-	if _, ok := b.byName["filename"]; ok {
-		if cfg.dedupEnabled() {
-			return nil, fmt.Errorf(
-				"s3sql: T has a `parquet:\"filename\"` field, " +
-					"which collides with DuckDB's " +
-					"read_parquet(filename=true) used for " +
-					"the dedup tie-breaker; rename the field")
-		}
-		if cfg.InsertedAtField != "" {
-			return nil, fmt.Errorf(
-				"s3sql: T has a `parquet:\"filename\"` field, " +
-					"which collides with DuckDB's " +
-					"read_parquet(filename=true) used to " +
-					"populate InsertedAtField; rename the field")
-		}
+	if _, ok := b.byName["filename"]; ok && cfg.dedupEnabled() {
+		return nil, fmt.Errorf(
+			"s3sql: T has a `parquet:\"filename\"` field, " +
+				"which collides with DuckDB's " +
+				"read_parquet(filename=true) used for " +
+				"the dedup tie-breaker; rename the field")
 	}
 
 	db, err := openDuckDB(cfg.Target.S3Client, cfg.ExtraInitSQL)
@@ -185,10 +172,9 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 
 // validateInsertedAtField resolves Config.InsertedAtField to a
 // struct-field index on T. Mirrors s3parquet.validateInsertedAtField:
-// the field must exist, be time.Time, and carry `parquet:"-"` so
-// it stays off the parquet schema and the row binder leaves it
-// alone — we populate it ourselves from the `filename` helper
-// column.
+// the field must exist, be time.Time, and carry a non-empty,
+// non-"-" parquet tag so DuckDB's SELECT * sees a real column
+// (the writer populates it as part of the parquet schema).
 func validateInsertedAtField[T any](name string) ([]int, error) {
 	if name == "" {
 		return nil, nil
@@ -210,11 +196,13 @@ func validateInsertedAtField[T any](name string) ([]int, error) {
 			"s3sql: InsertedAtField %q: must be time.Time, got %s",
 			name, f.Type)
 	}
-	if tag := f.Tag.Get("parquet"); tag != "-" {
+	tag := f.Tag.Get("parquet")
+	name0, _, _ := strings.Cut(tag, ",")
+	if name0 == "" || name0 == "-" {
 		return nil, fmt.Errorf(
-			"s3sql: InsertedAtField %q: must be tagged "+
-				"`parquet:\"-\"` to stay library-managed "+
-				"(got %q)", name, tag)
+			"s3sql: InsertedAtField %q: must carry a non-empty, "+
+				"non-\"-\" parquet tag so DuckDB can decode the "+
+				"writer-populated column (got %q)", name, tag)
 	}
 	return f.Index, nil
 }

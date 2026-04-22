@@ -3,6 +3,7 @@ package s3parquet
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
@@ -78,15 +79,26 @@ func (s *Reader[T]) PollRecords(
 		return nil, since, nil
 	}
 
-	keys := make([]string, len(entries))
+	// Carry each entry's InsertedAt (= dataTsMicros from the ref
+	// filename) on the KeyMeta. Used as the fallback when the
+	// reader has no InsertedAtField configured — same value the
+	// writer captured, so dedup / sort matches the column path.
+	keys := make([]core.KeyMeta, len(entries))
 	for i, e := range entries {
-		keys[i] = e.DataPath
+		keys[i] = core.KeyMeta{
+			Key:        e.DataPath,
+			InsertedAt: e.InsertedAt,
+		}
 	}
 
 	versioned, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, since, err
 	}
+
+	sort.SliceStable(versioned, func(i, j int) bool {
+		return s.sortCmp(versioned[i], versioned[j]) < 0
+	})
 
 	if o.IncludeHistory || !s.cfg.dedupEnabled() {
 		return stripVersions(versioned), newOffset, nil

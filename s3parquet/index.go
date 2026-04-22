@@ -394,7 +394,8 @@ func (i *Index[K]) listMatchingMarkers(
 func (i *Index[K]) listAllMatchingMarkers(
 	ctx context.Context, plans []*readPlan,
 ) ([]string, error) {
-	return runPlansConcurrent(ctx, plans, i.listMatchingMarkers)
+	return runPlansConcurrent(ctx, plans,
+		i.listMatchingMarkers, identityKey)
 }
 
 // hiveKeyOfMarker returns the "col=val/col=val/..." body of a
@@ -652,7 +653,7 @@ func listDataFilesBelowUntil(
 		func(ctx context.Context, plan *readPlan) ([]string, error) {
 			return listDataFilesForPlan(
 				ctx, target, plan, dataPath, filter, cutoff)
-		})
+		}, identityKey)
 }
 
 // listDataFilesForPlan is the per-plan body extracted so the
@@ -757,8 +758,11 @@ func backfillMarkersForObject[T any, K comparable](
 func parseUntilToTime(off Offset) time.Time {
 	s := string(off)
 	// Full ref key path first — ParseRefKey accepts the shape.
-	if _, tsMicros, _, err := core.ParseRefKey(s); err == nil {
-		return time.UnixMicro(tsMicros)
+	// The ref-publication timestamp is what RefCutoff encodes, so
+	// use refTsMicros (not dataTsMicros) as the "what time does
+	// this offset correspond to" answer.
+	if _, refTsMicros, _, _, err := core.ParseRefKey(s); err == nil {
+		return time.UnixMicro(refTsMicros)
 	}
 	// RefCutoff prefix: "{refPath}/{tsMicros}". The last '/'
 	// separator starts the decimal tail.

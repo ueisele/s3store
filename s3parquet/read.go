@@ -11,6 +11,7 @@ import (
 	"path"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,9 +47,15 @@ const pollDownloadConcurrency = 8
 // write time of the parquet file it came from. The library
 // passes insertedAt to Config.VersionOf, which can use it as
 // a fallback or ignore it in favor of a domain-level version.
+// insertedAt is sourced from the writer-populated
+// InsertedAtField column when the reader has InsertedAtField
+// configured, else from the S3 object's LastModified. fileName
+// is the base name of the source parquet key — used as a
+// deterministic tiebreaker in the record-level sort.
 type versionedRecord[T any] struct {
 	rec        T
 	insertedAt time.Time
+	fileName   string
 }
 
 // Read returns all records whose data files match the given
@@ -128,6 +135,10 @@ func (s *Reader[T]) ReadMany(
 	if err != nil {
 		return nil, err
 	}
+
+	sort.SliceStable(versioned, func(i, j int) bool {
+		return s.sortCmp(versioned[i], versioned[j]) < 0
+	})
 
 	if o.IncludeHistory || !s.cfg.dedupEnabled() {
 		return stripVersions(versioned), nil
@@ -254,7 +265,7 @@ type partitionBatch[T any] struct {
 // Dedup/no-dedup handling is identical across both modes and
 // lives in emitPartition.
 func (s *Reader[T]) streamByPartition(
-	ctx context.Context, keys []string, dedup bool, readAhead int,
+	ctx context.Context, keys []core.KeyMeta, dedup bool, readAhead int,
 	yield func(T, error) bool,
 ) {
 	byPartition := s.groupKeysByPartition(keys)
@@ -263,7 +274,7 @@ func (s *Reader[T]) streamByPartition(
 	if readAhead <= 0 {
 		for _, p := range partitions {
 			files := byPartition[p]
-			slices.Sort(files)
+			sortKeyMetasByKey(files)
 			recs, err := s.downloadAndDecodeAll(ctx, files)
 			if err != nil {
 				yield(*new(T), err)
@@ -284,7 +295,7 @@ func (s *Reader[T]) streamByPartition(
 		defer close(pipeline)
 		for _, p := range partitions {
 			files := byPartition[p]
-			slices.Sort(files)
+			sortKeyMetasByKey(files)
 			recs, err := s.downloadAndDecodeAll(ctx, files)
 			select {
 			case pipeline <- partitionBatch[T]{recs: recs, err: err}:
@@ -308,10 +319,24 @@ func (s *Reader[T]) streamByPartition(
 	}
 }
 
+// sortKeyMetasByKey orders a partition's files by their S3 key
+// for deterministic download order. Emission order is then
+// decided by emitPartition's record-content sort, so this only
+// affects the internal download pipeline's determinism.
+func sortKeyMetasByKey(files []core.KeyMeta) {
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Key < files[j].Key
+	})
+}
+
 // emitPartition yields one partition's records to the consumer,
 // applying per-partition dedup when requested. Returns false when
 // the consumer asked to stop (yield returned false), so the outer
 // loop can break cleanly.
+//
+// Records are sorted by the reader's resolved sortCmp before
+// emission so callers observe a deterministic order regardless
+// of LIST response shape or goroutine scheduling.
 func (s *Reader[T]) emitPartition(
 	recs []versionedRecord[T], dedup bool,
 	yield func(T, error) bool,
@@ -319,6 +344,9 @@ func (s *Reader[T]) emitPartition(
 	if len(recs) == 0 {
 		return true
 	}
+	sort.SliceStable(recs, func(i, j int) bool {
+		return s.sortCmp(recs[i], recs[j]) < 0
+	})
 	if dedup {
 		for _, rec := range dedupLatest(recs,
 			s.cfg.EntityKeyOf, s.cfg.VersionOf) {
@@ -338,14 +366,16 @@ func (s *Reader[T]) emitPartition(
 
 // listMatchingParquet lists every parquet object under the
 // plan's ListPrefix and returns the subset whose Hive key
-// matches the plan's predicate. S3 LIST handles pagination; the
-// predicate runs in memory per key.
+// matches the plan's predicate, carrying each object's
+// LastModified so the read path can stamp InsertedAtField from
+// S3 metadata rather than re-parsing the filename. S3 LIST
+// handles pagination; the predicate runs in memory per key.
 func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *readPlan,
-) ([]string, error) {
+) ([]core.KeyMeta, error) {
 	paginator := s.cfg.Target.list(plan.ListPrefix)
 
-	var keys []string
+	var out []core.KeyMeta
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
@@ -362,37 +392,50 @@ func (s *Reader[T]) listMatchingParquet(
 				continue
 			}
 			if plan.Match(hiveKey) {
-				keys = append(keys, objKey)
+				out = append(out, core.KeyMeta{
+					Key:        objKey,
+					InsertedAt: aws.ToTime(obj.LastModified),
+				})
 			}
 		}
 	}
-	return keys, nil
+	return out, nil
 }
 
 // listAllMatchingParquet runs listMatchingParquet across every
 // plan with bounded concurrency and returns the unioned set of
-// keys, deduplicated (overlapping plans can list the same
-// parquet file, e.g. "period=*" and "period=2026-03" both cover
-// March data). Fast-path: len(plans) == 1 falls through to the
-// single-plan implementation with no goroutine overhead.
+// KeyMetas, deduplicated on key (overlapping plans can list the
+// same parquet file, e.g. "period=*" and "period=2026-03" both
+// cover March data). Fast-path: len(plans) == 1 falls through
+// to the single-plan implementation with no goroutine overhead.
 func (s *Reader[T]) listAllMatchingParquet(
 	ctx context.Context, plans []*readPlan,
-) ([]string, error) {
-	return runPlansConcurrent(ctx, plans, s.listMatchingParquet)
+) ([]core.KeyMeta, error) {
+	return runPlansConcurrent(ctx, plans,
+		s.listMatchingParquet, keyMetaKey)
 }
+
+// keyMetaKey is the keyOf function for KeyMeta fan-outs.
+func keyMetaKey(k core.KeyMeta) string { return k.Key }
 
 // runPlansConcurrent forwards to core.RunPlansConcurrent,
 // pinning the per-package concurrency cap. Kept as a package-
 // local name so the existing call sites don't have to pass
 // pollDownloadConcurrency every time.
-func runPlansConcurrent[P any](
+func runPlansConcurrent[P any, R any](
 	ctx context.Context,
 	plans []P,
-	listOne func(ctx context.Context, p P) ([]string, error),
-) ([]string, error) {
+	listOne func(ctx context.Context, p P) ([]R, error),
+	keyOf func(R) string,
+) ([]R, error) {
 	return core.RunPlansConcurrent(
-		ctx, plans, pollDownloadConcurrency, listOne)
+		ctx, plans, pollDownloadConcurrency, listOne, keyOf)
 }
+
+// identityKey is the keyOf function for []string fan-outs — the
+// element is itself the dedup key. Used by the index/backfill
+// callers that haven't been migrated to []core.KeyMeta.
+func identityKey(s string) string { return s }
 
 // dedupePatterns forwards to core.DedupePatterns.
 var dedupePatterns = core.DedupePatterns
@@ -400,14 +443,17 @@ var dedupePatterns = core.DedupePatterns
 // downloadAndDecodeAll fans out a bounded set of parallel
 // downloads, decodes each parquet file into []T, and returns
 // the concatenated result wrapped with each source file's
-// insertedAt. Preserves the input key order so callers who
-// don't dedup observe a deterministic stream.
+// insertedAt (sourced from LastModified). The input is sorted
+// by S3 key for deterministic download order; user-visible
+// emission order is set later by the caller's sort.
 func (s *Reader[T]) downloadAndDecodeAll(
-	ctx context.Context, keys []string,
+	ctx context.Context, keys []core.KeyMeta,
 ) ([]versionedRecord[T], error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
+
+	sortKeyMetasByKey(keys)
 
 	results := make([][]versionedRecord[T], len(keys))
 	errs := make([]error, len(keys))
@@ -417,9 +463,9 @@ func (s *Reader[T]) downloadAndDecodeAll(
 
 	sem := make(chan struct{}, pollDownloadConcurrency)
 	var wg sync.WaitGroup
-	for i, key := range keys {
+	for i, km := range keys {
 		wg.Add(1)
-		go func(i int, key string) {
+		go func(i int, km core.KeyMeta) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
@@ -429,14 +475,14 @@ func (s *Reader[T]) downloadAndDecodeAll(
 			}
 			defer func() { <-sem }()
 
-			recs, err := s.downloadAndDecodeOne(ctx, key)
+			recs, err := s.downloadAndDecodeOne(ctx, km)
 			if err != nil {
 				errs[i] = err
 				cancel()
 				return
 			}
 			results[i] = recs
-		}(i, key)
+		}(i, km)
 	}
 	wg.Wait()
 
@@ -464,22 +510,27 @@ func (s *Reader[T]) downloadAndDecodeAll(
 
 // downloadAndDecodeOne is the per-file body shared by
 // downloadAndDecodeAll and the iter streaming paths. Pulls one
-// parquet object from S3, decodes it, populates InsertedAtField
-// when configured, and wraps each record with the file's
-// write-time insertedAt.
+// parquet object from S3, decodes it, and wraps each record with
+// its insertedAt plus the source filename for sort tiebreaking.
+//
+// insertedAt source, in priority order:
+//
+//  1. When InsertedAtField is configured, read the writer-
+//     populated column off each decoded record — exact, same
+//     value across every read path.
+//  2. Otherwise fall back to the S3 object's LastModified from
+//     the LIST response. DefaultVersionOf's "newer wins" dedup
+//     still works on this fallback (different by the LIST-vs-
+//     HEAD precision delta, but monotonic over time).
 //
 // Returns (nil, nil) when the object is missing — a dangling ref
 // or a LIST-to-GET race. The OnMissingData hook is invoked so
 // the caller can log/count without failing the read.
 func (s *Reader[T]) downloadAndDecodeOne(
-	ctx context.Context, key string,
+	ctx context.Context, km core.KeyMeta,
 ) ([]versionedRecord[T], error) {
-	tsMicros, _, err := core.ParseDataFileName(path.Base(key))
-	if err != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: parse data filename %s: %w", key, err)
-	}
-	insertedAt := time.UnixMicro(tsMicros)
+	key := km.Key
+	fileName := path.Base(key)
 
 	data, err := s.cfg.Target.get(ctx, key)
 	if err != nil {
@@ -495,34 +546,34 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	if err != nil {
 		return nil, fmt.Errorf("s3parquet: decode %s: %w", key, err)
 	}
-	if s.insertedAtFieldIndex != nil {
-		tsVal := reflect.ValueOf(insertedAt)
-		for j := range recs {
-			rv := reflect.ValueOf(&recs[j]).Elem()
-			rv.FieldByIndex(s.insertedAtFieldIndex).Set(tsVal)
-		}
-	}
 	versioned := make([]versionedRecord[T], len(recs))
 	for j, r := range recs {
+		ia := km.InsertedAt
+		if s.insertedAtFieldIndex != nil {
+			ia = reflect.ValueOf(&recs[j]).Elem().
+				FieldByIndex(s.insertedAtFieldIndex).
+				Interface().(time.Time)
+		}
 		versioned[j] = versionedRecord[T]{
 			rec:        r,
-			insertedAt: insertedAt,
+			insertedAt: ia,
+			fileName:   fileName,
 		}
 	}
 	return versioned, nil
 }
 
-// groupKeysByPartition splits a flat list of data-file S3 keys
+// groupKeysByPartition splits a flat list of data-file KeyMetas
 // into one slice per Hive partition (the path between dataPath
-// and the filename). Within each partition the input order is
-// preserved — combined with sorted-key LIST output, that yields
-// lex/time order per partition for free.
+// and the filename). Emission order is decided by the record-
+// level sort in emitPartition — groupKeysByPartition itself no
+// longer implies chronological-within-partition output.
 func (s *Reader[T]) groupKeysByPartition(
-	keys []string,
-) map[string][]string {
-	out := make(map[string][]string)
+	keys []core.KeyMeta,
+) map[string][]core.KeyMeta {
+	out := make(map[string][]core.KeyMeta)
 	for _, k := range keys {
-		hk, ok := hiveKeyOfDataFile(k, s.dataPath)
+		hk, ok := hiveKeyOfDataFile(k.Key, s.dataPath)
 		if !ok {
 			// Defensively skip keys that don't parse. List paths
 			// already filtered to .parquet, so reaching here means

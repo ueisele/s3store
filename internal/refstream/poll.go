@@ -71,10 +71,7 @@ func Poll(
 	cutoffPrefix := core.RefCutoff(
 		opts.RefPath, time.Now(), opts.SettleWindow)
 
-	pageSize := opts.MaxEntries
-	if pageSize > s3ListMaxKeys {
-		pageSize = s3ListMaxKeys
-	}
+	pageSize := min(opts.MaxEntries, s3ListMaxKeys)
 
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(opts.Bucket),
@@ -110,7 +107,7 @@ outer:
 			if opts.Until != "" && objKey >= string(opts.Until) {
 				break outer
 			}
-			key, tsMicros, shortID, err := core.ParseRefKey(objKey)
+			key, _, shortID, dataTsMicros, err := core.ParseRefKey(objKey)
 			if err != nil {
 				return nil, opts.Since,
 					fmt.Errorf("parse ref: %w", err)
@@ -119,7 +116,9 @@ outer:
 				Offset: core.Offset(objKey),
 				Key:    key,
 				DataPath: core.BuildDataFilePath(
-					opts.DataPath, key, tsMicros, shortID),
+					opts.DataPath, key, dataTsMicros, shortID),
+				RefPath:    objKey,
+				InsertedAt: time.UnixMicro(dataTsMicros),
 			})
 			lastKey = objKey
 		}

@@ -24,24 +24,39 @@ func RefPath(prefix string) string {
 // components. The refPath is the per-store refs prefix as
 // returned by RefPath. The returned key:
 //
-//   - sorts lexicographically by tsMicros (Poll relies on this),
+//   - sorts lexicographically by refTsMicros (Poll relies on
+//     this) — the publication timestamp captured just before
+//     the ref PUT, so SettleWindow only needs to cover ref-PUT
+//     latency + LIST propagation,
 //   - carries the shortID that identifies the data file,
+//   - carries dataTsMicros — the writer's wall-clock at write-
+//     start, i.e. the timestamp embedded in the data filename —
+//     so consumers can reconstruct the data path from the ref
+//     without a separate LIST,
 //   - carries the PathEscape'd Hive key via a RefSeparator-split
 //     tail.
+//
+// Format: "{refTsMicros}-{shortID}-{dataTsMicros}<RefSep>{hive}.ref"
+// The three pre-sep fields are dash-separated; refTsMicros is
+// leftmost so it dominates lex ordering.
 func EncodeRefKey(
-	refPath string, tsMicros int64, shortID string, hiveKey string,
+	refPath string, refTsMicros int64, shortID string,
+	dataTsMicros int64, hiveKey string,
 ) string {
-	return fmt.Sprintf("%s/%d-%s%s%s.ref",
-		refPath, tsMicros, shortID,
+	return fmt.Sprintf("%s/%d-%s-%d%s%s.ref",
+		refPath, refTsMicros, shortID, dataTsMicros,
 		RefSeparator, url.PathEscape(hiveKey))
 }
 
 // ParseRefKey is the inverse of EncodeRefKey. It accepts any
 // S3-style key (with or without a path prefix) ending in the
 // encoded ref filename and returns the decoded Hive key, the
-// write timestamp (µs since epoch), and the shortID.
+// ref-publication timestamp (µs since epoch), the shortID, and
+// the data-file timestamp (µs since epoch) used to reconstruct
+// the data path.
 func ParseRefKey(refKey string) (
-	hiveKey string, tsMicros int64, shortID string, err error,
+	hiveKey string, refTsMicros int64, shortID string,
+	dataTsMicros int64, err error,
 ) {
 	name := refKey
 	if idx := strings.LastIndex(name, "/"); idx >= 0 {
@@ -51,27 +66,34 @@ func ParseRefKey(refKey string) (
 
 	parts := strings.SplitN(name, RefSeparator, 2)
 	if len(parts) != 2 {
-		return "", 0, "", fmt.Errorf(
+		return "", 0, "", 0, fmt.Errorf(
 			"s3store: invalid ref key: %s", refKey)
 	}
 
-	tsStr, short, ok := strings.Cut(parts[0], "-")
-	if !ok {
-		return "", 0, "", fmt.Errorf(
+	// pre-sep is "{refTsMicros}-{shortID}-{dataTsMicros}".
+	seg := strings.SplitN(parts[0], "-", 3)
+	if len(seg) != 3 {
+		return "", 0, "", 0, fmt.Errorf(
 			"s3store: invalid ref key: %s", refKey)
 	}
-	tsMicros, err = strconv.ParseInt(tsStr, 10, 64)
+	refTsMicros, err = strconv.ParseInt(seg[0], 10, 64)
 	if err != nil {
-		return "", 0, "", fmt.Errorf(
-			"s3store: invalid ts in ref key %q: %w", refKey, err)
+		return "", 0, "", 0, fmt.Errorf(
+			"s3store: invalid ref ts in ref key %q: %w", refKey, err)
+	}
+	shortID = seg[1]
+	dataTsMicros, err = strconv.ParseInt(seg[2], 10, 64)
+	if err != nil {
+		return "", 0, "", 0, fmt.Errorf(
+			"s3store: invalid data ts in ref key %q: %w", refKey, err)
 	}
 
 	hiveKey, err = url.PathUnescape(parts[1])
 	if err != nil {
-		return "", 0, "", fmt.Errorf(
+		return "", 0, "", 0, fmt.Errorf(
 			"s3store: invalid ref key %q: %w", refKey, err)
 	}
-	return hiveKey, tsMicros, short, nil
+	return hiveKey, refTsMicros, shortID, dataTsMicros, nil
 }
 
 // BuildDataFilePath returns the S3 object key for a data file.

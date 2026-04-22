@@ -126,14 +126,16 @@ func TestOffsetAt(t *testing.T) {
 	offset := OffsetAt(refPath, now)
 
 	earlier := core.EncodeRefKey(refPath,
-		now.Add(-time.Second).UnixMicro(), "abcd1234", hiveKey)
+		now.Add(-time.Second).UnixMicro(), "abcd1234",
+		now.Add(-time.Second).UnixMicro(), hiveKey)
 	if string(offset) <= earlier {
 		t.Errorf("offset %q should sort after earlier ref %q",
 			offset, earlier)
 	}
 
 	later := core.EncodeRefKey(refPath,
-		now.Add(time.Second).UnixMicro(), "abcd1234", hiveKey)
+		now.Add(time.Second).UnixMicro(), "abcd1234",
+		now.Add(time.Second).UnixMicro(), hiveKey)
 	if string(offset) >= later {
 		t.Errorf("offset %q should sort before later ref %q",
 			offset, later)

@@ -1,6 +1,7 @@
 package s3parquet
 
 import (
+	"cmp"
 	"fmt"
 	"time"
 
@@ -62,6 +63,12 @@ type Reader[T any] struct {
 	// Config.InsertedAtField, resolved once at New() so the hot
 	// path doesn't reparse the type. nil when unset.
 	insertedAtFieldIndex []int
+
+	// sortCmp is the resolved comparison function for emission
+	// order. Two-tier cascade:
+	//   - EntityKeyOf set: (entityKey, versionOf(rec, insertedAt)) asc
+	//   - else:            (insertedAt, fileName) asc
+	sortCmp func(a, b versionedRecord[T]) int
 }
 
 // Target returns the untyped S3Target this Reader is bound to.
@@ -96,7 +103,49 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 		dataPath:             core.DataPath(cfg.Target.Prefix),
 		refPath:              core.RefPath(cfg.Target.Prefix),
 		insertedAtFieldIndex: insertedAtIdx,
+		sortCmp:              resolveSortCmp(cfg.EntityKeyOf, cfg.VersionOf),
 	}, nil
+}
+
+// resolveSortCmp returns the versionedRecord comparator that
+// decides the reader's emission order. The cascade is:
+//
+//   - EntityKeyOf set: sort by (entityKey, versionOf) ascending
+//     so each entity's records land grouped and in version-
+//     ascending order (newest last). When VersionOf is nil the
+//     NewReader default (DefaultVersionOf = insertedAt.UnixMicro)
+//     applies, so this reduces to (entity, LastModified).
+//   - EntityKeyOf nil: sort by (insertedAt, fileName) ascending
+//     for per-file chronological output. fileName is the base
+//     name of the source parquet key — a deterministic tiebreaker
+//     when two files share a LastModified.
+//
+// cmp.Compare gives a stable three-way result on int64 nanoseconds
+// so ties fall through to the secondary key cleanly.
+func resolveSortCmp[T any](
+	entityKeyOf func(T) string,
+	versionOf func(T, time.Time) int64,
+) func(a, b versionedRecord[T]) int {
+	if entityKeyOf != nil {
+		return func(a, b versionedRecord[T]) int {
+			if c := cmp.Compare(
+				entityKeyOf(a.rec), entityKeyOf(b.rec)); c != 0 {
+				return c
+			}
+			return cmp.Compare(
+				versionOf(a.rec, a.insertedAt),
+				versionOf(b.rec, b.insertedAt))
+		}
+	}
+	return func(a, b versionedRecord[T]) int {
+		switch {
+		case a.insertedAt.Before(b.insertedAt):
+			return -1
+		case a.insertedAt.After(b.insertedAt):
+			return 1
+		}
+		return cmp.Compare(a.fileName, b.fileName)
+	}
 }
 
 // NewReaderFromWriter constructs a Reader[T] over the data a

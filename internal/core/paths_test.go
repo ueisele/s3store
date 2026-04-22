@@ -9,7 +9,8 @@ import (
 
 func TestRefKeyRoundTrip(t *testing.T) {
 	const refPath = "test-prefix/_stream/refs"
-	const ts int64 = 1710684000000000
+	const refTs int64 = 1710684000000000
+	const dataTs int64 = 1710683999500000
 	const shortID = "a3f2e1b4"
 
 	cases := []struct {
@@ -28,20 +29,23 @@ func TestRefKeyRoundTrip(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			encoded := EncodeRefKey(refPath, ts, shortID, tc.key)
+			encoded := EncodeRefKey(refPath, refTs, shortID, dataTs, tc.key)
 
-			gotKey, gotTs, gotID, err := ParseRefKey(encoded)
+			gotKey, gotRefTs, gotID, gotDataTs, err := ParseRefKey(encoded)
 			if err != nil {
 				t.Fatalf("ParseRefKey(%q): %v", encoded, err)
 			}
 			if gotKey != tc.key {
 				t.Errorf("key: got %q want %q", gotKey, tc.key)
 			}
-			if gotTs != ts {
-				t.Errorf("ts: got %d want %d", gotTs, ts)
+			if gotRefTs != refTs {
+				t.Errorf("refTs: got %d want %d", gotRefTs, refTs)
 			}
 			if gotID != shortID {
 				t.Errorf("id: got %q want %q", gotID, shortID)
+			}
+			if gotDataTs != dataTs {
+				t.Errorf("dataTs: got %d want %d", gotDataTs, dataTs)
 			}
 		})
 	}
@@ -63,7 +67,7 @@ func TestRefKeyLexicalOrdering(t *testing.T) {
 
 	var encoded []string
 	for _, ts := range timestamps {
-		encoded = append(encoded, EncodeRefKey(refPath, ts, "abcd1234", key))
+		encoded = append(encoded, EncodeRefKey(refPath, ts, "abcd1234", ts-1, key))
 	}
 	for i := 0; i < len(encoded)-1; i++ {
 		if encoded[i] >= encoded[i+1] {
@@ -72,8 +76,8 @@ func TestRefKeyLexicalOrdering(t *testing.T) {
 		}
 	}
 
-	a := EncodeRefKey(refPath, 1_710_684_000_000_000, "aaaaaaaa", key)
-	b := EncodeRefKey(refPath, 1_710_684_000_000_000, "bbbbbbbb", key)
+	a := EncodeRefKey(refPath, 1_710_684_000_000_000, "aaaaaaaa", 1_710_683_999_000_000, key)
+	b := EncodeRefKey(refPath, 1_710_684_000_000_000, "bbbbbbbb", 1_710_683_999_000_000, key)
 	if a >= b {
 		t.Errorf("same-ts id ordering: %q !< %q", a, b)
 	}
@@ -83,14 +87,16 @@ func TestParseRefKeyInvalid(t *testing.T) {
 	cases := []string{
 		"not-a-ref-key",
 		"refs/garbage.ref",
-		"refs/1710684000000000.ref",                   // no separator
-		"refs/1710684000000000;period=X.ref",          // no '-' between ts and id
-		"refs/notanumber-id;period=X.ref",             // non-numeric ts
-		"refs/1710684000000000-id;period=X%ZZabc.ref", // invalid percent escape
+		"refs/1710684000000000.ref",                                    // no separator
+		"refs/1710684000000000;period=X.ref",                           // no '-' between fields
+		"refs/1710684000000000-id;period=X.ref",                        // only 2 dash-fields
+		"refs/notanumber-id-1710683999500000;period=X.ref",             // non-numeric ref ts
+		"refs/1710684000000000-id-notanumber;period=X.ref",             // non-numeric data ts
+		"refs/1710684000000000-id-1710683999500000;period=X%ZZabc.ref", // invalid percent escape
 	}
 	for _, raw := range cases {
 		t.Run(raw, func(t *testing.T) {
-			if _, _, _, err := ParseRefKey(raw); err == nil {
+			if _, _, _, _, err := ParseRefKey(raw); err == nil {
 				t.Errorf("ParseRefKey(%q): expected error", raw)
 			}
 		})
@@ -305,6 +311,7 @@ func TestRefCutoff(t *testing.T) {
 	earlier := EncodeRefKey(refPath,
 		now.Add(-settle).Add(-time.Second).UnixMicro(),
 		"abcd1234",
+		now.Add(-settle).Add(-time.Second).UnixMicro(),
 		"period=X/customer=y")
 	if earlier >= cutoff {
 		t.Errorf("earlier ref %q should sort before cutoff %q",
@@ -315,6 +322,7 @@ func TestRefCutoff(t *testing.T) {
 	later := EncodeRefKey(refPath,
 		now.UnixMicro(),
 		"abcd1234",
+		now.UnixMicro(),
 		"period=X/customer=y")
 	if later <= cutoff {
 		t.Errorf("later ref %q should sort after cutoff %q",

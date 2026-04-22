@@ -3,7 +3,6 @@ package s3sql
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/ueisele/s3store/s3parquet"
@@ -285,58 +284,32 @@ func TestNewReader_DedupValidation(t *testing.T) {
 
 // TestNewReader_FilenameColumnCollision guards the guard: a T
 // with a `parquet:"filename"` field collides with DuckDB's
-// read_parquet(filename=true), which we use for the dedup
-// tie-breaker and the InsertedAtField populate path. NewReader
-// must reject both configurations up front instead of producing
-// wrong rows (dedup) or silently stealing the user's field
-// value (InsertedAtField) at query time.
+// read_parquet(filename=true), which we use for the dedup CTE's
+// tie-breaker. NewReader must reject the configuration up front
+// instead of producing wrong rows at query time.
+//
+// (After Phase 1, InsertedAtField is a real parquet column
+// decoded natively — no filename plumbing — so the historical
+// "InsertedAtField set" branch of this test no longer applies.)
 func TestNewReader_FilenameColumnCollision(t *testing.T) {
 	type recWithFilename struct {
-		Period     string    `parquet:"period"`
-		Customer   string    `parquet:"customer"`
-		Filename   string    `parquet:"filename"`
-		InsertedAt time.Time `parquet:"-"`
+		Period   string `parquet:"period"`
+		Customer string `parquet:"customer"`
+		Filename string `parquet:"filename"`
 	}
-	mkCfg := func() ReaderConfig[recWithFilename] {
-		return ReaderConfig[recWithFilename]{
-			Target:     validTarget(),
-			TableAlias: "t",
-		}
+	cfg := ReaderConfig[recWithFilename]{
+		Target:           validTarget(),
+		TableAlias:       "t",
+		EntityKeyColumns: []string{"period"},
+		VersionColumn:    "customer",
 	}
-	cases := []struct {
-		name    string
-		mutate  func(*ReaderConfig[recWithFilename])
-		wantSub string
-	}{
-		{
-			name: "dedup enabled",
-			mutate: func(c *ReaderConfig[recWithFilename]) {
-				c.EntityKeyColumns = []string{"period"}
-				c.VersionColumn = "customer"
-			},
-			wantSub: "dedup tie-breaker",
-		},
-		{
-			name: "InsertedAtField set",
-			mutate: func(c *ReaderConfig[recWithFilename]) {
-				c.InsertedAtField = "InsertedAt"
-			},
-			wantSub: "InsertedAtField",
-		},
+	_, err := NewReader(cfg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := mkCfg()
-			tc.mutate(&cfg)
-			_, err := NewReader(cfg)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-			if !strings.Contains(err.Error(), tc.wantSub) {
-				t.Errorf("error %q did not contain %q",
-					err.Error(), tc.wantSub)
-			}
-		})
+	if !strings.Contains(err.Error(), "dedup tie-breaker") {
+		t.Errorf("error %q did not contain %q",
+			err.Error(), "dedup tie-breaker")
 	}
 }
 

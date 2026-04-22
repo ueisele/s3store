@@ -158,6 +158,27 @@ func (t S3Target) put(
 	return err
 }
 
+// putWithMeta is put with user-supplied S3 object metadata.
+// The AWS SDK transforms each entry into an x-amz-meta-<key>
+// HTTP header; values are preserved verbatim. Used by the data
+// PUT to stamp x-amz-meta-created-at so external tooling can
+// see the writer's wall-clock time alongside the in-file
+// InsertedAtField column. Marker and ref PUTs stay on the
+// plain put — they don't carry writer metadata.
+func (t S3Target) putWithMeta(
+	ctx context.Context, key string, data []byte,
+	contentType string, meta map[string]string,
+) error {
+	_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(t.Bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(contentType),
+		Metadata:    meta,
+	})
+	return err
+}
+
 // exists reports whether an object exists, mapping S3's NotFound
 // to (false, nil) so callers can distinguish "missing" from real
 // failures without pattern-matching the error at every site.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
@@ -103,6 +104,15 @@ func (s *Writer[T]) WriteWithKeyRowGroupsBy(
 		return flushKeyOf(sorted[i]) < flushKeyOf(sorted[j])
 	})
 
+	// Capture writeStartTime here (before encode) so the same
+	// value propagates into the InsertedAtField column, the data
+	// filename's tsMicros, and the x-amz-meta-created-at header —
+	// matching the plain-write path semantics.
+	writeStartTime := time.Now()
+	if s.insertedAtFieldIndex != nil {
+		populateInsertedAt(sorted, s.insertedAtFieldIndex, writeStartTime)
+	}
+
 	parquetBytes, err := encodeParquetWithFlush(
 		sorted, s.compressionCodec, flushKeyOf)
 	if err != nil {
@@ -115,7 +125,7 @@ func (s *Writer[T]) WriteWithKeyRowGroupsBy(
 	// the same order. collectIndexMarkerPaths dedupes by path, so
 	// ordering doesn't change the marker set, but we keep the
 	// invariant that records passed here match the file contents.
-	return s.writeEncodedPayload(ctx, key, sorted, parquetBytes)
+	return s.writeEncodedPayload(ctx, key, sorted, parquetBytes, writeStartTime)
 }
 
 // encodeParquetWithFlush writes records into a parquet byte

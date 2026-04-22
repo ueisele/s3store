@@ -2,6 +2,9 @@ package s3parquet
 
 import (
 	"fmt"
+	"reflect"
+	"strings"
+	"time"
 
 	"github.com/parquet-go/parquet-go/compress"
 	"github.com/ueisele/s3store/internal/core"
@@ -31,6 +34,19 @@ type WriterConfig[T any] struct {
 	// buffers are large enough that N × buffer-size would
 	// dominate memory.
 	PartitionWriteConcurrency int
+
+	// InsertedAtField names a time.Time field on T that the writer
+	// populates with its wall-clock time.Now() just before parquet
+	// encoding, so the value becomes a real parquet column in every
+	// written file. The field must carry a non-empty, non-"-"
+	// parquet tag (e.g. `parquet:"inserted_at"`) — the value is
+	// persisted on disk, not library-managed metadata. Empty
+	// disables the feature; there is no reflection cost when unset.
+	//
+	// Paired with ReaderConfig.InsertedAtField so the same struct
+	// field round-trips unchanged end-to-end. Callers that want the
+	// write-time stamp surfaced at read time must set both sides.
+	InsertedAtField string
 }
 
 // Writer is the write-side half of a Store. Owns the write path
@@ -55,6 +71,12 @@ type Writer[T any] struct {
 	// erased at the closure boundary so the slice stays
 	// homogeneous over T.
 	indexes []indexWriter[T]
+
+	// insertedAtFieldIndex is the reflect struct-field path for
+	// WriterConfig.InsertedAtField, resolved once at NewWriter so
+	// the write hot path doesn't re-parse the type. nil when unset
+	// — populateInsertedAt is then skipped entirely.
+	insertedAtFieldIndex []int
 }
 
 // indexWriter is the internal, entry-type-erased contract
@@ -120,10 +142,54 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err != nil {
 		return nil, err
 	}
+	insertedAtIdx, err := validateWriterInsertedAtField[T](cfg.InsertedAtField)
+	if err != nil {
+		return nil, err
+	}
 	return &Writer[T]{
-		cfg:              cfg,
-		dataPath:         core.DataPath(cfg.Target.Prefix),
-		refPath:          core.RefPath(cfg.Target.Prefix),
-		compressionCodec: codec,
+		cfg:                  cfg,
+		dataPath:             core.DataPath(cfg.Target.Prefix),
+		refPath:              core.RefPath(cfg.Target.Prefix),
+		compressionCodec:     codec,
+		insertedAtFieldIndex: insertedAtIdx,
 	}, nil
+}
+
+// validateWriterInsertedAtField resolves WriterConfig.InsertedAtField
+// to a struct-field index on T. Mirrors the reader's
+// validateInsertedAtField but enforces the *column* contract: the
+// field must exist, be time.Time, and carry a non-empty, non-"-"
+// parquet tag, because the writer persists the value as a real
+// parquet column (not library-managed metadata). Returns nil when
+// name is empty.
+func validateWriterInsertedAtField[T any](name string) ([]int, error) {
+	if name == "" {
+		return nil, nil
+	}
+	rt := reflect.TypeFor[T]()
+	if rt.Kind() != reflect.Struct {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField requires T to be a struct, got %s",
+			rt)
+	}
+	f, ok := rt.FieldByName(name)
+	if !ok {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField %q: no such field on %s",
+			name, rt)
+	}
+	if f.Type != reflect.TypeFor[time.Time]() {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField %q: must be time.Time, got %s",
+			name, f.Type)
+	}
+	tag := f.Tag.Get("parquet")
+	name0, _, _ := strings.Cut(tag, ",")
+	if name0 == "" || name0 == "-" {
+		return nil, fmt.Errorf(
+			"s3parquet: InsertedAtField %q: must carry a non-empty, "+
+				"non-\"-\" parquet tag so the writer can populate it "+
+				"as a real parquet column (got %q)", name, tag)
+	}
+	return f.Index, nil
 }

@@ -376,6 +376,7 @@ func TestParseUntilToTime(t *testing.T) {
 	// pass directly as until.
 	fullKey := core.EncodeRefKey(
 		refPath, anchor.UnixMicro(), "abcd1234",
+		anchor.UnixMicro(),
 		"period=2026-03-17/customer=abc")
 	got = parseUntilToTime(Offset(fullKey))
 	if !got.Equal(anchor) {

@@ -35,7 +35,7 @@ func (s *Reader[T]) listMatchingParquet(
 			Prefix: aws.String(plan.ListPrefix),
 		})
 
-	var keys []string
+	var out []string
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
@@ -52,18 +52,17 @@ func (s *Reader[T]) listMatchingParquet(
 				continue
 			}
 			if plan.Match(hiveKey) {
-				keys = append(keys, objKey)
+				out = append(out, objKey)
 			}
 		}
 	}
-	return keys, nil
+	return out, nil
 }
 
 // listAllMatchingURIs runs listMatchingParquet across every
 // pattern with bounded concurrency and returns the deduplicated
 // union of file URIs (s3://bucket/key form, ready to pass into
-// DuckDB's read_parquet). Each pattern becomes one ReadPlan; a
-// file matched by two patterns is returned exactly once.
+// DuckDB's read_parquet).
 //
 // method identifies the caller (e.g. "ReadMany", "QueryMany")
 // so pattern-validation errors surface with the right entry
@@ -86,7 +85,8 @@ func (s *Reader[T]) listAllMatchingURIs(
 	}
 
 	keys, err := core.RunPlansConcurrent(ctx, plans,
-		listFanOutConcurrency, s.listMatchingParquet)
+		listFanOutConcurrency, s.listMatchingParquet,
+		func(k string) string { return k })
 	if err != nil {
 		return nil, err
 	}

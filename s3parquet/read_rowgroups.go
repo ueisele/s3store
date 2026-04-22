@@ -102,7 +102,7 @@ func (s *Reader[T]) ReadManyIterWhere(
 // unfiltered one — zero risk of regressing existing Read/
 // ReadIter behavior.
 func (s *Reader[T]) streamByPartitionFiltered(
-	ctx context.Context, keys []string, dedup bool, readAhead int,
+	ctx context.Context, keys []core.KeyMeta, dedup bool, readAhead int,
 	predicate RowGroupPredicate, yield func(T, error) bool,
 ) {
 	byPartition := s.groupKeysByPartition(keys)
@@ -111,7 +111,7 @@ func (s *Reader[T]) streamByPartitionFiltered(
 	if readAhead <= 0 {
 		for _, p := range partitions {
 			files := byPartition[p]
-			slices.Sort(files)
+			sortKeyMetasByKey(files)
 			recs, err := s.downloadFilteredAll(ctx, files, predicate)
 			if err != nil {
 				yield(*new(T), err)
@@ -129,7 +129,7 @@ func (s *Reader[T]) streamByPartitionFiltered(
 		defer close(pipeline)
 		for _, p := range partitions {
 			files := byPartition[p]
-			slices.Sort(files)
+			sortKeyMetasByKey(files)
 			recs, err := s.downloadFilteredAll(ctx, files, predicate)
 			select {
 			case pipeline <- partitionBatch[T]{recs: recs, err: err}:
@@ -157,13 +157,15 @@ func (s *Reader[T]) streamByPartitionFiltered(
 // downloadAndDecodeAll: fans out one goroutine per file, each
 // opens the file through a ranged-GET ReaderAt, applies the
 // row-group predicate, and decodes only the accepted row
-// groups. Preserves input order in the returned slice.
+// groups. Sorts input by key for deterministic download order.
 func (s *Reader[T]) downloadFilteredAll(
-	ctx context.Context, keys []string, predicate RowGroupPredicate,
+	ctx context.Context, keys []core.KeyMeta, predicate RowGroupPredicate,
 ) ([]versionedRecord[T], error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
+
+	sortKeyMetasByKey(keys)
 
 	results := make([][]versionedRecord[T], len(keys))
 	errs := make([]error, len(keys))
@@ -173,9 +175,9 @@ func (s *Reader[T]) downloadFilteredAll(
 
 	sem := make(chan struct{}, pollDownloadConcurrency)
 	var wg sync.WaitGroup
-	for i, key := range keys {
+	for i, km := range keys {
 		wg.Add(1)
-		go func(i int, key string) {
+		go func(i int, km core.KeyMeta) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
@@ -185,14 +187,14 @@ func (s *Reader[T]) downloadFilteredAll(
 			}
 			defer func() { <-sem }()
 
-			recs, err := s.downloadFilteredOne(ctx, key, predicate)
+			recs, err := s.downloadFilteredOne(ctx, km, predicate)
 			if err != nil {
 				errs[i] = err
 				cancel()
 				return
 			}
 			results[i] = recs
-		}(i, key)
+		}(i, km)
 	}
 	wg.Wait()
 
@@ -223,14 +225,10 @@ func (s *Reader[T]) downloadFilteredAll(
 // semantics as downloadAndDecodeOne so a dangling ref or
 // LIST-to-GET race doesn't poison the read.
 func (s *Reader[T]) downloadFilteredOne(
-	ctx context.Context, key string, predicate RowGroupPredicate,
+	ctx context.Context, km core.KeyMeta, predicate RowGroupPredicate,
 ) ([]versionedRecord[T], error) {
-	tsMicros, _, err := core.ParseDataFileName(path.Base(key))
-	if err != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: parse data filename %s: %w", key, err)
-	}
-	insertedAt := time.UnixMicro(tsMicros)
+	key := km.Key
+	fileName := path.Base(key)
 
 	size, err := s.cfg.Target.size(ctx, key)
 	if err != nil {
@@ -293,19 +291,18 @@ func (s *Reader[T]) downloadFilteredOne(
 		recs = append(recs, buf[:n]...)
 	}
 
-	if s.insertedAtFieldIndex != nil {
-		tsVal := reflect.ValueOf(insertedAt)
-		for j := range recs {
-			rv := reflect.ValueOf(&recs[j]).Elem()
-			rv.FieldByIndex(s.insertedAtFieldIndex).Set(tsVal)
-		}
-	}
-
 	versioned := make([]versionedRecord[T], len(recs))
 	for j, r := range recs {
+		ia := km.InsertedAt
+		if s.insertedAtFieldIndex != nil {
+			ia = reflect.ValueOf(&recs[j]).Elem().
+				FieldByIndex(s.insertedAtFieldIndex).
+				Interface().(time.Time)
+		}
 		versioned[j] = versionedRecord[T]{
 			rec:        r,
-			insertedAt: insertedAt,
+			insertedAt: ia,
+			fileName:   fileName,
 		}
 	}
 	return versioned, nil

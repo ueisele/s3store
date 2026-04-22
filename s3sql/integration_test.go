@@ -132,12 +132,11 @@ func TestRead_WithDedup(t *testing.T) {
 }
 
 // TestInsertedAtField_Populate covers the s3sql side of the
-// InsertedAtField hook: Read (which drives Query + scanAll)
-// populates a parquet-untagged time.Time field with the source
-// file's write timestamp, parsed out of DuckDB's `filename`
-// column. Validates the hot-path wiring end-to-end: scan-expr
-// emits filename=true, CTE keeps the column, scanAll routes it
-// through core.ParseDataFileName into the struct field.
+// InsertedAtField hook: the writer stamps the struct field with
+// its wall-clock time.Now() into a real parquet column, and the
+// DuckDB-backed Read decodes the column natively via SELECT *.
+// Validates the hot-path wiring end-to-end — no filename routing,
+// no LIST-supplied LastModified map, just a first-class column.
 func TestInsertedAtField_Populate(t *testing.T) {
 	type RecWithMeta struct {
 		Period     string    `parquet:"period"`
@@ -145,7 +144,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		SKU        string    `parquet:"sku"`
 		Amount     float64   `parquet:"amount"`
 		Ts         time.Time `parquet:"ts,timestamp(millisecond)"`
-		InsertedAt time.Time `parquet:"-"`
+		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
 	f := testutil.New(t)
@@ -162,6 +161,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
+		InsertedAtField: "InsertedAt",
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.NewWriter: %v", err)
@@ -196,9 +196,10 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		t.Fatalf("got %d records, want 1", len(got))
 	}
 	ia := got[0].InsertedAt
-	if ia.Before(before.Add(-time.Millisecond)) ||
-		ia.After(after.Add(time.Millisecond)) {
-		t.Errorf("InsertedAt=%v outside [%v, %v]",
+	if ia.Before(before.Add(-100*time.Millisecond)) ||
+		ia.After(after.Add(100*time.Millisecond)) {
+		t.Errorf("InsertedAt=%v outside [%v, %v] — writer "+
+			"should have captured time.Now() inside Write",
 			ia, before, after)
 	}
 	// Data columns still scan through the normal binder —

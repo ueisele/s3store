@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -172,13 +173,23 @@ func (s *Writer[T]) WriteWithKey(
 		return nil, err
 	}
 
+	// Capture writeStartTime here (before encode) so the same value
+	// is used to populate the InsertedAtField column AND to stamp
+	// the data filename / x-amz-meta-created-at header — a single
+	// "when was this batch written" value propagates to every
+	// downstream surface.
+	writeStartTime := time.Now()
+	if s.insertedAtFieldIndex != nil {
+		populateInsertedAt(records, s.insertedAtFieldIndex, writeStartTime)
+	}
+
 	parquetBytes, err := encodeParquet(
 		records, s.compressionCodec)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"s3parquet: parquet encode: %w", err)
 	}
-	return s.writeEncodedPayload(ctx, key, records, parquetBytes)
+	return s.writeEncodedPayload(ctx, key, records, parquetBytes, writeStartTime)
 }
 
 // writeEncodedPayload is the post-encode tail shared between
@@ -188,8 +199,15 @@ func (s *Writer[T]) WriteWithKey(
 // factored ensures the two write entry points can't drift on
 // ordering guarantees (data before ref, markers before ref,
 // orphan cleanup on ref-PUT failure).
+//
+// writeStartTime is the wall clock captured by the caller just
+// before parquet encoding — used to stamp the data filename
+// tsMicros AND the x-amz-meta-created-at header so external
+// tooling sees the same value that's in the InsertedAtField
+// column.
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
+	writeStartTime time.Time,
 ) (*WriteResult, error) {
 	// Compute marker paths up-front so a bad IndexDef.Of fails the
 	// whole Write before we touch S3, matching how validateKey
@@ -201,18 +219,21 @@ func (s *Writer[T]) writeEncodedPayload(
 
 	shortID := uuid.New().String()[:8]
 
-	// Capture the write timestamp before the data PUT so both
-	// the data filename and the ref filename share a single
-	// tsMicros — the data file is chronologically sortable in
-	// S3 LIST without consulting refs, and the invariant
-	// "ref visible implies data exists" still holds because
-	// the ref PUT is sequenced after the data PUT.
-	tsMicros := time.Now().UnixMicro()
+	// tsMicros derives from writeStartTime so the data filename
+	// carries the same "when did this batch start" stamp as the
+	// InsertedAtField column and the x-amz-meta-created-at header.
+	// The ref filename captures a separate timestamp below, taken
+	// immediately before the ref PUT so SettleWindow only needs to
+	// cover ref-PUT latency + LIST propagation.
+	tsMicros := writeStartTime.UnixMicro()
 
 	dataKey := core.BuildDataFilePath(s.dataPath, key, tsMicros, shortID)
-	if err := s.cfg.Target.put(
+	if err := s.cfg.Target.putWithMeta(
 		ctx, dataKey, parquetBytes,
 		"application/octet-stream",
+		map[string]string{
+			"created-at": writeStartTime.Format(time.RFC3339Nano),
+		},
 	); err != nil {
 		return nil, fmt.Errorf(
 			"s3parquet: put data: %w", err)
@@ -245,18 +266,26 @@ func (s *Writer[T]) writeEncodedPayload(
 	// for a Poll-visible stream position.
 	if s.cfg.Target.DisableRefStream {
 		return &WriteResult{
-			Offset:   "",
-			DataPath: dataKey,
-			RefPath:  "",
+			Offset:     "",
+			DataPath:   dataKey,
+			RefPath:    "",
+			InsertedAt: writeStartTime,
 		}, nil
 	}
 
-	refKey := core.EncodeRefKey(s.refPath, tsMicros, shortID, key)
+	// Capture a second timestamp immediately before the ref PUT so
+	// the ref filename reflects publication time (when the ref
+	// became visible) rather than write-start time. SettleWindow
+	// then only needs to cover ref-PUT latency + LIST propagation,
+	// independent of marker count.
+	refTsMicros := time.Now().UnixMicro()
+	refKey := core.EncodeRefKey(s.refPath, refTsMicros, shortID, tsMicros, key)
 
 	result := &WriteResult{
-		Offset:   Offset(refKey),
-		DataPath: dataKey,
-		RefPath:  refKey,
+		Offset:     Offset(refKey),
+		DataPath:   dataKey,
+		RefPath:    refKey,
+		InsertedAt: writeStartTime,
 	}
 
 	putErr := s.cfg.Target.put(
@@ -429,6 +458,23 @@ func (s *Writer[T]) putMarkersParallel(
 		return err
 	}
 	return nil
+}
+
+// populateInsertedAt reflectively writes t into every record's
+// InsertedAtField (at path fieldIdx). Called by both
+// WriteWithKey and WriteWithKeyRowGroupsBy before parquet encode
+// so the value lands in the file as a real column. Package-
+// level rather than a method so the row-groups writer can reuse
+// it without giving a reflective helper Writer[T] access.
+//
+// fieldIdx must not be nil — callers guard on s.insertedAtFieldIndex
+// at the call site.
+func populateInsertedAt[T any](recs []T, fieldIdx []int, t time.Time) {
+	tsVal := reflect.ValueOf(t)
+	for i := range recs {
+		rv := reflect.ValueOf(&recs[i]).Elem()
+		rv.FieldByIndex(fieldIdx).Set(tsVal)
+	}
 }
 
 // encodeParquet writes records to a parquet byte stream using

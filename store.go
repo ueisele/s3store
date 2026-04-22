@@ -55,6 +55,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		PartitionKeyOf:            cfg.PartitionKeyOf,
 		Compression:               cfg.Compression,
 		PartitionWriteConcurrency: cfg.PartitionWriteConcurrency,
+		InsertedAtField:           cfg.InsertedAtField,
 	})
 	if err != nil {
 		return nil, err

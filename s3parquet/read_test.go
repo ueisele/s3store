@@ -1,6 +1,7 @@
 package s3parquet
 
 import (
+	"sort"
 	"testing"
 	"time"
 
@@ -253,4 +254,103 @@ func TestDedupLatest_TieKeepsFirst(t *testing.T) {
 	if got[0].payload != "first" {
 		t.Errorf("got %q, want first", got[0].payload)
 	}
+}
+
+// vrf is a terse versionedRecord[dedupRec] constructor that also
+// sets the fileName field, used by the sort-resolver tests where
+// fileName participates in the order.
+func vrf(e string, v int64, p string, insertedAt time.Time, fn string) versionedRecord[dedupRec] {
+	return versionedRecord[dedupRec]{
+		rec:        dedupRec{entity: e, ver: v, payload: p},
+		insertedAt: insertedAt,
+		fileName:   fn,
+	}
+}
+
+// TestResolveSortCmp_EntityAndExplicitVersion covers the
+// "EntityKeyOf set, explicit VersionOf" branch: records group
+// per entity and ascend by the explicit version so newer lands
+// after older within each entity.
+func TestResolveSortCmp_EntityAndExplicitVersion(t *testing.T) {
+	cmp := resolveSortCmp[dedupRec](
+		func(r dedupRec) string { return r.entity },
+		func(r dedupRec, _ time.Time) int64 { return r.ver })
+
+	now := time.UnixMicro(1_000_000)
+	recs := []versionedRecord[dedupRec]{
+		vrf("b", 1, "b1", now, "f-b1"),
+		vrf("a", 2, "a2", now, "f-a2"),
+		vrf("a", 1, "a1", now, "f-a1"),
+		vrf("b", 2, "b2", now, "f-b2"),
+	}
+	sortWith(recs, cmp)
+	wantOrder := []string{"a1", "a2", "b1", "b2"}
+	for i, want := range wantOrder {
+		if recs[i].rec.payload != want {
+			t.Errorf("[%d] got %q, want %q",
+				i, recs[i].rec.payload, want)
+		}
+	}
+}
+
+// TestResolveSortCmp_EntityAndDefaultVersion covers the
+// "EntityKeyOf set, VersionOf defaulted to DefaultVersionOf"
+// branch: the sort picks insertedAt (= LastModified) as version,
+// so within each entity the newer LastModified lands later.
+func TestResolveSortCmp_EntityAndDefaultVersion(t *testing.T) {
+	cmp := resolveSortCmp[dedupRec](
+		func(r dedupRec) string { return r.entity },
+		DefaultVersionOf[dedupRec])
+
+	early := time.UnixMicro(1_000_000)
+	late := time.UnixMicro(2_000_000)
+	recs := []versionedRecord[dedupRec]{
+		vrf("b", 0, "b-late", late, "f-b-late"),
+		vrf("a", 0, "a-late", late, "f-a-late"),
+		vrf("a", 0, "a-early", early, "f-a-early"),
+		vrf("b", 0, "b-early", early, "f-b-early"),
+	}
+	sortWith(recs, cmp)
+	wantOrder := []string{"a-early", "a-late", "b-early", "b-late"}
+	for i, want := range wantOrder {
+		if recs[i].rec.payload != want {
+			t.Errorf("[%d] got %q, want %q",
+				i, recs[i].rec.payload, want)
+		}
+	}
+}
+
+// TestResolveSortCmp_LastModifiedFallback covers the
+// "EntityKeyOf nil" branch: per-file chronological, tiebreak by
+// fileName for determinism across identical LastModified values.
+func TestResolveSortCmp_LastModifiedFallback(t *testing.T) {
+	cmp := resolveSortCmp[dedupRec](nil, nil)
+
+	early := time.UnixMicro(1_000_000)
+	late := time.UnixMicro(2_000_000)
+	recs := []versionedRecord[dedupRec]{
+		vrf("x", 0, "late-b", late, "late-b.parquet"),
+		vrf("x", 0, "early-b", early, "early-b.parquet"),
+		vrf("x", 0, "late-a", late, "late-a.parquet"),
+		vrf("x", 0, "early-a", early, "early-a.parquet"),
+	}
+	sortWith(recs, cmp)
+	wantOrder := []string{"early-a", "early-b", "late-a", "late-b"}
+	for i, want := range wantOrder {
+		if recs[i].rec.payload != want {
+			t.Errorf("[%d] got %q, want %q",
+				i, recs[i].rec.payload, want)
+		}
+	}
+}
+
+// sortWith is a tiny test helper that applies a cmp-returning
+// comparator through sort.SliceStable, matching how the reader
+// invokes its sortCmp in the hot path.
+func sortWith(recs []versionedRecord[dedupRec],
+	cmpFn func(a, b versionedRecord[dedupRec]) int,
+) {
+	sort.SliceStable(recs, func(i, j int) bool {
+		return cmpFn(recs[i], recs[j]) < 0
+	})
 }

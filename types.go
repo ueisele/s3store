@@ -85,13 +85,14 @@ type Config[T any] struct {
 	// s3parquet.CompressionCodec for the accepted values.
 	Compression s3parquet.CompressionCodec
 
-	// InsertedAtField names a time.Time field on T that Read and
-	// PollRecords populate with the source parquet file's write
-	// timestamp on decode. The field must be tagged `parquet:"-"`
-	// (validated at New()) so it stays off the parquet schema.
-	// Forwarded to both sub-stores so the umbrella's read paths
-	// — whether routed via s3parquet.PollRecords or s3sql.Read /
-	// PollRecords — populate the field consistently.
+	// InsertedAtField names a time.Time field on T that the
+	// writer populates with its wall-clock time.Now() at write
+	// time; Read and PollRecords surface the same value back.
+	// The field must carry a non-empty, non-"-" parquet tag (e.g.
+	// `parquet:"inserted_at"`) — the value is a real parquet
+	// column, not library-managed metadata. Forwarded to both
+	// sub-stores so the umbrella's read paths return the
+	// identical value across s3parquet and s3sql.
 	InsertedAtField string
 
 	// DisableRefStream opts the dataset out of writing stream ref

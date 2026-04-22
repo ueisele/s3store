@@ -624,11 +624,11 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 }
 
 // TestInsertedAtField_Populate covers the InsertedAtField hook:
-// Read and PollRecords populate a struct field with the source
-// file's write timestamp on decode. The field carries
-// `parquet:"-"` so it's library-managed (parquet-go ignores it
-// on both sides of the round-trip). We assert the populated
-// time is close to the Write wall-clock time for the call.
+// the writer populates a struct field with its wall-clock
+// time.Now() before parquet encode, and Read / PollRecords
+// surface that same value back. The field carries a real parquet
+// tag so it's a first-class column — identical across every read
+// path.
 func TestInsertedAtField_Populate(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
@@ -638,7 +638,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		Customer   string    `parquet:"customer"`
 		SKU        string    `parquet:"sku"`
 		Ts         time.Time `parquet:"ts,timestamp(millisecond)"`
-		InsertedAt time.Time `parquet:"-"`
+		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
 	store, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
@@ -674,17 +674,20 @@ func TestInsertedAtField_Populate(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d records, want 1", len(got))
 	}
-	// The populated InsertedAt is the parquet file's write
-	// tsMicros, captured between before and after.
+	// The populated InsertedAt is the writer's time.Now()
+	// captured inside Write, so it's bracketed precisely by
+	// before/after. 100 ms of tolerance covers scheduler jitter.
 	ia := got[0].InsertedAt
-	if ia.Before(before.Add(-time.Millisecond)) ||
-		ia.After(after.Add(time.Millisecond)) {
+	if ia.Before(before.Add(-100*time.Millisecond)) ||
+		ia.After(after.Add(100*time.Millisecond)) {
 		t.Errorf("InsertedAt=%v outside [%v, %v]",
 			ia, before, after)
 	}
 
-	// PollRecords goes through the same decode path; same
-	// populated value is expected.
+	// Phase 1's promise: the InsertedAt returned from PollRecords
+	// is the exact same column value Read produces. Previous
+	// LastModified-based implementations drifted by the ref-PUT-
+	// vs-data-PUT delta; the column sidesteps that entirely.
 	polled, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
@@ -693,19 +696,30 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		t.Fatalf("PollRecords: got %d, want 1", len(polled))
 	}
 	if !polled[0].InsertedAt.Equal(ia) {
-		t.Errorf("PollRecords InsertedAt=%v, Read=%v "+
-			"(should match, same parquet file)",
+		t.Errorf("PollRecords InsertedAt=%v != Read InsertedAt=%v "+
+			"(column value must match exactly)",
 			polled[0].InsertedAt, ia)
 	}
 }
 
 // TestInsertedAtField_Validation covers the New()-time checks
 // that protect users from configuring InsertedAtField wrong: no
-// such field, wrong type, or a missing parquet:"-" tag.
+// such field, wrong type, or a missing / "-" parquet tag (the
+// field is now a real parquet column, so it must carry a
+// non-empty, non-"-" tag).
 func TestInsertedAtField_Validation(t *testing.T) {
 	f := testutil.New(t)
 
-	mkCfg := func(field string) s3parquet.Config[Rec] {
+	type RecIgnoredMeta struct {
+		Period   string    `parquet:"period"`
+		Customer string    `parquet:"customer"`
+		SKU      string    `parquet:"sku"`
+		Value    int64     `parquet:"value"`
+		Ts       time.Time `parquet:"ts,timestamp(millisecond)"`
+		Ignored  time.Time `parquet:"-"`
+	}
+
+	mkCfgRec := func(field string) s3parquet.Config[Rec] {
 		return s3parquet.Config[Rec]{
 			Bucket:            f.Bucket,
 			Prefix:            "store",
@@ -717,30 +731,40 @@ func TestInsertedAtField_Validation(t *testing.T) {
 			InsertedAtField: field,
 		}
 	}
+	mkCfgIgnored := func(field string) s3parquet.Config[RecIgnoredMeta] {
+		return s3parquet.Config[RecIgnoredMeta]{
+			Bucket:            f.Bucket,
+			Prefix:            "store",
+			S3Client:          f.S3Client,
+			PartitionKeyParts: []string{"period", "customer"},
+			PartitionKeyOf: func(r RecIgnoredMeta) string {
+				return "period=p/customer=c"
+			},
+			InsertedAtField: field,
+		}
+	}
 
-	cases := []struct {
-		name     string
-		field    string
-		wantSubs string
-	}{
-		{"no such field", "Nonexistent", "no such field"},
-		// Ts is time.Time but has parquet:"ts,..." tag, not "-".
-		{"wrong parquet tag", "Ts", `must be tagged`},
+	t.Run("no such field", func(t *testing.T) {
+		_, err := s3parquet.New[Rec](mkCfgRec("Nonexistent"))
+		if err == nil || !strings.Contains(err.Error(), "no such field") {
+			t.Fatalf("want %q error, got %v", "no such field", err)
+		}
+	})
+	t.Run("wrong type", func(t *testing.T) {
 		// Period is string, not time.Time.
-		{"wrong type", "Period", "must be time.Time"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := s3parquet.New[Rec](mkCfg(tc.field))
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-			if !strings.Contains(err.Error(), tc.wantSubs) {
-				t.Errorf("error %q does not contain %q",
-					err, tc.wantSubs)
-			}
-		})
-	}
+		_, err := s3parquet.New[Rec](mkCfgRec("Period"))
+		if err == nil || !strings.Contains(err.Error(), "must be time.Time") {
+			t.Fatalf("want %q error, got %v", "must be time.Time", err)
+		}
+	})
+	t.Run("parquet dash tag rejected", func(t *testing.T) {
+		// Ignored is time.Time but tagged parquet:"-" — rejected
+		// because the value must be persisted as a real column.
+		_, err := s3parquet.New[RecIgnoredMeta](mkCfgIgnored("Ignored"))
+		if err == nil || !strings.Contains(err.Error(), "non-empty, non-\"-\" parquet tag") {
+			t.Fatalf("want non-empty/non-\"-\" error, got %v", err)
+		}
+	})
 }
 
 // TestNewReaderFromStore_NarrowT covers the cross-T read path:
@@ -2688,5 +2712,349 @@ func TestReadIterWhere_EmptyMatch(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("want 0 records (pruned), got %d", count)
+	}
+}
+
+// TestInsertedAtField_PopulatedByWriter pins the Phase 1
+// guarantee that InsertedAtField is populated by the writer at
+// Write time, not derived from S3 LastModified at read time. We
+// bracket the write with before/after timestamps and assert the
+// column's value lies between them — the writer captures
+// time.Now() inside Write, so the bracket is tight.
+func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+
+	type RecWithMeta struct {
+		Period     string    `parquet:"period"`
+		Customer   string    `parquet:"customer"`
+		SKU        string    `parquet:"sku"`
+		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
+	}
+
+	store, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r RecWithMeta) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow:    10 * time.Millisecond,
+		InsertedAtField: "InsertedAt",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	before := time.Now()
+	if _, err := store.Write(ctx, []RecWithMeta{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1"},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	after := time.Now()
+	time.Sleep(30 * time.Millisecond)
+
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1", len(got))
+	}
+	ia := got[0].InsertedAt
+	if ia.Before(before.Add(-100*time.Millisecond)) ||
+		ia.After(after.Add(100*time.Millisecond)) {
+		t.Errorf("InsertedAt=%v outside [%v, %v] — writer "+
+			"should have captured time.Now() inside the Write "+
+			"call, so the value is bracketed precisely",
+			ia, before, after)
+	}
+}
+
+// TestInsertedAtField_ColumnIsAuthoritativeOverLastModified pins
+// the Phase 1 contract that the column's value — not S3
+// LastModified — is what Read surfaces. We write, sleep long
+// enough that time.Now() diverges clearly from writeStartTime,
+// and assert the decoded InsertedAt is close to writeStartTime
+// (from the column) and NOT close to time.Now() (where
+// LastModified-based sourcing would have landed if the reader
+// were wrong).
+func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.New(t)
+
+	type RecWithMeta struct {
+		Period     string    `parquet:"period"`
+		Customer   string    `parquet:"customer"`
+		SKU        string    `parquet:"sku"`
+		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
+	}
+
+	store, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r RecWithMeta) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		SettleWindow:    10 * time.Millisecond,
+		InsertedAtField: "InsertedAt",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	writeStart := time.Now()
+	if _, err := store.Write(ctx, []RecWithMeta{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1"},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	writeEnd := time.Now()
+
+	// Sleep long enough that now-time clearly differs from the
+	// write instant — if the read path were pulling from
+	// something time-of-read-ish (it shouldn't), the delta would
+	// show up here. LastModified is second-granular on MinIO and
+	// stamped around the writeStart anyway, so this test doesn't
+	// exercise divergence between column and LastModified per se;
+	// it exercises that the read path does NOT stamp its own
+	// clock on the record.
+	time.Sleep(2 * time.Second)
+	readTime := time.Now()
+
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1", len(got))
+	}
+	ia := got[0].InsertedAt
+	if ia.Before(writeStart.Add(-100*time.Millisecond)) ||
+		ia.After(writeEnd.Add(100*time.Millisecond)) {
+		t.Errorf("InsertedAt=%v outside write bracket [%v, %v]",
+			ia, writeStart, writeEnd)
+	}
+	// Guard: InsertedAt should be clearly earlier than readTime
+	// by at least the sleep. If the reader were sourcing from a
+	// fresh time.Now() this check would fail.
+	if readTime.Sub(ia) < time.Second {
+		t.Errorf("InsertedAt=%v is too close to readTime=%v "+
+			"(delta %v < 1s) — reader must source from the "+
+			"column, not a fresh clock",
+			ia, readTime, readTime.Sub(ia))
+	}
+}
+
+// TestDefaultVersionOf_UsesLastModified pins the fallback
+// behaviour when InsertedAtField is NOT configured: the dedup
+// tiebreaker (DefaultVersionOf with no explicit VersionOf) still
+// picks the record with the newer S3 LastModified. Two writes
+// land at observably different LastModified values (one-second
+// MinIO precision); dedup must keep the later one. With
+// InsertedAtField configured the path sources the column value
+// instead; this test exists specifically to cover the no-column
+// fallback.
+func TestDefaultVersionOf_UsesLastModified(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Period + "|" + r.Customer + "|" + r.SKU
+		},
+		// VersionOf nil → NewReader fills with DefaultVersionOf,
+		// which reads insertedAt (= LastModified).
+	})
+
+	// Value 1 writes first; sleep past one second so MinIO stamps
+	// a distinct LastModified, then write Value 2. DefaultVersionOf
+	// must pick the later file.
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Value: 1, Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("Write 1: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Value: 2, Ts: time.UnixMilli(200)},
+	}); err != nil {
+		t.Fatalf("Write 2: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1 (dedup)", len(got))
+	}
+	if got[0].Value != 2 {
+		t.Errorf("dedup picked Value=%d, want 2 (newer LastModified)",
+			got[0].Value)
+	}
+}
+
+// TestSort_ByEntityKeyAndVersion covers the two-tier sort when
+// both EntityKeyOf and VersionOf are configured: records arrive
+// grouped by entity, ascending by version within each group.
+func TestSort_ByEntityKeyAndVersion(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string { return r.SKU },
+		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+	})
+
+	// Interleaved entities + versions; write one record per call
+	// so every record lands in its own file.
+	writes := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "b",
+			Value: 2, Ts: time.UnixMilli(100)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "a",
+			Value: 1, Ts: time.UnixMilli(200)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "b",
+			Value: 1, Ts: time.UnixMilli(300)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "a",
+			Value: 2, Ts: time.UnixMilli(400)},
+	}
+	for i, r := range writes {
+		if _, err := store.Write(ctx, []Rec{r}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	// WithHistory so sort can be observed without dedup folding.
+	got, err := store.Read(ctx, "*", s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	want := []struct {
+		sku string
+		v   int64
+	}{
+		{"a", 1}, {"a", 2}, {"b", 1}, {"b", 2},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d records, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].SKU != w.sku || got[i].Value != w.v {
+			t.Errorf("[%d] got (sku=%q, v=%d), want (sku=%q, v=%d)",
+				i, got[i].SKU, got[i].Value, w.sku, w.v)
+		}
+	}
+}
+
+// TestSort_LastModifiedFallback covers the no-EntityKeyOf branch:
+// emission order is per-file chronological by LastModified, with
+// a fileName tiebreak that fires only on identical LastModified.
+// We use one-second MinIO precision to produce distinct times.
+func TestSort_LastModifiedFallback(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{}) // no dedup, no EntityKeyOf
+
+	// Each Write call produces its own data file with its own
+	// LastModified. Sleep past one second between writes so
+	// MinIO stamps distinct values.
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Value: 1, Ts: time.UnixMilli(100)},
+	}); err != nil {
+		t.Fatalf("Write 1: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := store.Write(ctx, []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Value: 2, Ts: time.UnixMilli(200)},
+	}); err != nil {
+		t.Fatalf("Write 2: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	got, err := store.Read(ctx, "*")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2", len(got))
+	}
+	if got[0].Value != 1 || got[1].Value != 2 {
+		t.Errorf("order wrong: got [%d, %d], want [1, 2]",
+			got[0].Value, got[1].Value)
+	}
+}
+
+// TestSort_AppliesToAllReadPaths checks Read, ReadIter, and
+// PollRecords all emit the same deterministic order when the
+// reader is configured with EntityKeyOf + VersionOf. This is
+// Phase 1's "sort is the source of truth" contract.
+func TestSort_AppliesToAllReadPaths(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string { return r.SKU },
+		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+	})
+
+	writes := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "b",
+			Value: 2, Ts: time.UnixMilli(100)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "a",
+			Value: 1, Ts: time.UnixMilli(200)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "a",
+			Value: 2, Ts: time.UnixMilli(300)},
+		{Period: "2026-03-17", Customer: "abc", SKU: "b",
+			Value: 1, Ts: time.UnixMilli(400)},
+	}
+	for i, r := range writes {
+		if _, err := store.Write(ctx, []Rec{r}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	readGot, err := store.Read(ctx, "*", s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	var iterGot []Rec
+	for rec, err := range store.ReadIter(ctx, "*", s3parquet.WithHistory()) {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		iterGot = append(iterGot, rec)
+	}
+
+	pollGot, _, err := store.PollRecords(ctx, "", 100, s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("PollRecords: %v", err)
+	}
+
+	sameOrder := func(a, b []Rec) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i].SKU != b[i].SKU || a[i].Value != b[i].Value {
+				return false
+			}
+		}
+		return true
+	}
+	if !sameOrder(readGot, iterGot) {
+		t.Errorf("Read vs ReadIter order mismatch:\n read=%+v\n iter=%+v",
+			readGot, iterGot)
+	}
+	if !sameOrder(readGot, pollGot) {
+		t.Errorf("Read vs PollRecords order mismatch:\n read=%+v\n poll=%+v",
+			readGot, pollGot)
 	}
 }

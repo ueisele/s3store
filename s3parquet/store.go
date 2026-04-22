@@ -3,6 +3,7 @@ package s3parquet
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -78,10 +79,12 @@ type Config[T any] struct {
 	EntityKeyOf func(T) string
 
 	// VersionOf returns the monotonic version of a record for
-	// dedup ordering. The library passes the source file's
-	// write time in insertedAt — useful as a fallback when the
-	// record has no domain-level version, or combine it with a
-	// business timestamp for hybrid strategies.
+	// dedup ordering. The library passes an insertedAt time that
+	// defaults to the writer-populated InsertedAtField column
+	// value when configured, otherwise the source file's S3
+	// LastModified — useful as a fallback when the record has no
+	// domain-level version, or combine it with a business
+	// timestamp for hybrid strategies.
 	//
 	// Nil defaults to DefaultVersionOf (wrote-last-wins). The
 	// default is assigned inside New() when EntityKeyOf is
@@ -106,19 +109,21 @@ type Config[T any] struct {
 	// for concurrent invocation.
 	OnMissingData func(dataPath string)
 
-	// InsertedAtField names a time.Time field on T that Read and
-	// PollRecords populate with the source parquet file's write
-	// timestamp on decode. The field must be tagged `parquet:"-"`
-	// so parquet-go ignores it on both encode and decode — the
-	// field is library-managed metadata, not a parquet column.
-	// Empty disables the feature; there is no reflection cost when
-	// unset.
+	// InsertedAtField names a time.Time field on T that the writer
+	// populates with its wall-clock time.Now() captured just before
+	// parquet encoding; Read and PollRecords then surface the same
+	// value back to the caller. The field must carry a non-empty,
+	// non-"-" parquet tag (e.g. `parquet:"inserted_at"`) — the value
+	// is a real parquet column persisted on disk, not library-
+	// managed metadata. Empty disables the feature; there is no
+	// reflection cost when unset.
 	//
-	// Motivating case: a stream consumer needs per-record "when did
-	// this land in S3" without storing it as an on-disk column.
-	// Before this config, the only options were duplicating the
-	// value into a data column (wasteful) or reconstructing it
-	// from Poll + StreamEntry.
+	// Motivating case: a stream consumer needs a per-record "when
+	// was this written" stamp that is identical across every read
+	// path (s3parquet Read / ReadIter / PollRecords, s3sql Read /
+	// PollRecords). Sourcing the value from a writer-populated
+	// parquet column makes it exact — S3 LastModified would drift
+	// by the ref-PUT-vs-data-PUT delta.
 	InsertedAtField string
 
 	// Compression selects the parquet compression codec used on
@@ -145,10 +150,14 @@ type Config[T any] struct {
 	PartitionWriteConcurrency int
 }
 
-// DefaultVersionOf returns insertedAt in microseconds. Assigned
-// to Config.VersionOf inside New() when that field is nil and
-// EntityKeyOf is set; also exported so users can reference the
-// wrote-last-wins default explicitly in their config.
+// DefaultVersionOf returns insertedAt in microseconds. The
+// reader sources insertedAt from the writer-populated
+// InsertedAtField column when configured, else from the source
+// file's S3 LastModified — either way this yields a "newer
+// wins" dedup policy. Assigned to Config.VersionOf inside New()
+// when that field is nil and EntityKeyOf is set; also exported
+// so users can reference the wrote-last-wins default explicitly
+// in their config.
 func DefaultVersionOf[T any](_ T, insertedAt time.Time) int64 {
 	return insertedAt.UnixMicro()
 }
@@ -220,6 +229,7 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 		PartitionKeyOf:            c.PartitionKeyOf,
 		Compression:               c.Compression,
 		PartitionWriteConcurrency: c.PartitionWriteConcurrency,
+		InsertedAtField:           c.InsertedAtField,
 	}
 }
 
@@ -258,10 +268,10 @@ func resolveCompression(c CompressionCodec) (compress.Codec, error) {
 
 // validateInsertedAtField resolves Config.InsertedAtField to a
 // struct-field index on T. Rejects typos (no such field), wrong
-// type (not time.Time), and — critically — a missing `parquet:"-"`
-// tag, because without it the field would either round-trip
-// through parquet (double bookkeeping) or shadow a real parquet
-// column. Returns nil when name is empty.
+// type (not time.Time), and — critically — a missing or "-"
+// parquet tag, because the field now carries a real parquet column
+// populated by the writer; the reader decodes it back through the
+// normal parquet schema. Returns nil when name is empty.
 func validateInsertedAtField[T any](name string) ([]int, error) {
 	if name == "" {
 		return nil, nil
@@ -283,11 +293,14 @@ func validateInsertedAtField[T any](name string) ([]int, error) {
 			"s3parquet: InsertedAtField %q: must be time.Time, got %s",
 			name, f.Type)
 	}
-	if tag := f.Tag.Get("parquet"); tag != "-" {
+	tag := f.Tag.Get("parquet")
+	name0, _, _ := strings.Cut(tag, ",")
+	if name0 == "" || name0 == "-" {
 		return nil, fmt.Errorf(
-			"s3parquet: InsertedAtField %q: must be tagged "+
-				"`parquet:\"-\"` to stay library-managed "+
-				"(got %q)", name, tag)
+			"s3parquet: InsertedAtField %q: must carry a non-empty, "+
+				"non-\"-\" parquet tag so the reader can decode it "+
+				"from the writer-populated column (got %q)",
+			name, tag)
 	}
 	return f.Index, nil
 }
