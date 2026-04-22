@@ -85,13 +85,12 @@ func (s *Reader[T]) ReadManyIterWhere(
 			return
 		}
 
-		dedup := s.cfg.dedupEnabled() && !o.IncludeHistory
 		readAhead := o.ReadAheadPartitions
 		if readAhead < 0 {
 			readAhead = 0
 		}
 		s.streamByPartitionFiltered(
-			ctx, keys, dedup, readAhead, predicate, yield)
+			ctx, keys, o.IncludeHistory, readAhead, predicate, yield)
 	}
 }
 
@@ -102,7 +101,8 @@ func (s *Reader[T]) ReadManyIterWhere(
 // unfiltered one — zero risk of regressing existing Read/
 // ReadIter behavior.
 func (s *Reader[T]) streamByPartitionFiltered(
-	ctx context.Context, keys []core.KeyMeta, dedup bool, readAhead int,
+	ctx context.Context, keys []core.KeyMeta,
+	includeHistory bool, readAhead int,
 	predicate RowGroupPredicate, yield func(T, error) bool,
 ) {
 	byPartition := s.groupKeysByPartition(keys)
@@ -117,7 +117,7 @@ func (s *Reader[T]) streamByPartitionFiltered(
 				yield(*new(T), err)
 				return
 			}
-			if !s.emitPartition(recs, dedup, yield) {
+			if !s.emitPartition(recs, includeHistory, yield) {
 				return
 			}
 		}
@@ -147,7 +147,7 @@ func (s *Reader[T]) streamByPartitionFiltered(
 			yield(*new(T), b.err)
 			return
 		}
-		if !s.emitPartition(b.recs, dedup, yield) {
+		if !s.emitPartition(b.recs, includeHistory, yield) {
 			return
 		}
 	}

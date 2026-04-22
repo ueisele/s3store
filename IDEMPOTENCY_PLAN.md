@@ -122,7 +122,7 @@ Semantic notes on `LastModified` as the sort / version source:
 
 ---
 
-## Phase 1.5 — Replica dedup (independent of version dedup)
+## Phase 1.5 — Replica dedup (independent of version dedup) ✅ implemented
 
 **Outcome**: when `EntityKeyOf` + `VersionOf` are configured, records with the same `(entity, version)` are collapsed to one regardless of `WithHistory`. This catches retry / zombie replicas that produce byte-identical writes, while `WithHistory` continues to control whether *distinct versions* are preserved or reduced to "latest wins".
 

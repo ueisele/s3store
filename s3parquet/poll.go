@@ -100,8 +100,12 @@ func (s *Reader[T]) PollRecords(
 		return s.sortCmp(versioned[i], versioned[j]) < 0
 	})
 
-	if o.IncludeHistory || !s.cfg.dedupEnabled() {
+	if !s.cfg.dedupEnabled() {
 		return stripVersions(versioned), newOffset, nil
+	}
+	if o.IncludeHistory {
+		return stripVersions(dedupReplicas(versioned,
+			s.cfg.EntityKeyOf, s.cfg.VersionOf)), newOffset, nil
 	}
 	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf),
 		newOffset, nil

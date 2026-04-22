@@ -102,7 +102,7 @@ func (s *Reader[T]) ReadMany(
 		return nil, nil
 	}
 
-	scanExpr := s.scanExprForURIs(uris, s.needsFilename(o.IncludeHistory))
+	scanExpr := s.scanExprForURIs(uris, s.needsFilename())
 	rows, err := s.db.QueryContext(ctx,
 		s.wrapScanExpr(scanExpr,
 			"SELECT * FROM "+s.cfg.TableAlias, o.IncludeHistory))
@@ -214,7 +214,7 @@ func (s *Reader[T]) openIterRows(
 	if len(uris) == 0 {
 		return nil, nil
 	}
-	scanExpr := s.scanExprForURIs(uris, s.needsFilename(o.IncludeHistory))
+	scanExpr := s.scanExprForURIs(uris, s.needsFilename())
 	r, err := s.db.QueryContext(ctx,
 		s.wrapScanExpr(scanExpr,
 			"SELECT * FROM "+s.cfg.TableAlias, o.IncludeHistory))

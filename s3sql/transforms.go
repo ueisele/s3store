@@ -82,12 +82,16 @@ func filenameOpt(withFilename bool) string {
 }
 
 // needsFilename reports whether read_parquet must be invoked with
-// filename=true for this query. Only the dedup CTE needs the
-// column (as a tie-breaker on equal VersionColumn values). The
-// scan-expr builders and wrapScanExpr both consult this so the
-// scan and the CTE agree on whether filename is present.
-func (s *Reader[T]) needsFilename(includeHistory bool) bool {
-	return !includeHistory && s.cfg.dedupEnabled()
+// filename=true for this query. The dedup CTE uses `filename` as
+// a tie-breaker — both for the latest-per-entity path (tie-break
+// on equal VersionColumn) and the history-with-replica-dedup path
+// (tie-break within one (entity, version) group so the same row
+// wins on every re-read). Needed whenever dedup is enabled,
+// regardless of WithHistory. The scan-expr builders and
+// wrapScanExpr both consult this so the scan and the CTE agree on
+// whether filename is present.
+func (s *Reader[T]) needsFilename() bool {
+	return s.cfg.dedupEnabled()
 }
 
 // errorRow returns a *sql.Row that will fail on Scan with the
@@ -106,12 +110,24 @@ func (s *Reader[T]) errorRow(
 // dedup CTE and the user's SQL query. Shared by Query, QueryRow,
 // Read, PollRecords.
 //
-// When dedup applies (!includeHistory && dedupEnabled), the CTE
-// uses filename DESC as the tie-breaker on equal VersionColumn
-// so a retry with the same domain timestamp has a deterministic
-// winner, and then EXCLUDEs `filename` so the helper column
-// doesn't leak into user SQL. When dedup is off the CTE is just
-// the scan.
+// Three branches, driven by (dedupEnabled, includeHistory):
+//
+//   - dedupEnabled && !includeHistory: latest-per-entity CTE
+//     picks the row with the highest VersionColumn per entity,
+//     tie-broken by filename DESC. This path implicitly collapses
+//     replicas (same entity, same version) because the tie-break
+//     picks exactly one row per (entity, version, filename) group.
+//   - dedupEnabled && includeHistory: replica-dedup-only CTE
+//     partitions on (entity, version) and picks one row per group
+//     by filename DESC. Distinct versions of each entity flow
+//     through; byte-identical replicas from retries / zombies
+//     collapse to one.
+//   - !dedupEnabled: CTE is just the scan; replica collapse
+//     requires EntityKeyColumns + VersionColumn and is skipped
+//     when neither is configured.
+//
+// All dedup branches EXCLUDE the filename helper column so the
+// helper doesn't leak into user SQL.
 //
 // Dedup requires scanExpr to have been built with filename=true;
 // the caller computes that flag via needsFilename, keeping the
@@ -121,12 +137,28 @@ func (s *Reader[T]) wrapScanExpr(
 	userSQL string,
 	includeHistory bool,
 ) string {
-	dedup := !includeHistory && s.cfg.dedupEnabled()
-
 	var sb strings.Builder
 	sb.WriteString("WITH ")
-	if dedup {
-		dedupCols := strings.Join(s.cfg.EntityKeyColumns, ", ")
+	switch {
+	case !s.cfg.dedupEnabled():
+		fmt.Fprintf(&sb,
+			"%s AS (\n  %s\n)\n",
+			s.cfg.TableAlias, scanExpr)
+	case includeHistory:
+		entityCols := strings.Join(s.cfg.EntityKeyColumns, ", ")
+		fmt.Fprintf(&sb,
+			"%s AS (\n"+
+				"  SELECT * EXCLUDE (filename) FROM (\n"+
+				"    %s\n"+
+				"    QUALIFY ROW_NUMBER() OVER "+
+				"(PARTITION BY %s, %s ORDER BY filename DESC"+
+				") = 1\n"+
+				"  )\n"+
+				")\n",
+			s.cfg.TableAlias, scanExpr,
+			entityCols, s.cfg.VersionColumn)
+	default:
+		entityCols := strings.Join(s.cfg.EntityKeyColumns, ", ")
 		fmt.Fprintf(&sb,
 			"%s AS (\n"+
 				"  SELECT * EXCLUDE (filename) FROM (\n"+
@@ -137,11 +169,7 @@ func (s *Reader[T]) wrapScanExpr(
 				"  )\n"+
 				")\n",
 			s.cfg.TableAlias, scanExpr,
-			dedupCols, s.cfg.VersionColumn)
-	} else {
-		fmt.Fprintf(&sb,
-			"%s AS (\n  %s\n)\n",
-			s.cfg.TableAlias, scanExpr)
+			entityCols, s.cfg.VersionColumn)
 	}
 	sb.WriteString(userSQL)
 	return sb.String()

@@ -26,7 +26,7 @@ func (s *Reader[T]) Query(
 	o.Apply(opts...)
 
 	scanExpr, err := s.scanExprForPattern(
-		keyPattern, s.needsFilename(o.IncludeHistory))
+		keyPattern, s.needsFilename())
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +87,7 @@ func (s *Reader[T]) QueryMany(
 	}
 
 	scanExpr := s.scanExprForURIs(
-		uris, s.needsFilename(o.IncludeHistory))
+		uris, s.needsFilename())
 	return s.db.QueryContext(ctx,
 		s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
 }
@@ -110,7 +110,7 @@ func (s *Reader[T]) QueryRow(
 	o.Apply(opts...)
 
 	scanExpr, err := s.scanExprForPattern(
-		keyPattern, s.needsFilename(o.IncludeHistory))
+		keyPattern, s.needsFilename())
 	if err != nil {
 		return s.errorRow(ctx, err)
 	}
@@ -154,7 +154,7 @@ func (s *Reader[T]) QueryRowMany(
 	}
 
 	scanExpr := s.scanExprForURIs(
-		uris, s.needsFilename(o.IncludeHistory))
+		uris, s.needsFilename())
 	return s.db.QueryRowContext(ctx,
 		s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
 }

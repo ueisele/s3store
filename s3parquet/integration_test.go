@@ -1407,6 +1407,130 @@ func TestDedupDefault(t *testing.T) {
 	}
 }
 
+// TestReplicaDedup_CollapsesSameEntityVersion proves Phase 1.5's
+// core contract: two writes that produce the same (entity,
+// version) pair — i.e. byte-identical replicas from a retry,
+// zombie writer, or cross-node race — collapse to one record on
+// read, regardless of WithHistory. Without this, retries surface
+// as phantom "distinct versions" to the consumer.
+func TestReplicaDedup_CollapsesSameEntityVersion(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+		versionOf: func(r Rec, _ time.Time) int64 {
+			return r.Ts.UnixNano()
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	same := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Value: 10, Ts: time.UnixMilli(100)},
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := store.WriteWithKey(ctx, key, same); err != nil {
+			t.Fatalf("write #%d: %v", i, err)
+		}
+	}
+
+	deduped, err := store.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("Read (default): %v", err)
+	}
+	if len(deduped) != 1 {
+		t.Errorf("default dedup: got %d records, want 1", len(deduped))
+	}
+
+	full, err := store.Read(ctx, key, s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("Read (history): %v", err)
+	}
+	if len(full) != 1 {
+		t.Errorf("WithHistory: got %d records, want 1 "+
+			"(replicas must collapse even under WithHistory)",
+			len(full))
+	}
+}
+
+// TestReplicaDedup_PreservesDistinctVersionsWithHistory guards
+// the other side of Phase 1.5: distinct versions of the same
+// entity still flow through WithHistory. Only byte-identical
+// replicas (same version) collapse; genuinely different versions
+// never do.
+func TestReplicaDedup_PreservesDistinctVersionsWithHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+		versionOf: func(r Rec, _ time.Time) int64 {
+			return r.Ts.UnixNano()
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	for i := int64(1); i <= 3; i++ {
+		if _, err := store.WriteWithKey(ctx, key, []Rec{
+			{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+				Value: i, Ts: time.UnixMilli(i * 100)},
+		}); err != nil {
+			t.Fatalf("write ver=%d: %v", i, err)
+		}
+	}
+
+	full, err := store.Read(ctx, key, s3parquet.WithHistory())
+	if err != nil {
+		t.Fatalf("Read (history): %v", err)
+	}
+	if len(full) != 3 {
+		t.Errorf("WithHistory: got %d records, want 3 "+
+			"(three distinct versions must survive)", len(full))
+	}
+}
+
+// TestReadIter_ReplicaDedupWithHistory covers the ReadIter path
+// through emitPartition: same (entity, version) replicas collapse
+// even with WithHistory. ReadMany's dedup path is covered by
+// TestReplicaDedup_CollapsesSameEntityVersion — this test pins
+// the iter path so the emitPartition refactor doesn't regress.
+func TestReadIter_ReplicaDedupWithHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{
+		entityKeyOf: func(r Rec) string {
+			return r.Customer + "|" + r.SKU
+		},
+		versionOf: func(r Rec, _ time.Time) int64 {
+			return r.Ts.UnixNano()
+		},
+	})
+
+	key := "period=2026-03-17/customer=abc"
+	same := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Value: 10, Ts: time.UnixMilli(100)},
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := store.WriteWithKey(ctx, key, same); err != nil {
+			t.Fatalf("write #%d: %v", i, err)
+		}
+	}
+
+	var got []Rec
+	for r, err := range store.ReadIter(ctx, key, s3parquet.WithHistory()) {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		got = append(got, r)
+	}
+	if len(got) != 1 {
+		t.Errorf("WithHistory via ReadIter: got %d, want 1 "+
+			"(replicas must collapse even under WithHistory)",
+			len(got))
+	}
+}
+
 // TestReadWithHistory opts out of dedup: every written record
 // must appear in the result.
 func TestReadWithHistory(t *testing.T) {

@@ -140,8 +140,12 @@ func (s *Reader[T]) ReadMany(
 		return s.sortCmp(versioned[i], versioned[j]) < 0
 	})
 
-	if o.IncludeHistory || !s.cfg.dedupEnabled() {
+	if !s.cfg.dedupEnabled() {
 		return stripVersions(versioned), nil
+	}
+	if o.IncludeHistory {
+		return stripVersions(dedupReplicas(versioned,
+			s.cfg.EntityKeyOf, s.cfg.VersionOf)), nil
 	}
 	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf), nil
 }
@@ -229,12 +233,11 @@ func (s *Reader[T]) ReadManyIter(
 			return
 		}
 
-		dedup := s.cfg.dedupEnabled() && !o.IncludeHistory
 		readAhead := o.ReadAheadPartitions
 		if readAhead < 0 {
 			readAhead = 0
 		}
-		s.streamByPartition(ctx, keys, dedup, readAhead, yield)
+		s.streamByPartition(ctx, keys, o.IncludeHistory, readAhead, yield)
 	}
 }
 
@@ -265,7 +268,8 @@ type partitionBatch[T any] struct {
 // Dedup/no-dedup handling is identical across both modes and
 // lives in emitPartition.
 func (s *Reader[T]) streamByPartition(
-	ctx context.Context, keys []core.KeyMeta, dedup bool, readAhead int,
+	ctx context.Context, keys []core.KeyMeta,
+	includeHistory bool, readAhead int,
 	yield func(T, error) bool,
 ) {
 	byPartition := s.groupKeysByPartition(keys)
@@ -280,7 +284,7 @@ func (s *Reader[T]) streamByPartition(
 				yield(*new(T), err)
 				return
 			}
-			if !s.emitPartition(recs, dedup, yield) {
+			if !s.emitPartition(recs, includeHistory, yield) {
 				return
 			}
 		}
@@ -313,7 +317,7 @@ func (s *Reader[T]) streamByPartition(
 			yield(*new(T), b.err)
 			return
 		}
-		if !s.emitPartition(b.recs, dedup, yield) {
+		if !s.emitPartition(b.recs, includeHistory, yield) {
 			return
 		}
 	}
@@ -329,16 +333,19 @@ func sortKeyMetasByKey(files []core.KeyMeta) {
 	})
 }
 
-// emitPartition yields one partition's records to the consumer,
-// applying per-partition dedup when requested. Returns false when
-// the consumer asked to stop (yield returned false), so the outer
-// loop can break cleanly.
+// emitPartition yields one partition's records to the consumer.
+// When EntityKeyOf is configured, applies either latest-per-
+// entity dedup (default) or replica dedup (WithHistory) — the
+// latter-only branch keeps distinct versions while collapsing
+// byte-identical replicas. Returns false when the consumer asked
+// to stop (yield returned false), so the outer loop can break
+// cleanly.
 //
 // Records are sorted by the reader's resolved sortCmp before
-// emission so callers observe a deterministic order regardless
-// of LIST response shape or goroutine scheduling.
+// dedup / emission so callers observe a deterministic order
+// regardless of LIST response shape or goroutine scheduling.
 func (s *Reader[T]) emitPartition(
-	recs []versionedRecord[T], dedup bool,
+	recs []versionedRecord[T], includeHistory bool,
 	yield func(T, error) bool,
 ) bool {
 	if len(recs) == 0 {
@@ -347,17 +354,26 @@ func (s *Reader[T]) emitPartition(
 	sort.SliceStable(recs, func(i, j int) bool {
 		return s.sortCmp(recs[i], recs[j]) < 0
 	})
-	if dedup {
-		for _, rec := range dedupLatest(recs,
-			s.cfg.EntityKeyOf, s.cfg.VersionOf) {
-			if !yield(rec, nil) {
+	if !s.cfg.dedupEnabled() {
+		for _, vr := range recs {
+			if !yield(vr.rec, nil) {
 				return false
 			}
 		}
 		return true
 	}
-	for _, vr := range recs {
-		if !yield(vr.rec, nil) {
+	if includeHistory {
+		for _, vr := range dedupReplicas(recs,
+			s.cfg.EntityKeyOf, s.cfg.VersionOf) {
+			if !yield(vr.rec, nil) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, rec := range dedupLatest(recs,
+		s.cfg.EntityKeyOf, s.cfg.VersionOf) {
+		if !yield(rec, nil) {
 			return false
 		}
 	}
@@ -616,6 +632,48 @@ func stripVersions[T any](in []versionedRecord[T]) []T {
 	out := make([]T, len(in))
 	for i, v := range in {
 		out[i] = v.rec
+	}
+	return out
+}
+
+// dedupReplicas collapses records that share (entity, version)
+// down to one, keeping the first-seen occurrence. Two records
+// with identical (entity, version) describe the same logical
+// write (a retry, zombie, or cross-node race); emitting both as
+// "distinct versions" would mislead callers.
+//
+// Only called on the WithHistory path. Without WithHistory,
+// dedupLatest already collapses replicas as a side effect of
+// its max-version-per-entity reduction (first-seen wins on ties,
+// and replicas tie on version).
+//
+// Runs after the reader's sort, so "first-seen" is deterministic:
+// input order is (entity, version) ascending, tiebroken by the
+// lex-first source filename via sort stability.
+func dedupReplicas[T any](
+	records []versionedRecord[T],
+	entityKey func(T) string,
+	versionOf func(record T, insertedAt time.Time) int64,
+) []versionedRecord[T] {
+	if len(records) == 0 {
+		return nil
+	}
+	type key struct {
+		entity  string
+		version int64
+	}
+	seen := make(map[key]struct{}, len(records))
+	out := make([]versionedRecord[T], 0, len(records))
+	for _, vr := range records {
+		k := key{
+			entity:  entityKey(vr.rec),
+			version: versionOf(vr.rec, vr.insertedAt),
+		}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, vr)
 	}
 	return out
 }

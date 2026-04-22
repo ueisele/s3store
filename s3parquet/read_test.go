@@ -234,6 +234,66 @@ func TestDedupePatterns(t *testing.T) {
 	}
 }
 
+// TestDedupReplicas_CollapsesIdenticalEntityVersion covers the
+// primary case: two records with the same (entity, version)
+// collapse to the first occurrence, while distinct versions of
+// the same entity are preserved untouched.
+func TestDedupReplicas_CollapsesIdenticalEntityVersion(t *testing.T) {
+	now := time.UnixMicro(1_000_000)
+	recs := []versionedRecord[dedupRec]{
+		vr("a", 1, "a-1-first", now),
+		vr("a", 1, "a-1-dup", now),
+		vr("a", 2, "a-2", now),
+		vr("b", 1, "b-1-first", now),
+		vr("b", 1, "b-1-dup", now),
+	}
+	got := dedupReplicas(recs,
+		func(r dedupRec) string { return r.entity },
+		func(r dedupRec, _ time.Time) int64 { return r.ver })
+
+	if len(got) != 3 {
+		t.Fatalf("got %d records, want 3", len(got))
+	}
+	wantPayloads := []string{"a-1-first", "a-2", "b-1-first"}
+	for i, want := range wantPayloads {
+		if got[i].rec.payload != want {
+			t.Errorf("[%d] got %q, want %q",
+				i, got[i].rec.payload, want)
+		}
+	}
+}
+
+// TestDedupReplicas_EmptyInput guards the nil/empty-slice fast
+// path. Mirrors TestDedupLatest_EmptyInput.
+func TestDedupReplicas_EmptyInput(t *testing.T) {
+	got := dedupReplicas(nil,
+		func(r dedupRec) string { return r.entity },
+		func(r dedupRec, _ time.Time) int64 { return r.ver })
+	if len(got) != 0 {
+		t.Errorf("expected empty, got %d", len(got))
+	}
+}
+
+// TestDedupReplicas_NoOpOnDistinctVersions confirms that when
+// every (entity, version) pair is unique, dedupReplicas returns
+// its input unchanged — the function only collapses true
+// replicas, never distinct versions.
+func TestDedupReplicas_NoOpOnDistinctVersions(t *testing.T) {
+	now := time.UnixMicro(1_000_000)
+	recs := []versionedRecord[dedupRec]{
+		vr("a", 1, "a-1", now),
+		vr("a", 2, "a-2", now),
+		vr("a", 3, "a-3", now),
+		vr("b", 1, "b-1", now),
+	}
+	got := dedupReplicas(recs,
+		func(r dedupRec) string { return r.entity },
+		func(r dedupRec, _ time.Time) int64 { return r.ver })
+	if len(got) != 4 {
+		t.Fatalf("got %d records, want 4 (no collapse)", len(got))
+	}
+}
+
 // TestDedupLatest_TieKeepsFirst documents the
 // stability-on-tie invariant: when two records share the same
 // version, the first occurrence wins. Integration tests can't

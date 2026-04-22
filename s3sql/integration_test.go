@@ -266,6 +266,45 @@ func TestRead_DedupVersionTieDeterministic(t *testing.T) {
 	}
 }
 
+// TestRead_ReplicaDedupWithHistory proves Phase 1.5's contract
+// on the DuckDB path: two writes of the same (entity, version)
+// collapse to one even under WithHistory. Mirrors the s3parquet
+// TestReplicaDedup_CollapsesSameEntityVersion.
+func TestRead_ReplicaDedupWithHistory(t *testing.T) {
+	f := newFixture(t, sqlOpts{
+		versionColumn:    "ts",
+		entityKeyColumns: []string{"period", "customer", "sku"},
+	})
+
+	same := []Rec{
+		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+			Amount: 10, Currency: "USD", Ts: time.UnixMilli(100)},
+	}
+	f.writeSome(t, same)
+	f.writeSome(t, same)
+
+	ctx := context.Background()
+
+	deduped, err := f.sql.Read(ctx, "period=2026-03-17/customer=abc")
+	if err != nil {
+		t.Fatalf("Read (default): %v", err)
+	}
+	if len(deduped) != 1 {
+		t.Errorf("default dedup: got %d, want 1", len(deduped))
+	}
+
+	full, err := f.sql.Read(ctx,
+		"period=2026-03-17/customer=abc", s3sql.WithHistory())
+	if err != nil {
+		t.Fatalf("Read (history): %v", err)
+	}
+	if len(full) != 1 {
+		t.Errorf("WithHistory: got %d, want 1 "+
+			"(replicas must collapse even under WithHistory)",
+			len(full))
+	}
+}
+
 // TestRead_WithHistory verifies every version is returned when
 // WithHistory disables dedup.
 func TestRead_WithHistory(t *testing.T) {
