@@ -3,7 +3,6 @@ package s3parquet
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
@@ -96,19 +95,7 @@ func (s *Reader[T]) PollRecords(
 		return nil, since, err
 	}
 
-	sort.SliceStable(versioned, func(i, j int) bool {
-		return s.sortCmp(versioned[i], versioned[j]) < 0
-	})
-
-	if !s.cfg.dedupEnabled() {
-		return stripVersions(versioned), newOffset, nil
-	}
-	if o.IncludeHistory {
-		return stripVersions(dedupReplicas(versioned,
-			s.cfg.EntityKeyOf, s.cfg.VersionOf)), newOffset, nil
-	}
-	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf),
-		newOffset, nil
+	return s.sortAndDedup(versioned, o.IncludeHistory), newOffset, nil
 }
 
 // PollRecordsAll reads every record in [since, until) in one

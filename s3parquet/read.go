@@ -136,18 +136,7 @@ func (s *Reader[T]) ReadMany(
 		return nil, err
 	}
 
-	sort.SliceStable(versioned, func(i, j int) bool {
-		return s.sortCmp(versioned[i], versioned[j]) < 0
-	})
-
-	if !s.cfg.dedupEnabled() {
-		return stripVersions(versioned), nil
-	}
-	if o.IncludeHistory {
-		return stripVersions(dedupReplicas(versioned,
-			s.cfg.EntityKeyOf, s.cfg.VersionOf)), nil
-	}
-	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf), nil
+	return s.sortAndDedup(versioned, o.IncludeHistory), nil
 }
 
 // ReadIter returns an iter.Seq2[T, error] yielding records one
@@ -333,17 +322,42 @@ func sortKeyMetasByKey(files []core.KeyMeta) {
 	})
 }
 
-// emitPartition yields one partition's records to the consumer.
-// When EntityKeyOf is configured, applies either latest-per-
-// entity dedup (default) or replica dedup (WithHistory) — the
-// latter-only branch keeps distinct versions while collapsing
-// byte-identical replicas. Returns false when the consumer asked
-// to stop (yield returned false), so the outer loop can break
-// cleanly.
+// sortAndDedup runs the reader's resolved sortCmp over versioned,
+// then dispatches on (dedupEnabled, includeHistory) to produce the
+// user-visible []T. Shared by ReadMany, PollRecords, and
+// emitPartition so all three emission paths agree on order,
+// replica handling, and latest-per-entity reduction.
 //
-// Records are sorted by the reader's resolved sortCmp before
-// dedup / emission so callers observe a deterministic order
-// regardless of LIST response shape or goroutine scheduling.
+// Branches:
+//
+//   - dedup disabled (no EntityKeyOf): strip versions and return.
+//   - WithHistory + dedup enabled: collapse (entity, version)
+//     replicas, keep distinct versions.
+//   - default: dedupLatest reduces to one record per entity; it
+//     absorbs replicas as a side effect (ties tie on version,
+//     first-seen wins) so no replica pre-pass is needed.
+func (s *Reader[T]) sortAndDedup(
+	versioned []versionedRecord[T], includeHistory bool,
+) []T {
+	sort.SliceStable(versioned, func(i, j int) bool {
+		return s.sortCmp(versioned[i], versioned[j]) < 0
+	})
+	if !s.cfg.dedupEnabled() {
+		return stripVersions(versioned)
+	}
+	if includeHistory {
+		return stripVersions(dedupReplicas(versioned,
+			s.cfg.EntityKeyOf, s.cfg.VersionOf))
+	}
+	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf)
+}
+
+// emitPartition yields one partition's records to the consumer
+// through the shared sortAndDedup pipeline, so the iter paths
+// observe the same order / replica-collapse / latest-per-entity
+// semantics as the materialised Read paths. Returns false when
+// the consumer asked to stop (yield returned false), so the
+// outer loop can break cleanly.
 func (s *Reader[T]) emitPartition(
 	recs []versionedRecord[T], includeHistory bool,
 	yield func(T, error) bool,
@@ -351,29 +365,8 @@ func (s *Reader[T]) emitPartition(
 	if len(recs) == 0 {
 		return true
 	}
-	sort.SliceStable(recs, func(i, j int) bool {
-		return s.sortCmp(recs[i], recs[j]) < 0
-	})
-	if !s.cfg.dedupEnabled() {
-		for _, vr := range recs {
-			if !yield(vr.rec, nil) {
-				return false
-			}
-		}
-		return true
-	}
-	if includeHistory {
-		for _, vr := range dedupReplicas(recs,
-			s.cfg.EntityKeyOf, s.cfg.VersionOf) {
-			if !yield(vr.rec, nil) {
-				return false
-			}
-		}
-		return true
-	}
-	for _, rec := range dedupLatest(recs,
-		s.cfg.EntityKeyOf, s.cfg.VersionOf) {
-		if !yield(rec, nil) {
+	for _, r := range s.sortAndDedup(recs, includeHistory) {
+		if !yield(r, nil) {
 			return false
 		}
 	}
