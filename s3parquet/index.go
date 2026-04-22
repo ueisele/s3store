@@ -360,7 +360,7 @@ func (i *Index[K]) listMatchingMarkers(
 	var keys []string
 	suffix := "/" + core.IndexMarkerFilename
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := i.target.listPage(ctx, paginator)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: index %q list: %w", i.name, err)
@@ -671,7 +671,7 @@ func listDataFilesForPlan(
 
 	var keys []string
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := target.listPage(ctx, paginator)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: backfill list data files: %w", err)

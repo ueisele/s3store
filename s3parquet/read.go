@@ -386,7 +386,7 @@ func (s *Reader[T]) listMatchingParquet(
 
 	var out []core.KeyMeta
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := s.cfg.Target.listPage(ctx, paginator)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: list data files: %w", err)

@@ -182,7 +182,7 @@ Miss any of these and guarantees degrade to at-least-once (but never below).
 
 ---
 
-## Phase 2 — Internal retries (transparent)
+## Phase 2 — Internal retries (transparent) ✅ implemented
 
 **Outcome**: transient S3 errors inside one `Write` call don't bubble up or produce orphans. No API surface change.
 

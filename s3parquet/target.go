@@ -132,15 +132,20 @@ func (t S3Target) EffectiveSettleWindow() time.Duration {
 // path (Read, PollRecords) and by BackfillIndex when scanning
 // historical parquet data.
 func (t S3Target) get(ctx context.Context, key string) ([]byte, error) {
-	resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(t.Bucket),
-		Key:    aws.String(key),
+	var data []byte
+	err := retry(ctx, func() error {
+		resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(t.Bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		data, err = io.ReadAll(resp.Body)
+		return err
 	})
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return data, err
 }
 
 // put uploads data under key. Used by the write path (parquet +
@@ -149,13 +154,15 @@ func (t S3Target) get(ctx context.Context, key string) ([]byte, error) {
 func (t S3Target) put(
 	ctx context.Context, key string, data []byte, contentType string,
 ) error {
-	_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(t.Bucket),
-		Key:         aws.String(key),
-		Body:        bytes.NewReader(data),
-		ContentType: aws.String(contentType),
+	return retry(ctx, func() error {
+		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(t.Bucket),
+			Key:         aws.String(key),
+			Body:        bytes.NewReader(data),
+			ContentType: aws.String(contentType),
+		})
+		return err
 	})
-	return err
 }
 
 // putWithMeta is put with user-supplied S3 object metadata.
@@ -169,23 +176,28 @@ func (t S3Target) putWithMeta(
 	ctx context.Context, key string, data []byte,
 	contentType string, meta map[string]string,
 ) error {
-	_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(t.Bucket),
-		Key:         aws.String(key),
-		Body:        bytes.NewReader(data),
-		ContentType: aws.String(contentType),
-		Metadata:    meta,
+	return retry(ctx, func() error {
+		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(t.Bucket),
+			Key:         aws.String(key),
+			Body:        bytes.NewReader(data),
+			ContentType: aws.String(contentType),
+			Metadata:    meta,
+		})
+		return err
 	})
-	return err
 }
 
 // exists reports whether an object exists, mapping S3's NotFound
 // to (false, nil) so callers can distinguish "missing" from real
 // failures without pattern-matching the error at every site.
 func (t S3Target) exists(ctx context.Context, key string) (bool, error) {
-	_, err := t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(t.Bucket),
-		Key:    aws.String(key),
+	err := retry(ctx, func() error {
+		_, err := t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(t.Bucket),
+			Key:    aws.String(key),
+		})
+		return err
 	})
 	if err == nil {
 		return true, nil
@@ -198,20 +210,27 @@ func (t S3Target) exists(ctx context.Context, key string) (bool, error) {
 
 // del removes an object. Used on the write-cleanup paths.
 func (t S3Target) del(ctx context.Context, key string) error {
-	_, err := t.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(t.Bucket),
-		Key:    aws.String(key),
+	return retry(ctx, func() error {
+		_, err := t.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(t.Bucket),
+			Key:    aws.String(key),
+		})
+		return err
 	})
-	return err
 }
 
 // size returns the object's content length. Used by the
 // row-group-filtered read path to size the io.ReaderAt parquet-
 // go opens the file through.
 func (t S3Target) size(ctx context.Context, key string) (int64, error) {
-	resp, err := t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(t.Bucket),
-		Key:    aws.String(key),
+	var resp *s3.HeadObjectOutput
+	err := retry(ctx, func() error {
+		var err error
+		resp, err = t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(t.Bucket),
+			Key:    aws.String(key),
+		})
+		return err
 	})
 	if err != nil {
 		return 0, err
@@ -232,20 +251,25 @@ func (t S3Target) getRange(
 	if end <= start {
 		return nil, nil
 	}
-	resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(t.Bucket),
-		Key:    aws.String(key),
-		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end-1)),
+	var data []byte
+	err := retry(ctx, func() error {
+		resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(t.Bucket),
+			Key:    aws.String(key),
+			Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end-1)),
+		})
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		data, err = io.ReadAll(resp.Body)
+		return err
 	})
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return data, err
 }
 
 // list returns a paginator over objects under a prefix. Callers
-// iterate via HasMorePages + NextPage; no in-memory accumulation
+// iterate via HasMorePages + listPage; no in-memory accumulation
 // here — large prefixes must stream.
 func (t S3Target) list(prefix string) *s3.ListObjectsV2Paginator {
 	return s3.NewListObjectsV2Paginator(
@@ -253,4 +277,20 @@ func (t S3Target) list(prefix string) *s3.ListObjectsV2Paginator {
 			Bucket: aws.String(t.Bucket),
 			Prefix: aws.String(prefix),
 		})
+}
+
+// listPage fetches the next page from p, wrapping NextPage in
+// the standard transient-error retry loop. A failed NextPage
+// does not advance the paginator's continuation token, so
+// retrying re-requests the same page cleanly.
+func (t S3Target) listPage(
+	ctx context.Context, p *s3.ListObjectsV2Paginator,
+) (*s3.ListObjectsV2Output, error) {
+	var out *s3.ListObjectsV2Output
+	err := retry(ctx, func() error {
+		var err error
+		out, err = p.NextPage(ctx)
+		return err
+	})
+	return out, err
 }
