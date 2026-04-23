@@ -437,26 +437,30 @@ func (s *Writer[T]) writeEncodedPayload(
 		//   - elapsed <= settle: genuine lost-ack within budget —
 		//     the ref's refTsMicros is fresh enough for Poll to
 		//     see it. Return success as before.
-		//   - elapsed > settle: the ref may have aged past Poll's
-		//     cutoff while we were still waiting for the PUT to
-		//     return. Surface ErrRefSettleBudgetExceeded so the
-		//     caller can retry (safe with WithIdempotencyToken;
-		//     reader dedup absorbs duplicate refs otherwise).
+		//   - elapsed > settle: the stale ref sits at an offset
+		//     that a concurrent Poll may have already advanced
+		//     past (after yielding fresher refs from other
+		//     partitions). Run the recovery path: write a fresh
+		//     ref well inside budget, then best-effort delete the
+		//     stale one.
 		if elapsed > settle {
-			return result, ErrRefSettleBudgetExceeded
+			return s.recoverRefAfterBudgetExceeded(
+				ctx, cleanupCtx, result,
+				id, tsMicros, key, settle, refKey)
 		}
 		return result, nil
 	}
 
 	// HEAD failed or reported the ref absent. When the PUT itself
-	// claimed success (putErr == nil), we're in the budget-blown
-	// branch: the PUT responded but beyond SettleWindow, and a
-	// weakly-consistent HEAD can't see the ref yet. Treat this as
-	// budget-exceeded rather than wrapping a nil error — the ref
-	// may still propagate but isn't safely Poll-visible, so the
-	// caller should retry (deterministic with WithIdempotencyToken).
+	// claimed success (putErr == nil) the ref may still be
+	// propagating on a weakly-consistent backend; the budget-
+	// blown case is the same — run recovery so consumers have a
+	// fresh, in-budget ref regardless of whether the original
+	// propagates later (reader dedup absorbs the rare duplicate).
 	if putErr == nil {
-		return result, ErrRefSettleBudgetExceeded
+		return s.recoverRefAfterBudgetExceeded(
+			ctx, cleanupCtx, result,
+			id, tsMicros, key, settle, refKey)
 	}
 
 	if !idempotent && !s.cfg.DisableCleanup {
@@ -475,6 +479,65 @@ func (s *Writer[T]) writeEncodedPayload(
 	// orphans for lifecycle policies to garbage-collect.
 
 	return nil, fmt.Errorf("s3parquet: put ref: %w", putErr)
+}
+
+// recoverRefAfterBudgetExceeded runs the settle-budget recovery
+// path: the initial ref PUT either took longer than SettleWindow
+// or landed with an inconclusive HEAD, so its refTsMicros sits at
+// an offset some consumers may have already advanced past. Write
+// a fresh ref with a new refTsMicros well inside budget so
+// subsequent polls pick it up, then best-effort delete the stale
+// one to narrow the duplicate window for any consumer that polled
+// between "stale ref landed" and "delete took effect".
+//
+// Duplicate semantics: when a consumer reads both the stale and
+// the fresh ref, both point at the same idempotent data file. The
+// records share (entity, version), so reader-layer dedup
+// (EntityKeyOf + VersionOf) collapses them to one. Callers without
+// reader dedup see the raw duplicate — documented tradeoff; the
+// library explicitly chooses "rare duplicate absorbed by dedup"
+// over "silent missed write" here.
+//
+// On failure of the recovery PUT (error or its own budget blown),
+// returns ErrRefSettleBudgetExceeded so the caller retries. A
+// caller retry's findExistingRef filters stale refs out of the
+// dedup window (by refTsMicros age), so the retry writes cleanly
+// rather than matching the already-stale ref and silently
+// succeeding.
+func (s *Writer[T]) recoverRefAfterBudgetExceeded(
+	ctx, cleanupCtx context.Context,
+	result *WriteResult,
+	id string, dataTsMicros int64, hiveKey string,
+	settle time.Duration, staleRefKey string,
+) (*WriteResult, error) {
+	refCaptureTime := time.Now()
+	refTsMicros := refCaptureTime.UnixMicro()
+	newRefKey := core.EncodeRefKey(
+		s.refPath, refTsMicros, id, dataTsMicros, hiveKey)
+
+	putCtx, cancelPut := context.WithTimeout(
+		ctx, refPutBudget(s.cfg.ConsistencyControl, settle))
+	putErr := s.cfg.Target.put(
+		putCtx, newRefKey, []byte{}, "application/octet-stream")
+	cancelPut()
+	elapsed := time.Since(refCaptureTime)
+
+	if putErr != nil || elapsed > settle {
+		// Recovery PUT also missed budget. Surface the sentinel so
+		// the caller retries; their retry's scoped LIST rejects the
+		// stale ref by age and writes a fresh one.
+		return result, ErrRefSettleBudgetExceeded
+	}
+
+	// Best-effort delete. S3 DeleteObject is idempotent (204 even
+	// for missing keys), so this is safe whether the stale ref
+	// actually landed or not. A failing DELETE leaves a garbage ref
+	// that reader dedup absorbs — not a correctness problem.
+	_ = s.cfg.Target.del(cleanupCtx, staleRefKey)
+
+	result.RefPath = newRefKey
+	result.Offset = Offset(newRefKey)
+	return result, nil
 }
 
 // putDataIdempotent issues the idempotent data PUT using whichever
@@ -502,20 +565,31 @@ func (s *Writer[T]) putDataIdempotent(
 }
 
 // findExistingRef scans the ref stream for a ref whose id field
-// equals token, within the lexical range [now - maxRetryAge, now].
-// Returns the full ref key when found, empty string when not.
+// equals token and whose refTsMicros is still fresh enough to be
+// a safe dedup target. Returns the full ref key when found, empty
+// string when not.
 //
-// Bounded on both sides:
+// Bounded on three axes:
 //
 //   - Lower bound via listRange(startAfter=lo) so the paginator
 //     starts at (now - maxRetryAge).
 //   - Upper bound via an in-loop compare against hi so we stop as
 //     soon as a page yields a key past the retry window. Without
-//     this the paginator walks every ref newer than the window —
+//     this the paginator walks every ref newer than "now" —
 //     concurrent writers' refs, the store's tail — which costs
-//     additional LIST pages proportional to the traffic beyond
-//     "now" without adding any chance of a match (our token can't
+//     additional LIST pages proportional to traffic beyond "now"
+//     without adding any chance of a match (our token can't
 //     appear with a future refTsMicros).
+//   - Freshness via the settle-cutoff filter: a ref with
+//     refTsMicros < now - SettleWindow sits at an offset some
+//     consumers may have advanced past. Treating it as a dedup
+//     match would silently miss those consumers, so the scan
+//     skips stale matches and lets the caller emit a fresh ref.
+//     The in-flight settle-budget recovery (see
+//     recoverRefAfterBudgetExceeded) normally prevents a stale
+//     ref from existing at all; this filter is the backstop for
+//     the cascading-failure case where recovery also failed and
+//     the caller retried.
 //
 // When maxRetryAge == 0 the function returns "" immediately — the
 // caller explicitly disabled ref dedup for this retry.
@@ -530,7 +604,10 @@ func (s *Writer[T]) findExistingRef(
 	if maxRetryAge <= 0 {
 		return "", nil
 	}
-	lo, hi := core.RefRangeForRetry(s.refPath, time.Now(), maxRetryAge)
+	now := time.Now()
+	lo, hi := core.RefRangeForRetry(s.refPath, now, maxRetryAge)
+	settleCutoffUs := now.Add(
+		-s.cfg.Target.EffectiveSettleWindow()).UnixMicro()
 	paginator := s.cfg.Target.listRange(s.refPath+"/", lo)
 	for paginator.HasMorePages() {
 		page, err := s.cfg.Target.listPage(
@@ -551,7 +628,7 @@ func (s *Writer[T]) findExistingRef(
 				// RefRangeForRetry's lo already rely on.
 				return "", nil
 			}
-			id, err := core.ExtractRefID(*obj.Key)
+			_, refTsMicros, id, _, err := core.ParseRefKey(*obj.Key)
 			if err != nil {
 				// Malformed ref keys (externally written or a
 				// future schema the parser doesn't understand)
@@ -559,9 +636,18 @@ func (s *Writer[T]) findExistingRef(
 				// the write.
 				continue
 			}
-			if id == token {
-				return *obj.Key, nil
+			if id != token {
+				continue
 			}
+			if refTsMicros < settleCutoffUs {
+				// Stale match: the ref sits past the settle cutoff
+				// a concurrent Poll would compute right now, so
+				// some consumers may have advanced past it. Skip,
+				// so the caller emits a fresh ref that every
+				// consumer can still yield.
+				continue
+			}
+			return *obj.Key, nil
 		}
 	}
 	return "", nil

@@ -18,36 +18,38 @@ import (
 var ErrRefStreamDisabled = refstream.ErrDisabled
 
 // ErrRefSettleBudgetExceeded is returned from the write path when
-// the ref PUT's total elapsed time exceeds SettleWindow. The ref's
-// refTsMicros is already older than the settle cutoff a concurrent
-// Poll would compute, so Poll's offset may have advanced past it
-// and consumers may have missed it — the write is not safely
-// visible regardless of whether the ref physically landed.
+// the initial ref PUT blew SettleWindow AND the internal recovery
+// PUT (a second attempt with a fresh refTsMicros) also missed its
+// budget. The stale refTsMicros sits past the settle cutoff a
+// concurrent Poll would compute, so consumers who advanced past
+// it can't observe the write — and the library gave up trying to
+// publish a fresher one on its own.
 //
-// Raised in two sub-cases:
+// Normal budget-blown path (no sentinel): the library detects the
+// first PUT's elapsed > SettleWindow, runs the recovery PUT with
+// a new refTsMicros, and best-effort deletes the stale ref. The
+// write returns success with the fresh RefPath / Offset. A rare
+// duplicate lands when a consumer polled during the "stale ref
+// landed → delete propagated" gap; reader-layer (entity, version)
+// dedup absorbs it.
 //
-//   - PUT returned success but elapsed > SettleWindow, and the
-//     confirmation HEAD either saw the ref (genuine "landed but
-//     late") or couldn't see it (weak consistency, may propagate
-//     later). Both are unsafe.
-//   - PUT failed transiently but a follow-up HEAD within the
-//     cleanup window confirmed the ref landed anyway ("lost ack
-//     beyond budget").
-//
-// Callers should treat this as a failed write and retry; with
-// WithIdempotencyToken the retry is deterministic (same data
-// path, scoped-LIST dedup on the ref side), so re-running the
-// same Write is safe. Without an idempotency token the retry
-// creates a new data file, which reader-side dedup
-// (EntityKeyOf + VersionOf) absorbs.
+// Sentinel path: both the initial PUT and the recovery PUT missed
+// budget — typically indicates persistent backend slowness or a
+// mis-sized SettleWindow. Callers should treat this as a failed
+// write and retry; with WithIdempotencyToken the retry is
+// deterministic (same data path, scoped-LIST dedup on the ref
+// side). On retry, findExistingRef's freshness filter rejects the
+// now-stale ref as a dedup target so the retry emits a fresh ref
+// rather than silently matching the stale one.
 //
 // Real PUT failures where HEAD also reports the ref absent (PUT
 // didn't land, caller ctx cancelled, etc.) surface as a wrapped
 // put-ref error — not this sentinel — because the ref is known-
 // absent and the caller can retry without the freshness concern.
 var ErrRefSettleBudgetExceeded = errors.New(
-	"s3parquet: ref PUT exceeded SettleWindow; " +
-		"retry (with WithIdempotencyToken for deterministic recovery)")
+	"s3parquet: ref PUT exceeded SettleWindow on initial and " +
+		"recovery attempts; retry (with WithIdempotencyToken for " +
+		"deterministic recovery)")
 
 // Offset represents a position in the stream.
 type Offset = core.Offset

@@ -1497,28 +1497,49 @@ post-hoc check compares elapsed time against `SettleWindow`.
   `ConsistencyControl == ""` is ambiguous (strong on AWS / MinIO,
   weak on StorageGRID) and the library can't tell them apart.
 
-If the ref PUT's elapsed time exceeds `SettleWindow`, the write
-returns `ErrRefSettleBudgetExceeded`:
+If the ref PUT's elapsed time exceeds `SettleWindow`, the stale
+`refTsMicros` sits at an offset some consumers may already have
+advanced past (after yielding fresher refs from other partitions).
+The library recovers automatically before returning success:
+
+1. Write a **fresh ref** with a new `refTsMicros` well inside the
+   SettleWindow budget.
+2. **Best-effort delete** the stale ref to narrow the window where
+   both are LIST-visible.
+
+Consumers who polled after the recovery delete see only the fresh
+ref. Consumers who polled between "stale ref landed" and "delete
+took effect" see both and process the same idempotent data file
+twice — reader-layer `EntityKeyOf + VersionOf` dedup collapses
+them to one record. This duplicate-absorbed-by-dedup tradeoff is
+deliberate: the alternative ("return success pointing at the stale
+ref") silently misses the write for every consumer who advanced
+past that offset, which is strictly worse.
+
+`ErrRefSettleBudgetExceeded` is raised only when **both** the
+initial PUT and the recovery PUT miss budget — a persistent
+backend-slowness signal rather than a one-off glitch:
 
 ```go
 if _, err := store.Write(ctx, recs, s3store.WithIdempotencyToken(token, time.Hour)); err != nil {
     if errors.Is(err, s3parquet.ErrRefSettleBudgetExceeded) {
-        // Ref may have landed but is not safely consumable.
-        // With WithIdempotencyToken the retry is deterministic
-        // (same data path). Without it, the retry produces a new
-        // data file — reader-side dedup absorbs the overlap.
+        // Initial PUT and internal recovery both missed budget.
+        // Retry — with WithIdempotencyToken the retry is
+        // deterministic (same data path); the retry's scoped-LIST
+        // freshness filter ignores the stale ref so a fresh one
+        // is emitted rather than silently matching the stale.
         return retry(...)
     }
     return err
 }
 ```
 
-The error is raised whenever the library can't guarantee the ref
-is Poll-visible within budget. A silent success in that scenario
-would cause the ref to be skipped by consumers — hence the hard
-failure. The sentinel exists so callers can distinguish budget-
-exceeded writes from other failures (e.g., permission errors) and
-act on them without parsing error strings.
+The sentinel lets callers distinguish budget-exceeded writes from
+other failures (permission errors, etc.) without parsing error
+strings. For **exactly-once at the consumer** through this path,
+configure reader dedup (`EntityKeyOf + VersionOf`) — the rare
+duplicates produced by recovery's narrow gap all share
+`(entity, version)` and dedup collapses them.
 
 **AWS S3 / MinIO users on strong consistency**: set
 `ConsistencyControl: s3store.ConsistencyStrongGlobal` on the
