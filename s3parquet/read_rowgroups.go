@@ -302,9 +302,12 @@ func (s *Reader[T]) downloadFilteredOne(
 	for j, r := range recs {
 		ia := km.InsertedAt
 		if s.insertedAtFieldIndex != nil {
-			ia = reflect.ValueOf(&recs[j]).Elem().
+			colVal := reflect.ValueOf(&recs[j]).Elem().
 				FieldByIndex(s.insertedAtFieldIndex).
 				Interface().(time.Time)
+			if !colVal.IsZero() {
+				ia = colVal
+			}
 		}
 		versioned[j] = versionedRecord[T]{
 			rec:        r,

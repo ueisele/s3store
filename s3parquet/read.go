@@ -553,13 +553,17 @@ func (s *Reader[T]) downloadAndDecodeAll(
 //
 // insertedAt source, in priority order:
 //
-//  1. When InsertedAtField is configured, read the writer-
-//     populated column off each decoded record — exact, same
-//     value across every read path.
-//  2. Otherwise fall back to the S3 object's LastModified from
-//     the LIST response. DefaultVersionOf's "newer wins" dedup
-//     still works on this fallback (different by the LIST-vs-
-//     HEAD precision delta, but monotonic over time).
+//  1. When InsertedAtField is configured AND the decoded column
+//     value is non-zero, use it — the writer-populated wall clock,
+//     exact and identical across every read path.
+//  2. Otherwise fall back to km.InsertedAt — either the S3 object's
+//     LastModified on the Read path, or the ref's dataTsMicros on
+//     the PollRecords path. Both cases covered: InsertedAtField
+//     unset, OR the column was absent from the parquet file (file
+//     written before the column existed, or by a tool that skipped
+//     it). The fallback keeps sort + DefaultVersionOf monotonic
+//     during a rollout without forcing a rewrite of historical
+//     data.
 //
 // Returns (nil, nil) when the object is missing — a dangling ref
 // or a LIST-to-GET race. The OnMissingData hook is invoked so
@@ -589,9 +593,12 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	for j, r := range recs {
 		ia := km.InsertedAt
 		if s.insertedAtFieldIndex != nil {
-			ia = reflect.ValueOf(&recs[j]).Elem().
+			colVal := reflect.ValueOf(&recs[j]).Elem().
 				FieldByIndex(s.insertedAtFieldIndex).
 				Interface().(time.Time)
+			if !colVal.IsZero() {
+				ia = colVal
+			}
 		}
 		versioned[j] = versionedRecord[T]{
 			rec:        r,
