@@ -3,6 +3,7 @@ package s3parquet
 import (
 	"cmp"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
@@ -23,6 +24,19 @@ type ReaderConfig[T any] struct {
 	VersionOf       func(T, time.Time) int64
 	InsertedAtField string
 	OnMissingData   func(dataPath string)
+
+	// ConsistencyControl sets the Consistency-Control HTTP header
+	// on data-file GETs following a LIST, matching the WriterConfig
+	// ConsistencyControl value per NetApp's "same consistency for
+	// paired PUT and GET" rule. Zero (ConsistencyDefault) sends no
+	// header and is correct on AWS S3 / MinIO; on StorageGRID
+	// match the writer's setting explicitly.
+	//
+	// Only the data-file GET applies the header — LIST of the ref
+	// stream and of partitions stay at the bucket default (their
+	// consistency needs are absorbed by SettleWindow, not the
+	// header).
+	ConsistencyControl ConsistencyLevel
 }
 
 // dedupEnabled reports whether latest-per-entity dedup applies.
@@ -43,10 +57,11 @@ func (c ReaderConfig[T]) dedupEnabled() bool {
 // with an identical name and type (enforced by a reflect-based
 // unit test).
 type ReaderExtras[T any] struct {
-	EntityKeyOf     func(T) string
-	VersionOf       func(T, time.Time) int64
-	InsertedAtField string
-	OnMissingData   func(dataPath string)
+	EntityKeyOf        func(T) string
+	VersionOf          func(T, time.Time) int64
+	InsertedAtField    string
+	OnMissingData      func(dataPath string)
+	ConsistencyControl ConsistencyLevel
 }
 
 // Reader is the read-side half of a Store. Owns Read / Poll /
@@ -97,6 +112,13 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	insertedAtIdx, err := validateInsertedAtField[T](cfg.InsertedAtField)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ConsistencyControl != "" && !cfg.ConsistencyControl.IsKnown() {
+		log.Printf(
+			"s3parquet: ReaderConfig.ConsistencyControl %q is not one "+
+				"of the known levels — header will be sent verbatim; "+
+				"verify the backend accepts it",
+			cfg.ConsistencyControl)
 	}
 	return &Reader[T]{
 		cfg:                  cfg,
@@ -167,11 +189,12 @@ func NewReaderFromWriter[T, U any](
 			"s3parquet: NewReaderFromWriter: writer is nil")
 	}
 	return NewReader(ReaderConfig[T]{
-		Target:          w.cfg.Target,
-		EntityKeyOf:     extras.EntityKeyOf,
-		VersionOf:       extras.VersionOf,
-		InsertedAtField: extras.InsertedAtField,
-		OnMissingData:   extras.OnMissingData,
+		Target:             w.cfg.Target,
+		EntityKeyOf:        extras.EntityKeyOf,
+		VersionOf:          extras.VersionOf,
+		InsertedAtField:    extras.InsertedAtField,
+		OnMissingData:      extras.OnMissingData,
+		ConsistencyControl: extras.ConsistencyControl,
 	})
 }
 

@@ -109,6 +109,26 @@ type Config[T any] struct {
 	// s3parquet.WriterConfig.PartitionWriteConcurrency for tuning
 	// guidance; forwarded there verbatim.
 	PartitionWriteConcurrency int
+
+	// DuplicateWriteDetection selects the retry-detection strategy
+	// for idempotent writes (WithIdempotencyToken). Forwarded to
+	// s3parquet.WriterConfig. Nil resolves to
+	// s3parquet.DuplicateWriteDetectionByProbe(true) — auto-detect
+	// and clean up the scratch object.
+	DuplicateWriteDetection s3parquet.DuplicateWriteDetection
+
+	// DisableCleanup disables best-effort orphan cleanup on the
+	// write path's failure branches. Forwarded to
+	// s3parquet.WriterConfig; see that field for the full contract.
+	DisableCleanup bool
+
+	// ConsistencyControl sets the Consistency-Control HTTP header
+	// on correctness-critical S3 operations. Empty value sends no
+	// header (AWS S3 / MinIO default). On NetApp StorageGRID, set
+	// to one of the stronger levels for Phase 3's idempotency
+	// guarantees. Forwarded to both s3parquet.WriterConfig and
+	// s3parquet.ReaderConfig so the two halves cannot drift.
+	ConsistencyControl s3parquet.ConsistencyLevel
 }
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /
@@ -128,6 +148,24 @@ type StreamEntry = core.StreamEntry
 
 // WriteResult contains metadata about a completed write.
 type WriteResult = core.WriteResult
+
+// WriteOption configures write-path behavior. See
+// s3parquet.WriteOption for the full contract — this umbrella
+// alias exists so callers don't have to import s3parquet just to
+// pass WithIdempotencyToken through.
+type WriteOption = core.WriteOption
+
+// WithIdempotencyToken marks a write as a retry-safe logical unit.
+// See core.WithIdempotencyToken for the full contract (token
+// replaces the library-default id in the data filename; retries
+// trigger overwrite-prevention so the parquet body is not re-
+// uploaded; maxRetryAge bounds the scoped LIST used to dedup
+// the ref emission).
+func WithIdempotencyToken(
+	token string, maxRetryAge time.Duration,
+) WriteOption {
+	return core.WithIdempotencyToken(token, maxRetryAge)
+}
 
 // QueryOption configures read-path behavior.
 type QueryOption = core.QueryOption

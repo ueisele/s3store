@@ -541,7 +541,8 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	key := km.Key
 	fileName := path.Base(key)
 
-	data, err := s.cfg.Target.get(ctx, key)
+	data, err := s.cfg.Target.get(
+		ctx, key, withConsistencyControl(s.cfg.ConsistencyControl))
 	if err != nil {
 		if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
 			if s.cfg.OnMissingData != nil {

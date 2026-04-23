@@ -10,6 +10,7 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
+	"github.com/ueisele/s3store/internal/core"
 )
 
 // WriteRowGroupsBy is the auto-key sibling of
@@ -37,6 +38,7 @@ import (
 func (s *Writer[T]) WriteRowGroupsBy(
 	ctx context.Context, records []T,
 	flushKeyOf func(T) string,
+	opts ...WriteOption,
 ) ([]WriteResult, error) {
 	if len(records) == 0 {
 		return nil, nil
@@ -51,9 +53,14 @@ func (s *Writer[T]) WriteRowGroupsBy(
 		return nil, fmt.Errorf(
 			"s3parquet: WriteRowGroupsBy: flushKeyOf is required")
 	}
+	writeOpts, err := resolveWriteOpts(opts)
+	if err != nil {
+		return nil, err
+	}
 	return s.writeGroupedFanOut(ctx, records,
 		func(ctx context.Context, key string, recs []T) (*WriteResult, error) {
-			return s.WriteWithKeyRowGroupsBy(ctx, key, recs, flushKeyOf)
+			return s.writeWithKeyRowGroupsByResolved(
+				ctx, key, recs, flushKeyOf, writeOpts)
 		})
 }
 
@@ -87,6 +94,7 @@ func (s *Writer[T]) WriteRowGroupsBy(
 func (s *Writer[T]) WriteWithKeyRowGroupsBy(
 	ctx context.Context, key string, records []T,
 	flushKeyOf func(T) string,
+	opts ...WriteOption,
 ) (*WriteResult, error) {
 	if len(records) == 0 {
 		return nil, nil
@@ -95,6 +103,22 @@ func (s *Writer[T]) WriteWithKeyRowGroupsBy(
 		return nil, fmt.Errorf(
 			"s3parquet: WriteWithKeyRowGroupsBy: flushKeyOf is required")
 	}
+	writeOpts, err := resolveWriteOpts(opts)
+	if err != nil {
+		return nil, err
+	}
+	return s.writeWithKeyRowGroupsByResolved(
+		ctx, key, records, flushKeyOf, writeOpts)
+}
+
+// writeWithKeyRowGroupsByResolved is the post-option-resolution
+// shared path for WriteRowGroupsBy (per-partition dispatch) and
+// WriteWithKeyRowGroupsBy (direct call). Mirrors writeWithKeyResolved
+// on the plain-write side.
+func (s *Writer[T]) writeWithKeyRowGroupsByResolved(
+	ctx context.Context, key string, records []T,
+	flushKeyOf func(T) string, opts core.WriteOpts,
+) (*WriteResult, error) {
 	if err := s.validateKey(key); err != nil {
 		return nil, err
 	}
@@ -125,7 +149,8 @@ func (s *Writer[T]) WriteWithKeyRowGroupsBy(
 	// the same order. collectIndexMarkerPaths dedupes by path, so
 	// ordering doesn't change the marker set, but we keep the
 	// invariant that records passed here match the file contents.
-	return s.writeEncodedPayload(ctx, key, sorted, parquetBytes, writeStartTime)
+	return s.writeEncodedPayload(
+		ctx, key, sorted, parquetBytes, writeStartTime, opts)
 }
 
 // encodeParquetWithFlush writes records into a parquet byte

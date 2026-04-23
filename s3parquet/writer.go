@@ -1,7 +1,9 @@
 package s3parquet
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"reflect"
 	"strings"
 	"time"
@@ -9,6 +11,13 @@ import (
 	"github.com/parquet-go/parquet-go/compress"
 	"github.com/ueisele/s3store/internal/core"
 )
+
+// probeTimeout caps the wall-clock duration of the eager
+// overwrite-prevention probe in NewWriter. Defends against a
+// misconfigured endpoint that would otherwise hang construction
+// indefinitely. 10s leaves room for a slow first TLS handshake +
+// 2-3 S3 round-trips while still failing fast on a real outage.
+const probeTimeout = 10 * time.Second
 
 // WriterConfig is the narrower Config form for constructing a
 // Writer directly (without a Reader). Holds the S3-wiring bundle
@@ -47,6 +56,65 @@ type WriterConfig[T any] struct {
 	// field round-trips unchanged end-to-end. Callers that want the
 	// write-time stamp surfaced at read time must set both sides.
 	InsertedAtField string
+
+	// DuplicateWriteDetection selects the strategy for detecting
+	// retries of idempotent writes. Only consulted when a write
+	// carries WithIdempotencyToken — without a token the field is
+	// irrelevant and the writer never probes.
+	//
+	// Three options (see the DuplicateWriteDetectionBy* factory
+	// functions for details):
+	//
+	//   - DuplicateWriteDetectionByOverwritePrevention(): always
+	//     send If-None-Match: *. Use when you know the backend
+	//     rejects overwrites (AWS, recent MinIO, or StorageGRID
+	//     with the s3:PutOverwriteObject deny policy).
+	//   - DuplicateWriteDetectionByHEAD(): pre-flight HEAD on
+	//     every idempotent write. Use when the backend has no
+	//     overwrite prevention.
+	//   - DuplicateWriteDetectionByProbe(deleteScratch): auto-
+	//     detect on the first idempotent write. Default.
+	//
+	// Nil resolves to DuplicateWriteDetectionByProbe(true) —
+	// auto-detect, clean up the scratch object after probing.
+	DuplicateWriteDetection DuplicateWriteDetection
+
+	// DisableCleanup opts out of the best-effort DeleteObject
+	// calls on partial-write failure paths (orphan data after a
+	// marker or ref PUT failure). When true, orphan objects
+	// remain at their S3 keys for bucket lifecycle policies to
+	// garbage-collect. Set when the writer lacks DELETE permission
+	// (common in STACKIT / StorageGRID deployments with a narrowly-
+	// scoped service account).
+	//
+	// Independent of DuplicateWriteDetectionByProbe's deleteScratch
+	// flag: probe cleanup and write-orphan cleanup are separate
+	// concerns. Pair DisableCleanup=true with Probe(false) (or
+	// an explicit OverwritePrevention() / HEAD() strategy) when
+	// DELETE is withheld globally.
+	DisableCleanup bool
+
+	// ConsistencyControl sets the Consistency-Control HTTP header
+	// on S3 operations where the library's correctness depends
+	// on strong read-after-write / list-after-write visibility —
+	// today that's the data PUT of an idempotent write and the
+	// scoped LIST used to dedup refs on the retry path.
+	//
+	// Zero value (ConsistencyDefault) sends no header — bucket
+	// default applies. On AWS S3 / MinIO that's strongly
+	// consistent by default so the field can stay empty. On
+	// NetApp StorageGRID the bucket default is typically
+	// read-after-new-write, which is insufficient for Phase 3's
+	// correctness conditions — set ConsistencyStrongGlobal (multi-
+	// site) or ConsistencyStrongSite (single-site) explicitly.
+	//
+	// NetApp requires PUT and paired GET to use matching
+	// consistency levels, so WriterConfig.ConsistencyControl and
+	// ReaderConfig.ConsistencyControl should match. NewWriter /
+	// NewReader can't cross-validate (they're independent
+	// constructors), so this is a caller contract documented
+	// here.
+	ConsistencyControl ConsistencyLevel
 }
 
 // Writer is the write-side half of a Store. Owns the write path
@@ -77,6 +145,21 @@ type Writer[T any] struct {
 	// the write hot path doesn't re-parse the type. nil when unset
 	// — populateInsertedAt is then skipped entirely.
 	insertedAtFieldIndex []int
+
+	// overwritePreventionActive is the resolved capability decided
+	// by NewWriter from the configured DuplicateWriteDetection:
+	//
+	//   - DuplicateWriteDetectionByOverwritePrevention(): always true
+	//     (caller asserted backend support; no probe).
+	//   - DuplicateWriteDetectionByHEAD(): always false (caller opted
+	//     into pre-flight HEAD; no probe).
+	//   - DuplicateWriteDetectionByProbe(deleteScratch): result of the
+	//     eager probe NewWriter ran against the bucket. true means
+	//     putIfAbsent path; false falls back to headThenPut.
+	//
+	// Read by the idempotent write path; never mutated after
+	// NewWriter returns, so no synchronisation needed.
+	overwritePreventionActive bool
 }
 
 // indexWriter is the internal, entry-type-erased contract
@@ -120,7 +203,7 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 }
 
 // NewWriter constructs a Writer directly from WriterConfig. Use
-// this in services that only write; use New(Config) when the
+// this in services that only write; use New(ctx, Config) when the
 // same process also reads through a Reader/Store.
 //
 // Validation mirrors the writer-side half of New: the Target
@@ -128,7 +211,19 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 // Compression resolves to a codec (zero value → snappy).
 // PartitionKeyOf is optional at construction — Write errors if
 // called without it, but WriteWithKey works regardless.
-func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
+//
+// ctx bounds the optional overwrite-prevention probe: when
+// DuplicateWriteDetection is the default Probe strategy, NewWriter
+// runs an eager probe against the bucket so the capability is
+// known before the first write. The probe is wrapped in an
+// internal 10s timeout (probeTimeout) layered onto ctx so a
+// caller-supplied context.Background() doesn't hang construction
+// indefinitely on a misconfigured endpoint. The other two
+// strategies (OverwritePrevention, HEAD) skip the probe entirely
+// — ctx is consulted only by the probe path.
+func NewWriter[T any](
+	ctx context.Context, cfg WriterConfig[T],
+) (*Writer[T], error) {
 	if err := cfg.Target.Validate(); err != nil {
 		return nil, err
 	}
@@ -146,13 +241,68 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.ConsistencyControl != "" && !cfg.ConsistencyControl.IsKnown() {
+		log.Printf(
+			"s3parquet: WriterConfig.ConsistencyControl %q is not one "+
+				"of the known levels (all, strong-global, strong-site, "+
+				"read-after-new-write, available) — header will be "+
+				"sent verbatim; verify the backend accepts it",
+			cfg.ConsistencyControl)
+	}
+	detection := asConcrete(cfg.DuplicateWriteDetection)
+	active, err := resolveOverwritePreventionActive(
+		ctx, cfg.Target, detection, cfg.ConsistencyControl)
+	if err != nil {
+		return nil, err
+	}
 	return &Writer[T]{
-		cfg:                  cfg,
-		dataPath:             core.DataPath(cfg.Target.Prefix),
-		refPath:              core.RefPath(cfg.Target.Prefix),
-		compressionCodec:     codec,
-		insertedAtFieldIndex: insertedAtIdx,
+		cfg:                       cfg,
+		dataPath:                  core.DataPath(cfg.Target.Prefix),
+		refPath:                   core.RefPath(cfg.Target.Prefix),
+		compressionCodec:          codec,
+		insertedAtFieldIndex:      insertedAtIdx,
+		overwritePreventionActive: active,
 	}, nil
+}
+
+// resolveOverwritePreventionActive runs at NewWriter time to
+// resolve the configured DuplicateWriteDetection strategy into a
+// concrete capability:
+//
+//   - ByOverwritePrevention: returns true unconditionally; the
+//     caller asserted that the backend rejects re-PUTs.
+//   - ByHEAD: returns false unconditionally; the caller wants
+//     pre-flight HEAD on every idempotent write.
+//   - ByProbe: PUTs a scratch object twice against the bucket and
+//     observes whether the second PUT is rejected. Wrapped in a
+//     probeTimeout-bounded context so a misconfigured endpoint
+//     doesn't hang NewWriter.
+//
+// The probe call carries the Writer's configured
+// ConsistencyControl so StorageGRID deployments that gate the
+// overwrite-deny policy on strong consistency see the same
+// header on the probe.
+func resolveOverwritePreventionActive(
+	ctx context.Context,
+	target S3Target,
+	detection duplicateWriteDetection,
+	consistency ConsistencyLevel,
+) (bool, error) {
+	switch detection.kind {
+	case detectKindOverwritePrevention:
+		return true, nil
+	case detectKindHEAD:
+		return false, nil
+	case detectKindProbe:
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		defer cancel()
+		return target.probeOverwritePrevention(
+			probeCtx, detection.deleteScratch,
+			withConsistencyControl(consistency))
+	}
+	return false, fmt.Errorf(
+		"s3parquet: unhandled DuplicateWriteDetection kind %d",
+		detection.kind)
 }
 
 // validateWriterInsertedAtField resolves WriterConfig.InsertedAtField

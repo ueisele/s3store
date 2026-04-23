@@ -57,7 +57,7 @@ type CostRecord struct {
     CalculatedAt time.Time `parquet:"calculated_at,timestamp(millisecond)"`
 }
 
-store, err := s3store.New[CostRecord](s3store.Config[CostRecord]{
+store, err := s3store.New[CostRecord](ctx, s3store.Config[CostRecord]{
     Bucket:        "warehouse",
     Prefix:        "billing",
     S3Client:      s3Client,
@@ -90,7 +90,7 @@ rows, err := store.Query(ctx, "charge_period=2026-03-*/*",
 For write-heavy services or consumers that don't need SQL:
 
 ```go
-store, err := s3parquet.New[CostRecord](s3parquet.Config[CostRecord]{
+store, err := s3parquet.New[CostRecord](ctx, s3parquet.Config[CostRecord]{
     Bucket:   "warehouse",
     Prefix:   "billing",
     S3Client: s3Client,
@@ -169,7 +169,7 @@ type NarrowRec struct {
     // ProcessLog deliberately absent.
 }
 
-store, _ := s3parquet.New[FullRec](cfg)
+store, _ := s3parquet.New[FullRec](ctx, cfg)
 view, _ := s3parquet.NewReaderFromStore[NarrowRec, FullRec](store,
     s3parquet.ReaderExtras[NarrowRec]{})
 
@@ -187,8 +187,8 @@ The relationship between constructors:
 
 | Want | Call |
 |---|---|
-| Both write and read, same `T` | `New(Config[T])` → `*Store[T]` |
-| Write only, narrow config | `NewWriter(WriterConfig[T])` → `*Writer[T]` |
+| Both write and read, same `T` | `New(ctx, Config[T])` → `*Store[T]` |
+| Write only, narrow config | `NewWriter(ctx, WriterConfig[T])` → `*Writer[T]` |
 | Read only, narrow config | `NewReader(ReaderConfig[T])` → `*Reader[T]` |
 | Same-/narrower-`T'` Reader over a Writer | `NewReaderFromWriter[T', U](writer, extras)` |
 | Same-/narrower-`T'` Reader over a Store | `NewReaderFromStore[T', U](store, extras)` |
@@ -247,7 +247,7 @@ func fromFile(f UsageFile) (Usage, error) {
 }
 
 // Hand the library UsageFile, not Usage.
-store, _ := s3parquet.New[UsageFile](s3parquet.Config[UsageFile]{ /* ... */ })
+store, _ := s3parquet.New[UsageFile](ctx, s3parquet.Config[UsageFile]{ /* ... */ })
 
 // Writes:
 files := make([]UsageFile, len(usages))
@@ -401,6 +401,9 @@ result, err := store.WriteWithKey(ctx, "charge_period=X/customer=Y", recs)
 Writes are atomic at the file level: if the ref PUT fails after the data
 PUT succeeded, s3store best-effort deletes the orphan parquet (with a HEAD
 check to detect lost-ack).
+
+For retry-safe writes (orchestrator failover, crash-and-resume), see
+[Idempotent writes](#idempotent-writes).
 
 For layouts where you want one parquet file to contain records from
 multiple logical entities but still prune at query time, use
@@ -855,6 +858,180 @@ Deduplicated by default. Pass `s3store.WithHistory()` to see all versions.
 most one row — construction-time errors surface through the returned
 `*sql.Row` at `Scan` time.
 
+## Idempotent writes
+
+s3store defaults to at-least-once on the write path: a retry after a
+partial failure re-runs the whole write and produces duplicate data,
+markers, and refs under fresh keys. For workloads where retries are
+common (orchestrator failover, network flakiness, crash-and-resume),
+`WithIdempotencyToken` makes the write retry-safe end-to-end.
+
+```go
+const token = "job-2026-04-22T10:15:00Z-batch42"
+
+_, err := store.WriteWithKey(ctx, key, records,
+    s3store.WithIdempotencyToken(token, 6*time.Hour))
+```
+
+On retry with the same token:
+
+- **Data file path is deterministic** — the token replaces the
+  default `{tsMicros}-{shortID}` id in the filename. The backend's
+  overwrite-prevention rejects the second PUT, so the parquet body
+  is not re-uploaded.
+- **Ref dedup via scoped LIST** — bounded by `maxRetryAge`. If a ref
+  for this token already exists in the window, the retry skips the
+  ref PUT. If the original attempt wrote data but not the ref
+  ("scenario B"), the retry completes by emitting the ref only.
+
+### Idempotency and reader dedup are complementary
+
+Tokens reduce *storage* duplication. They do **not** on their own
+guarantee exactly-once at the consumer. For that, pair tokens with
+reader-side dedup:
+
+- `EntityKeyOf` + `VersionOf` on `s3parquet.Reader`
+- `EntityKeyColumns` + `VersionColumn` on `s3sql.Reader` / umbrella
+
+| Config | Storage layer | Consumer layer |
+|---|---|---|
+| No token, no dedup | at-least-once | at-least-once |
+| No token, dedup configured | at-least-once | **exactly-once** (per entity) |
+| Token + dedup, strong consistency | at-least-once (minimal duplication) | **exactly-once** (within `maxRetryAge` across sessions) |
+| Token + dedup, weak consistency (StorageGRID `read-after-new-write`) | at-least-once (some residual duplication) | **exactly-once** — reader dedup collapses storage replicas |
+
+**Recommendation**: enable reader dedup whenever correctness matters.
+Tokens are additive — they cut S3 cost and traffic on retry.
+
+### `maxRetryAge` — tuning guide
+
+Bounds the scoped LIST on the retry path. Cost is
+`O(writes × maxRetryAge / 1000)` LIST pages per retry. No library
+default — pick based on your retry SLA.
+
+| Value | Use case |
+|---|---|
+| `0` | Disable scoped LIST; retry always writes a duplicate ref. Cheapest retry path, relies on reader dedup. |
+| `1 * time.Hour` | Fast-retry streaming; orchestrator retries within the hour. |
+| `6 * time.Hour` | Same-day recovery (cron-driven jobs that may rerun mid-day). |
+| `24 * time.Hour` | Cross-day orchestrator recovery (overnight batch retries). |
+
+Tokens older than `maxRetryAge` produce a duplicate ref on retry
+(documented tradeoff). Reader dedup absorbs it.
+
+### Backend detection strategies
+
+The writer detects "this retry already landed" via one of three
+strategies, selected at construction:
+
+```go
+s3store.Config[T]{
+    // ...
+    DuplicateWriteDetection: s3parquet.DuplicateWriteDetectionByProbe(true),
+}
+```
+
+| Factory | What it does |
+|---|---|
+| `DuplicateWriteDetectionByProbe(deleteScratch bool)` | **Default.** At `NewWriter` time, PUTs a scratch object at `{prefix}/_probe/overwrite-prevention` twice and observes whether the second PUT is rejected. Caches the result. `deleteScratch=true` removes the probe object after; `false` leaves it (use when the service account lacks DELETE). |
+| `DuplicateWriteDetectionByOverwritePrevention()` | Skip probe. Always send `If-None-Match: *` on the data PUT. Use when you know the backend enforces overwrite prevention (AWS, recent MinIO, or StorageGRID with the deny policy applied). |
+| `DuplicateWriteDetectionByHEAD()` | Skip probe. Pre-flight HEAD on every idempotent write — 200 skips the body upload, 404 proceeds. Use when neither `If-None-Match` nor a deny policy is available. |
+
+**Picking the right one:**
+
+| Deployment | `DuplicateWriteDetection` | `DisableCleanup` |
+|---|---|---|
+| AWS S3, full permissions | default (`Probe(true)`) | `false` |
+| STACKIT / StorageGRID, full permissions, bucket policy applied | default (`Probe(true)`) | `false` |
+| STACKIT / StorageGRID, no DELETE permission | `OverwritePrevention()` or `Probe(false)` | `true` |
+| Old MinIO, full permissions | default (`Probe(true)` auto-falls-back to HEAD) | `false` |
+| Old MinIO, no DELETE permission | `HEAD()` | `true` |
+
+**Trust contract for `OverwritePrevention()`**: picking this
+strategy is an assertion that the backend rejects re-PUTs. If the
+assertion is wrong, retries silently produce duplicates (at-least-
+once fallback). `Probe(...)` auto-detects and is safer when you're
+not sure.
+
+### StorageGRID / NetApp setup
+
+StorageGRID doesn't honor `If-None-Match: *` directly; instead,
+apply a bucket policy that denies `s3:PutOverwriteObject`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyOverwrite",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:PutOverwriteObject"],
+      "Resource": "arn:aws:s3:::YOUR-BUCKET/*"
+    }
+  ]
+}
+```
+
+Apply with:
+
+```python
+s3.put_bucket_policy(Bucket="YOUR-BUCKET", Policy=json.dumps(policy))
+```
+
+Then set `ConsistencyControl` to one of the stronger levels so the
+scoped retry-LIST sees prior refs across nodes:
+
+```go
+s3store.Config[T]{
+    // ...
+    ConsistencyControl: s3parquet.ConsistencyStrongGlobal, // or ConsistencyStrongSite
+}
+```
+
+`WriterConfig.ConsistencyControl` and `ReaderConfig.ConsistencyControl`
+must match — NetApp requires paired PUT and GET to use the same
+consistency level. The umbrella `Config` forwards a single value to
+both halves. On AWS / MinIO the header is an unknown string and is
+ignored, so leaving `ConsistencyControl` empty is correct there.
+
+### Zombie writers and orchestrators
+
+The library does not enforce single-writer-per-partition — that's a
+caller invariant. If two writers race on the same partition with the
+**same token**, they produce identical physical writes (both get
+rejected after the first; deterministic and safe). With **different
+tokens**, they produce two distinct data files (different paths), and
+reader dedup via `(entity, version)` collapses them at read time.
+
+For orchestrator-driven jobs: **reuse the same token across
+failovers** (persist it in your job state). A fresh token per
+restart is valid but creates real storage duplication.
+
+### Alternative: external outbox (Postgres / similar)
+
+If you already run a transactional database alongside your writers,
+an outbox pattern often composes better than s3store's ref stream:
+
+1. Set `DisableRefStream: true` on the s3store Config.
+2. On every successful write, `INSERT` into an outbox table with
+   columns `(token, partition_key, data_path, created_at)` and a
+   monotonic `id`.
+3. Consumers read by `id`.
+4. Unique constraint on `token` makes zombie/retry writes visible as
+   constraint violations — Postgres is the authoritative dedup.
+
+This moves the dedup primitive off S3, so on StorageGRID you can
+leave `ConsistencyControl` at the empty default and still get
+exactly-once at the consumer layer. Any rare storage-layer
+duplicate from a weak-consistency race becomes a "ghost" file that
+isn't referenced by an outbox row — wasted bytes, not a visible
+duplicate.
+
+s3store does not ship this pattern; document it as a valid
+alternative for callers who already have the transactional
+infrastructure.
+
 ## Schema evolution
 
 Both read paths tolerate missing columns out of the box: a field whose
@@ -897,7 +1074,7 @@ type SkuPeriodEntry struct {
     ChargePeriodEnd   string `parquet:"charge_period_end"`
 }
 
-store, _ := s3store.New[Usage](cfg)
+store, _ := s3store.New[Usage](ctx, cfg)
 
 skuIdx, err := s3store.NewIndex[Usage, SkuPeriodEntry](store,
     s3store.IndexDef[Usage, SkuPeriodEntry]{
@@ -1164,6 +1341,11 @@ Multi-group `Write` returns `([]WriteResult, error)` — consult
 the slice for records that *did* commit before the error so a
 retry can skip them if needed.
 
+To make retries produce deterministic data paths at the storage
+layer (no duplicate bytes, no duplicate refs within a bounded
+window), pass `WithIdempotencyToken` — see
+[Idempotent writes](#idempotent-writes).
+
 ### Read
 
 `Read`, `PollRecords`, and `BackfillIndex` tolerate a missing
@@ -1231,6 +1413,13 @@ type Config[T any] struct {
     // Parquet compression codec (default snappy).
     Compression CompressionCodec
 
+    // Idempotent-write knobs (optional; see "Idempotent writes"
+    // for the full contract). Only consulted when a Write call
+    // carries WithIdempotencyToken.
+    DuplicateWriteDetection s3parquet.DuplicateWriteDetection
+    DisableCleanup          bool
+    ConsistencyControl      s3parquet.ConsistencyLevel
+
     // DuckDB extras
     ExtraInitSQL []string                 // SET / CREATE SECRET / LOAD
                                           // statements run after the
@@ -1251,6 +1440,41 @@ Configuration for the sub-packages is narrower — see
 the exact fields.
 
 ## Migration from earlier versions
+
+Breaking changes in the idempotent-write release:
+
+- **`s3store.New`, `s3parquet.New`, `s3parquet.NewWriter` now take
+  `context.Context` as the first argument.** Construction runs an
+  eager capability probe against the S3 bucket when the default
+  `DuplicateWriteDetection` strategy is active, so the constructor
+  surfaces misconfigurations (bad credentials, wrong region,
+  missing bucket) at startup instead of on first write. The probe
+  is bounded by an internal 10s timeout layered onto the caller's
+  ctx. `NewReader` and `s3sql.NewReader` are unchanged — they do
+  no construction-time I/O.
+
+  ```go
+  // Before
+  store, err := s3store.New[T](cfg)
+
+  // After
+  store, err := s3store.New[T](ctx, cfg)
+  ```
+
+  Tests that construct a Writer against a fake S3 client should set
+  `DuplicateWriteDetection` explicitly to skip the probe:
+
+  ```go
+  cfg := s3store.Config[T]{
+      // ...
+      DuplicateWriteDetection: s3parquet.DuplicateWriteDetectionByHEAD(),
+  }
+  ```
+
+- **`Write`, `WriteWithKey`, `WriteRowGroupsBy`,
+  `WriteWithKeyRowGroupsBy` now accept a variadic `...WriteOption`
+  tail** for `WithIdempotencyToken`. Existing callers that don't
+  pass options compile unchanged — the tail is variadic.
 
 Breaking changes in the bloom-filter removal:
 

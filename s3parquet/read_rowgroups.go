@@ -230,7 +230,8 @@ func (s *Reader[T]) downloadFilteredOne(
 	key := km.Key
 	fileName := path.Base(key)
 
-	size, err := s.cfg.Target.size(ctx, key)
+	size, err := s.cfg.Target.size(
+		ctx, key, withConsistencyControl(s.cfg.ConsistencyControl))
 	if err != nil {
 		if _, ok := errors.AsType[*s3types.NotFound](err); ok {
 			if s.cfg.OnMissingData != nil {
@@ -242,9 +243,10 @@ func (s *Reader[T]) downloadFilteredOne(
 	}
 
 	ra := &s3ReaderAt{
-		ctx:    ctx,
-		target: s.cfg.Target,
-		key:    key,
+		ctx:         ctx,
+		target:      s.cfg.Target,
+		key:         key,
+		consistency: s.cfg.ConsistencyControl,
 	}
 	f, err := parquet.OpenFile(ra, size)
 	if err != nil {
@@ -313,9 +315,10 @@ func (s *Reader[T]) downloadFilteredOne(
 // per file: ctx is bound at construction so the reader doesn't
 // need ctx on every ReadAt call (interface signature forbids it).
 type s3ReaderAt struct {
-	ctx    context.Context
-	target S3Target
-	key    string
+	ctx         context.Context
+	target      S3Target
+	key         string
+	consistency ConsistencyLevel
 }
 
 // ReadAt issues a ranged GET for [off, off+len(p)) and copies
@@ -326,7 +329,9 @@ func (r *s3ReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	body, err := r.target.getRange(r.ctx, r.key, off, off+int64(len(p)))
+	body, err := r.target.getRange(
+		r.ctx, r.key, off, off+int64(len(p)),
+		withConsistencyControl(r.consistency))
 	if err != nil {
 		return 0, err
 	}

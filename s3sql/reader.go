@@ -75,6 +75,17 @@ type ReaderConfig[T any] struct {
 	// InsertedAtField: the value round-trips through the parquet
 	// file, identical at every read path.
 	InsertedAtField string
+
+	// ConsistencyControl sets the Consistency-Control HTTP header
+	// on the S3 operations this Reader controls — today that's
+	// LIST of the ref stream. Data-file reads go through DuckDB's
+	// opaque HTTP client and are unaffected: on weakly-consistent
+	// backends (StorageGRID read-after-new-write), use the
+	// s3parquet.Reader paths (Read / ReadIter / ReadIterWhere) if
+	// strong-consistent GETs of parquet data are required. See
+	// s3parquet.WriterConfig.ConsistencyControl for the full
+	// contract.
+	ConsistencyControl s3parquet.ConsistencyLevel
 }
 
 // dedupEnabled reports whether the reader should emit a dedup

@@ -11,8 +11,89 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/ueisele/s3store/internal/core"
 )
+
+// ErrAlreadyExists is the sentinel returned by putIfAbsent and
+// headThenPut when the target key is already present at the
+// destination. Signals the write path that the current attempt is
+// a retry of a previously-persisted logical write; callers scope-
+// LIST the ref stream to decide whether the ref also needs
+// re-emission.
+var ErrAlreadyExists = errors.New("s3parquet: object already exists")
+
+// s3CallOpt configures a single S3 target call. Used to thread
+// optional per-operation headers (currently Consistency-Control)
+// through put / get / head / list without widening method
+// signatures with scalar parameters that are empty on every call
+// today. Unexported — callers use the `with...` helpers below.
+type s3CallOpt func(*s3CallOpts)
+
+// s3CallOpts is the resolved per-call option set.
+type s3CallOpts struct {
+	// consistencyControl is the value for the Consistency-Control
+	// HTTP header when non-empty; unknown to AWS S3 and MinIO
+	// (ignored), honoured by NetApp StorageGRID.
+	consistencyControl string
+}
+
+// applyS3CallOpts folds a variadic s3CallOpt chain into an
+// s3CallOpts value.
+func applyS3CallOpts(opts []s3CallOpt) s3CallOpts {
+	var o s3CallOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
+// withConsistencyControl sets the Consistency-Control header on
+// the target call. Zero-length values (ConsistencyDefault) become
+// no-ops so callers can forward their config value unconditionally
+// without guarding on emptiness at every site.
+func withConsistencyControl(level ConsistencyLevel) s3CallOpt {
+	return func(o *s3CallOpts) {
+		o.consistencyControl = string(level)
+	}
+}
+
+// apiOptionsForOpts returns the aws.Config.APIOptions slice the
+// current call should pass to the SDK. Today it contains at most
+// one middleware — the Consistency-Control header setter — and
+// returns nil when no header is requested.
+func apiOptionsForOpts(o s3CallOpts) []func(*middleware.Stack) error {
+	if o.consistencyControl == "" {
+		return nil
+	}
+	return []func(*middleware.Stack) error{
+		addHeaderMiddleware("Consistency-Control", o.consistencyControl),
+	}
+}
+
+// addHeaderMiddleware returns an APIOption that installs a Build-
+// step middleware writing the given HTTP header into the request.
+// Registered at the Build step (after Serialize, before Finalize)
+// so it runs once per operation regardless of retries, and sees
+// the assembled smithyhttp.Request.
+func addHeaderMiddleware(
+	header, value string,
+) func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		return stack.Build.Add(middleware.BuildMiddlewareFunc(
+			"s3parquet.addHeader."+header,
+			func(
+				ctx context.Context, in middleware.BuildInput,
+				next middleware.BuildHandler,
+			) (middleware.BuildOutput, middleware.Metadata, error) {
+				if req, ok := in.Request.(*smithyhttp.Request); ok {
+					req.Header.Set(header, value)
+				}
+				return next.HandleBuild(ctx, in)
+			}), middleware.After)
+	}
+}
 
 // S3Target is the untyped handle to an s3parquet dataset. Holds
 // the S3 wiring and partitioning metadata shared by Writer,
@@ -131,12 +212,18 @@ func (t S3Target) EffectiveSettleWindow() time.Duration {
 // get downloads a single object into memory. Used by the read
 // path (Read, PollRecords) and by BackfillIndex when scanning
 // historical parquet data.
-func (t S3Target) get(ctx context.Context, key string) ([]byte, error) {
+func (t S3Target) get(
+	ctx context.Context, key string, opts ...s3CallOpt,
+) ([]byte, error) {
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
 	var data []byte
 	err := retry(ctx, func() error {
 		resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(t.Bucket),
 			Key:    aws.String(key),
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
 		})
 		if err != nil {
 			return err
@@ -153,13 +240,18 @@ func (t S3Target) get(ctx context.Context, key string) ([]byte, error) {
 // emission.
 func (t S3Target) put(
 	ctx context.Context, key string, data []byte, contentType string,
+	opts ...s3CallOpt,
 ) error {
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
 	return retry(ctx, func() error {
 		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.Bucket),
 			Key:         aws.String(key),
 			Body:        bytes.NewReader(data),
 			ContentType: aws.String(contentType),
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
 		})
 		return err
 	})
@@ -175,7 +267,10 @@ func (t S3Target) put(
 func (t S3Target) putWithMeta(
 	ctx context.Context, key string, data []byte,
 	contentType string, meta map[string]string,
+	opts ...s3CallOpt,
 ) error {
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
 	return retry(ctx, func() error {
 		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.Bucket),
@@ -183,19 +278,116 @@ func (t S3Target) putWithMeta(
 			Body:        bytes.NewReader(data),
 			ContentType: aws.String(contentType),
 			Metadata:    meta,
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
 		})
 		return err
 	})
 }
 
+// putIfAbsent PUTs data at key with an If-None-Match: * header so
+// the PUT is rejected by the backend when the object already
+// exists. Returns ErrAlreadyExists on:
+//
+//   - HTTP 412 PreconditionFailed — direct If-None-Match rejection
+//     (AWS S3, recent MinIO).
+//   - HTTP 403 AccessDenied followed by a HEAD that finds the
+//     object — StorageGRID path where a bucket policy denies
+//     s3:PutOverwriteObject. A 403 whose follow-up HEAD returns
+//     404 or 403 is a real permission error and surfaces
+//     unchanged so callers don't mask it.
+//
+// Any other error propagates as-is. On success returns nil with
+// the object written. meta is attached as x-amz-meta-<k> headers
+// when non-nil; mirrors putWithMeta for the idempotent data PUT.
+func (t S3Target) putIfAbsent(
+	ctx context.Context, key string, data []byte,
+	contentType string, meta map[string]string,
+	opts ...s3CallOpt,
+) error {
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
+	putErr := retry(ctx, func() error {
+		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(t.Bucket),
+			Key:         aws.String(key),
+			Body:        bytes.NewReader(data),
+			ContentType: aws.String(contentType),
+			Metadata:    meta,
+			IfNoneMatch: aws.String("*"),
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
+		})
+		return err
+	})
+	if putErr == nil {
+		return nil
+	}
+	// 412 PreconditionFailed: direct If-None-Match rejection. Any
+	// HTTP response error carrying that status lands us here —
+	// smithy wraps it in *smithyhttp.ResponseError, and retry()
+	// classifies 412 as non-transient so we see it on the first
+	// attempt.
+	if status, ok := httpStatusOf(putErr); ok {
+		switch status {
+		case 412:
+			return ErrAlreadyExists
+		case 403:
+			// Could be overwrite-deny (StorageGRID bucket policy)
+			// or a real permission error. Disambiguate via HEAD.
+			//
+			// The HEAD uses the same APIOptions so it carries the
+			// same Consistency-Control header — NetApp's rule is
+			// that paired PUT and follow-up operations must match
+			// on consistency.
+			ok, headErr := t.exists(ctx, key, opts...)
+			if headErr == nil && ok {
+				return ErrAlreadyExists
+			}
+			// Either HEAD failed (surface the HEAD error, still a
+			// real failure) or the object genuinely doesn't exist
+			// — the 403 is a permission problem. Either way, don't
+			// mask the error as "already exists".
+			return putErr
+		}
+	}
+	return putErr
+}
+
+// headThenPut is the pre-flight-HEAD write path used when the
+// backend has no overwrite-prevention mechanism. HEAD first;
+// if the object exists returns ErrAlreadyExists without writing
+// (so the parquet body is never re-uploaded on retry), otherwise
+// PUTs data and returns the PUT error (or nil).
+func (t S3Target) headThenPut(
+	ctx context.Context, key string, data []byte,
+	contentType string, meta map[string]string,
+	opts ...s3CallOpt,
+) error {
+	existsAlready, err := t.exists(ctx, key, opts...)
+	if err != nil {
+		return err
+	}
+	if existsAlready {
+		return ErrAlreadyExists
+	}
+	return t.putWithMeta(ctx, key, data, contentType, meta, opts...)
+}
+
 // exists reports whether an object exists, mapping S3's NotFound
 // to (false, nil) so callers can distinguish "missing" from real
 // failures without pattern-matching the error at every site.
-func (t S3Target) exists(ctx context.Context, key string) (bool, error) {
+func (t S3Target) exists(
+	ctx context.Context, key string, opts ...s3CallOpt,
+) (bool, error) {
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
 	err := retry(ctx, func() error {
 		_, err := t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(t.Bucket),
 			Key:    aws.String(key),
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
 		})
 		return err
 	})
@@ -222,13 +414,19 @@ func (t S3Target) del(ctx context.Context, key string) error {
 // size returns the object's content length. Used by the
 // row-group-filtered read path to size the io.ReaderAt parquet-
 // go opens the file through.
-func (t S3Target) size(ctx context.Context, key string) (int64, error) {
+func (t S3Target) size(
+	ctx context.Context, key string, opts ...s3CallOpt,
+) (int64, error) {
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
 	var resp *s3.HeadObjectOutput
 	err := retry(ctx, func() error {
 		var err error
 		resp, err = t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(t.Bucket),
 			Key:    aws.String(key),
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
 		})
 		return err
 	})
@@ -247,16 +445,21 @@ func (t S3Target) size(ctx context.Context, key string) (int64, error) {
 // row-group-filtered parquet reader.
 func (t S3Target) getRange(
 	ctx context.Context, key string, start, end int64,
+	opts ...s3CallOpt,
 ) ([]byte, error) {
 	if end <= start {
 		return nil, nil
 	}
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
 	var data []byte
 	err := retry(ctx, func() error {
 		resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(t.Bucket),
 			Key:    aws.String(key),
 			Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end-1)),
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
 		})
 		if err != nil {
 			return err
@@ -279,18 +482,112 @@ func (t S3Target) list(prefix string) *s3.ListObjectsV2Paginator {
 		})
 }
 
+// listRange returns a paginator over objects in the lexical
+// string range [startAfter, endInclusive]. Used by the
+// idempotent-retry path: bounded LIST on the ref stream scoped
+// to [now - MaxRetryAge, now] keeps the scan cost independent of
+// stream length. StartAfter is exclusive on the S3 side, which
+// is fine — the caller pads the lower bound into a tsMicros
+// prefix that never matches a real ref key directly.
+func (t S3Target) listRange(
+	prefix, startAfter string,
+) *s3.ListObjectsV2Paginator {
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(t.Bucket),
+		Prefix: aws.String(prefix),
+	}
+	if startAfter != "" {
+		input.StartAfter = aws.String(startAfter)
+	}
+	return s3.NewListObjectsV2Paginator(t.S3Client, input)
+}
+
 // listPage fetches the next page from p, wrapping NextPage in
 // the standard transient-error retry loop. A failed NextPage
 // does not advance the paginator's continuation token, so
 // retrying re-requests the same page cleanly.
 func (t S3Target) listPage(
 	ctx context.Context, p *s3.ListObjectsV2Paginator,
+	opts ...s3CallOpt,
 ) (*s3.ListObjectsV2Output, error) {
+	callOpts := applyS3CallOpts(opts)
+	apiOpts := apiOptionsForOpts(callOpts)
 	var out *s3.ListObjectsV2Output
 	err := retry(ctx, func() error {
 		var err error
-		out, err = p.NextPage(ctx)
+		out, err = p.NextPage(ctx, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
+		})
 		return err
 	})
 	return out, err
+}
+
+// httpStatusOf extracts the HTTP status code from a smithy-wrapped
+// S3 error. Returns (0, false) when err carries no HTTP response
+// (transport-level failure or non-SDK error).
+func httpStatusOf(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
+		return respErr.HTTPStatusCode(), true
+	}
+	return 0, false
+}
+
+// probeOverwritePrevention writes a scratch object at a stable
+// key ({Prefix}/_probe/overwrite-prevention), then attempts a
+// second putIfAbsent at the same key. If the second call returns
+// ErrAlreadyExists, the backend enforces overwrite prevention
+// (via If-None-Match honoured natively OR a bucket policy denying
+// s3:PutOverwriteObject — the writer doesn't distinguish). If
+// the second call succeeds silently, the backend has no overwrite
+// prevention and the writer must fall back to HEAD-before-PUT.
+//
+// deleteScratch controls whether the scratch object is deleted
+// after probing. Set to false on deployments where the writer
+// lacks DELETE permission on {Prefix}/_probe/ — the scratch stays
+// at a stable key, so subsequent restarts overwrite it rather
+// than accumulating.
+//
+// Invoked lazily from the write path on the first idempotent
+// write, guarded by sync.Once on the Writer. Errors on the first
+// (seeding) PUT surface verbatim — the probe can't conclude, so
+// the caller doesn't learn the capability and the write fails.
+func (t S3Target) probeOverwritePrevention(
+	ctx context.Context, deleteScratch bool,
+	opts ...s3CallOpt,
+) (bool, error) {
+	key := t.Prefix + "/_probe/overwrite-prevention"
+	body := []byte("s3store probe — safe to delete")
+	// Seed the scratch with a plain PUT. If this fails we can't
+	// distinguish "missing capability" from "credentials are
+	// wrong", so propagate the error rather than guessing.
+	if err := t.put(ctx, key, body, "text/plain", opts...); err != nil {
+		return false, fmt.Errorf(
+			"s3parquet: probe seed PUT %s: %w", key, err)
+	}
+	secondErr := t.putIfAbsent(ctx, key, body, "text/plain", nil, opts...)
+	overwritePreventionActive := errors.Is(secondErr, ErrAlreadyExists)
+	if !overwritePreventionActive && secondErr != nil {
+		// The second call failed for a reason other than "already
+		// exists" — surface it rather than silently mis-classifying
+		// the backend.
+		return false, fmt.Errorf(
+			"s3parquet: probe PUT %s: %w", key, secondErr)
+	}
+	if deleteScratch {
+		if err := t.del(ctx, key); err != nil {
+			// Probe-scratch delete failing is annoying but not
+			// fatal — capability is already detected. Log via
+			// the returned error so the caller can surface it
+			// once, not on every write.
+			return overwritePreventionActive, fmt.Errorf(
+				"s3parquet: probe scratch cleanup %s: %w "+
+					"(capability detected: %v)",
+				key, err, overwritePreventionActive)
+		}
+	}
+	return overwritePreventionActive, nil
 }

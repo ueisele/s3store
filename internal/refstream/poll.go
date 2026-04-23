@@ -107,16 +107,15 @@ outer:
 			if opts.Until != "" && objKey >= string(opts.Until) {
 				break outer
 			}
-			key, _, shortID, dataTsMicros, err := core.ParseRefKey(objKey)
+			key, _, id, dataTsMicros, err := core.ParseRefKey(objKey)
 			if err != nil {
 				return nil, opts.Since,
 					fmt.Errorf("parse ref: %w", err)
 			}
 			entries = append(entries, core.StreamEntry{
-				Offset: core.Offset(objKey),
-				Key:    key,
-				DataPath: core.BuildDataFilePath(
-					opts.DataPath, key, dataTsMicros, shortID),
+				Offset:     core.Offset(objKey),
+				Key:        key,
+				DataPath:   core.BuildDataFilePath(opts.DataPath, key, id),
 				RefPath:    objKey,
 				InsertedAt: time.UnixMicro(dataTsMicros),
 			})

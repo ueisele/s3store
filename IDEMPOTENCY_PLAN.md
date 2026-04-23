@@ -204,7 +204,7 @@ Low. Pure retry loop; no behaviour change on happy path.
 
 ---
 
-## Phase 3 — External idempotency via `WithIdempotencyToken(token)`
+## Phase 3 — External idempotency via `WithIdempotencyToken(token)` ✅ implemented
 
 **Outcome**: caller retries of a whole `Write` call with the same token produce deterministic data file paths, so overwrite-prevention triggers and the parquet body is not re-uploaded. Markers and refs are best-effort deduplicated via scoped LIST. **Consumer-side exactly-once is delivered jointly with Phase 1.5's replica dedup** — tokens reduce the number of physical replicas; replica dedup collapses any that remain (residual duplicates from weak consistency, zombie writers, or retries beyond `maxRetryAge`).
 

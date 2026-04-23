@@ -58,7 +58,7 @@ func (s *Writer[T]) partitionConcurrency() int {
 // callers don't have to guard against batch-pipeline edge
 // cases.
 func (s *Writer[T]) Write(
-	ctx context.Context, records []T,
+	ctx context.Context, records []T, opts ...WriteOption,
 ) ([]WriteResult, error) {
 	if len(records) == 0 {
 		return nil, nil
@@ -68,10 +68,36 @@ func (s *Writer[T]) Write(
 			"s3parquet: PartitionKeyOf is required for Write; " +
 				"use WriteWithKey for explicit keys")
 	}
+	writeOpts, err := resolveWriteOpts(opts)
+	if err != nil {
+		return nil, err
+	}
 	return s.writeGroupedFanOut(ctx, records,
 		func(ctx context.Context, key string, recs []T) (*WriteResult, error) {
-			return s.WriteWithKey(ctx, key, recs)
+			return s.writeWithKeyResolved(ctx, key, recs, writeOpts)
 		})
+}
+
+// resolveWriteOpts folds the variadic WriteOption chain into a
+// core.WriteOpts and validates embedded values (IdempotencyToken
+// passes ValidateIdempotencyToken). Done once per Write call so
+// per-partition dispatch doesn't re-validate on every goroutine.
+func resolveWriteOpts(opts []WriteOption) (core.WriteOpts, error) {
+	var w core.WriteOpts
+	w.Apply(opts...)
+	if w.IdempotencyToken != "" {
+		if err := core.ValidateIdempotencyToken(
+			w.IdempotencyToken); err != nil {
+			return core.WriteOpts{}, err
+		}
+		if w.MaxRetryAge < 0 {
+			return core.WriteOpts{}, fmt.Errorf(
+				"s3parquet: MaxRetryAge must be >= 0 (got %s); "+
+					"zero disables scoped-LIST ref dedup",
+				w.MaxRetryAge)
+		}
+	}
+	return w, nil
 }
 
 // writeGroupedFanOut is the partition-level fan-out shared by
@@ -163,12 +189,33 @@ func (s *Writer[T]) writeGroupedFanOut(
 // failure. On a real failure it best-effort deletes the orphan
 // parquet; if that cleanup also fails, the returned error
 // includes the orphan data path so the operator can clean up.
+//
+// Passing WithIdempotencyToken makes this call retry-safe: the
+// data filename is derived from the token, so retries produce
+// the same path and the backend's overwrite-prevention triggers
+// without re-uploading the parquet body. See
+// core.WithIdempotencyToken for the full contract.
 func (s *Writer[T]) WriteWithKey(
-	ctx context.Context, key string, records []T,
+	ctx context.Context, key string, records []T, opts ...WriteOption,
 ) (*WriteResult, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
+	writeOpts, err := resolveWriteOpts(opts)
+	if err != nil {
+		return nil, err
+	}
+	return s.writeWithKeyResolved(ctx, key, records, writeOpts)
+}
+
+// writeWithKeyResolved is the post-option-resolution shared entry
+// point for Write (per-partition dispatch) and WriteWithKey (direct
+// call). Lets Write resolve options once and avoid the per-
+// partition revalidation that calling WriteWithKey in the fan-out
+// closure would imply.
+func (s *Writer[T]) writeWithKeyResolved(
+	ctx context.Context, key string, records []T, opts core.WriteOpts,
+) (*WriteResult, error) {
 	if err := s.validateKey(key); err != nil {
 		return nil, err
 	}
@@ -189,7 +236,8 @@ func (s *Writer[T]) WriteWithKey(
 		return nil, fmt.Errorf(
 			"s3parquet: parquet encode: %w", err)
 	}
-	return s.writeEncodedPayload(ctx, key, records, parquetBytes, writeStartTime)
+	return s.writeEncodedPayload(
+		ctx, key, records, parquetBytes, writeStartTime, opts)
 }
 
 // writeEncodedPayload is the post-encode tail shared between
@@ -205,9 +253,15 @@ func (s *Writer[T]) WriteWithKey(
 // tsMicros AND the x-amz-meta-created-at header so external
 // tooling sees the same value that's in the InsertedAtField
 // column.
+//
+// opts carries the resolved WriteOpts from the caller; when
+// IdempotencyToken is set the write path uses the deterministic
+// token-based id, detects retries via overwrite-prevention or
+// HEAD-before-PUT, and scopes a LIST on the ref stream to dedup
+// the ref emission.
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
-	writeStartTime time.Time,
+	writeStartTime time.Time, opts core.WriteOpts,
 ) (*WriteResult, error) {
 	// Compute marker paths up-front so a bad IndexDef.Of fails the
 	// whole Write before we touch S3, matching how validateKey
@@ -217,26 +271,68 @@ func (s *Writer[T]) writeEncodedPayload(
 		return nil, err
 	}
 
-	shortID := uuid.New().String()[:8]
-
-	// tsMicros derives from writeStartTime so the data filename
-	// carries the same "when did this batch start" stamp as the
-	// InsertedAtField column and the x-amz-meta-created-at header.
-	// The ref filename captures a separate timestamp below, taken
-	// immediately before the ref PUT so SettleWindow only needs to
-	// cover ref-PUT latency + LIST propagation.
+	// Compute the data-file id. With a token, use the token verbatim
+	// as the id so retries produce deterministic data paths (the
+	// retry-detection path can rely on equality of dataKey). Without
+	// a token, fall back to the library's {tsMicros}-{shortID}
+	// scheme — still lex-sortable by time within a partition.
 	tsMicros := writeStartTime.UnixMicro()
+	var id string
+	idempotent := opts.IdempotencyToken != ""
+	if idempotent {
+		id = opts.IdempotencyToken
+	} else {
+		id = core.MakeAutoID(tsMicros, uuid.New().String()[:8])
+	}
 
-	dataKey := core.BuildDataFilePath(s.dataPath, key, tsMicros, shortID)
-	if err := s.cfg.Target.putWithMeta(
-		ctx, dataKey, parquetBytes,
-		"application/octet-stream",
-		map[string]string{
-			"created-at": writeStartTime.Format(time.RFC3339Nano),
-		},
-	); err != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: put data: %w", err)
+	dataKey := core.BuildDataFilePath(s.dataPath, key, id)
+	meta := map[string]string{
+		"created-at": writeStartTime.Format(time.RFC3339Nano),
+	}
+
+	// isRetry drives the post-data-PUT flow: fresh writes unconditionally
+	// emit markers + ref; retries run the scoped-LIST dedup to avoid
+	// re-emitting refs that already landed.
+	var isRetry bool
+	if idempotent {
+		putErr := s.putDataIdempotent(ctx, dataKey, parquetBytes, meta)
+		switch {
+		case errors.Is(putErr, ErrAlreadyExists):
+			isRetry = true
+		case putErr != nil:
+			return nil, fmt.Errorf(
+				"s3parquet: put data: %w", putErr)
+		}
+	} else {
+		if err := s.cfg.Target.putWithMeta(
+			ctx, dataKey, parquetBytes,
+			"application/octet-stream", meta,
+			withConsistencyControl(s.cfg.ConsistencyControl),
+		); err != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: put data: %w", err)
+		}
+	}
+
+	// On retry, scoped-LIST the ref stream for a ref carrying
+	// this id. Found → full-success retry, skip markers + ref.
+	// Not found → scenario B (data landed but ref didn't on the
+	// original attempt), continue to emit markers + ref.
+	if isRetry {
+		existingRefKey, err := s.findExistingRef(
+			ctx, opts.IdempotencyToken, opts.MaxRetryAge)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: scoped LIST for retry: %w", err)
+		}
+		if existingRefKey != "" {
+			return &WriteResult{
+				Offset:     Offset(existingRefKey),
+				DataPath:   dataKey,
+				RefPath:    existingRefKey,
+				InsertedAt: writeStartTime,
+			}, nil
+		}
 	}
 
 	// Index markers are written after data (so a successful
@@ -246,17 +342,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// any markers that landed before the failure stay as
 	// orphans, which Lookup tolerates.
 	if err := s.putMarkersParallel(ctx, markerPaths); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(), writeCleanupTimeout)
-		defer cancel()
-		if delErr := s.cfg.Target.del(
-			cleanupCtx, dataKey,
-		); delErr != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: put index markers: %w "+
-					"(orphan data at %s: %v)",
-				err, dataKey, delErr)
-		}
+		s.cleanupOrphanData(dataKey, idempotent)
 		return nil, fmt.Errorf(
 			"s3parquet: put index markers: %w", err)
 	}
@@ -279,7 +365,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// then only needs to cover ref-PUT latency + LIST propagation,
 	// independent of marker count.
 	refTsMicros := time.Now().UnixMicro()
-	refKey := core.EncodeRefKey(s.refPath, refTsMicros, shortID, tsMicros, key)
+	refKey := core.EncodeRefKey(s.refPath, refTsMicros, id, tsMicros, key)
 
 	result := &WriteResult{
 		Offset:     Offset(refKey),
@@ -308,15 +394,114 @@ func (s *Writer[T]) writeEncodedPayload(
 		return result, nil
 	}
 
-	if delErr := s.cfg.Target.del(
-		cleanupCtx, dataKey,
-	); delErr != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: put ref: %w (orphan data at %s: %v)",
-			putErr, dataKey, delErr)
+	if !idempotent && !s.cfg.DisableCleanup {
+		if delErr := s.cfg.Target.del(
+			cleanupCtx, dataKey,
+		); delErr != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: put ref: %w (orphan data at %s: %v)",
+				putErr, dataKey, delErr)
+		}
 	}
+	// Idempotent writes leave orphan data in place by design:
+	// a retry with the same token reuses the same data path and
+	// overwrite-prevention triggers, so deletion would make the
+	// retry re-upload the body. DisableCleanup likewise preserves
+	// orphans for lifecycle policies to garbage-collect.
 
 	return nil, fmt.Errorf("s3parquet: put ref: %w", putErr)
+}
+
+// putDataIdempotent issues the idempotent data PUT using whichever
+// detection strategy the Writer resolved — putIfAbsent for
+// overwrite-prevention backends (honours If-None-Match: *
+// natively OR via a bucket policy denying s3:PutOverwriteObject),
+// or headThenPut for backends without either mechanism.
+//
+// Returns ErrAlreadyExists on retry (callers interpret as "skip
+// the body re-upload, scope-LIST refs"), nil on fresh write, and
+// any other error verbatim.
+func (s *Writer[T]) putDataIdempotent(
+	ctx context.Context, dataKey string, parquetBytes []byte,
+	meta map[string]string,
+) error {
+	opts := withConsistencyControl(s.cfg.ConsistencyControl)
+	if s.overwritePreventionActive {
+		return s.cfg.Target.putIfAbsent(
+			ctx, dataKey, parquetBytes,
+			"application/octet-stream", meta, opts)
+	}
+	return s.cfg.Target.headThenPut(
+		ctx, dataKey, parquetBytes,
+		"application/octet-stream", meta, opts)
+}
+
+// findExistingRef scans the ref stream for a ref whose id field
+// equals token, within the lexical range [now - maxRetryAge, now].
+// Returns the full ref key when found, empty string when not.
+//
+// Bounded by maxRetryAge so the scan cost is O(refs in window)
+// rather than O(all refs). When maxRetryAge == 0 the function
+// returns "" immediately — the caller explicitly disabled ref
+// dedup for this retry.
+//
+// Uses the Writer's ConsistencyControl on the LIST so the scan
+// sees all prior refs on StorageGRID-style backends — a weak-
+// consistency LIST can miss a ref the writer just published on
+// another node, silently breaking dedup.
+func (s *Writer[T]) findExistingRef(
+	ctx context.Context, token string, maxRetryAge time.Duration,
+) (string, error) {
+	if maxRetryAge <= 0 {
+		return "", nil
+	}
+	lo, _ := core.RefRangeForRetry(s.refPath, time.Now(), maxRetryAge)
+	paginator := s.cfg.Target.listRange(s.refPath+"/", lo)
+	for paginator.HasMorePages() {
+		page, err := s.cfg.Target.listPage(
+			ctx, paginator,
+			withConsistencyControl(s.cfg.ConsistencyControl))
+		if err != nil {
+			return "", err
+		}
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			id, err := core.ExtractRefID(*obj.Key)
+			if err != nil {
+				// Malformed ref keys (externally written or a
+				// future schema the parser doesn't understand)
+				// aren't our retry target — skip rather than fail
+				// the write.
+				continue
+			}
+			if id == token {
+				return *obj.Key, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// cleanupOrphanData runs the best-effort delete for an orphaned
+// data object on the failure paths. No-op when the write is
+// idempotent (retries reuse the same path; deleting would force
+// body re-upload) or when DisableCleanup is set (operator opted
+// into lifecycle-based garbage collection).
+//
+// Errors are silently swallowed: the caller already has a richer
+// error to surface, and compounding it with a delete failure
+// obscures the root cause. Operators running without lifecycle
+// policies should monitor for orphan data/ref drift separately.
+func (s *Writer[T]) cleanupOrphanData(dataKey string, idempotent bool) {
+	if idempotent || s.cfg.DisableCleanup {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(
+		context.Background(), writeCleanupTimeout)
+	defer cancel()
+	_ = s.cfg.Target.del(cleanupCtx, dataKey)
 }
 
 func (s *Writer[T]) groupByKey(records []T) map[string][]T {

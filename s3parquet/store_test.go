@@ -24,6 +24,10 @@ func validConfig() Config[testRec] {
 		Prefix:            "p",
 		PartitionKeyParts: []string{"period", "customer"},
 		S3Client:          &s3.Client{},
+		// HEAD strategy bypasses NewWriter's eager probe — these
+		// unit tests use a fake S3 client that can't service the
+		// probe PUTs and don't exercise idempotent writes.
+		DuplicateWriteDetection: DuplicateWriteDetectionByHEAD(),
 	}
 }
 
@@ -42,7 +46,7 @@ func TestNew_Validation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
 			tc.mutate(&cfg)
-			_, err := New(cfg)
+			_, err := New(context.Background(), cfg)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -188,7 +192,7 @@ func TestNewPopulatesDefaultVersionOf(t *testing.T) {
 	cfg.EntityKeyOf = func(r testRec) string { return r.Customer }
 	// VersionOf deliberately nil
 
-	s, err := New(cfg)
+	s, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -212,7 +216,7 @@ func TestNewLeavesUserVersionOfAlone(t *testing.T) {
 		return r.Value * 2
 	}
 
-	s, err := New(cfg)
+	s, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -336,7 +340,7 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 	cfg := validConfig()
 	// both EntityKeyOf and VersionOf left nil
 
-	s, err := New(cfg)
+	s, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -380,7 +384,7 @@ func TestPartitionConcurrency(t *testing.T) {
 func TestNewWriterRejectsNegativeConcurrency(t *testing.T) {
 	cfg := writerConfigFrom(validConfig())
 	cfg.PartitionWriteConcurrency = -1
-	if _, err := NewWriter(cfg); err == nil {
+	if _, err := NewWriter(context.Background(), cfg); err == nil {
 		t.Fatal("NewWriter: expected error, got nil")
 	}
 }

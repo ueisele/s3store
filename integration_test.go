@@ -44,7 +44,7 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 	if len(opts.entityKeyColumns) > 0 {
 		versionColumn = "ts"
 	}
-	store, err := New[IntRecord](Config[IntRecord]{
+	store, err := New[IntRecord](context.Background(), Config[IntRecord]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -323,7 +323,7 @@ func TestUmbrella_SettleWindow(t *testing.T) {
 // bug where only one sub-store was closed would leak the other.
 func TestUmbrella_Close(t *testing.T) {
 	f := testutil.New(t)
-	store, err := New[IntRecord](Config[IntRecord]{
+	store, err := New[IntRecord](context.Background(), Config[IntRecord]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,

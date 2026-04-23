@@ -41,7 +41,11 @@ type Store[T any] struct {
 // DuckDB-backed Reader from a single umbrella Config. Both
 // halves share one S3Target so they can't drift on Bucket /
 // Prefix / PartitionKeyParts / SettleWindow / DisableRefStream.
-func New[T any](cfg Config[T]) (*Store[T], error) {
+//
+// ctx bounds the underlying s3parquet.NewWriter probe; see that
+// constructor for the full contract. The s3sql Reader does no
+// construction-time I/O.
+func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 	target := s3parquet.S3Target{
 		Bucket:            cfg.Bucket,
 		Prefix:            cfg.Prefix,
@@ -50,23 +54,27 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		SettleWindow:      cfg.SettleWindow,
 		DisableRefStream:  cfg.DisableRefStream,
 	}
-	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[T]{
+	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[T]{
 		Target:                    target,
 		PartitionKeyOf:            cfg.PartitionKeyOf,
 		Compression:               cfg.Compression,
 		PartitionWriteConcurrency: cfg.PartitionWriteConcurrency,
 		InsertedAtField:           cfg.InsertedAtField,
+		DuplicateWriteDetection:   cfg.DuplicateWriteDetection,
+		DisableCleanup:            cfg.DisableCleanup,
+		ConsistencyControl:        cfg.ConsistencyControl,
 	})
 	if err != nil {
 		return nil, err
 	}
 	r, err := s3sql.NewReader(s3sql.ReaderConfig[T]{
-		Target:           target,
-		TableAlias:       cfg.TableAlias,
-		VersionColumn:    cfg.VersionColumn,
-		EntityKeyColumns: cfg.EntityKeyColumns,
-		ExtraInitSQL:     cfg.ExtraInitSQL,
-		InsertedAtField:  cfg.InsertedAtField,
+		Target:             target,
+		TableAlias:         cfg.TableAlias,
+		VersionColumn:      cfg.VersionColumn,
+		EntityKeyColumns:   cfg.EntityKeyColumns,
+		ExtraInitSQL:       cfg.ExtraInitSQL,
+		InsertedAtField:    cfg.InsertedAtField,
+		ConsistencyControl: cfg.ConsistencyControl,
 	})
 	if err != nil {
 		return nil, err
@@ -103,18 +111,20 @@ func (s *Store[T]) Close() error {
 	return s.reader.Close()
 }
 
-// Write delegates to the Writer.
+// Write delegates to the Writer. Accepts WriteOption for
+// retry-safe idempotent writes (WithIdempotencyToken).
 func (s *Store[T]) Write(
-	ctx context.Context, records []T,
+	ctx context.Context, records []T, opts ...WriteOption,
 ) ([]WriteResult, error) {
-	return s.writer.Write(ctx, records)
+	return s.writer.Write(ctx, records, opts...)
 }
 
-// WriteWithKey delegates to the Writer.
+// WriteWithKey delegates to the Writer. Accepts WriteOption for
+// retry-safe idempotent writes (WithIdempotencyToken).
 func (s *Store[T]) WriteWithKey(
-	ctx context.Context, key string, records []T,
+	ctx context.Context, key string, records []T, opts ...WriteOption,
 ) (*WriteResult, error) {
-	return s.writer.WriteWithKey(ctx, key, records)
+	return s.writer.WriteWithKey(ctx, key, records, opts...)
 }
 
 // WriteWithKeyRowGroupsBy delegates to the Writer. See
@@ -123,9 +133,10 @@ func (s *Store[T]) WriteWithKey(
 // later ReadIterWhere can prune via chunk-level stats.
 func (s *Store[T]) WriteWithKeyRowGroupsBy(
 	ctx context.Context, key string, records []T,
-	flushKeyOf func(T) string,
+	flushKeyOf func(T) string, opts ...WriteOption,
 ) (*WriteResult, error) {
-	return s.writer.WriteWithKeyRowGroupsBy(ctx, key, records, flushKeyOf)
+	return s.writer.WriteWithKeyRowGroupsBy(
+		ctx, key, records, flushKeyOf, opts...)
 }
 
 // WriteRowGroupsBy delegates to the Writer. Auto-keyed sibling
@@ -134,9 +145,9 @@ func (s *Store[T]) WriteWithKeyRowGroupsBy(
 // flushKeyOf value.
 func (s *Store[T]) WriteRowGroupsBy(
 	ctx context.Context, records []T,
-	flushKeyOf func(T) string,
+	flushKeyOf func(T) string, opts ...WriteOption,
 ) ([]WriteResult, error) {
-	return s.writer.WriteRowGroupsBy(ctx, records, flushKeyOf)
+	return s.writer.WriteRowGroupsBy(ctx, records, flushKeyOf, opts...)
 }
 
 // PartitionKey delegates to the Writer. Handy when paired with

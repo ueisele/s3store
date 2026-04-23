@@ -1,6 +1,7 @@
 package s3parquet
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -148,6 +149,23 @@ type Config[T any] struct {
 	// to WriterConfig. See WriterConfig.PartitionWriteConcurrency
 	// for when to tune it.
 	PartitionWriteConcurrency int
+
+	// DuplicateWriteDetection selects the retry-detection strategy
+	// for idempotent writes (WithIdempotencyToken). Forwarded to
+	// WriterConfig; see WriterConfig.DuplicateWriteDetection.
+	DuplicateWriteDetection DuplicateWriteDetection
+
+	// DisableCleanup disables best-effort orphan cleanup on the
+	// write path's failure branches. Forwarded to WriterConfig;
+	// see WriterConfig.DisableCleanup.
+	DisableCleanup bool
+
+	// ConsistencyControl is the Consistency-Control HTTP header
+	// value applied to correctness-critical S3 operations.
+	// Forwarded to both WriterConfig and ReaderConfig so the two
+	// halves of the Store share the same value. See
+	// WriterConfig.ConsistencyControl for the contract.
+	ConsistencyControl ConsistencyLevel
 }
 
 // DefaultVersionOf returns insertedAt in microseconds. The
@@ -194,8 +212,12 @@ func (s *Store[T]) Target() S3Target {
 // The unified Config[T] is kept as a back-compat entry point;
 // new code that only writes or only reads should prefer
 // NewWriter / NewReader directly.
-func New[T any](cfg Config[T]) (*Store[T], error) {
-	w, err := NewWriter(writerConfigFrom(cfg))
+//
+// ctx bounds the underlying NewWriter probe; see NewWriter for the
+// full contract. NewReader does not consult ctx — the read side
+// performs no construction-time I/O.
+func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
+	w, err := NewWriter(ctx, writerConfigFrom(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -230,6 +252,9 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 		Compression:               c.Compression,
 		PartitionWriteConcurrency: c.PartitionWriteConcurrency,
 		InsertedAtField:           c.InsertedAtField,
+		DuplicateWriteDetection:   c.DuplicateWriteDetection,
+		DisableCleanup:            c.DisableCleanup,
+		ConsistencyControl:        c.ConsistencyControl,
 	}
 }
 
@@ -237,11 +262,12 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 // ReaderConfig[T].
 func readerConfigFrom[T any](c Config[T]) ReaderConfig[T] {
 	return ReaderConfig[T]{
-		Target:          targetFrom(c),
-		EntityKeyOf:     c.EntityKeyOf,
-		VersionOf:       c.VersionOf,
-		InsertedAtField: c.InsertedAtField,
-		OnMissingData:   c.OnMissingData,
+		Target:             targetFrom(c),
+		EntityKeyOf:        c.EntityKeyOf,
+		VersionOf:          c.VersionOf,
+		InsertedAtField:    c.InsertedAtField,
+		OnMissingData:      c.OnMissingData,
+		ConsistencyControl: c.ConsistencyControl,
 	}
 }
 

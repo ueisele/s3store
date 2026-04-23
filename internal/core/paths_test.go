@@ -2,6 +2,7 @@ package core
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -106,30 +107,33 @@ func TestParseRefKeyInvalid(t *testing.T) {
 func TestBuildDataFilePath(t *testing.T) {
 	const dataPath = "test-prefix/data"
 	cases := []struct {
-		name     string
-		key      string
-		tsMicros int64
-		shortID  string
-		want     string
+		name string
+		key  string
+		id   string
+		want string
 	}{
 		{
-			name:     "standard key",
-			key:      "period=2026-03-17/customer=abc",
-			tsMicros: 1710684000000000,
-			shortID:  "a3f2e1b4",
-			want:     "test-prefix/data/period=2026-03-17/customer=abc/1710684000000000-a3f2e1b4.parquet",
+			name: "auto id (library default)",
+			key:  "period=2026-03-17/customer=abc",
+			id:   MakeAutoID(1710684000000000, "a3f2e1b4"),
+			want: "test-prefix/data/period=2026-03-17/customer=abc/1710684000000000-a3f2e1b4.parquet",
 		},
 		{
-			name:     "value with hyphen",
-			key:      "period=X/customer=foo-bar",
-			tsMicros: 1710770400000000,
-			shortID:  "c7d9f0e2",
-			want:     "test-prefix/data/period=X/customer=foo-bar/1710770400000000-c7d9f0e2.parquet",
+			name: "value with hyphen",
+			key:  "period=X/customer=foo-bar",
+			id:   MakeAutoID(1710770400000000, "c7d9f0e2"),
+			want: "test-prefix/data/period=X/customer=foo-bar/1710770400000000-c7d9f0e2.parquet",
+		},
+		{
+			name: "caller-supplied token id",
+			key:  "period=X/customer=Y",
+			id:   "2026-04-22T10:15:00Z-batch42",
+			want: "test-prefix/data/period=X/customer=Y/2026-04-22T10:15:00Z-batch42.parquet",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := BuildDataFilePath(dataPath, tc.key, tc.tsMicros, tc.shortID)
+			got := BuildDataFilePath(dataPath, tc.key, tc.id)
 			if got != tc.want {
 				t.Errorf("\ngot  %q\nwant %q", got, tc.want)
 			}
@@ -139,47 +143,47 @@ func TestBuildDataFilePath(t *testing.T) {
 
 func TestParseDataFileName(t *testing.T) {
 	cases := []struct {
-		name      string
-		in        string
-		wantTs    int64
-		wantShort string
-		wantErr   bool
+		name    string
+		in      string
+		wantID  string
+		wantErr bool
 	}{
 		{
-			name:      "standard",
-			in:        "1710684000000000-a3f2e1b4.parquet",
-			wantTs:    1710684000000000,
-			wantShort: "a3f2e1b4",
+			name:   "auto-id format",
+			in:     "1710684000000000-a3f2e1b4.parquet",
+			wantID: "1710684000000000-a3f2e1b4",
 		},
 		{
-			name:    "missing dash",
-			in:      "a3f2e1b4.parquet",
+			name:   "caller-token id with dashes",
+			in:     "2026-04-22T10:15:00Z-batch42.parquet",
+			wantID: "2026-04-22T10:15:00Z-batch42",
+		},
+		{
+			name:    "missing .parquet suffix",
+			in:      "1710684000000000-a3f2e1b4",
 			wantErr: true,
 		},
 		{
-			name:    "non-numeric ts",
-			in:      "notanumber-a3f2e1b4.parquet",
+			name:    "empty id",
+			in:      ".parquet",
 			wantErr: true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ts, short, err := ParseDataFileName(tc.in)
+			id, err := ParseDataFileName(tc.in)
 			if tc.wantErr {
 				if err == nil {
-					t.Errorf("expected error for %q, got ts=%d id=%q",
-						tc.in, ts, short)
+					t.Errorf("expected error for %q, got id=%q",
+						tc.in, id)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if ts != tc.wantTs {
-				t.Errorf("ts: got %d want %d", ts, tc.wantTs)
-			}
-			if short != tc.wantShort {
-				t.Errorf("shortID: got %q want %q", short, tc.wantShort)
+			if id != tc.wantID {
+				t.Errorf("id: got %q want %q", id, tc.wantID)
 			}
 		})
 	}
@@ -187,39 +191,46 @@ func TestParseDataFileName(t *testing.T) {
 
 // TestBuildParseDataFileNameRoundTrip guards that
 // ParseDataFileName is the inverse of BuildDataFilePath (for
-// the filename portion).
+// the filename portion) — works for both auto-id and caller-
+// token shapes.
 func TestBuildParseDataFileNameRoundTrip(t *testing.T) {
 	const (
 		dataPath = "p/data"
 		hiveKey  = "period=X/customer=Y"
-		ts       = int64(1_710_684_000_000_000)
-		shortID  = "a3f2e1b4"
 	)
-	full := BuildDataFilePath(dataPath, hiveKey, ts, shortID)
-	// strip the dataPath + "/" + hiveKey + "/" prefix to get
-	// the filename part.
-	filename := full[len(dataPath)+len(hiveKey)+2:]
-	gotTs, gotID, err := ParseDataFileName(filename)
-	if err != nil {
-		t.Fatalf("ParseDataFileName(%q): %v", filename, err)
+	cases := []string{
+		MakeAutoID(1_710_684_000_000_000, "a3f2e1b4"),
+		"2026-04-22T10:15:00Z-batch42",
+		"job.uuid.0e0e0e0e",
 	}
-	if gotTs != ts || gotID != shortID {
-		t.Errorf("round-trip: got (ts=%d, id=%q), want (ts=%d, id=%q)",
-			gotTs, gotID, ts, shortID)
+	for _, id := range cases {
+		t.Run(id, func(t *testing.T) {
+			full := BuildDataFilePath(dataPath, hiveKey, id)
+			filename := full[len(dataPath)+len(hiveKey)+2:]
+			gotID, err := ParseDataFileName(filename)
+			if err != nil {
+				t.Fatalf("ParseDataFileName(%q): %v", filename, err)
+			}
+			if gotID != id {
+				t.Errorf("round-trip: got id=%q want %q", gotID, id)
+			}
+		})
 	}
 }
 
-// TestBuildDataFilePathLexicalOrdering guards that two writes
-// to the same partition key sort chronologically in S3 LIST by
-// filename — the primary reason we embed tsMicros in the data
-// filename.
+// TestBuildDataFilePathLexicalOrdering guards that two
+// auto-id writes to the same partition sort chronologically
+// in S3 LIST by filename — the property MakeAutoID's tsMicros
+// prefix preserves.
 func TestBuildDataFilePathLexicalOrdering(t *testing.T) {
 	const (
 		dataPath = "p/data"
 		key      = "period=X/customer=Y"
 	)
-	earlier := BuildDataFilePath(dataPath, key, 1_000_000_000_000, "aaaaaaaa")
-	later := BuildDataFilePath(dataPath, key, 2_000_000_000_000, "aaaaaaaa")
+	earlier := BuildDataFilePath(dataPath, key,
+		MakeAutoID(1_000_000_000_000, "aaaaaaaa"))
+	later := BuildDataFilePath(dataPath, key,
+		MakeAutoID(2_000_000_000_000, "aaaaaaaa"))
 	if earlier >= later {
 		t.Errorf("earlier %q should sort before later %q", earlier, later)
 	}
@@ -328,4 +339,120 @@ func TestRefCutoff(t *testing.T) {
 		t.Errorf("later ref %q should sort after cutoff %q",
 			later, cutoff)
 	}
+}
+
+func TestValidateIdempotencyToken(t *testing.T) {
+	cases := []struct {
+		name    string
+		token   string
+		wantErr bool
+	}{
+		{"ok simple", "batch42", false},
+		{"ok with dashes", "2026-04-22T10:15:00Z-batch42", false},
+		{"ok with digits", "job.1234567890", false},
+		{"ok max length", strings.Repeat("a", 200), false},
+		{"empty", "", true},
+		{"too long", strings.Repeat("a", 201), true},
+		{"contains slash", "ns/job42", true},
+		{"contains dotdot", "job..42", true},
+		{"contains space", "job 42", true},
+		{"contains tab", "job\t42", true},
+		{"contains null", "job\x0042", true},
+		{"contains unicode", "jöb42", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateIdempotencyToken(tc.token)
+			if tc.wantErr && err == nil {
+				t.Errorf("want error for %q, got nil", tc.token)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("want nil error for %q, got %v",
+					tc.token, err)
+			}
+		})
+	}
+}
+
+func TestExtractRefID(t *testing.T) {
+	const refPath = "test/_stream/refs"
+	cases := []struct {
+		name    string
+		id      string
+		wantErr bool
+	}{
+		{"library-shortID", "a1b2c3d4", false},
+		{"caller-token", "2026-04-22T10:15:00Z-batch42", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build a ref key and verify ExtractRefID round-trips
+			// the id field (shortID slot).
+			key := EncodeRefKey(
+				refPath, 1_000_000, tc.id, 999_999,
+				"period=X/customer=alice")
+			got, err := ExtractRefID(key)
+			if tc.wantErr && err == nil {
+				t.Fatalf("want error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.id {
+				t.Errorf("ExtractRefID = %q, want %q", got, tc.id)
+			}
+		})
+	}
+}
+
+func TestExtractRefID_InvalidKey(t *testing.T) {
+	_, err := ExtractRefID("not-a-ref-key")
+	if err == nil {
+		t.Fatal("want error on unparseable ref key")
+	}
+}
+
+func TestRefRangeForRetry(t *testing.T) {
+	const refPath = "test/_stream/refs"
+	// Pick a reference instant far from the epoch so we can see
+	// the subtraction in the lower bound clearly.
+	now := time.Date(2026, 4, 22, 10, 15, 0, 0, time.UTC)
+
+	lo, hi := RefRangeForRetry(refPath, now, time.Hour)
+	loExpected := refPath + "/" +
+		itoa(now.Add(-time.Hour).UnixMicro())
+	hiExpected := refPath + "/" + itoa(now.UnixMicro())
+	if lo != loExpected {
+		t.Errorf("lo = %q, want %q", lo, loExpected)
+	}
+	if hi != hiExpected {
+		t.Errorf("hi = %q, want %q", hi, hiExpected)
+	}
+
+	// A ref published at now-30m must sort into [lo, hi].
+	within := EncodeRefKey(refPath,
+		now.Add(-30*time.Minute).UnixMicro(),
+		"abc12345",
+		now.Add(-30*time.Minute).UnixMicro(),
+		"period=X/customer=y")
+	if within < lo || within > hi {
+		t.Errorf("ref inside window %q sorted outside [%q, %q]",
+			within, lo, hi)
+	}
+
+	// A ref published two hours before now (outside the 1h
+	// window) must sort below lo.
+	before := EncodeRefKey(refPath,
+		now.Add(-2*time.Hour).UnixMicro(),
+		"abc12345",
+		now.Add(-2*time.Hour).UnixMicro(),
+		"period=X/customer=y")
+	if before >= lo {
+		t.Errorf("ref before window %q should sort below lo %q",
+			before, lo)
+	}
+}
+
+func itoa(n int64) string {
+	return strconv.FormatInt(n, 10)
 }

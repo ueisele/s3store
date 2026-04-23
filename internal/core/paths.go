@@ -70,19 +70,26 @@ func ParseRefKey(refKey string) (
 			"s3store: invalid ref key: %s", refKey)
 	}
 
-	// pre-sep is "{refTsMicros}-{shortID}-{dataTsMicros}".
-	seg := strings.SplitN(parts[0], "-", 3)
-	if len(seg) != 3 {
+	// pre-sep is "{refTsMicros}-{id}-{dataTsMicros}". The id may
+	// itself contain '-' (e.g. an idempotency token formatted as
+	// "{ISO-timestamp}-{suffix}"), so anchor on the numeric
+	// timestamps at both ends: first '-' splits refTs from the
+	// rest; last '-' splits the id from dataTs.
+	firstDash := strings.IndexByte(parts[0], '-')
+	lastDash := strings.LastIndexByte(parts[0], '-')
+	if firstDash <= 0 || lastDash <= firstDash {
 		return "", 0, "", 0, fmt.Errorf(
 			"s3store: invalid ref key: %s", refKey)
 	}
-	refTsMicros, err = strconv.ParseInt(seg[0], 10, 64)
+	refTsStr := parts[0][:firstDash]
+	shortID = parts[0][firstDash+1 : lastDash]
+	dataTsStr := parts[0][lastDash+1:]
+	refTsMicros, err = strconv.ParseInt(refTsStr, 10, 64)
 	if err != nil {
 		return "", 0, "", 0, fmt.Errorf(
 			"s3store: invalid ref ts in ref key %q: %w", refKey, err)
 	}
-	shortID = seg[1]
-	dataTsMicros, err = strconv.ParseInt(seg[2], 10, 64)
+	dataTsMicros, err = strconv.ParseInt(dataTsStr, 10, 64)
 	if err != nil {
 		return "", 0, "", 0, fmt.Errorf(
 			"s3store: invalid data ts in ref key %q: %w", refKey, err)
@@ -97,34 +104,43 @@ func ParseRefKey(refKey string) (
 }
 
 // BuildDataFilePath returns the S3 object key for a data file.
-// The filename includes the write timestamp (µs since epoch)
-// followed by the shortID so S3 LIST of a partition prefix
-// returns files in chronological write order, and so the
-// timestamp is recoverable without consulting the ref stream.
-func BuildDataFilePath(
-	dataPath string, hiveKey string, tsMicros int64, shortID string,
-) string {
-	return fmt.Sprintf("%s/%s/%d-%s.parquet",
-		dataPath, hiveKey, tsMicros, shortID)
+// The filename is `{id}.parquet`. id is opaque to this helper —
+// the writer generates it as either `{tsMicros}-{shortID}` (the
+// library's default, lex-sortable by time within a partition)
+// or the caller's idempotency token verbatim.
+//
+// Format: `{dataPath}/{hiveKey}/{id}.parquet`.
+func BuildDataFilePath(dataPath, hiveKey, id string) string {
+	return fmt.Sprintf("%s/%s/%s.parquet", dataPath, hiveKey, id)
 }
 
-// ParseDataFileName is the inverse of BuildDataFilePath for the
-// filename portion: it extracts the tsMicros and shortID from
-// the last path segment of a data-file key. Callers typically
-// pass filepath.Base(s3Key) or everything after the last '/'.
-func ParseDataFileName(name string) (tsMicros int64, shortID string, err error) {
-	name = strings.TrimSuffix(name, ".parquet")
-	tsStr, short, ok := strings.Cut(name, "-")
-	if !ok {
-		return 0, "", fmt.Errorf(
+// MakeAutoID returns the library's default {tsMicros}-{shortID}
+// id used for non-idempotent writes. tsMicros is the writer's
+// wall-clock at write-start (so the filename remains lex-
+// sortable by time within a partition); shortID is an 8-char
+// random fragment so concurrent writes within the same
+// microsecond don't collide.
+func MakeAutoID(tsMicros int64, shortID string) string {
+	return fmt.Sprintf("%d-%s", tsMicros, shortID)
+}
+
+// ParseDataFileName extracts the opaque id from a data-file
+// filename. Callers typically pass filepath.Base(s3Key) or
+// everything after the last '/'. Returns the id as the writer
+// stored it (no further parsing into {tsMicros, shortID} —
+// idempotent writes use the caller's token, which has its own
+// shape).
+func ParseDataFileName(name string) (id string, err error) {
+	if !strings.HasSuffix(name, ".parquet") {
+		return "", fmt.Errorf(
 			"s3store: invalid data filename: %s", name)
 	}
-	tsMicros, err = strconv.ParseInt(tsStr, 10, 64)
-	if err != nil {
-		return 0, "", fmt.Errorf(
-			"s3store: invalid ts in data filename %q: %w", name, err)
+	id = strings.TrimSuffix(name, ".parquet")
+	if id == "" {
+		return "", fmt.Errorf(
+			"s3store: invalid data filename: %s", name)
 	}
-	return tsMicros, short, nil
+	return id, nil
 }
 
 // IndexPath returns the prefix under which markers for the named
@@ -210,4 +226,87 @@ func ParseIndexMarkerKey(
 func RefCutoff(refPath string, now time.Time, settleWindow time.Duration) string {
 	cutoff := now.Add(-settleWindow)
 	return fmt.Sprintf("%s/%d", refPath, cutoff.UnixMicro())
+}
+
+// RefRangeForRetry returns the [lo, hi] ref-key string bounds for
+// a scoped LIST on the idempotent-retry path. When the writer
+// detects a retry (overwrite-prevention fired on the data PUT),
+// it LISTs refs whose publication timestamp falls in
+// [now - maxRetryAge, now] and scans for an entry matching the
+// token's id.
+//
+// Bounds are lexical prefixes of ref keys — EncodeRefKey prepends
+// the publication tsMicros to the filename, so a tsMicros-based
+// string compare gives an exact-age scope.
+func RefRangeForRetry(
+	refPath string, now time.Time, maxRetryAge time.Duration,
+) (lo, hi string) {
+	loTs := now.Add(-maxRetryAge).UnixMicro()
+	hiTs := now.UnixMicro()
+	lo = fmt.Sprintf("%s/%d", refPath, loTs)
+	hi = fmt.Sprintf("%s/%d", refPath, hiTs)
+	return lo, hi
+}
+
+// ExtractRefID pulls the id field out of a ref key so the retry-
+// path scoped LIST can compare it against the caller's
+// IdempotencyToken. The id is the shortID portion of the ref
+// filename under the default scheme, or the caller's token
+// verbatim under WithIdempotencyToken — ParseRefKey already
+// deserializes it into the shortID return slot, so this is a
+// thin convenience wrapper. Errors on an unparseable ref key.
+func ExtractRefID(refKey string) (string, error) {
+	_, _, shortID, _, err := ParseRefKey(refKey)
+	if err != nil {
+		return "", err
+	}
+	return shortID, nil
+}
+
+// ValidateIdempotencyToken rejects token values that can't be
+// safely embedded in a data-file path or a ref filename. Run at
+// WithIdempotencyToken-application time so typos surface
+// immediately at the call site, not buried inside the write
+// path's PUT error.
+//
+// Rules:
+//   - non-empty
+//   - no "/" (would split the S3 key into unintended segments)
+//   - no ".." (collides with the key-pattern grammar's range
+//     separator; tokens with ".." would be unaddressable on read)
+//   - no whitespace, no control characters — printable ASCII
+//     subset 0x21..0x7E
+//   - <= 200 characters so the resulting data path stays well
+//     under S3's 1024-byte key limit even with long Hive keys
+func ValidateIdempotencyToken(token string) error {
+	if token == "" {
+		return fmt.Errorf(
+			"s3store: IdempotencyToken must not be empty")
+	}
+	if len(token) > 200 {
+		return fmt.Errorf(
+			"s3store: IdempotencyToken must be <= 200 characters "+
+				"(got %d)", len(token))
+	}
+	if strings.Contains(token, "/") {
+		return fmt.Errorf(
+			"s3store: IdempotencyToken %q must not contain '/'",
+			token)
+	}
+	if strings.Contains(token, "..") {
+		return fmt.Errorf(
+			"s3store: IdempotencyToken %q must not contain "+
+				"'..' (reserved by the key-pattern grammar)",
+			token)
+	}
+	for i := 0; i < len(token); i++ {
+		c := token[i]
+		if c < 0x21 || c > 0x7E {
+			return fmt.Errorf(
+				"s3store: IdempotencyToken %q contains a "+
+					"non-printable-ASCII byte at index %d "+
+					"(want 0x21..0x7E)", token, i)
+		}
+	}
+	return nil
 }

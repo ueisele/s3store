@@ -1,6 +1,7 @@
 package s3parquet
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -27,11 +28,15 @@ type SkuIndexEntry struct {
 
 func newIndexTestStore(t *testing.T) *Store[testIndexRec] {
 	t.Helper()
-	s, err := New(Config[testIndexRec]{
+	s, err := New(context.Background(), Config[testIndexRec]{
 		Bucket:            "b",
 		Prefix:            "p",
 		S3Client:          &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
+		// HEAD strategy bypasses the eager NewWriter probe — these
+		// tests use a fake S3 client that can't service a real probe
+		// PUT, and they never exercise idempotent writes.
+		DuplicateWriteDetection: DuplicateWriteDetectionByHEAD(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

@@ -1,6 +1,8 @@
 package s3parquet
 
 import (
+	"time"
+
 	"github.com/ueisele/s3store/internal/core"
 	"github.com/ueisele/s3store/internal/refstream"
 )
@@ -22,6 +24,22 @@ type StreamEntry = core.StreamEntry
 
 // WriteResult contains metadata about a completed write.
 type WriteResult = core.WriteResult
+
+// WriteOption configures write-path behavior (today:
+// WithIdempotencyToken). Accepted by Write / WriteWithKey /
+// WriteRowGroupsBy / WriteWithKeyRowGroupsBy as a variadic tail.
+type WriteOption = core.WriteOption
+
+// WithIdempotencyToken marks a write as a retry-safe logical unit.
+// See core.WithIdempotencyToken for the full contract — token
+// replaces the default {tsMicros}-{shortID} id in the data
+// filename so retries produce deterministic paths; maxRetryAge
+// bounds the scoped LIST used to dedup refs on the retry path.
+func WithIdempotencyToken(
+	token string, maxRetryAge time.Duration,
+) WriteOption {
+	return core.WithIdempotencyToken(token, maxRetryAge)
+}
 
 // QueryOption configures read-path behavior.
 type QueryOption = core.QueryOption

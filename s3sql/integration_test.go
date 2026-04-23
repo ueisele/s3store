@@ -70,7 +70,7 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      10 * time.Millisecond,
 	}
-	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
+	w, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[Rec]{
 		Target:         target,
 		PartitionKeyOf: partitionKeyOfRec,
 	})
@@ -155,7 +155,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      10 * time.Millisecond,
 	}
-	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecWithMeta]{
+	w, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[RecWithMeta]{
 		Target: target,
 		PartitionKeyOf: func(r RecWithMeta) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -721,7 +721,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      10 * time.Millisecond,
 	}
-	wOld, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecNarrow]{
+	wOld, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[RecNarrow]{
 		Target: target,
 		PartitionKeyOf: func(r RecNarrow) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -795,7 +795,7 @@ func TestRead_SliceField(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      10 * time.Millisecond,
 	}
-	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[TagRec]{
+	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[TagRec]{
 		Target: target,
 		PartitionKeyOf: func(r TagRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -890,7 +890,7 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      10 * time.Millisecond,
 	}
-	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[JobRec]{
+	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[JobRec]{
 		Target: target,
 		PartitionKeyOf: func(r JobRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -1335,7 +1335,7 @@ func TestDisableRefStream_s3sql(t *testing.T) {
 		SettleWindow:      10 * time.Millisecond,
 		DisableRefStream:  true,
 	}
-	writer, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
+	writer, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[Rec]{
 		Target:         target,
 		PartitionKeyOf: partitionKeyOfRec,
 	})
