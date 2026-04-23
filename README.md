@@ -956,18 +956,23 @@ not sure.
 ### StorageGRID / NetApp setup
 
 StorageGRID doesn't honor `If-None-Match: *` directly; instead,
-apply a bucket policy that denies `s3:PutOverwriteObject`:
+apply a bucket policy that denies `s3:PutOverwriteObject` — but
+**scope the deny to `{prefix}/data/*` + `{prefix}/_probe/*` only**,
+not the whole bucket:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "DenyOverwrite",
+      "Sid": "DenyDataAndProbeOverwrite",
       "Effect": "Deny",
       "Principal": "*",
       "Action": ["s3:PutOverwriteObject"],
-      "Resource": "arn:aws:s3:::YOUR-BUCKET/*"
+      "Resource": [
+        "arn:aws:s3:::YOUR-BUCKET/YOUR-PREFIX/data/*",
+        "arn:aws:s3:::YOUR-BUCKET/YOUR-PREFIX/_probe/*"
+      ]
     }
   ]
 }
@@ -978,6 +983,31 @@ Apply with:
 ```python
 s3.put_bucket_policy(Bucket="YOUR-BUCKET", Policy=json.dumps(policy))
 ```
+
+> **Why the narrow scope matters.** s3store's layout has three
+> subtrees under `{prefix}`:
+>
+> - `data/` — parquet files. Deterministic paths under
+>   `WithIdempotencyToken`; the deny fires here on retry so the body
+>   isn't re-uploaded. **This is what needs the deny.**
+> - `_index/` — secondary-index markers. **Byte-identical idempotent
+>   overwrites by design** — the same `{col}={value}/m.idx` marker
+>   is written every time that `(col, value)` tuple recurs in a
+>   batch. A bucket-wide deny rejects the second such write with
+>   `403 AccessDenied` and breaks index writes entirely.
+> - `_stream/refs/` — ref files. Unique per-PUT keys (refTsMicros
+>   prefix), so they never overwrite either way.
+>
+> The `_probe/` scratch key the Probe strategy uses is also included
+> in the deny so capability detection at `NewWriter` works as
+> intended — without it, the probe observes "second PUT succeeded"
+> and falls back to HEAD-before-PUT mode.
+>
+> **Symptom of an over-scoped deny**: data writes succeed, then
+> markers fail with `403 AccessDenied` as soon as any `(col, value)`
+> tuple is seen in a second batch. The library attempts a cleanup
+> DELETE on the orphan data, which often fails with the same 403,
+> leaving orphan parquet under `data/` with no markers and no ref.
 
 Then set `ConsistencyControl` to one of the stronger levels so the
 scoped retry-LIST sees prior refs across nodes:
