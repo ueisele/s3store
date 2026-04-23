@@ -489,8 +489,12 @@ the tie deterministically:
 - **`s3parquet`**: first write wins (first occurrence, stable across
   repeated reads).
 - **`s3sql`**: later write wins (secondary `ORDER BY filename DESC` in
-  the dedup CTE; data filenames embed the write tsMicros, so lex-later
-  = wrote-later). Stable across repeated reads.
+  the dedup CTE). Holds for the auto-generated `{tsMicros}-{shortID}`
+  id — lex-later = wrote-later. With `WithIdempotencyToken` the
+  filename is the caller's token, so the tie-break follows the token's
+  lex order rather than wall-clock order; use a time-sortable token
+  format (e.g. `{ISO-timestamp}-{suffix}`) if you rely on this. Stable
+  across repeated reads either way.
 
 The two packages differ in *which* record wins, but each is deterministic
 on its own. Pick the package whose tie-break matches your retry
@@ -499,17 +503,18 @@ semantics — or make the tie impossible by ensuring `VersionColumn` /
 
 ### Per-record "when was this inserted"
 
-If a consumer needs the S3 write time of every record without
-storing it as a data column, set `Config.InsertedAtField` to the
-name of a `time.Time` field on `T`. The field must carry
-`parquet:"-"` so it stays off the parquet schema — the library
-populates it on decode from the source file's tsMicros.
+If a consumer needs the write time of every record, set
+`Config.InsertedAtField` to the name of a `time.Time` field on
+`T`. The field must carry a non-empty, non-`"-"` parquet tag — the
+writer populates it with its wall-clock time at write-start and
+persists the value as a real parquet column, so both read paths
+see the exact same timestamp on disk.
 
 ```go
 type Event struct {
     Customer   string    `parquet:"customer"`
     Amount     float64   `parquet:"amount"`
-    InsertedAt time.Time `parquet:"-"` // populated by the library
+    InsertedAt time.Time `parquet:"inserted_at"` // writer populates this column
 }
 
 s3store.Config[Event]{
@@ -518,13 +523,13 @@ s3store.Config[Event]{
 }
 
 recs, _ := store.Read(ctx, "*")
-// recs[i].InsertedAt is the parquet file's write time
+// recs[i].InsertedAt is the writer's wall-clock at write-start.
 ```
 
 Works on `s3parquet.Read` / `PollRecords` and, for the umbrella,
-`s3sql.Read` / `PollRecords` (via DuckDB's `read_parquet(filename=true)`
-— the helper column is parsed post-scan and never touches the
-parquet schema on disk). Zero reflection cost when unset.
+`s3sql.Read` / `PollRecords` — DuckDB decodes the column natively
+via `SELECT *`; no filename-based routing is involved. Zero
+reflection cost when unset.
 
 ### Stream — time window
 
@@ -839,11 +844,13 @@ memory.
 files and runs `QUALIFY` over the full result, so dedup is global
 regardless of how rows are streamed back.
 
-**Order**: `s3parquet.Reader.ReadIter` visits partitions in lex order;
-files within a partition in lex order (= write-time order, since data
-filenames start with their `tsMicros`). `s3sql.Reader.ReadIter` returns
-rows in DuckDB's query order — add `ORDER BY` in a custom `Query` call
-if you need stability.
+**Order**: `s3parquet.Reader.ReadIter` visits partitions in lex order
+and downloads files within a partition in lex order; the user-visible
+emission order inside each partition is then decided by the reader's
+sort cascade — `(entity, version)` when `EntityKeyOf` is set, else
+`(insertedAt, fileName)`. `s3sql.Reader.ReadIter` returns rows in
+DuckDB's query order — add `ORDER BY` in a custom `Query` call if you
+need stability.
 
 ### SQL query (umbrella or `s3sql`)
 
@@ -1613,9 +1620,11 @@ type Config[T any] struct {
     // Stream
     SettleWindow time.Duration            // default: 5s
 
-    // Optional metadata hook: if set, Read / PollRecords
-    // populate this field on T (must be `time.Time`, tagged
-    // `parquet:"-"`) with the source file's write timestamp.
+    // Optional write-time column: if set, the writer populates
+    // this field on T (must be `time.Time` with a non-empty,
+    // non-"-" parquet tag like `parquet:"inserted_at"`) with
+    // its wall-clock at write-start, and Read / PollRecords
+    // surface the value back from the parquet column.
     InsertedAtField string
 
     // Parquet compression codec (default snappy).

@@ -448,6 +448,17 @@ func (s *Writer[T]) writeEncodedPayload(
 		return result, nil
 	}
 
+	// HEAD failed or reported the ref absent. When the PUT itself
+	// claimed success (putErr == nil), we're in the budget-blown
+	// branch: the PUT responded but beyond SettleWindow, and a
+	// weakly-consistent HEAD can't see the ref yet. Treat this as
+	// budget-exceeded rather than wrapping a nil error — the ref
+	// may still propagate but isn't safely Poll-visible, so the
+	// caller should retry (deterministic with WithIdempotencyToken).
+	if putErr == nil {
+		return result, ErrRefSettleBudgetExceeded
+	}
+
 	if !idempotent && !s.cfg.DisableCleanup {
 		if delErr := s.cfg.Target.del(
 			cleanupCtx, dataKey,

@@ -514,53 +514,78 @@ func httpStatusOf(err error) (int, bool) {
 	return 0, false
 }
 
-// probeOverwritePrevention writes a scratch object at a stable
-// key ({Prefix}/_probe/overwrite-prevention), then attempts a
-// second putIfAbsent at the same key. If the second call returns
-// ErrAlreadyExists, the backend enforces overwrite prevention
-// (via If-None-Match honoured natively OR a bucket policy denying
-// s3:PutOverwriteObject — the writer doesn't distinguish). If
-// the second call succeeds silently, the backend has no overwrite
-// prevention and the writer must fall back to HEAD-before-PUT.
+// probeOverwritePrevention tests whether the backend rejects
+// re-PUTs to an existing key. Uses putIfAbsent for both the seed
+// and the follow-up so the "capability detected" signal is the
+// same ErrAlreadyExists sentinel in every case — including the
+// one where scratch persists from a prior run with deleteScratch
+// false, which a plain-PUT seed would fail outright on StorageGRID
+// deployments with a deny-overwrite policy scoped to _probe/*.
 //
-// deleteScratch controls whether the scratch object is deleted
-// after probing. Set to false on deployments where the writer
+// Two sequential putIfAbsent calls, short-circuiting as soon as
+// capability is proven:
+//
+//   - Call 1 returns ErrAlreadyExists: scratch already existed and
+//     the backend rejected our overwrite → capability confirmed,
+//     no call 2 needed. Typical on restart when deleteScratch was
+//     false.
+//   - Call 1 succeeds: scratch was absent, this PUT created it.
+//     Call 2 attempts a second write to the same key; if the
+//     backend rejects it → capability confirmed. If call 2 also
+//     succeeds → no overwrite prevention, writer falls back to
+//     HEAD-before-PUT.
+//
+// On StorageGRID the If-None-Match header is ignored; the bucket
+// policy denying s3:PutOverwriteObject produces the 403 that
+// putIfAbsent maps to ErrAlreadyExists via the follow-up HEAD. On
+// AWS / MinIO the header itself produces a 412. Both collapse to
+// the same sentinel, so this probe doesn't need to distinguish
+// between the two mechanisms.
+//
+// deleteScratch controls whether the scratch object is removed
+// after detection. Set to false on deployments where the writer
 // lacks DELETE permission on {Prefix}/_probe/ — the scratch stays
-// at a stable key, so subsequent restarts overwrite it rather
-// than accumulating.
+// at the stable key, next restart's call 1 trivially detects the
+// capability.
 //
-// Invoked lazily from the write path on the first idempotent
-// write, guarded by sync.Once on the Writer. Errors on the first
-// (seeding) PUT surface verbatim — the probe can't conclude, so
-// the caller doesn't learn the capability and the write fails.
+// Invoked from NewWriter under a 10s deadline. Any non-
+// ErrAlreadyExists error from either call surfaces verbatim so a
+// misconfigured endpoint fails construction rather than silently
+// mis-classifying the backend.
 func (t S3Target) probeOverwritePrevention(
 	ctx context.Context, deleteScratch bool,
 	opts ...s3CallOpt,
 ) (bool, error) {
 	key := t.Prefix + "/_probe/overwrite-prevention"
 	body := []byte("s3store probe — safe to delete")
-	// Seed the scratch with a plain PUT. If this fails we can't
-	// distinguish "missing capability" from "credentials are
-	// wrong", so propagate the error rather than guessing.
-	if err := t.put(ctx, key, body, "text/plain", opts...); err != nil {
-		return false, fmt.Errorf(
-			"s3parquet: probe seed PUT %s: %w", key, err)
+
+	firstErr := t.putIfAbsent(
+		ctx, key, body, "text/plain", nil, opts...)
+	overwritePreventionActive := errors.Is(firstErr, ErrAlreadyExists)
+	if !overwritePreventionActive {
+		if firstErr != nil {
+			return false, fmt.Errorf(
+				"s3parquet: probe seed PUT %s: %w", key, firstErr)
+		}
+		// Seed succeeded (scratch was absent). A second putIfAbsent
+		// decides capability: rejection → overwrite prevention
+		// active; silent success → not active.
+		secondErr := t.putIfAbsent(
+			ctx, key, body, "text/plain", nil, opts...)
+		overwritePreventionActive = errors.Is(
+			secondErr, ErrAlreadyExists)
+		if !overwritePreventionActive && secondErr != nil {
+			return false, fmt.Errorf(
+				"s3parquet: probe PUT %s: %w", key, secondErr)
+		}
 	}
-	secondErr := t.putIfAbsent(ctx, key, body, "text/plain", nil, opts...)
-	overwritePreventionActive := errors.Is(secondErr, ErrAlreadyExists)
-	if !overwritePreventionActive && secondErr != nil {
-		// The second call failed for a reason other than "already
-		// exists" — surface it rather than silently mis-classifying
-		// the backend.
-		return false, fmt.Errorf(
-			"s3parquet: probe PUT %s: %w", key, secondErr)
-	}
+
 	if deleteScratch {
 		if err := t.del(ctx, key); err != nil {
 			// Probe-scratch delete failing is annoying but not
-			// fatal — capability is already detected. Log via
-			// the returned error so the caller can surface it
-			// once, not on every write.
+			// fatal — capability is already detected. Surface
+			// via the returned error so the caller sees it once
+			// at NewWriter, not on every write.
 			return overwritePreventionActive, fmt.Errorf(
 				"s3parquet: probe scratch cleanup %s: %w "+
 					"(capability detected: %v)",

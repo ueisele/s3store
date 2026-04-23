@@ -18,11 +18,21 @@ import (
 var ErrRefStreamDisabled = refstream.ErrDisabled
 
 // ErrRefSettleBudgetExceeded is returned from the write path when
-// the ref PUT's total elapsed time exceeds SettleWindow AND a
-// follow-up HEAD confirms the ref did land in S3 — a "lost-ack
-// beyond budget". The ref's refTsMicros is already older than the
-// settle cutoff a concurrent Poll would compute, so Poll's offset
-// may have advanced past it and consumers may have missed it.
+// the ref PUT's total elapsed time exceeds SettleWindow. The ref's
+// refTsMicros is already older than the settle cutoff a concurrent
+// Poll would compute, so Poll's offset may have advanced past it
+// and consumers may have missed it — the write is not safely
+// visible regardless of whether the ref physically landed.
+//
+// Raised in two sub-cases:
+//
+//   - PUT returned success but elapsed > SettleWindow, and the
+//     confirmation HEAD either saw the ref (genuine "landed but
+//     late") or couldn't see it (weak consistency, may propagate
+//     later). Both are unsafe.
+//   - PUT failed transiently but a follow-up HEAD within the
+//     cleanup window confirmed the ref landed anyway ("lost ack
+//     beyond budget").
 //
 // Callers should treat this as a failed write and retry; with
 // WithIdempotencyToken the retry is deterministic (same data
@@ -31,10 +41,10 @@ var ErrRefStreamDisabled = refstream.ErrDisabled
 // creates a new data file, which reader-side dedup
 // (EntityKeyOf + VersionOf) absorbs.
 //
-// Other ref-PUT failures (PUT didn't land, HEAD errored, caller
-// ctx cancelled) surface as a wrapped put-ref error — not this
-// sentinel — because the ref is known-absent and the caller can
-// retry without the freshness concern.
+// Real PUT failures where HEAD also reports the ref absent (PUT
+// didn't land, caller ctx cancelled, etc.) surface as a wrapped
+// put-ref error — not this sentinel — because the ref is known-
+// absent and the caller can retry without the freshness concern.
 var ErrRefSettleBudgetExceeded = errors.New(
 	"s3parquet: ref PUT exceeded SettleWindow; " +
 		"retry (with WithIdempotencyToken for deterministic recovery)")
