@@ -505,10 +505,20 @@ func (s *Writer[T]) putDataIdempotent(
 // equals token, within the lexical range [now - maxRetryAge, now].
 // Returns the full ref key when found, empty string when not.
 //
-// Bounded by maxRetryAge so the scan cost is O(refs in window)
-// rather than O(all refs). When maxRetryAge == 0 the function
-// returns "" immediately — the caller explicitly disabled ref
-// dedup for this retry.
+// Bounded on both sides:
+//
+//   - Lower bound via listRange(startAfter=lo) so the paginator
+//     starts at (now - maxRetryAge).
+//   - Upper bound via an in-loop compare against hi so we stop as
+//     soon as a page yields a key past the retry window. Without
+//     this the paginator walks every ref newer than the window —
+//     concurrent writers' refs, the store's tail — which costs
+//     additional LIST pages proportional to the traffic beyond
+//     "now" without adding any chance of a match (our token can't
+//     appear with a future refTsMicros).
+//
+// When maxRetryAge == 0 the function returns "" immediately — the
+// caller explicitly disabled ref dedup for this retry.
 //
 // Uses the Writer's ConsistencyControl on the LIST so the scan
 // sees all prior refs on StorageGRID-style backends — a weak-
@@ -520,7 +530,7 @@ func (s *Writer[T]) findExistingRef(
 	if maxRetryAge <= 0 {
 		return "", nil
 	}
-	lo, _ := core.RefRangeForRetry(s.refPath, time.Now(), maxRetryAge)
+	lo, hi := core.RefRangeForRetry(s.refPath, time.Now(), maxRetryAge)
 	paginator := s.cfg.Target.listRange(s.refPath+"/", lo)
 	for paginator.HasMorePages() {
 		page, err := s.cfg.Target.listPage(
@@ -532,6 +542,14 @@ func (s *Writer[T]) findExistingRef(
 		for _, obj := range page.Contents {
 			if obj.Key == nil {
 				continue
+			}
+			if *obj.Key > hi {
+				// Past the retry window. Lex compare holds because
+				// all real tsMicros share the same decimal width
+				// (16 digits post-2001), so lex order matches
+				// numeric order — same assumption RefCutoff and
+				// RefRangeForRetry's lo already rely on.
+				return "", nil
 			}
 			id, err := core.ExtractRefID(*obj.Key)
 			if err != nil {
