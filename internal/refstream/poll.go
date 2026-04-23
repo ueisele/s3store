@@ -17,6 +17,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
 	"github.com/ueisele/s3store/internal/core"
 )
 
@@ -49,6 +50,15 @@ type PollOpts struct {
 	MaxEntries   int32
 	Until        core.Offset   // empty = no upper bound (reads up to the settle cutoff)
 	SettleWindow time.Duration // 0 means read to live tip (use with care)
+
+	// ConsistencyControl, when non-empty, is sent as the
+	// Consistency-Control HTTP header on the ref-LIST. Matches the
+	// writer's ConsistencyControl so the LIST linearizes with the
+	// ref PUT under StorageGRID strong-global / strong-site. Empty
+	// sends no header (correct on AWS S3 / MinIO; relies on bucket-
+	// default consistency on StorageGRID). Ignored by backends that
+	// don't honour the header.
+	ConsistencyControl string
 }
 
 // Poll returns up to MaxEntries stream entries after Since, up
@@ -89,9 +99,23 @@ func Poll(
 	var lastKey string
 
 	paginator := s3.NewListObjectsV2Paginator(s3Client, input)
+
+	// Per-call APIOptions install the Consistency-Control middleware
+	// when the caller asked for it. Empty → nil → no middleware →
+	// unchanged behaviour on AWS S3 / MinIO.
+	var apiOpts []func(*middleware.Stack) error
+	if opts.ConsistencyControl != "" {
+		apiOpts = []func(*middleware.Stack) error{
+			core.AddHeaderMiddleware(
+				"Consistency-Control", opts.ConsistencyControl),
+		}
+	}
+
 outer:
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := paginator.NextPage(ctx, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
+		})
 		if err != nil {
 			return nil, opts.Since,
 				fmt.Errorf("list refs: %w", err)

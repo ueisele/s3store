@@ -68,30 +68,8 @@ func apiOptionsForOpts(o s3CallOpts) []func(*middleware.Stack) error {
 		return nil
 	}
 	return []func(*middleware.Stack) error{
-		addHeaderMiddleware("Consistency-Control", o.consistencyControl),
-	}
-}
-
-// addHeaderMiddleware returns an APIOption that installs a Build-
-// step middleware writing the given HTTP header into the request.
-// Registered at the Build step (after Serialize, before Finalize)
-// so it runs once per operation regardless of retries, and sees
-// the assembled smithyhttp.Request.
-func addHeaderMiddleware(
-	header, value string,
-) func(*middleware.Stack) error {
-	return func(stack *middleware.Stack) error {
-		return stack.Build.Add(middleware.BuildMiddlewareFunc(
-			"s3parquet.addHeader."+header,
-			func(
-				ctx context.Context, in middleware.BuildInput,
-				next middleware.BuildHandler,
-			) (middleware.BuildOutput, middleware.Metadata, error) {
-				if req, ok := in.Request.(*smithyhttp.Request); ok {
-					req.Header.Set(header, value)
-				}
-				return next.HandleBuild(ctx, in)
-			}), middleware.After)
+		core.AddHeaderMiddleware(
+			"Consistency-Control", o.consistencyControl),
 	}
 }
 

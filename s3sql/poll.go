@@ -18,6 +18,11 @@ import (
 // with offset >= until are skipped and the paginator breaks
 // early.
 //
+// ConsistencyControl on the Reader's config is forwarded as the
+// Consistency-Control HTTP header on the paginator LISTs, so on
+// StorageGRID strong-global / strong-site a newly-written ref is
+// LIST-visible before Poll's cutoff can advance past it.
+//
 // The paginator + cutoff logic lives in internal/refstream — it's
 // byte-identical with s3parquet.Poll and shares this one
 // implementation.
@@ -36,13 +41,14 @@ func (s *Reader[T]) Poll(
 
 	entries, offset, err := refstream.Poll(ctx, s.cfg.Target.S3Client,
 		refstream.PollOpts{
-			Bucket:       s.cfg.Target.Bucket,
-			RefPath:      s.refPath,
-			DataPath:     s.dataPath,
-			Since:        since,
-			MaxEntries:   maxEntries,
-			Until:        o.Until,
-			SettleWindow: s.cfg.Target.EffectiveSettleWindow(),
+			Bucket:             s.cfg.Target.Bucket,
+			RefPath:            s.refPath,
+			DataPath:           s.dataPath,
+			Since:              since,
+			MaxEntries:         maxEntries,
+			Until:              o.Until,
+			SettleWindow:       s.cfg.Target.EffectiveSettleWindow(),
+			ConsistencyControl: string(s.cfg.ConsistencyControl),
 		})
 	if err != nil {
 		return nil, since, fmt.Errorf("s3sql: %w", err)
