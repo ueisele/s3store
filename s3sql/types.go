@@ -49,3 +49,16 @@ func WithUntilOffset(until Offset) QueryOption {
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }
+
+// WithIdempotentRead makes Read / ReadIter / ReadMany /
+// ReadManyIter / Query / QueryRow / QueryMany / QueryRowMany /
+// PollRecords retry-safe: the result reflects state as of the
+// first write of the given idempotency token. On s3sql the
+// single-pattern DuckDB-glob fast path is skipped when this option
+// is set — the Go-side LIST drives filter application so the
+// contract matches s3parquet. Pair with WithIdempotencyToken on
+// the write side so one token drives both sides. See
+// core.WithIdempotentRead for the full contract.
+func WithIdempotentRead(token string) QueryOption {
+	return core.WithIdempotentRead(token)
+}

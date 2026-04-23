@@ -74,6 +74,40 @@ func (s *Reader[T]) PollRecords(
 		return nil, since, nil
 	}
 
+	// When WithIdempotentRead is set, filter entries whose data
+	// files fall outside the barrier window. The barrier's write-
+	// time dimension uses each ref's InsertedAt (= writer capture
+	// from the ref filename's dataTsMicros), identical to what the
+	// data file's LastModified would be on a fresh write.
+	if o.IdempotentReadToken != "" {
+		keys := make([]core.KeyMeta, len(entries))
+		for i, e := range entries {
+			keys[i] = core.KeyMeta{
+				Key:        e.DataPath,
+				InsertedAt: e.InsertedAt,
+			}
+		}
+		keys, err = s.applyIdempotentRead(keys, &o)
+		if err != nil {
+			return nil, since, err
+		}
+		if len(keys) == 0 {
+			return nil, newOffset, nil
+		}
+		kept := keys
+		filtered := make([]StreamEntry, 0, len(kept))
+		keepSet := make(map[string]struct{}, len(kept))
+		for _, k := range kept {
+			keepSet[k.Key] = struct{}{}
+		}
+		for _, e := range entries {
+			if _, ok := keepSet[e.DataPath]; ok {
+				filtered = append(filtered, e)
+			}
+		}
+		entries = filtered
+	}
+
 	uris := make([]string, len(entries))
 	for i, e := range entries {
 		uris[i] = sqlQuote(s.s3URI(e.DataPath))

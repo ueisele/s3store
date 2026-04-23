@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -1520,5 +1521,242 @@ func TestReadManyIter_MultiPattern(t *testing.T) {
 	wantSet := map[float64]bool{1: true, 3: true}
 	if !reflect.DeepEqual(gotSet, wantSet) {
 		t.Errorf("got %v, want %v", gotSet, wantSet)
+	}
+}
+
+// newIdempotentFixture builds a fixture with HEAD-based retry
+// detection — safe regardless of whether MinIO supports If-None-
+// Match — and dedup wired up so Phase 3b tests see at-most-one
+// record at the reader layer if something slips through.
+func newIdempotentFixture(t *testing.T) *testFixture {
+	t.Helper()
+	f := testutil.New(t)
+	target := s3parquet.S3Target{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+		SettleWindow:      10 * time.Millisecond,
+	}
+	w, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[Rec]{
+		Target:                  target,
+		PartitionKeyOf:          partitionKeyOfRec,
+		DuplicateWriteDetection: s3parquet.DuplicateWriteDetectionByHEAD(),
+	})
+	if err != nil {
+		t.Fatalf("s3parquet.NewWriter: %v", err)
+	}
+
+	s, err := s3sql.NewReader(s3sql.ReaderConfig[Rec]{
+		Target:           target,
+		TableAlias:       "records",
+		VersionColumn:    "ts",
+		EntityKeyColumns: []string{"period", "customer", "sku"},
+		ExtraInitSQL:     f.DuckDBCredentials(),
+	})
+	if err != nil {
+		t.Fatalf("s3sql.NewReader: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return &testFixture{bucket: f.Bucket, writer: w, sql: s}
+}
+
+// TestIdempotentRead_SingleSQLReadModifyWriteRetrySafe is the
+// s3sql mirror of the s3parquet Phase 3b integration test. Guards
+// that WithIdempotentRead disables the single-pattern DuckDB-glob
+// fast path and routes through the Go-side LIST + filter, so an
+// attempt-2 Read returns the same state attempt-1 saw.
+func TestIdempotentRead_SingleSQLReadModifyWriteRetrySafe(t *testing.T) {
+	ctx := context.Background()
+	f := newIdempotentFixture(t)
+
+	key := "period=2026-04-22/customer=alice"
+
+	// 1. Seed baseline.
+	if _, err := f.writer.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "baseline", Amount: 1, Ts: time.UnixMilli(1),
+	}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	const token = "2026-04-22T10:15:00Z-sql-rmw"
+
+	// 2. Attempt-1 reads with barrier — token hasn't been written.
+	attempt1, err := f.sql.Read(ctx, key,
+		s3sql.WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("attempt-1 Read: %v", err)
+	}
+	if len(attempt1) != 1 || attempt1[0].SKU != "baseline" {
+		t.Fatalf("attempt-1 saw %+v, want [baseline]", attempt1)
+	}
+
+	// 3. Attempt-1 writes with matching token.
+	if _, err := f.writer.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "derived", Amount: 100, Ts: time.UnixMilli(10),
+	}}, s3parquet.WithIdempotencyToken(token, time.Hour)); err != nil {
+		t.Fatalf("attempt-1 write: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	// 4. Zombie writes another record without the token.
+	if _, err := f.writer.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "zombie", Amount: 999, Ts: time.UnixMilli(20),
+	}}); err != nil {
+		t.Fatalf("zombie: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Attempt-2 Read with the barrier sees only the baseline.
+	attempt2, err := f.sql.Read(ctx, key,
+		s3sql.WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("attempt-2 Read: %v", err)
+	}
+	if len(attempt2) != 1 || attempt2[0].SKU != "baseline" {
+		t.Fatalf("attempt-2 saw %+v, want [baseline] "+
+			"(barrier should exclude attempt-1 + zombie)", attempt2)
+	}
+
+	// Sanity: without the barrier, all three records survive dedup
+	// (entity = (period, customer, sku), three distinct SKUs).
+	full, err := f.sql.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("full Read: %v", err)
+	}
+	if len(full) != 3 {
+		t.Fatalf("full Read saw %d, want 3", len(full))
+	}
+}
+
+// TestIdempotentRead_SQLRejectsBadToken guards that an invalid
+// barrier token surfaces through the Read call before any DuckDB
+// work — the error bubbles up from ValidateIdempotencyToken.
+func TestIdempotentRead_SQLRejectsBadToken(t *testing.T) {
+	ctx := context.Background()
+	f := newIdempotentFixture(t)
+	if _, err := f.sql.Read(ctx, "period=2026-04-22/customer=*",
+		s3sql.WithIdempotentRead("has/slash")); err == nil {
+		t.Fatal("want error for barrier token with '/', got nil")
+	}
+}
+
+// TestIdempotentRead_QueryAndQueryRow drives the Go-side LIST
+// + URI-list path that Query and QueryRow take when the barrier
+// is set: attempt-1's own file is excluded, attempt-2 sees only
+// baseline records, and the usual "zero files matched" error
+// surfaces correctly when the barrier filters everything away.
+func TestIdempotentRead_QueryAndQueryRow(t *testing.T) {
+	ctx := context.Background()
+	f := newIdempotentFixture(t)
+
+	key := "period=2026-04-22/customer=alice"
+
+	// Seed a baseline.
+	if _, err := f.writer.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "baseline", Amount: 1, Ts: time.UnixMilli(1),
+	}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	const token = "2026-04-22T10:15:00Z-query-rmw"
+
+	// Attempt-1 writes with token.
+	if _, err := f.writer.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "derived", Amount: 100, Ts: time.UnixMilli(10),
+	}}, s3parquet.WithIdempotencyToken(token, time.Hour)); err != nil {
+		t.Fatalf("attempt-1 write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Query with the barrier: only the baseline survives.
+	rows, err := f.sql.Query(ctx, key,
+		"SELECT COUNT(*) FROM records",
+		s3sql.WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !rows.Next() {
+		rows.Close()
+		t.Fatal("Query: expected one count row")
+	}
+	var n int
+	if err := rows.Scan(&n); err != nil {
+		rows.Close()
+		t.Fatalf("Query scan: %v", err)
+	}
+	rows.Close()
+	if n != 1 {
+		t.Errorf("Query with barrier got count=%d, want 1 (baseline only)", n)
+	}
+
+	// QueryRow with the barrier: single-row convenience wrapper
+	// returns the same 1 count.
+	row := f.sql.QueryRow(ctx, key,
+		"SELECT COUNT(*) FROM records",
+		s3sql.WithIdempotentRead(token))
+	var n2 int
+	if err := row.Scan(&n2); err != nil {
+		t.Fatalf("QueryRow scan: %v", err)
+	}
+	if n2 != 1 {
+		t.Errorf("QueryRow with barrier got count=%d, want 1", n2)
+	}
+}
+
+// TestIdempotentRead_QueryZeroMatches guards that a barrier
+// which filters every file away produces an
+// isNoFilesMatchedError-compatible error on Query (and Scan on
+// QueryRow), so callers that already branch on that helper keep
+// working unchanged.
+func TestIdempotentRead_QueryZeroMatches(t *testing.T) {
+	ctx := context.Background()
+	f := newIdempotentFixture(t)
+
+	key := "period=2026-04-22/customer=alice"
+	const token = "zero-match-token"
+
+	// Write a single file with the matching token, no other files
+	// in the partition. The barrier picks up the token file as its
+	// own and self-excludes it — zero files survive.
+	if _, err := f.writer.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "only", Amount: 1, Ts: time.UnixMilli(1),
+	}}, s3parquet.WithIdempotencyToken(token, time.Hour)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Query: raw error is returned; isNoFilesMatchedError must
+	// still recognize it.
+	_, err := f.sql.Query(ctx, key,
+		"SELECT COUNT(*) FROM records",
+		s3sql.WithIdempotentRead(token))
+	if err == nil {
+		t.Fatal("Query: want no-files-matched error, got nil")
+	}
+	if !strings.Contains(err.Error(), "No files found that match") {
+		t.Errorf("Query: err %q missing the expected fragment", err)
+	}
+
+	// QueryRow: same error surfaces via Scan.
+	row := f.sql.QueryRow(ctx, key,
+		"SELECT COUNT(*) FROM records",
+		s3sql.WithIdempotentRead(token))
+	var n int
+	scanErr := row.Scan(&n)
+	if scanErr == nil {
+		t.Fatal("QueryRow: want no-files-matched error, got nil")
+	}
+	if !strings.Contains(scanErr.Error(), "No files found that match") {
+		t.Errorf("QueryRow: err %q missing the expected fragment",
+			scanErr)
 	}
 }

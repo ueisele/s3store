@@ -18,9 +18,11 @@ const listFanOutConcurrency = 8
 
 // listMatchingParquet LISTs every parquet object under the
 // plan's ListPrefix and returns the subset whose Hive key
-// matches the plan's predicate. Mirrors s3parquet's helper of
-// the same name so both read paths see identical file-selection
-// semantics.
+// matches the plan's predicate, carrying each object's
+// LastModified so downstream filters (WithIdempotentRead) can
+// reason about write time without a second S3 round-trip.
+// Mirrors s3parquet's helper of the same name so both read paths
+// see identical file-selection semantics.
 //
 // Used by the multi-pattern fast path on *Many methods: each
 // pattern becomes one plan, each plan gets one LIST, and the
@@ -28,14 +30,14 @@ const listFanOutConcurrency = 8
 // so DuckDB plans once over the full set.
 func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *core.ReadPlan,
-) ([]string, error) {
+) ([]core.KeyMeta, error) {
 	paginator := s3.NewListObjectsV2Paginator(s.cfg.Target.S3Client,
 		&s3.ListObjectsV2Input{
 			Bucket: aws.String(s.cfg.Target.Bucket),
 			Prefix: aws.String(plan.ListPrefix),
 		})
 
-	var out []string
+	var out []core.KeyMeta
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
@@ -52,7 +54,10 @@ func (s *Reader[T]) listMatchingParquet(
 				continue
 			}
 			if plan.Match(hiveKey) {
-				out = append(out, objKey)
+				out = append(out, core.KeyMeta{
+					Key:        objKey,
+					InsertedAt: aws.ToTime(obj.LastModified),
+				})
 			}
 		}
 	}
@@ -60,9 +65,10 @@ func (s *Reader[T]) listMatchingParquet(
 }
 
 // listAllMatchingURIs runs listMatchingParquet across every
-// pattern with bounded concurrency and returns the deduplicated
-// union of file URIs (s3://bucket/key form, ready to pass into
-// DuckDB's read_parquet).
+// pattern with bounded concurrency, applies the idempotent-read
+// filter when opts.IdempotentReadToken is set, and returns the
+// deduplicated union of file URIs (s3://bucket/key form, ready to
+// pass into DuckDB's read_parquet).
 //
 // method identifies the caller (e.g. "ReadMany", "QueryMany")
 // so pattern-validation errors surface with the right entry
@@ -70,7 +76,8 @@ func (s *Reader[T]) listMatchingParquet(
 // literal-duplicate patterns via core.DedupePatterns — this
 // function doesn't repeat that work.
 func (s *Reader[T]) listAllMatchingURIs(
-	ctx context.Context, patterns []string, method string,
+	ctx context.Context, patterns []string,
+	opts *core.QueryOpts, method string,
 ) ([]string, error) {
 	plans := make([]*core.ReadPlan, len(patterns))
 	for i, p := range patterns {
@@ -86,7 +93,11 @@ func (s *Reader[T]) listAllMatchingURIs(
 
 	keys, err := core.RunPlansConcurrent(ctx, plans,
 		listFanOutConcurrency, s.listMatchingParquet,
-		func(k string) string { return k })
+		func(k core.KeyMeta) string { return k.Key })
+	if err != nil {
+		return nil, err
+	}
+	keys, err = s.applyIdempotentRead(keys, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +107,26 @@ func (s *Reader[T]) listAllMatchingURIs(
 
 	uris := make([]string, len(keys))
 	for i, k := range keys {
-		uris[i] = s.s3URI(k)
+		uris[i] = s.s3URI(k.Key)
 	}
 	return uris, nil
+}
+
+// applyIdempotentRead validates opts.IdempotentReadToken when set
+// and filters keys accordingly. Runs at LIST time with no S3 call;
+// see core.ApplyIdempotentRead for the per-partition self-
+// exclusion + later-write-exclusion contract.
+func (s *Reader[T]) applyIdempotentRead(
+	keys []core.KeyMeta, opts *core.QueryOpts,
+) ([]core.KeyMeta, error) {
+	if opts.IdempotentReadToken == "" {
+		return keys, nil
+	}
+	if err := core.ValidateIdempotencyToken(
+		opts.IdempotentReadToken); err != nil {
+		return nil, fmt.Errorf(
+			"s3sql: WithIdempotentRead: %w", err)
+	}
+	return core.ApplyIdempotentRead(
+		keys, s.dataPath, opts.IdempotentReadToken), nil
 }

@@ -539,21 +539,21 @@ All three modes avoid the parquet body upload on retry (the dominant cost). Fall
 
 ---
 
-## Phase 3b — Snapshot-isolated reads via `WithSnapshotBarrier(token)`
+## Phase 3b — Idempotent reads via `WithIdempotentRead(token)` ✅ implemented
 
-**Outcome**: callers doing read-modify-write with idempotency can get retry-safe snapshot isolation in one option. A Read / ReadIter / ReadMany / PollRecords call takes `WithSnapshotBarrier(token)` and returns state as of the first attempt's write time, excluding both the caller's own prior attempts AND any data written at or after them.
+**Outcome**: callers doing read-modify-write with idempotency can get retry-safe reads in one option. A Read / ReadIter / ReadMany / PollRecords call takes `WithIdempotentRead(token)` and returns state as of the first attempt's write time, excluding both the caller's own prior attempts AND any data written at or after them. Under the single-writer-per-partition caller invariant this is an exact snapshot of attempt-1's view; under a violated invariant self-exclusion still holds and record-layer dedup absorbs the rest.
 
 ### Motivation
 
 Typical read-modify-write cycle:
 
 ```go
-snapshotToken := "job-2026-04-22T10:15:00Z-batch42"
+const token = "job-2026-04-22T10:15:00Z-batch42"
 existing, _ := store.Read(ctx, pattern,
-    s3parquet.WithSnapshotBarrier(snapshotToken))
+    s3parquet.WithIdempotentRead(token))
 // compute diff against `existing`
 store.Write(ctx, changes,
-    s3parquet.WithIdempotencyToken(snapshotToken, 6*time.Hour))
+    s3parquet.WithIdempotencyToken(token, 6*time.Hour))
 ```
 
 On retry, the Read sees the same state attempt 1 saw, computes the same diff, writes the same bytes. Idempotent read-modify-write without callers having to thread a separate timestamp through their retry state.
@@ -575,7 +575,7 @@ If the caller violates single-writer-per-partition, the barrier still catches th
 
 ### Why the token, not a timestamp
 
-Earlier iteration considered `WithSnapshotBarrier(t time.Time, token string)`. Dropped because:
+Earlier iteration considered `WithIdempotentRead(t time.Time, token string)`. Dropped because:
 
 - The token's files' LastModified is *more* accurate than any caller-supplied time for reconstructing "when did attempt 1 run". A caller-supplied `time.Now()` on retry could be hours past the original attempt.
 - Passing both forces callers to persist a `(time, token)` pair between attempts. Passing only the token means the caller persists just the token (which they already do for `WithIdempotencyToken`).
@@ -583,27 +583,27 @@ Earlier iteration considered `WithSnapshotBarrier(t time.Time, token string)`. D
 
 ### Changes
 
-- **`internal/core/queryopt.go`** (or wherever read options live): new option `WithSnapshotBarrier(token string) QueryOption`. Adds `SnapshotBarrierToken string` to `QueryOpts`.
-- **`s3parquet/read.go` `listMatchingParquet`**: when `SnapshotBarrierToken` is set, apply the two-pass filter:
+- **`internal/core/queryopt.go`** (or wherever read options live): new option `WithIdempotentRead(token string) QueryOption`. Adds `IdempotentReadToken string` to `QueryOpts`.
+- **`s3parquet/read.go` `listMatchingParquet`**: when `IdempotentReadToken` is set, apply the two-pass filter:
   1. First pass builds `barrier[partition]` from token-matching files.
   2. Second pass excludes token-matching files and files with `LastModified >= barrier[partition]`.
   
   Can be a single pass with delayed emission if we buffer per-partition, but two-pass is simpler.
 - **`s3sql/listing.go` `listMatchingParquet`**: same filter. Affects `s3sql.Read` / `ReadIter` / `PollRecords` (for the SELECT-over-specific-URIs path).
-- **`internal/core/queryopt.go`**: if tokens are validated at `WithIdempotencyToken` time (per Phase 3's spec), `WithSnapshotBarrier` reuses the same `ValidateIdempotencyToken` helper.
+- **`internal/core/queryopt.go`**: if tokens are validated at `WithIdempotencyToken` time (per Phase 3's spec), `WithIdempotentRead` reuses the same `ValidateIdempotencyToken` helper.
 
 ### Tests
 
-- `TestSnapshotBarrier_NoFirstAttempt` — no file matches token yet → no barrier → returns full current state.
-- `TestSnapshotBarrier_RetryReturnsSameState` — write with token, write with a second token (simulating a subsequent job), read with the *first* token → excludes own writes AND the second token's later writes.
-- `TestSnapshotBarrier_PerPartitionIsolation` — multi-partition pattern, different partitions have different barrier times; each partition is filtered independently.
-- `TestSnapshotBarrier_SingleWriterInvariant` — documents the correctness contract (under single-writer, the barrier is exact).
+- `TestIdempotentRead_NoFirstAttempt` — no file matches token yet → no barrier → returns full current state.
+- `TestIdempotentRead_RetryReturnsSameState` — write with token, write with a second token (simulating a subsequent job), read with the *first* token → excludes own writes AND the second token's later writes.
+- `TestIdempotentRead_PerPartitionIsolation` — multi-partition pattern, different partitions have different barrier times; each partition is filtered independently.
+- `TestIdempotentRead_SingleWriterInvariant` — documents the correctness contract (under single-writer, the barrier is exact).
 - Integration test over MinIO exercising the full read-modify-write cycle twice with the same token, asserting the second attempt produces the same output.
 
 ### Risks / open questions
 
 1. **Two-pass LIST**: adds in-memory buffering of all matching files before filtering. For patterns spanning hundreds of thousands of files, this is a memory bump. Mitigation: streaming two-pass (buffer per-partition only, emit as each partition completes). Not urgent for v1.
-2. **s3sql fast path**: today the single-pattern Read uses DuckDB's glob directly, skipping the Go-side LIST. When `WithSnapshotBarrier` is set, we need the Go-side LIST to build the barrier — same fallthrough pattern as `s3sql.Read`'s multi-pattern branch. Small branching at `s3sql/read.go:ReadMany`.
+2. **s3sql fast path**: today the single-pattern Read uses DuckDB's glob directly, skipping the Go-side LIST. When `WithIdempotentRead` is set, we need the Go-side LIST to build the barrier — same fallthrough pattern as `s3sql.Read`'s multi-pattern branch. Small branching at `s3sql/read.go:ReadMany`.
 3. **Read-modify-write contract must be documented**: callers need to understand that retries with the *same* token produce deterministic reads. Persisting the token between attempts is the caller's job.
 
 **Estimate**: ~1 day once Phase 3 has landed.
@@ -679,7 +679,7 @@ Earlier iteration considered `WithSnapshotBarrier(t time.Time, token string)`. D
 | 2 | Phase 1.5 (replica dedup) | — | Phase 1, Phase 2, Phase 3 |
 | 3 | Phase 2 (internal retries) | — | Phase 1, Phase 1.5, Phase 3 |
 | 4 | Phase 3 (idempotency token) | Phase 3b, Phase 4 | — (but depends on Phase 1) |
-| 5 | Phase 3b (snapshot-isolated reads) | — | — (depends on Phase 3) |
+| 5 | Phase 3b (idempotent reads) | — | — (depends on Phase 3) |
 | 6 (optional) | Phase 4 (benchmark harness) | — | — (depends on Phase 3) |
 
 Phase 3 code-depends on Phase 1 (Phase 3 removes `tsMicros` from the data filename, which only works after Phase 1 moves `insertedAt` off filename parsing). Phase 1.5 does **not** code-depend on Phase 3 and can ship standalone, but the full record-level exactly-once guarantee requires both: Phase 3 reduces physical replicas, Phase 1.5 collapses any that remain. Phase 3b code-depends on Phase 3 (the token-in-filename encoding). Phase 2 is orthogonal and can land in any order. Phase 4 is optional follow-up, best done after Phase 3 stabilises so the benchmark isn't measuring about-to-change code.

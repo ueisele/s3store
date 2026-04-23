@@ -3405,3 +3405,191 @@ func TestWriteWithIdempotencyToken_RejectsBadToken(t *testing.T) {
 		t.Fatal("want error for token with '/', got nil")
 	}
 }
+
+// TestIdempotentRead_ReadModifyWriteRetrySafe drives the full
+// Phase 3b read-modify-write cycle end-to-end on MinIO:
+//
+//  1. Seed a partition with a baseline record (no token).
+//  2. Attempt-1: Read the baseline with WithIdempotentRead — the
+//     token has no files yet, so Read returns the baseline.
+//  3. Attempt-1 writes a new record with WithIdempotencyToken
+//     using the same token as the barrier read.
+//  4. A zombie / subsequent writer pushes another record into the
+//     same partition without the token.
+//  5. Attempt-2 retries the same Read with the same token. It
+//     must see the *baseline only* — the attempt-1 file is self-
+//     excluded, and the zombie file has LastModified >= the
+//     barrier so it is also excluded.
+//
+// This gives callers retry-safe read-modify-write: attempt-2 reads
+// the same state attempt-1 saw, computes the same diff, writes the
+// same bytes (idempotently, thanks to the token).
+func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+
+	key := "period=2026-04-22/customer=alice"
+	partition := []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "baseline", Value: 1, Ts: time.UnixMilli(1),
+	}}
+
+	// 1. Seed baseline.
+	if _, err := store.WriteWithKey(ctx, key, partition); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	// Wait so S3 LastModified of subsequent writes is strictly
+	// greater than the baseline's — the barrier comparison is
+	// LastModified-based, and MinIO has whole-second granularity on
+	// some versions.
+	time.Sleep(1100 * time.Millisecond)
+
+	const token = "2026-04-22T10:15:00Z-job-a"
+
+	// 2. Attempt-1 reads with the barrier: no token matches yet, so
+	// the full current state (baseline only) is returned.
+	attempt1, err := store.Read(ctx, key,
+		s3parquet.WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("attempt-1 Read: %v", err)
+	}
+	if len(attempt1) != 1 || attempt1[0].SKU != "baseline" {
+		t.Fatalf("attempt-1 saw %+v, want [baseline]", attempt1)
+	}
+
+	// 3. Attempt-1 writes with the matching idempotency token.
+	_, err = store.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "derived-a", Value: 100, Ts: time.UnixMilli(10),
+	}}, s3parquet.WithIdempotencyToken(token, time.Hour))
+	if err != nil {
+		t.Fatalf("attempt-1 write: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	// 4. A zombie writer / subsequent job lands another record in
+	// the same partition without the token.
+	if _, err := store.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "zombie", Value: 999, Ts: time.UnixMilli(20),
+	}}); err != nil {
+		t.Fatalf("zombie write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Attempt-2 retries the same Read with the same token. The
+	// barrier excludes both the attempt-1 file (self-exclusion) and
+	// the zombie file (LastModified >= barrier). Only the baseline
+	// survives.
+	attempt2, err := store.Read(ctx, key,
+		s3parquet.WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("attempt-2 Read: %v", err)
+	}
+	if len(attempt2) != 1 || attempt2[0].SKU != "baseline" {
+		t.Fatalf("attempt-2 saw %+v, want [baseline] "+
+			"(barrier should exclude attempt-1 + zombie)", attempt2)
+	}
+
+	// Sanity: without the barrier, Read sees all three records.
+	// The newIdempotentStore fixture has EntityKeyOf on
+	// (customer, sku) with VersionOf = Value, so the three SKUs
+	// are distinct entities and nothing dedups away.
+	full, err := store.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("full Read: %v", err)
+	}
+	if len(full) != 3 {
+		t.Fatalf("full Read saw %d records, want 3", len(full))
+	}
+}
+
+// TestIdempotentRead_PerPartitionIsolation verifies the per-
+// partition scope: a token written into partition A produces a
+// barrier in A but leaves partition B unfiltered, so a cross-
+// partition Read under the barrier still returns B's data in
+// full.
+func TestIdempotentRead_PerPartitionIsolation(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+
+	keyA := "period=2026-04-22/customer=alice"
+	keyB := "period=2026-04-22/customer=bob"
+
+	// Seed both partitions.
+	if _, err := store.WriteWithKey(ctx, keyA, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "a-baseline", Value: 1, Ts: time.UnixMilli(1),
+	}}); err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+	if _, err := store.WriteWithKey(ctx, keyB, []Rec{{
+		Period: "2026-04-22", Customer: "bob",
+		SKU: "b-baseline", Value: 1, Ts: time.UnixMilli(1),
+	}}); err != nil {
+		t.Fatalf("seed B: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	const token = "2026-04-22T10:15:00Z-cross-partition"
+
+	// Attempt-1 only touches partition A.
+	if _, err := store.WriteWithKey(ctx, keyA, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "a-derived", Value: 100, Ts: time.UnixMilli(10),
+	}}, s3parquet.WithIdempotencyToken(token, time.Hour)); err != nil {
+		t.Fatalf("attempt-1 A write: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	// Zombie adds data to B *after* the barrier on A.
+	if _, err := store.WriteWithKey(ctx, keyB, []Rec{{
+		Period: "2026-04-22", Customer: "bob",
+		SKU: "b-late", Value: 200, Ts: time.UnixMilli(20),
+	}}); err != nil {
+		t.Fatalf("zombie B: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Read across both partitions with the barrier. A is filtered
+	// (only baseline survives); B has no token file so its barrier
+	// is absent — both B records pass through.
+	got, err := store.Read(ctx, "period=2026-04-22/customer=*",
+		s3parquet.WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("barrier Read: %v", err)
+	}
+
+	// Expected: a-baseline, b-baseline, b-late. Attempt-1's A
+	// file (a-derived) is excluded by the barrier.
+	gotSKUs := make(map[string]bool, len(got))
+	for _, r := range got {
+		gotSKUs[r.SKU] = true
+	}
+	want := []string{"a-baseline", "b-baseline", "b-late"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d records, want %d: skus=%v",
+			len(got), len(want), gotSKUs)
+	}
+	for _, sku := range want {
+		if !gotSKUs[sku] {
+			t.Errorf("missing SKU %q (got %v)", sku, gotSKUs)
+		}
+	}
+	if gotSKUs["a-derived"] {
+		t.Error("attempt-1's A file should be excluded by barrier")
+	}
+}
+
+// TestIdempotentRead_RejectsBadToken: the barrier token must pass
+// ValidateIdempotencyToken — bad tokens surface at Read time with
+// a clear error, before any S3 GET.
+func TestIdempotentRead_RejectsBadToken(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+
+	if _, err := store.Read(ctx, "period=2026-04-22/customer=*",
+		s3parquet.WithIdempotentRead("has/slash")); err == nil {
+		t.Fatal("want error for barrier token with '/', got nil")
+	}
+}

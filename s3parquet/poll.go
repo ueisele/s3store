@@ -90,6 +90,14 @@ func (s *Reader[T]) PollRecords(
 		}
 	}
 
+	keys, err = s.applyIdempotentRead(keys, &o)
+	if err != nil {
+		return nil, since, err
+	}
+	if len(keys) == 0 {
+		return nil, newOffset, nil
+	}
+
 	versioned, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, since, err

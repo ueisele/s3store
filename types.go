@@ -193,3 +193,14 @@ func WithUntilOffset(until Offset) QueryOption {
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }
+
+// WithIdempotentRead makes reads retry-safe: the result reflects
+// state as of the first write of the given idempotency token —
+// the caller's own prior attempts are excluded, and every other
+// file with LastModified at or after the barrier is excluded too
+// (per partition). Pair with WithIdempotencyToken on the write
+// side; one token drives both halves of a retry-safe read-modify-
+// write. See core.WithIdempotentRead for the full contract.
+func WithIdempotentRead(token string) QueryOption {
+	return core.WithIdempotentRead(token)
+}

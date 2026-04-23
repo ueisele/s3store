@@ -51,16 +51,20 @@ func (s *Reader[T]) Read(
 // Execution model:
 //
 //   - Single-pattern fast path (len(patterns) == 1 after
-//     literal dedup): hands the glob URI directly to DuckDB so
-//     plan-time partition pruning and glob expansion happen
-//     server-side. No Go-side S3 LIST. "No files found" from
-//     DuckDB is translated to an empty result.
-//   - Multi-pattern path: per-pattern S3 LIST in Go with a
+//     literal dedup, WithIdempotentRead unset): hands the glob
+//     URI directly to DuckDB so plan-time partition pruning and
+//     glob expansion happen server-side. No Go-side S3 LIST.
+//     "No files found" from DuckDB is translated to an empty
+//     result.
+//   - Multi-pattern path (or any pattern count with
+//     WithIdempotentRead set): per-pattern S3 LIST in Go with a
 //     bounded concurrency cap, deduplicated union of exact file
 //     URIs → one read_parquet([uri1, ..., uriN]) call. DuckDB
 //     plans once over the full set, enabling cross-pattern
 //     aggregations / GROUP BY / joins the single-pattern path
-//     can't give you.
+//     can't give you. The barrier filter (if set) applies to the
+//     KeyMeta list before URI emission so DuckDB never sees
+//     excluded files.
 //
 // Empty slice → (nil, nil). Zero file matches → (nil, nil).
 // First malformed pattern fails with its index.
@@ -70,15 +74,20 @@ func (s *Reader[T]) ReadMany(
 	opts ...QueryOption,
 ) ([]T, error) {
 	patterns = core.DedupePatterns(patterns)
-	switch len(patterns) {
-	case 0:
+	if len(patterns) == 0 {
 		return nil, nil
-	case 1:
-		// Fast path: let DuckDB expand the glob so plan-time
-		// partition pruning stays in effect. "No files found"
-		// is normalized to an empty result — the multi-pattern
-		// branch below returns (nil, nil) on zero matches, so
-		// this branch should too.
+	}
+
+	var o core.QueryOpts
+	o.Apply(opts...)
+
+	// Single-pattern fast path: hand the glob URI to DuckDB so
+	// plan-time partition pruning stays in effect. Skipped when
+	// WithIdempotentRead is set — the per-partition filter needs
+	// each file's LastModified, so the Go-side LIST path is forced
+	// to keep the read-modify-write semantics consistent with the
+	// multi-pattern path.
+	if len(patterns) == 1 && o.IdempotentReadToken == "" {
 		rows, err := s.Query(ctx, patterns[0],
 			"SELECT * FROM "+s.cfg.TableAlias, opts...)
 		if err != nil {
@@ -91,10 +100,7 @@ func (s *Reader[T]) ReadMany(
 		return s.scanAll(rows)
 	}
 
-	var o core.QueryOpts
-	o.Apply(opts...)
-
-	uris, err := s.listAllMatchingURIs(ctx, patterns, "ReadMany")
+	uris, err := s.listAllMatchingURIs(ctx, patterns, &o, "ReadMany")
 	if err != nil {
 		return nil, err
 	}
@@ -183,16 +189,21 @@ func (s *Reader[T]) ReadManyIter(
 // openIterRows is the row-source factory shared by ReadIter and
 // ReadManyIter. Mirrors ReadMany's branching: single-pattern
 // hands the glob URI to DuckDB so plan-time partition pruning
-// stays in effect; multi-pattern lists in Go and feeds an
-// explicit URI list to read_parquet. Returns nil rows on a
-// "no files matched" outcome so the caller treats it as an
-// empty iterator instead of an error.
+// stays in effect; multi-pattern (or any count with
+// WithIdempotentRead set) lists in Go and feeds an explicit URI
+// list to read_parquet so the barrier filter can apply. Returns
+// nil rows on a "no files matched" outcome so the caller treats
+// it as an empty iterator instead of an error.
 func (s *Reader[T]) openIterRows(
 	ctx context.Context,
 	patterns []string,
 	opts ...QueryOption,
 ) (*sql.Rows, error) {
-	if len(patterns) == 1 {
+	var o core.QueryOpts
+	o.Apply(opts...)
+
+	// Same barrier-forces-LIST rule as ReadMany (see there).
+	if len(patterns) == 1 && o.IdempotentReadToken == "" {
 		r, err := s.Query(ctx, patterns[0],
 			"SELECT * FROM "+s.cfg.TableAlias, opts...)
 		if err != nil {
@@ -204,10 +215,7 @@ func (s *Reader[T]) openIterRows(
 		return r, nil
 	}
 
-	var o core.QueryOpts
-	o.Apply(opts...)
-
-	uris, err := s.listAllMatchingURIs(ctx, patterns, "ReadManyIter")
+	uris, err := s.listAllMatchingURIs(ctx, patterns, &o, "ReadManyIter")
 	if err != nil {
 		return nil, err
 	}

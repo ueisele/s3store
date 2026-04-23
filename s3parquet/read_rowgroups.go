@@ -81,6 +81,11 @@ func (s *Reader[T]) ReadManyIterWhere(
 			yield(*new(T), err)
 			return
 		}
+		keys, err = s.applyIdempotentRead(keys, &o)
+		if err != nil {
+			yield(*new(T), err)
+			return
+		}
 		if len(keys) == 0 {
 			return
 		}

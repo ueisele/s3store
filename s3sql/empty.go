@@ -3,6 +3,7 @@ package s3sql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 )
 
@@ -28,6 +29,17 @@ func isNoFilesMatchedError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), noFilesErrFragment)
+}
+
+// noFilesMatchedErr synthesizes an error whose text embeds
+// noFilesErrFragment so isNoFilesMatchedError keeps matching on
+// paths that bypass DuckDB's glob (e.g. Query with
+// WithIdempotentRead — the barrier filter ran in Go and
+// excluded every match). Same fragment, so existing callers that
+// branch on isNoFilesMatchedError keep working.
+func noFilesMatchedErr(pattern string) error {
+	return fmt.Errorf(
+		"IO Error: %s %q", noFilesErrFragment, pattern)
 }
 
 // emptyRows returns a *sql.Rows that yields zero rows. Used by

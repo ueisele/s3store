@@ -127,6 +127,10 @@ func (s *Reader[T]) ReadMany(
 	if err != nil {
 		return nil, err
 	}
+	keys, err = s.applyIdempotentRead(keys, &o)
+	if err != nil {
+		return nil, err
+	}
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -214,6 +218,11 @@ func (s *Reader[T]) ReadManyIter(
 		}
 
 		keys, err := s.listAllMatchingParquet(ctx, plans)
+		if err != nil {
+			yield(*new(T), err)
+			return
+		}
+		keys, err = s.applyIdempotentRead(keys, &o)
 		if err != nil {
 			yield(*new(T), err)
 			return
@@ -422,6 +431,26 @@ func (s *Reader[T]) listAllMatchingParquet(
 ) ([]core.KeyMeta, error) {
 	return runPlansConcurrent(ctx, plans,
 		s.listMatchingParquet, keyMetaKey)
+}
+
+// applyIdempotentRead validates opts.IdempotentReadToken when set
+// and filters keys accordingly. The filter runs at LIST time with
+// no S3 call; cost is O(len(keys)). See core.ApplyIdempotentRead
+// for the per-partition self-exclusion + later-write-exclusion
+// contract.
+func (s *Reader[T]) applyIdempotentRead(
+	keys []core.KeyMeta, opts *core.QueryOpts,
+) ([]core.KeyMeta, error) {
+	if opts.IdempotentReadToken == "" {
+		return keys, nil
+	}
+	if err := core.ValidateIdempotencyToken(
+		opts.IdempotentReadToken); err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: WithIdempotentRead: %w", err)
+	}
+	return core.ApplyIdempotentRead(
+		keys, s.dataPath, opts.IdempotentReadToken), nil
 }
 
 // keyMetaKey is the keyOf function for KeyMeta fan-outs.

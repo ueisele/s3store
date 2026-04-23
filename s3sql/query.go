@@ -16,6 +16,18 @@ import (
 // DuckDB's "No files found" error propagates. Use QueryMany (or
 // check isNoFilesMatchedError in caller code) if you want empty
 // treated as a successful zero-row iteration.
+//
+// Execution model:
+//
+//   - WithIdempotentRead unset (default): glob URI handed to
+//     DuckDB; plan-time partition pruning and glob expansion
+//     happen server-side. No Go-side S3 LIST.
+//   - WithIdempotentRead set: Go-side S3 LIST runs first, the
+//     per-partition barrier filter is applied, and the
+//     deduplicated URI list is passed to read_parquet([...]). A
+//     barrier that filters out every match surfaces an
+//     isNoFilesMatchedError-compatible error so callers checking
+//     that helper keep working.
 func (s *Reader[T]) Query(
 	ctx context.Context,
 	keyPattern string,
@@ -24,6 +36,20 @@ func (s *Reader[T]) Query(
 ) (*sql.Rows, error) {
 	var o core.QueryOpts
 	o.Apply(opts...)
+
+	if o.IdempotentReadToken != "" {
+		uris, err := s.listAllMatchingURIs(
+			ctx, []string{keyPattern}, &o, "Query")
+		if err != nil {
+			return nil, err
+		}
+		if len(uris) == 0 {
+			return nil, noFilesMatchedErr(keyPattern)
+		}
+		scanExpr := s.scanExprForURIs(uris, s.needsFilename())
+		return s.db.QueryContext(ctx,
+			s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
+	}
 
 	scanExpr, err := s.scanExprForPattern(
 		keyPattern, s.needsFilename())
@@ -42,13 +68,16 @@ func (s *Reader[T]) Query(
 // Execution model:
 //
 //   - Single-pattern fast path (len(patterns) == 1 after
-//     literal dedup): delegates to Query — DuckDB handles glob
-//     expansion and partition pruning server-side. "No files
-//     found" is normalized to an empty *sql.Rows.
-//   - Multi-pattern path: per-pattern S3 LIST in Go with a
+//     literal dedup, WithIdempotentRead unset): delegates to
+//     Query — DuckDB handles glob expansion and partition
+//     pruning server-side. "No files found" is normalized to an
+//     empty *sql.Rows.
+//   - Multi-pattern path (or any pattern count with
+//     WithIdempotentRead set): per-pattern S3 LIST in Go with a
 //     bounded concurrency cap, deduplicated union of exact file
 //     URIs → one read_parquet([...]) scan. DuckDB plans once
-//     over the full file set.
+//     over the full file set. The barrier filter (if set)
+//     applies to the KeyMeta list before URI emission.
 //
 // Empty patterns slice → empty *sql.Rows. Zero file matches →
 // empty *sql.Rows. The synthetic empty cursor carries a single
@@ -61,10 +90,15 @@ func (s *Reader[T]) QueryMany(
 	opts ...QueryOption,
 ) (*sql.Rows, error) {
 	patterns = core.DedupePatterns(patterns)
-	switch len(patterns) {
-	case 0:
+	if len(patterns) == 0 {
 		return s.emptyRows(ctx)
-	case 1:
+	}
+
+	var o core.QueryOpts
+	o.Apply(opts...)
+
+	// Same barrier-forces-LIST rule as ReadMany (see that method).
+	if len(patterns) == 1 && o.IdempotentReadToken == "" {
 		rows, err := s.Query(ctx, patterns[0], sqlQuery, opts...)
 		if err != nil {
 			if isNoFilesMatchedError(err) {
@@ -75,10 +109,7 @@ func (s *Reader[T]) QueryMany(
 		return rows, nil
 	}
 
-	var o core.QueryOpts
-	o.Apply(opts...)
-
-	uris, err := s.listAllMatchingURIs(ctx, patterns, "QueryMany")
+	uris, err := s.listAllMatchingURIs(ctx, patterns, &o, "QueryMany")
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +131,11 @@ func (s *Reader[T]) QueryMany(
 // Does not normalize "zero files match" — DuckDB's error
 // propagates via Scan. Use QueryRowMany if you want the
 // standard sql.ErrNoRows contract on empty matches.
+//
+// Execution model mirrors Query: without WithIdempotentRead the
+// glob URI goes to DuckDB; with it, a Go-side S3 LIST drives the
+// filter and an isNoFilesMatchedError-compatible error is
+// surfaced via Scan if the barrier leaves zero matches.
 func (s *Reader[T]) QueryRow(
 	ctx context.Context,
 	keyPattern string,
@@ -108,6 +144,20 @@ func (s *Reader[T]) QueryRow(
 ) *sql.Row {
 	var o core.QueryOpts
 	o.Apply(opts...)
+
+	if o.IdempotentReadToken != "" {
+		uris, err := s.listAllMatchingURIs(
+			ctx, []string{keyPattern}, &o, "QueryRow")
+		if err != nil {
+			return s.errorRow(ctx, err)
+		}
+		if len(uris) == 0 {
+			return s.errorRow(ctx, noFilesMatchedErr(keyPattern))
+		}
+		scanExpr := s.scanExprForURIs(uris, s.needsFilename())
+		return s.db.QueryRowContext(ctx,
+			s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
+	}
 
 	scanExpr, err := s.scanExprForPattern(
 		keyPattern, s.needsFilename())
@@ -145,7 +195,7 @@ func (s *Reader[T]) QueryRowMany(
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	uris, err := s.listAllMatchingURIs(ctx, patterns, "QueryRowMany")
+	uris, err := s.listAllMatchingURIs(ctx, patterns, &o, "QueryRowMany")
 	if err != nil {
 		return s.errorRow(ctx, err)
 	}

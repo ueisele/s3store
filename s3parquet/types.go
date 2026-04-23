@@ -65,3 +65,13 @@ func WithUntilOffset(until Offset) QueryOption {
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }
+
+// WithIdempotentRead makes Read / ReadIter / ReadMany /
+// ReadManyIter / ReadIterWhere / ReadManyIterWhere / PollRecords
+// retry-safe: the result reflects state as of the first write of
+// the given idempotency token. Pair with WithIdempotencyToken on
+// the write side so one token drives both sides of the retry.
+// See core.WithIdempotentRead for the full contract.
+func WithIdempotentRead(token string) QueryOption {
+	return core.WithIdempotentRead(token)
+}
