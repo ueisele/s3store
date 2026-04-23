@@ -1,6 +1,7 @@
 package s3parquet
 
 import (
+	"errors"
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
@@ -15,6 +16,28 @@ import (
 // Aliased to the shared sentinel in internal/refstream so
 // errors.Is matches across s3parquet, s3sql, and the umbrella.
 var ErrRefStreamDisabled = refstream.ErrDisabled
+
+// ErrRefSettleBudgetExceeded is returned from the write path when
+// the ref PUT's total elapsed time exceeds SettleWindow AND a
+// follow-up HEAD confirms the ref did land in S3 — a "lost-ack
+// beyond budget". The ref's refTsMicros is already older than the
+// settle cutoff a concurrent Poll would compute, so Poll's offset
+// may have advanced past it and consumers may have missed it.
+//
+// Callers should treat this as a failed write and retry; with
+// WithIdempotencyToken the retry is deterministic (same data
+// path, scoped-LIST dedup on the ref side), so re-running the
+// same Write is safe. Without an idempotency token the retry
+// creates a new data file, which reader-side dedup
+// (EntityKeyOf + VersionOf) absorbs.
+//
+// Other ref-PUT failures (PUT didn't land, HEAD errored, caller
+// ctx cancelled) surface as a wrapped put-ref error — not this
+// sentinel — because the ref is known-absent and the caller can
+// retry without the freshness concern.
+var ErrRefSettleBudgetExceeded = errors.New(
+	"s3parquet: ref PUT exceeded SettleWindow; " +
+		"retry (with WithIdempotencyToken for deterministic recovery)")
 
 // Offset represents a position in the stream.
 type Offset = core.Offset

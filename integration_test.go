@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ueisele/s3store/internal/testutil"
+	"github.com/ueisele/s3store/s3parquet"
 )
 
 // IntRecord is the umbrella-test record shape. Parquet tags
@@ -36,7 +37,7 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 	f := testutil.New(t)
 
 	if opts.settleWindow == 0 {
-		opts.settleWindow = 10 * time.Millisecond
+		opts.settleWindow = 100 * time.Millisecond
 	}
 	// VersionColumn is paired with EntityKeyColumns: both or
 	// neither, matching New()'s validation.
@@ -53,6 +54,10 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 		VersionColumn:     versionColumn,
 		EntityKeyColumns:  opts.entityKeyColumns,
 		SettleWindow:      opts.settleWindow,
+		// MinIO is in fact strongly consistent; claiming it lets the
+		// ref PUT use the full SettleWindow as its budget (the tight
+		// 10ms test setting doesn't tolerate the default half-budget).
+		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		PartitionKeyOf: func(r IntRecord) string {
 			return fmt.Sprintf(
 				"period=%s/customer=%s",
@@ -115,7 +120,7 @@ func TestUmbrella_WritePoll(t *testing.T) {
 			t.Fatalf("Write %s: %v", k, err)
 		}
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	entries, newOffset, err := store.Poll(ctx, "", 100)
 	if err != nil {
@@ -157,7 +162,7 @@ func TestUmbrella_WritePollRecords(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("second Write: %v", err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	deduped, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
@@ -313,7 +318,7 @@ func TestUmbrella_SettleWindow(t *testing.T) {
 		if len(entries) > 0 {
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("ref never became visible past the settle window")
 }
@@ -362,7 +367,7 @@ func TestUmbrella_ReadIter(t *testing.T) {
 	if _, err := store.Write(ctx, in); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	count := 0
 	for r, err := range store.ReadIter(ctx, "*") {

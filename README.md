@@ -1029,6 +1029,19 @@ consistency level. The umbrella `Config` forwards a single value to
 both halves. On AWS / MinIO the header is an unknown string and is
 ignored, so leaving `ConsistencyControl` empty is correct there.
 
+The configured `ConsistencyControl` also drives:
+
+- **Ref-stream `Poll` LIST.** The same header is sent on the
+  paginator so a newly-written ref is LIST-visible before `Poll`'s
+  cutoff can advance past it on StorageGRID `strong-*`. Without
+  this, a ref can become LIST-visible later than `SettleWindow`
+  assumes and be skipped silently.
+- **Ref-PUT budget against `SettleWindow`.** On strong levels the
+  PUT gets the full `SettleWindow` (LIST propagation is zero); on
+  the default / weak levels it gets half. See
+  [Settle window](#settle-window) for the contract and the
+  `ErrRefSettleBudgetExceeded` sentinel.
+
 ### Zombie writers and orchestrators
 
 The library does not enforce single-writer-per-partition — that's a
@@ -1455,6 +1468,60 @@ S3 PUTs aren't globally ordered, so `Poll` reads up to `now - SettleWindow`
 already-read one. This gives you a single monotonic offset with no seen-set
 or dedup bookkeeping.
 
+### Enforcement: the ref PUT is budgeted against SettleWindow
+
+The whole SettleWindow contract rests on one assumption: by the
+time `Poll`'s cutoff (`now - SettleWindow`) advances past a ref's
+`refTsMicros`, the ref is LIST-visible. The timestamp is captured
+just before the ref PUT (not after), so `SettleWindow` has to
+cover the PUT's own network time plus LIST propagation on the
+backend.
+
+The write path enforces this: the ref PUT is wrapped in a context
+timeout derived from the configured `ConsistencyControl`, and a
+post-hoc check compares elapsed time against `SettleWindow`.
+
+- **Strong consistency (`strong-global` / `strong-site` / `all`):**
+  LIST is linearized with the PUT, so zero propagation budget is
+  needed — the PUT gets the full `SettleWindow`.
+- **Default / `read-after-new-write` / `available` / unknown:**
+  half of `SettleWindow` reserved for LIST propagation; the PUT
+  gets the other half. Conservative default because
+  `ConsistencyControl == ""` is ambiguous (strong on AWS / MinIO,
+  weak on StorageGRID) and the library can't tell them apart.
+
+If the ref PUT's elapsed time exceeds `SettleWindow`, the write
+returns `ErrRefSettleBudgetExceeded`:
+
+```go
+if _, err := store.Write(ctx, recs, s3store.WithIdempotencyToken(token, time.Hour)); err != nil {
+    if errors.Is(err, s3parquet.ErrRefSettleBudgetExceeded) {
+        // Ref may have landed but is not safely consumable.
+        // With WithIdempotencyToken the retry is deterministic
+        // (same data path). Without it, the retry produces a new
+        // data file — reader-side dedup absorbs the overlap.
+        return retry(...)
+    }
+    return err
+}
+```
+
+The error is raised whenever the library can't guarantee the ref
+is Poll-visible within budget. A silent success in that scenario
+would cause the ref to be skipped by consumers — hence the hard
+failure. The sentinel exists so callers can distinguish budget-
+exceeded writes from other failures (e.g., permission errors) and
+act on them without parsing error strings.
+
+**AWS S3 / MinIO users on strong consistency**: set
+`ConsistencyControl: s3store.ConsistencyStrongGlobal` on the
+`Config` to claim the full SettleWindow budget for the ref PUT.
+The header is ignored by those backends but serves as the "I
+know my backend is strongly consistent" signal the budget
+computation uses. Leaving it empty (default) halves the PUT
+budget, which usually doesn't matter (real PUTs finish in ~tens
+of ms vs. the default 5 s window).
+
 ## Durability guarantees
 
 The contract is **at-least-once** on both sides of the wire.
@@ -1481,7 +1548,11 @@ retry can skip them if needed.
 To make retries produce deterministic data paths at the storage
 layer (no duplicate bytes, no duplicate refs within a bounded
 window), pass `WithIdempotencyToken` — see
-[Idempotent writes](#idempotent-writes).
+[Idempotent writes](#idempotent-writes). The ref PUT itself is
+budgeted against `SettleWindow`; a slow write that exceeds the
+budget returns `ErrRefSettleBudgetExceeded` (see
+[Settle window](#settle-window) for the contract and an idiomatic
+retry).
 
 ### Read
 

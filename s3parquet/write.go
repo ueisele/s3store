@@ -24,6 +24,34 @@ import (
 // lost ack or removing an orphan parquet.
 const writeCleanupTimeout = 5 * time.Second
 
+// refPutBudget returns the deadline the ref PUT must complete
+// within so the ref is LIST-visible before its refTsMicros ages
+// past the settle-window cutoff a concurrent Poll computes.
+// Derived from ConsistencyControl, no separate knob:
+//
+//   - Strong consistency (strong-global / strong-site / all): LIST
+//     sees the ref as soon as PUT returns → zero propagation
+//     budget → the PUT gets the full SettleWindow.
+//   - Default / read-after-new-write / available / unknown: LIST
+//     propagation is non-zero → reserve half of SettleWindow for
+//     it; PUT gets the other half.
+//
+// Conservative default (empty ConsistencyControl → weak
+// assumption). AWS / MinIO users who want the full budget can set
+// ConsistencyControl to one of the strong levels; the header is
+// unknown to those backends (ignored) and serves purely as the
+// "my backend is strongly consistent" signal the library needs.
+func refPutBudget(
+	c ConsistencyLevel, settleWindow time.Duration,
+) time.Duration {
+	switch c {
+	case ConsistencyStrongGlobal, ConsistencyStrongSite, ConsistencyAll:
+		return settleWindow
+	default:
+		return settleWindow / 2
+	}
+}
+
 // defaultPartitionWriteConcurrency is the fallback cap on how
 // many partitions Write fans out in parallel when
 // WriterConfig.PartitionWriteConcurrency is zero. Each partition
@@ -364,7 +392,8 @@ func (s *Writer[T]) writeEncodedPayload(
 	// became visible) rather than write-start time. SettleWindow
 	// then only needs to cover ref-PUT latency + LIST propagation,
 	// independent of marker count.
-	refTsMicros := time.Now().UnixMicro()
+	refCaptureTime := time.Now()
+	refTsMicros := refCaptureTime.UnixMicro()
 	refKey := core.EncodeRefKey(s.refPath, refTsMicros, id, tsMicros, key)
 
 	result := &WriteResult{
@@ -374,15 +403,29 @@ func (s *Writer[T]) writeEncodedPayload(
 		InsertedAt: writeStartTime,
 	}
 
+	// Bound the ref PUT's wall-clock time so its refTsMicros stays
+	// inside the settle-window budget a concurrent Poll uses to
+	// compute its cutoff. Budget is derived from ConsistencyControl
+	// (see refPutBudget): full SettleWindow on strong consistency,
+	// half on weak / unknown. The ctx timeout fires client-side;
+	// the post-hoc elapsed check (below) guards against cases where
+	// the timeout was ignored or masked by internal retries.
+	settle := s.cfg.Target.EffectiveSettleWindow()
+	putCtx, cancelPut := context.WithTimeout(
+		ctx, refPutBudget(s.cfg.ConsistencyControl, settle))
 	putErr := s.cfg.Target.put(
-		ctx, refKey, []byte{}, "application/octet-stream")
-	if putErr == nil {
+		putCtx, refKey, []byte{}, "application/octet-stream")
+	cancelPut()
+	elapsed := time.Since(refCaptureTime)
+
+	if putErr == nil && elapsed <= settle {
 		return result, nil
 	}
 
-	// Ref PUT failed. Disambiguate lost-ack from a real failure
-	// using a bounded, caller-independent context so cleanup
-	// still completes if the caller has cancelled.
+	// Ref PUT failed or blew the settle budget. Disambiguate lost-
+	// ack from a real failure using a bounded, caller-independent
+	// context so cleanup still completes if the caller has
+	// cancelled.
 	cleanupCtx, cancel := context.WithTimeout(
 		context.Background(), writeCleanupTimeout)
 	defer cancel()
@@ -390,7 +433,18 @@ func (s *Writer[T]) writeEncodedPayload(
 	if exists, headErr := s.cfg.Target.exists(
 		cleanupCtx, refKey,
 	); headErr == nil && exists {
-		// Ref actually got written — we just lost the ack.
+		// Ref is present in S3. Two sub-cases:
+		//   - elapsed <= settle: genuine lost-ack within budget —
+		//     the ref's refTsMicros is fresh enough for Poll to
+		//     see it. Return success as before.
+		//   - elapsed > settle: the ref may have aged past Poll's
+		//     cutoff while we were still waiting for the PUT to
+		//     return. Surface ErrRefSettleBudgetExceeded so the
+		//     caller can retry (safe with WithIdempotencyToken;
+		//     reader dedup absorbs duplicate refs otherwise).
+		if elapsed > settle {
+			return result, ErrRefSettleBudgetExceeded
+		}
 		return result, nil
 	}
 
