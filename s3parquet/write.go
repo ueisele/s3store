@@ -433,17 +433,28 @@ func (s *Writer[T]) writeEncodedPayload(
 	if exists, headErr := s.cfg.Target.exists(
 		cleanupCtx, refKey,
 	); headErr == nil && exists {
-		// Ref is present in S3. Two sub-cases:
-		//   - elapsed <= settle: genuine lost-ack within budget —
-		//     the ref's refTsMicros is fresh enough for Poll to
-		//     see it. Return success as before.
-		//   - elapsed > settle: the stale ref sits at an offset
+		// Ref is present in S3. The leapfrog window for a
+		// concurrent Poll opens at refCaptureTime + settle, so the
+		// safe question is "is *now* still within that window?",
+		// not "did the PUT itself finish in time?". For putErr ==
+		// nil the two are equivalent (PUT-return time is the
+		// visibility time). For putErr != nil (timeout) the actual
+		// visibility time is unobservable but bounded above by
+		// HEAD-completion time — re-measuring after the HEAD gives
+		// the conservative upper bound.
+		//
+		// Two sub-cases on visibilityElapsed:
+		//   - <= settle: genuine lost-ack within budget — the
+		//     ref's refTsMicros is fresh enough that no consumer
+		//     can have yielded another writer's later ref past
+		//     ours. Return success.
+		//   - >  settle: the ref's refTsMicros sits at an offset
 		//     that a concurrent Poll may have already advanced
 		//     past (after yielding fresher refs from other
-		//     partitions). Run the recovery path: write a fresh
-		//     ref well inside budget, then best-effort delete the
-		//     stale one.
-		if elapsed > settle {
+		//     partitions). Run recovery: write a fresh ref well
+		//     inside budget, best-effort delete the stale one.
+		visibilityElapsed := time.Since(refCaptureTime)
+		if visibilityElapsed > settle {
 			return s.recoverRefAfterBudgetExceeded(
 				ctx, cleanupCtx, result,
 				id, tsMicros, key, settle, refKey)
