@@ -271,24 +271,24 @@ func (s *Writer[T]) writeWithKeyResolved(
 // at-least-once contract one phase at a time:
 //
 //  1. data    — writeData PUTs the parquet bytes (idempotent or
-//               fresh). On a retry-detected idempotent PUT it
-//               returns isRetry=true instead of failing.
+//     fresh). On a retry-detected idempotent PUT it
+//     returns isRetry=true instead of failing.
 //  2. retry   — when isRetry, claimExistingRef scoped-LISTs the
-//               ref stream for a still-fresh ref with this token.
-//               Found → return that ref as the result (the prior
-//               attempt already made the write consumable). Not
-//               found → continue.
+//     ref stream for a still-fresh ref with this token.
+//     Found → return that ref as the result (the prior
+//     attempt already made the write consumable). Not
+//     found → continue.
 //  3. markers — commitMarkers PUTs the index markers (with
-//               orphan-data cleanup on failure). Sequenced after
-//               data so a landed marker implies the backing file
-//               exists, and before ref so Poll's commit semantics
-//               are unchanged.
+//     orphan-data cleanup on failure). Sequenced after
+//     data so a landed marker implies the backing file
+//     exists, and before ref so Poll's commit semantics
+//     are unchanged.
 //  4. ref     — commitRefOrRecover PUTs the ref with a
-//               SettleWindow/2 budget. On budget-blown or lost-
-//               ack past the budget, recovers internally (fresh
-//               ref + best-effort delete of stale). Only surfaces
-//               ErrRefSettleBudgetExceeded when both the initial
-//               and the recovery PUT miss budget.
+//     SettleWindow/2 budget. On budget-blown or lost-
+//     ack past the budget, recovers internally (fresh
+//     ref + best-effort delete of stale). Only surfaces
+//     ErrRefSettleBudgetExceeded when both the initial
+//     and the recovery PUT miss budget.
 //
 // writeStartTime is the wall clock captured by the caller just
 // before parquet encoding — used to stamp the data filename

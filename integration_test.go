@@ -53,7 +53,7 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 		TableAlias:        "records",
 		VersionColumn:     versionColumn,
 		EntityKeyColumns:  opts.entityKeyColumns,
-		SettleWindow: opts.settleWindow,
+		SettleWindow:      opts.settleWindow,
 		// MinIO is in fact strongly consistent; claiming it keeps
 		// idempotent writes on the conditional-PUT path and lets
 		// the scoped retry LIST linearize against prior writes.
