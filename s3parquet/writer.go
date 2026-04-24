@@ -95,10 +95,11 @@ type WriterConfig[T any] struct {
 	DisableCleanup bool
 
 	// ConsistencyControl sets the Consistency-Control HTTP header
-	// on S3 operations where the library's correctness depends
-	// on strong read-after-write / list-after-write visibility —
-	// today that's the data PUT of an idempotent write and the
-	// scoped LIST used to dedup refs on the retry path.
+	// on S3 operations where the library's correctness depends on
+	// strong read-after-write / list-after-write visibility: the
+	// data PUT of an idempotent write, the scoped LIST used to
+	// dedup refs on the retry path, and every registered index's
+	// marker PUT (so a paired Lookup sees it read-after-write).
 	//
 	// Zero value (ConsistencyDefault) sends no header — bucket
 	// default applies. On AWS S3 / MinIO that's strongly
@@ -113,7 +114,8 @@ type WriterConfig[T any] struct {
 	// ReaderConfig.ConsistencyControl should match. NewWriter /
 	// NewReader can't cross-validate (they're independent
 	// constructors), so this is a caller contract documented
-	// here.
+	// here. NewIndexWithRegister copies this value onto the
+	// returned Index so the marker-LIST side matches automatically.
 	ConsistencyControl ConsistencyLevel
 }
 

@@ -101,14 +101,19 @@ type S3Target struct {
 	// patterns are validated against this order.
 	PartitionKeyParts []string
 
-	// SettleWindow is how far behind the live tip Poll,
-	// PollRecords, and Index.Lookup read, and the total budget the
-	// ref PUT must fit inside (the ref-PUT timeout is SettleWindow
-	// / 2; see refPutBudget). Keeps readers consistent with near-
-	// tip writers whose refs may not yet be visible in S3 LIST.
+	// SettleWindow is how far behind the live tip Poll and
+	// PollRecords read, and the total budget the ref PUT must fit
+	// inside (the ref-PUT timeout is SettleWindow / 2; see
+	// refPutBudget). Keeps readers consistent with near-tip writers
+	// whose refs may not yet be visible in S3 LIST.
+	//
+	// Does not apply to Index.Lookup: marker visibility is
+	// delegated to the storage layer via ConsistencyControl, so a
+	// read-after-write Lookup works without any settle delay on
+	// strong-consistent backends.
 	//
 	// Default (zero value): 5s. Zero is treated as "use library
-	// default", not "disable settle" — consumer correctness and
+	// default", not "disable settle" — Poll correctness and
 	// ref-PUT budgeting both depend on a non-zero value, so there
 	// is no disabled mode. Set explicitly if you want a different
 	// window (e.g. 30s on a slow backend, 500ms for low-latency

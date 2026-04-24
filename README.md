@@ -1348,10 +1348,12 @@ machinery.
 ### What's in scope for v1
 
 - Register + auto-write on `Write` + `Lookup` via the typed handle.
-- SettleWindow applies to Lookup: markers LIST-visible but with
-  `LastModified` inside `now - SettleWindow` are hidden, matching
-  `Poll`'s guarantees so index and data views agree within the
-  window.
+- Read-after-write on Lookup: the marker PUT and the marker LIST
+  both carry the writer's `ConsistencyControl`, so a `Lookup`
+  issued immediately after `Write` sees the new marker without a
+  settle delay. On AWS S3 / MinIO that's native; on StorageGRID,
+  set `ConsistencyStrongGlobal` / `ConsistencyStrongSite` on the
+  Writer and it flows to marker PUT + LIST automatically.
 - **Backfill** as a standalone package function (below).
 
 ### Backfill
@@ -1407,9 +1409,11 @@ retry after cancel or crash is a no-op on work already done. Safe
 to run while the live writer keeps emitting markers for fresh
 records.
 
-Lookup's SettleWindow applies to backfilled markers too — expect
-up to one SettleWindow of lag before a just-backfilled index
-fully reports.
+Backfilled markers are subject to the same read-after-write
+contract as live-write markers: on a strong-consistent backend
+(AWS, MinIO, or StorageGRID with `ConsistencyControl` set on the
+`IndexDef`) a `Lookup` issued after `BackfillIndex` returns sees
+every marker it just wrote.
 
 ### Not in v1 (deferred)
 

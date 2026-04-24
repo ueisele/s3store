@@ -35,6 +35,21 @@ type IndexLookupDef[K comparable] struct {
 	// K must carry a `parquet:"..."` tag for every entry in
 	// Columns, and no additional tagged fields.
 	Columns []string
+
+	// ConsistencyControl sets the Consistency-Control HTTP header
+	// on marker PUTs (write path, BackfillIndex) and marker LISTs
+	// (Lookup). Together they give read-after-write visibility for
+	// Lookup on backends where the default consistency level is
+	// weaker than strong (e.g. NetApp StorageGRID with its default
+	// read-after-new-write). Zero (ConsistencyDefault) sends no
+	// header — correct on AWS S3 and MinIO, where LIST has been
+	// strongly consistent since 2020 regardless of any header.
+	//
+	// NewIndexWithRegister / NewIndexFromStoreWithRegister copy the
+	// enclosing Writer's ConsistencyControl onto the def when this
+	// field is unset, so register-style callers don't need to
+	// duplicate the setting. Explicit values on the def override.
+	ConsistencyControl ConsistencyLevel
 }
 
 // IndexDef declares a secondary index attached to a dataset. On
@@ -83,6 +98,7 @@ type Index[K comparable] struct {
 	columns      []string
 	indexPath    string
 	fieldIndices []int
+	consistency  ConsistencyLevel
 }
 
 // NewIndex builds a query handle for an index whose markers a
@@ -111,12 +127,20 @@ func NewIndex[K comparable](
 // emit markers, AND returns an Index[K] read-handle built from
 // w.Target(). Use when a service writes and reads through a
 // Writer but has no Reader/Store.
+//
+// Inherits w.cfg.ConsistencyControl onto the returned Index when
+// def.ConsistencyControl is unset, so a register-style caller
+// that already configured strong consistency on the Writer gets
+// the same level on marker LISTs automatically.
 func NewIndexWithRegister[T any, K comparable](
 	w *Writer[T], def IndexDef[T, K],
 ) (*Index[K], error) {
 	if w == nil {
 		return nil, fmt.Errorf(
 			"s3parquet: NewIndexWithRegister: writer is nil")
+	}
+	if def.ConsistencyControl == "" {
+		def.ConsistencyControl = w.cfg.ConsistencyControl
 	}
 	if err := RegisterIndex(w, def); err != nil {
 		return nil, err
@@ -215,6 +239,7 @@ func buildIndex[K comparable](
 		columns:      def.Columns,
 		indexPath:    core.IndexPath(target.Prefix, def.Name),
 		fieldIndices: fieldIndices,
+		consistency:  def.ConsistencyControl,
 	}, nil
 }
 
@@ -270,10 +295,12 @@ func (i *Index[K]) markerPath(entry K) (string, error) {
 // millions of matching markers. No deduplication is needed —
 // S3 PUT is idempotent, so distinct markers imply distinct K.
 //
-// SettleWindow applies the same way it does to Poll: markers
-// whose S3 LastModified timestamp is within now - SettleWindow
-// are hidden, so a caller that writes and immediately Looks Up
-// sees consistent state with PollRecords.
+// Read-after-write: Lookup carries the Index's ConsistencyControl
+// on the LIST, so it sees every marker the writer has already
+// published under the matching level — strong on AWS S3, strong
+// on MinIO, strong-global / strong-site on StorageGRID when the
+// header is honoured. Unlike Poll there is no SettleWindow filter
+// here; marker visibility is delegated to the storage layer.
 //
 // Single-pattern sugar over LookupMany — use LookupMany when
 // the caller has an arbitrary set of column tuples (e.g. a
@@ -348,19 +375,23 @@ func (i *Index[K]) valuesToEntry(values []string) K {
 }
 
 // listMatchingMarkers LISTs every marker under plan.ListPrefix and
-// returns the keys that match plan.Match AND were modified before
-// the settle-window cutoff. S3 handles pagination; filtering runs
-// per-page in memory.
+// returns the keys that match plan.Match. S3 handles pagination;
+// filtering runs per-page in memory.
+//
+// Carries the Index's ConsistencyControl on the LIST so that
+// Lookup sees every marker the writer has already published. With
+// a strong level (or on AWS S3, which is strong-LIST by default),
+// Lookup is read-after-write — no settle window needed.
 func (i *Index[K]) listMatchingMarkers(
 	ctx context.Context, plan *readPlan,
 ) ([]string, error) {
-	cutoff := time.Now().Add(-i.target.EffectiveSettleWindow())
 	paginator := i.target.list(plan.ListPrefix)
+	opts := withConsistencyControl(i.consistency)
 
 	var keys []string
 	suffix := "/" + core.IndexMarkerFilename
 	for paginator.HasMorePages() {
-		page, err := i.target.listPage(ctx, paginator)
+		page, err := i.target.listPage(ctx, paginator, opts)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: index %q list: %w", i.name, err)
@@ -368,10 +399,6 @@ func (i *Index[K]) listMatchingMarkers(
 		for _, obj := range page.Contents {
 			key := aws.ToString(obj.Key)
 			if !strings.HasSuffix(key, suffix) {
-				continue
-			}
-			if obj.LastModified != nil &&
-				obj.LastModified.After(cutoff) {
 				continue
 			}
 			hiveKey, ok := hiveKeyOfMarker(key, i.indexPath)
@@ -595,6 +622,7 @@ func BackfillIndexMany[T any, K comparable](
 			for _, p := range paths {
 				if err := target.put(
 					ctx, p, nil, "application/octet-stream",
+					withConsistencyControl(def.ConsistencyControl),
 				); err != nil {
 					errs[n] = fmt.Errorf(
 						"s3parquet: backfill index %q: put marker: %w",

@@ -112,9 +112,6 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	// Wait past the settle window so Lookup sees every marker.
-	time.Sleep(400 * time.Millisecond)
-
 	// Exact lookup: one SKU, one period, any customer.
 	got, err := idx.Lookup(ctx,
 		"sku=s1/period=2026-03-17/customer=*")
@@ -154,12 +151,14 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 	}
 }
 
-// TestIndex_SettleWindowHidesFresh guards the SettleWindow
-// semantic on Lookup: markers written in the last SettleWindow
-// are hidden (LastModified filter), matching Poll's behavior.
-func TestIndex_SettleWindowHidesFresh(t *testing.T) {
+// TestIndex_LookupReadAfterWrite guards the contract that Lookup
+// is read-after-write when ConsistencyControl is strong: a marker
+// written by Write MUST be returned by the very next Lookup, with
+// no sleep and no SettleWindow filter. Together with the header
+// propagation on marker PUT and marker LIST this is the whole
+// reason Index doesn't need a settle cutoff.
+func TestIndex_LookupReadAfterWrite(t *testing.T) {
 	ctx := context.Background()
-	// Use a generous SettleWindow so the "fresh" check isn't racy.
 	f := testutil.New(t)
 	store, err := s3parquet.New(ctx, s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
@@ -170,7 +169,11 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 300 * time.Millisecond,
+		// 5s picks up the library default; Lookup no longer uses it,
+		// so the magnitude doesn't matter — the point of this test
+		// is that Lookup ignores SettleWindow entirely.
+		SettleWindow:       5 * time.Second,
+		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -200,29 +203,13 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	// Inside SettleWindow: marker is invisible.
 	got, err := idx.Lookup(ctx, "sku=s1/customer=*")
 	if err != nil {
-		t.Fatalf("Lookup inside window: %v", err)
+		t.Fatalf("Lookup: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("inside window: got %d entries, want 0",
-			len(got))
+	if len(got) != 1 {
+		t.Errorf("read-after-write: got %d entries, want 1", len(got))
 	}
-
-	// Wait past SettleWindow; marker becomes visible.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		got, err = idx.Lookup(ctx, "sku=s1/customer=*")
-		if err != nil {
-			t.Fatalf("Lookup waiting: %v", err)
-		}
-		if len(got) > 0 {
-			return
-		}
-		time.Sleep(400 * time.Millisecond)
-	}
-	t.Fatal("marker never became visible past the settle window")
 }
 
 // TestBackfillIndex covers the relief-valve path: records

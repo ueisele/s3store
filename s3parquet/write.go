@@ -937,6 +937,7 @@ func (s *Writer[T]) putMarkersParallel(
 
 			if err := s.cfg.Target.put(
 				ctx, p, nil, "application/octet-stream",
+				withConsistencyControl(s.cfg.ConsistencyControl),
 			); err != nil {
 				errs[i] = err
 				cancel()
