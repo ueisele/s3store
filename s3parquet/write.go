@@ -543,7 +543,8 @@ func (s *Writer[T]) commitRefOrRecover(
 	putCtx, cancelPut := context.WithTimeout(
 		ctx, refPutBudget(settle))
 	putErr := s.cfg.Target.put(
-		putCtx, refKey, []byte{}, "application/octet-stream")
+		putCtx, refKey, []byte{}, "application/octet-stream",
+		withConsistencyControl(s.cfg.ConsistencyControl))
 	cancelPut()
 	elapsed := time.Since(refCaptureTime)
 
@@ -561,6 +562,7 @@ func (s *Writer[T]) commitRefOrRecover(
 
 	if exists, headErr := s.cfg.Target.exists(
 		cleanupCtx, refKey,
+		withConsistencyControl(s.cfg.ConsistencyControl),
 	); headErr == nil && exists {
 		// Ref is present in S3. The leapfrog window for a
 		// concurrent Poll opens at refCaptureTime + settle, so the
@@ -653,7 +655,8 @@ func (s *Writer[T]) recoverRefAfterBudgetExceeded(
 	putCtx, cancelPut := context.WithTimeout(
 		ctx, refPutBudget(settle))
 	putErr := s.cfg.Target.put(
-		putCtx, newRefKey, []byte{}, "application/octet-stream")
+		putCtx, newRefKey, []byte{}, "application/octet-stream",
+		withConsistencyControl(s.cfg.ConsistencyControl))
 	cancelPut()
 	elapsed := time.Since(refCaptureTime)
 
