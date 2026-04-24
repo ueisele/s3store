@@ -265,25 +265,40 @@ func (s *Writer[T]) writeWithKeyResolved(
 		ctx, key, records, parquetBytes, writeStartTime, opts)
 }
 
-// writeEncodedPayload is the post-encode tail shared between
-// WriteWithKey and WriteWithKeyRowGroupsBy: collect marker paths,
-// PUT data, PUT markers in parallel, PUT ref (unless
-// DisableRefStream), and run cleanup on failure. Keeping this
-// factored ensures the two write entry points can't drift on
-// ordering guarantees (data before ref, markers before ref,
-// orphan cleanup on ref-PUT failure).
+// writeEncodedPayload is the post-encode orchestration shared
+// between WriteWithKey and WriteWithKeyRowGroupsBy. The body
+// reads as a commit sequence so a reviewer can verify the
+// at-least-once contract one phase at a time:
+//
+//  1. data    — writeData PUTs the parquet bytes (idempotent or
+//               fresh). On a retry-detected idempotent PUT it
+//               returns isRetry=true instead of failing.
+//  2. retry   — when isRetry, claimExistingRef scoped-LISTs the
+//               ref stream for a still-fresh ref with this token.
+//               Found → return that ref as the result (the prior
+//               attempt already made the write consumable). Not
+//               found → continue.
+//  3. markers — commitMarkers PUTs the index markers (with
+//               orphan-data cleanup on failure). Sequenced after
+//               data so a landed marker implies the backing file
+//               exists, and before ref so Poll's commit semantics
+//               are unchanged.
+//  4. ref     — commitRefOrRecover PUTs the ref with a
+//               SettleWindow/2 budget. On budget-blown or lost-
+//               ack past the budget, recovers internally (fresh
+//               ref + best-effort delete of stale). Only surfaces
+//               ErrRefSettleBudgetExceeded when both the initial
+//               and the recovery PUT miss budget.
 //
 // writeStartTime is the wall clock captured by the caller just
 // before parquet encoding — used to stamp the data filename
-// tsMicros AND the x-amz-meta-created-at header so external
-// tooling sees the same value that's in the InsertedAtField
-// column.
+// tsMicros, the InsertedAtField column, and the
+// x-amz-meta-created-at header so every downstream surface sees
+// the same "when was this written" value.
 //
-// opts carries the resolved WriteOpts from the caller; when
-// IdempotencyToken is set the write path uses the deterministic
-// token-based id, detects retries via overwrite-prevention or
-// HEAD-before-PUT, and scopes a LIST on the ref stream to dedup
-// the ref emission.
+// opts.IdempotencyToken, when set, replaces the default
+// {tsMicros}-{shortID} id so retries produce deterministic data
+// paths; opts.MaxRetryAge bounds the scoped LIST in phase 2.
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
 	writeStartTime time.Time, opts core.WriteOpts,
@@ -302,74 +317,42 @@ func (s *Writer[T]) writeEncodedPayload(
 	// a token, fall back to the library's {tsMicros}-{shortID}
 	// scheme — still lex-sortable by time within a partition.
 	tsMicros := writeStartTime.UnixMicro()
-	var id string
 	idempotent := opts.IdempotencyToken != ""
+	var id string
 	if idempotent {
 		id = opts.IdempotencyToken
 	} else {
 		id = core.MakeAutoID(tsMicros, uuid.New().String()[:8])
 	}
-
 	dataKey := core.BuildDataFilePath(s.dataPath, key, id)
 	meta := map[string]string{
 		"created-at": writeStartTime.Format(time.RFC3339Nano),
 	}
 
-	// isRetry drives the post-data-PUT flow: fresh writes unconditionally
-	// emit markers + ref; retries run the scoped-LIST dedup to avoid
-	// re-emitting refs that already landed.
-	var isRetry bool
-	if idempotent {
-		putErr := s.putDataIdempotent(ctx, dataKey, parquetBytes, meta)
-		switch {
-		case errors.Is(putErr, ErrAlreadyExists):
-			isRetry = true
-		case putErr != nil:
-			return nil, fmt.Errorf(
-				"s3parquet: put data: %w", putErr)
-		}
-	} else {
-		if err := s.cfg.Target.putWithMeta(
-			ctx, dataKey, parquetBytes,
-			"application/octet-stream", meta,
-			withConsistencyControl(s.cfg.ConsistencyControl),
-		); err != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: put data: %w", err)
-		}
+	// Phase 1: data.
+	isRetry, err := s.writeData(
+		ctx, dataKey, parquetBytes, meta, idempotent)
+	if err != nil {
+		return nil, err
 	}
 
-	// On retry, scoped-LIST the ref stream for a ref carrying
-	// this id. Found → full-success retry, skip markers + ref.
-	// Not found → scenario B (data landed but ref didn't on the
-	// original attempt), continue to emit markers + ref.
+	// Phase 2: on retry, check for a still-fresh ref already
+	// emitted by the prior attempt. Found → return early.
 	if isRetry {
-		existingRefKey, err := s.findExistingRef(
-			ctx, opts.IdempotencyToken, opts.MaxRetryAge)
+		existing, err := s.claimExistingRef(
+			ctx, opts, dataKey, writeStartTime)
 		if err != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: scoped LIST for retry: %w", err)
+			return nil, err
 		}
-		if existingRefKey != "" {
-			return &WriteResult{
-				Offset:     Offset(existingRefKey),
-				DataPath:   dataKey,
-				RefPath:    existingRefKey,
-				InsertedAt: writeStartTime,
-			}, nil
+		if existing != nil {
+			return existing, nil
 		}
 	}
 
-	// Index markers are written after data (so a successful
-	// marker implies the backing data file exists) and before
-	// the ref (so Poll's commit semantics are unchanged). If any
-	// marker PUT fails we delete the orphan data and return —
-	// any markers that landed before the failure stay as
-	// orphans, which Lookup tolerates.
-	if err := s.putMarkersParallel(ctx, markerPaths); err != nil {
-		s.cleanupOrphanData(dataKey, idempotent)
-		return nil, fmt.Errorf(
-			"s3parquet: put index markers: %w", err)
+	// Phase 3: markers.
+	if err := s.commitMarkers(
+		ctx, markerPaths, dataKey, idempotent); err != nil {
+		return nil, err
 	}
 
 	// DisableRefStream: skip the ref PUT entirely. Offset and
@@ -384,6 +367,140 @@ func (s *Writer[T]) writeEncodedPayload(
 		}, nil
 	}
 
+	// Phase 4: ref (with internal budget-exceeded recovery).
+	return s.commitRefOrRecover(
+		ctx, dataKey, id, tsMicros, key, writeStartTime, idempotent)
+}
+
+// writeData is phase 1 of writeEncodedPayload: PUT the parquet
+// bytes to dataKey. Routes through the overwrite-prevention
+// detection path (putIfAbsent or headThenPut) when idempotent is
+// true, or a plain metadata-carrying PUT when it isn't.
+//
+// Returns isRetry=true when the data object already existed,
+// signalling that markers and ref may already have been emitted
+// by a prior attempt. Any other PUT error is wrapped and returned.
+//
+// At-least-once invariant on (isRetry=false, err=nil): the data
+// file at dataKey carries exactly the caller's parquet bytes,
+// just uploaded. On (isRetry=true, err=nil): the data file
+// exists with bytes from a prior attempt (idempotent token →
+// same logical content).
+func (s *Writer[T]) writeData(
+	ctx context.Context, dataKey string, parquetBytes []byte,
+	meta map[string]string, idempotent bool,
+) (isRetry bool, err error) {
+	if idempotent {
+		putErr := s.putDataIdempotent(
+			ctx, dataKey, parquetBytes, meta)
+		switch {
+		case errors.Is(putErr, ErrAlreadyExists):
+			return true, nil
+		case putErr != nil:
+			return false, fmt.Errorf(
+				"s3parquet: put data: %w", putErr)
+		}
+		return false, nil
+	}
+	if err := s.cfg.Target.putWithMeta(
+		ctx, dataKey, parquetBytes,
+		"application/octet-stream", meta,
+		withConsistencyControl(s.cfg.ConsistencyControl),
+	); err != nil {
+		return false, fmt.Errorf(
+			"s3parquet: put data: %w", err)
+	}
+	return false, nil
+}
+
+// claimExistingRef is phase 2 of writeEncodedPayload: on a
+// retry-detected idempotent write, scoped-LIST the ref stream
+// for a still-fresh ref carrying this token. Returns a populated
+// *WriteResult when such a ref exists (prior attempt already
+// made the write consumable), or (nil, nil) when no fresh match
+// exists (caller proceeds to emit markers + ref).
+//
+// Stale refs (refTsMicros past the settle cutoff) are filtered
+// by findExistingRef so they never satisfy dedup — treating one
+// as "found" would silently miss consumers who advanced past its
+// offset. Only called when opts.IdempotencyToken != "".
+func (s *Writer[T]) claimExistingRef(
+	ctx context.Context, opts core.WriteOpts,
+	dataKey string, writeStartTime time.Time,
+) (*WriteResult, error) {
+	existingRefKey, err := s.findExistingRef(
+		ctx, opts.IdempotencyToken, opts.MaxRetryAge)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: scoped LIST for retry: %w", err)
+	}
+	if existingRefKey == "" {
+		return nil, nil
+	}
+	return &WriteResult{
+		Offset:     Offset(existingRefKey),
+		DataPath:   dataKey,
+		RefPath:    existingRefKey,
+		InsertedAt: writeStartTime,
+	}, nil
+}
+
+// commitMarkers is phase 3 of writeEncodedPayload: PUT every
+// registered index marker in parallel. On any marker-PUT
+// failure, best-effort cleanup of the orphan data (non-
+// idempotent writes only; idempotent retries reuse the existing
+// data file) and surface the wrapped error. Partial marker
+// landings on failure are tolerated: orphan markers that outlive
+// their data file fall out at Lookup time via the same LIST-to-
+// GET race handling as dangling refs.
+//
+// At-least-once invariant on nil return: every required marker
+// is durably stored in S3; Lookup calls respecting SettleWindow
+// will yield them on the same contract as Poll.
+func (s *Writer[T]) commitMarkers(
+	ctx context.Context, markerPaths []string,
+	dataKey string, idempotent bool,
+) error {
+	if err := s.putMarkersParallel(ctx, markerPaths); err != nil {
+		s.cleanupOrphanData(dataKey, idempotent)
+		return fmt.Errorf(
+			"s3parquet: put index markers: %w", err)
+	}
+	return nil
+}
+
+// commitRefOrRecover is phase 4 of writeEncodedPayload: PUT the
+// ref under a SettleWindow/2 budget, with two recovery gates so
+// the at-least-once contract is preserved across backend slowness
+// and weak-consistency races.
+//
+// Happy path: PUT returns nil within budget → return success.
+//
+// Recovery gate A (ref landed, visibility > settle): the stale
+// ref sits at an offset a concurrent Poll may have already
+// advanced past. recoverRefAfterBudgetExceeded writes a fresh ref
+// inside budget and best-effort deletes the stale.
+//
+// Recovery gate B (PUT reported success but HEAD can't see it,
+// weak-consistency propagation): same recovery — emit a fresh,
+// visible ref and let any late-propagating stale be absorbed by
+// reader dedup.
+//
+// Hard failure: PUT failed AND HEAD confirms ref absent. Cleanup
+// the orphan data (non-idempotent) and return a wrapped put-ref
+// error.
+//
+// At-least-once invariant on nil return: the returned RefPath is
+// LIST-visible and its refTsMicros was captured < SettleWindow
+// ago, so any Poll whose `since` is lex-earlier will yield it.
+// On ErrRefSettleBudgetExceeded, findExistingRef's freshness
+// filter ensures the caller's retry emits a fresh ref rather
+// than silently matching the stale one.
+func (s *Writer[T]) commitRefOrRecover(
+	ctx context.Context,
+	dataKey, id string, dataTsMicros int64, hiveKey string,
+	writeStartTime time.Time, idempotent bool,
+) (*WriteResult, error) {
 	// Capture a second timestamp immediately before the ref PUT so
 	// the ref filename reflects publication time (when the ref
 	// became visible) rather than write-start time. SettleWindow
@@ -391,7 +508,8 @@ func (s *Writer[T]) writeEncodedPayload(
 	// independent of marker count.
 	refCaptureTime := time.Now()
 	refTsMicros := refCaptureTime.UnixMicro()
-	refKey := core.EncodeRefKey(s.refPath, refTsMicros, id, tsMicros, key)
+	refKey := core.EncodeRefKey(
+		s.refPath, refTsMicros, id, dataTsMicros, hiveKey)
 
 	result := &WriteResult{
 		Offset:     Offset(refKey),
@@ -402,11 +520,10 @@ func (s *Writer[T]) writeEncodedPayload(
 
 	// Bound the ref PUT's wall-clock time so its refTsMicros stays
 	// inside the settle-window budget a concurrent Poll uses to
-	// compute its cutoff. Budget is derived from ConsistencyControl
-	// (see refPutBudget): full SettleWindow on strong consistency,
-	// half on weak / unknown. The ctx timeout fires client-side;
-	// the post-hoc elapsed check (below) guards against cases where
-	// the timeout was ignored or masked by internal retries.
+	// compute its cutoff. Budget is SettleWindow/2 — see
+	// refPutBudget for why. The ctx timeout fires client-side; the
+	// post-hoc elapsed check guards against cases where the
+	// timeout was ignored or masked by internal retries.
 	settle := s.cfg.Target.EffectiveSettleWindow()
 	putCtx, cancelPut := context.WithTimeout(
 		ctx, refPutBudget(settle))
@@ -454,7 +571,7 @@ func (s *Writer[T]) writeEncodedPayload(
 		if visibilityElapsed > settle {
 			return s.recoverRefAfterBudgetExceeded(
 				ctx, cleanupCtx, result,
-				id, tsMicros, key, settle, refKey)
+				id, dataTsMicros, hiveKey, settle, refKey)
 		}
 		return result, nil
 	}
@@ -468,7 +585,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	if putErr == nil {
 		return s.recoverRefAfterBudgetExceeded(
 			ctx, cleanupCtx, result,
-			id, tsMicros, key, settle, refKey)
+			id, dataTsMicros, hiveKey, settle, refKey)
 	}
 
 	if !idempotent && !s.cfg.DisableCleanup {
