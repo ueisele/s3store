@@ -55,7 +55,7 @@ func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		EntityKeyOf:        opts.entityKeyOf,
 		VersionOf:          opts.versionOf,
@@ -113,7 +113,7 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 	}
 
 	// Wait past the settle window so Lookup sees every marker.
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Exact lookup: one SKU, one period, any customer.
 	got, err := idx.Lookup(ctx,
@@ -170,7 +170,7 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 500 * time.Millisecond,
+		SettleWindow: 300 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -220,7 +220,7 @@ func TestIndex_SettleWindowHidesFresh(t *testing.T) {
 		if len(got) > 0 {
 			return
 		}
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 	}
 	t.Fatal("marker never became visible past the settle window")
 }
@@ -281,7 +281,7 @@ func TestBackfillIndex(t *testing.T) {
 		t.Fatalf("post-registration Write: %v", err)
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Before BackfillIndex: only the post-registration record is
 	// visible.
@@ -318,7 +318,7 @@ func TestBackfillIndex(t *testing.T) {
 			stats.Markers)
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// After BackfillIndex: every distinct (sku, customer) is
 	// visible.
@@ -553,7 +553,7 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		OnMissingData: func(p string) {
 			missedMu.Lock()
@@ -591,7 +591,7 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Read is LIST-based; its LIST already reflects the
 	// deletion, so it never GETs the missing file and the hook
@@ -652,7 +652,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		InsertedAtField:    "InsertedAt",
 	})
@@ -668,7 +668,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	after := time.Now()
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	got, err := store.Read(ctx, "*")
 	if err != nil {
@@ -810,7 +810,7 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -1115,7 +1115,7 @@ func TestLookupMany_NonCartesian(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	got, err := idx.LookupMany(ctx, []string{
 		"sku=s1/customer=abc",
@@ -1204,7 +1204,7 @@ func TestBackfillIndexMany(t *testing.T) {
 			"March-18; April skipped)", stats.DataObjects)
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Sanity: Lookup sees the March markers, NOT April.
 	got, err := idx.Lookup(ctx, "sku=*/customer=*")
@@ -1595,7 +1595,7 @@ func TestPoll(t *testing.T) {
 		lastOffset = append(lastOffset, string(r.Offset))
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	entries, newOffset, err := store.Poll(ctx, "", 100)
 	if err != nil {
@@ -1654,7 +1654,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -1676,7 +1676,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -1723,7 +1723,7 @@ func TestPollRecords(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("second Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	deduped, off, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
@@ -1782,7 +1782,7 @@ func TestPollTimeWindow(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Write 3: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Full stream: three entries.
 	all, _, err := store.Poll(ctx, "", 100)
@@ -1844,7 +1844,7 @@ func TestPollRecordsAll(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	after := time.Now()
 
 	// Bounded window: all 5 records.
@@ -1928,7 +1928,7 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -1996,7 +1996,7 @@ func TestDisableRefStream(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		DisableRefStream:   true,
 	})
@@ -2074,7 +2074,7 @@ func TestDisableRefStream_WriteWithKey(t *testing.T) {
 		Prefix:             "store",
 		S3Client:           f.S3Client,
 		PartitionKeyParts:  []string{"period", "customer"},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		DisableRefStream:   true,
 	})
@@ -2127,7 +2127,7 @@ func TestDisableRefStream_IndexLookup(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		DisableRefStream:   true,
 	})
@@ -2162,7 +2162,7 @@ func TestDisableRefStream_IndexLookup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	got, err := idx.Lookup(ctx, "sku=s1/period=2026-03-17/customer=*")
 	if err != nil {
@@ -2625,7 +2625,7 @@ func TestWriteWithKeyRowGroupsBy_RowGroupCount(t *testing.T) {
 			return fmt.Sprintf(
 				"period=%s/customer=%s", r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -2767,7 +2767,7 @@ func TestWriteRowGroupsBy_EmptyAndNil(t *testing.T) {
 			Prefix:            "store",
 			S3Client:          f.S3Client,
 			PartitionKeyParts: []string{"period", "customer"},
-			SettleWindow:      500 * time.Millisecond,
+			SettleWindow:      300 * time.Millisecond,
 		},
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
@@ -2880,7 +2880,7 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		InsertedAtField:    "InsertedAt",
 	})
@@ -2895,7 +2895,7 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	after := time.Now()
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	got, err := store.Read(ctx, "*")
 	if err != nil {
@@ -2942,7 +2942,7 @@ func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       500 * time.Millisecond,
+		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		InsertedAtField:    "InsertedAt",
 	})
@@ -3028,7 +3028,7 @@ func TestDefaultVersionOf_UsesLastModified(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	got, err := store.Read(ctx, "*")
 	if err != nil {
@@ -3070,7 +3070,7 @@ func TestSort_ByEntityKeyAndVersion(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// WithHistory so sort can be observed without dedup folding.
 	got, err := store.Read(ctx, "*", s3parquet.WithHistory())
@@ -3118,7 +3118,7 @@ func TestSort_LastModifiedFallback(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	got, err := store.Read(ctx, "*")
 	if err != nil {
@@ -3159,7 +3159,7 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	readGot, err := store.Read(ctx, "*", s3parquet.WithHistory())
 	if err != nil {
@@ -3219,7 +3219,7 @@ func newIdempotentStore(
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 500 * time.Millisecond,
+		SettleWindow: 300 * time.Millisecond,
 		// MinIO is in fact strongly consistent; the claim keeps
 		// idempotent writes on the conditional-PUT path and lets
 		// the scoped retry LIST linearize against prior writes.
@@ -3295,7 +3295,7 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	// Read should see exactly one record — the idempotent retry
 	// didn't land a duplicate. Wait past SettleWindow first so
 	// Read can observe the ref in full.
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	got, err := store.Read(ctx, key)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -3345,7 +3345,7 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 			first.RefPath, second.RefPath)
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	got, err := store.Read(ctx, key)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -3394,7 +3394,7 @@ func TestWriteWithIdempotencyToken_MaxRetryAgeZero(t *testing.T) {
 	}
 
 	// Reader dedup brings the doubled refs back to one record.
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	got, err := store.Read(ctx, key)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -3493,7 +3493,7 @@ func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("zombie write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// 5. Attempt-2 retries the same Read with the same token. The
 	// barrier excludes both the attempt-1 file (self-exclusion) and
@@ -3567,7 +3567,7 @@ func TestIdempotentRead_PerPartitionIsolation(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("zombie B: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Read across both partitions with the barrier. A is filtered
 	// (only baseline survives); B has no token file so its barrier

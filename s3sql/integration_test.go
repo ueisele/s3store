@@ -69,7 +69,7 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      500 * time.Millisecond,
+		SettleWindow:      300 * time.Millisecond,
 	}
 	// MinIO is in fact strongly consistent; the claim keeps
 	// idempotent writes on the conditional-PUT path and lets the
@@ -108,7 +108,7 @@ func (f *testFixture) writeSome(t *testing.T, recs []Rec) {
 	if _, err := f.writer.Write(context.Background(), recs); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 }
 
 // TestRead_WithDedup exercises the SQL read path end-to-end,
@@ -161,7 +161,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      500 * time.Millisecond,
+		SettleWindow:      300 * time.Millisecond,
 	}
 	w, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[RecWithMeta]{
 		Target: target,
@@ -196,7 +196,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	after := time.Now()
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	got, err := sq.Read(context.Background(), "*")
 	if err != nil {
@@ -729,7 +729,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 		Prefix:            "store",
 		S3Client:          testFix.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      500 * time.Millisecond,
+		SettleWindow:      300 * time.Millisecond,
 	}
 	wOld, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[RecNarrow]{
 		Target: target,
@@ -747,7 +747,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write RecNarrow: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Reader scans into Rec (which has Amount + Currency).
 	s, err := s3sql.NewReader(s3sql.ReaderConfig[Rec]{
@@ -804,7 +804,7 @@ func TestRead_SliceField(t *testing.T) {
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      500 * time.Millisecond,
+		SettleWindow:      300 * time.Millisecond,
 	}
 	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[TagRec]{
 		Target: target,
@@ -828,7 +828,7 @@ func TestRead_SliceField(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	s, err := s3sql.NewReader(s3sql.ReaderConfig[TagRec]{
 		Target:       target,
@@ -900,7 +900,7 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      500 * time.Millisecond,
+		SettleWindow:      300 * time.Millisecond,
 	}
 	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[JobRec]{
 		Target: target,
@@ -941,7 +941,7 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 	if _, err := w.Write(ctx, []JobRec{in}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	s, err := s3sql.NewReader(s3sql.ReaderConfig[JobRec]{
 		Target:       target,
@@ -1345,7 +1345,7 @@ func TestDisableRefStream_s3sql(t *testing.T) {
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      500 * time.Millisecond,
+		SettleWindow:      300 * time.Millisecond,
 		DisableRefStream:  true,
 	}
 	writer, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[Rec]{
@@ -1550,7 +1550,7 @@ func newIdempotentFixture(t *testing.T) *testFixture {
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      500 * time.Millisecond,
+		SettleWindow:      300 * time.Millisecond,
 	}
 	// Claim strong consistency (MinIO is strong in practice) so the
 	// ref PUT gets the full 10ms SettleWindow as its budget. See
@@ -1629,7 +1629,7 @@ func TestIdempotentRead_SingleSQLReadModifyWriteRetrySafe(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("zombie: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// 5. Attempt-2 Read with the barrier sees only the baseline.
 	attempt2, err := f.sql.Read(ctx, key,
@@ -1694,7 +1694,7 @@ func TestIdempotentRead_QueryAndQueryRow(t *testing.T) {
 	}}, s3parquet.WithIdempotencyToken(token, time.Hour)); err != nil {
 		t.Fatalf("attempt-1 write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Query with the barrier: only the baseline survives.
 	rows, err := f.sql.Query(ctx, key,
@@ -1752,7 +1752,7 @@ func TestIdempotentRead_QueryZeroMatches(t *testing.T) {
 	}}, s3parquet.WithIdempotencyToken(token, time.Hour)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Query: raw error is returned; isNoFilesMatchedError must
 	// still recognize it.

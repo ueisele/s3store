@@ -37,7 +37,7 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 	f := testutil.New(t)
 
 	if opts.settleWindow == 0 {
-		opts.settleWindow = 500 * time.Millisecond
+		opts.settleWindow = 300 * time.Millisecond
 	}
 	// VersionColumn is paired with EntityKeyColumns: both or
 	// neither, matching New()'s validation.
@@ -121,7 +121,7 @@ func TestUmbrella_WritePoll(t *testing.T) {
 			t.Fatalf("Write %s: %v", k, err)
 		}
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	entries, newOffset, err := store.Poll(ctx, "", 100)
 	if err != nil {
@@ -163,7 +163,7 @@ func TestUmbrella_WritePollRecords(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("second Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	deduped, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
@@ -319,7 +319,7 @@ func TestUmbrella_SettleWindow(t *testing.T) {
 		if len(entries) > 0 {
 			return
 		}
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 	}
 	t.Fatalf("ref never became visible past the settle window")
 }
@@ -368,7 +368,7 @@ func TestUmbrella_ReadIter(t *testing.T) {
 	if _, err := store.Write(ctx, in); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	count := 0
 	for r, err := range store.ReadIter(ctx, "*") {
