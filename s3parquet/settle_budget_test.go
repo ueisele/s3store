@@ -5,56 +5,30 @@ import (
 	"time"
 )
 
-// TestRefPutBudget guards the consistency → ref-PUT budget
-// mapping. Strong levels get the full SettleWindow (LIST sees new
-// refs immediately, zero propagation reserve). Everything else —
-// default, read-after-new-write, available, unknown — gets half
-// the window so the other half covers LIST propagation on weakly-
-// consistent backends.
+// TestRefPutBudget guards the ref-PUT budget formula: always
+// half of SettleWindow, independent of ConsistencyControl. The
+// reserved half covers HEAD time on the post-PUT disambiguation
+// plus any LIST propagation between the node that accepted the
+// PUT and a concurrent Poll. A uniform settle/2 is simpler and
+// strictly safer than the old strong-vs-weak split, which handed
+// strong-consistency writers the full SettleWindow and forced
+// unnecessary recovery on borderline-slow PUTs that actually
+// landed in budget.
 func TestRefPutBudget(t *testing.T) {
 	const settle = 6 * time.Second
-
-	strong := []ConsistencyLevel{
-		ConsistencyStrongGlobal,
-		ConsistencyStrongSite,
-		ConsistencyAll,
-	}
-	for _, c := range strong {
-		t.Run(string(c), func(t *testing.T) {
-			if got := refPutBudget(c, settle); got != settle {
-				t.Errorf("strong level %q got %v, want %v",
-					c, got, settle)
-			}
-		})
-	}
-
-	weak := []ConsistencyLevel{
-		ConsistencyDefault,
-		ConsistencyReadAfterNewWrite,
-		ConsistencyAvailable,
-		ConsistencyLevel("unknown-future-value"),
-	}
-	for _, c := range weak {
-		t.Run(string(c), func(t *testing.T) {
-			want := settle / 2
-			if got := refPutBudget(c, settle); got != want {
-				t.Errorf("weak level %q got %v, want %v",
-					c, got, want)
-			}
-		})
+	want := settle / 2
+	if got := refPutBudget(settle); got != want {
+		t.Errorf("refPutBudget(%v) = %v, want %v", settle, got, want)
 	}
 }
 
 // TestRefPutBudget_ZeroSettleWindow guards the extreme case: a
-// zero SettleWindow (read-to-live-tip mode) produces a zero budget
-// on both paths. Callers using this mode accept the "no settle"
-// contract and don't need a PUT deadline; the write path still
-// completes but the caller can't expect Poll-visibility guarantees.
+// zero SettleWindow (read-to-live-tip mode) produces a zero
+// budget. Callers using that mode accept the "no settle" contract
+// and don't need a PUT deadline; the write path still completes
+// but the caller can't expect Poll-visibility guarantees.
 func TestRefPutBudget_ZeroSettleWindow(t *testing.T) {
-	if got := refPutBudget(ConsistencyStrongGlobal, 0); got != 0 {
-		t.Errorf("strong zero: got %v, want 0", got)
-	}
-	if got := refPutBudget(ConsistencyDefault, 0); got != 0 {
-		t.Errorf("weak zero: got %v, want 0", got)
+	if got := refPutBudget(0); got != 0 {
+		t.Errorf("refPutBudget(0) = %v, want 0", got)
 	}
 }

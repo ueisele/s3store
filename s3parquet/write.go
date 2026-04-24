@@ -24,32 +24,29 @@ import (
 // lost ack or removing an orphan parquet.
 const writeCleanupTimeout = 5 * time.Second
 
-// refPutBudget returns the deadline the ref PUT must complete
-// within so the ref is LIST-visible before its refTsMicros ages
-// past the settle-window cutoff a concurrent Poll computes.
-// Derived from ConsistencyControl, no separate knob:
+// refPutBudget returns the client-side timeout for a ref PUT:
+// half of SettleWindow, regardless of ConsistencyControl. The
+// reserved half covers two things that otherwise push the ref's
+// effective visibility time past SettleWindow:
 //
-//   - Strong consistency (strong-global / strong-site / all): LIST
-//     sees the ref as soon as PUT returns → zero propagation
-//     budget → the PUT gets the full SettleWindow.
-//   - Default / read-after-new-write / available / unknown: LIST
-//     propagation is non-zero → reserve half of SettleWindow for
-//     it; PUT gets the other half.
+//   - HEAD time on the post-PUT disambiguation. Non-zero on every
+//     backend. Without headroom, even a PUT that genuinely
+//     completes at exactly SettleWindow lands the HEAD past the
+//     budget, forcing unnecessary recovery.
+//   - LIST propagation between the node that accepted the PUT
+//     and the node a concurrent Poll hits. Zero on strong
+//     consistency, nonzero on weak backends.
 //
-// Conservative default (empty ConsistencyControl → weak
-// assumption). AWS / MinIO users who want the full budget can set
-// ConsistencyControl to one of the strong levels; the header is
-// unknown to those backends (ignored) and serves purely as the
-// "my backend is strongly consistent" signal the library needs.
-func refPutBudget(
-	c ConsistencyLevel, settleWindow time.Duration,
-) time.Duration {
-	switch c {
-	case ConsistencyStrongGlobal, ConsistencyStrongSite, ConsistencyAll:
-		return settleWindow
-	default:
-		return settleWindow / 2
-	}
+// An earlier version gated this on ConsistencyControl and handed
+// strong-consistency writers the full SettleWindow. That only
+// accounted for LIST propagation and ignored HEAD, so borderline-
+// slow PUTs that actually landed in budget triggered the recovery
+// path anyway. Uniform settle/2 is simpler and strictly safer —
+// real PUT latencies (tens of ms) fit comfortably inside settle/2
+// for any reasonable SettleWindow, so the halved budget doesn't
+// cost the happy path anything.
+func refPutBudget(settleWindow time.Duration) time.Duration {
+	return settleWindow / 2
 }
 
 // defaultPartitionWriteConcurrency is the fallback cap on how
@@ -412,7 +409,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// the timeout was ignored or masked by internal retries.
 	settle := s.cfg.Target.EffectiveSettleWindow()
 	putCtx, cancelPut := context.WithTimeout(
-		ctx, refPutBudget(s.cfg.ConsistencyControl, settle))
+		ctx, refPutBudget(settle))
 	putErr := s.cfg.Target.put(
 		putCtx, refKey, []byte{}, "application/octet-stream")
 	cancelPut()
@@ -527,7 +524,7 @@ func (s *Writer[T]) recoverRefAfterBudgetExceeded(
 		s.refPath, refTsMicros, id, dataTsMicros, hiveKey)
 
 	putCtx, cancelPut := context.WithTimeout(
-		ctx, refPutBudget(s.cfg.ConsistencyControl, settle))
+		ctx, refPutBudget(settle))
 	putErr := s.cfg.Target.put(
 		putCtx, newRefKey, []byte{}, "application/octet-stream")
 	cancelPut()

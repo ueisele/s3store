@@ -1043,11 +1043,11 @@ The configured `ConsistencyControl` also drives:
   cutoff can advance past it on StorageGRID `strong-*`. Without
   this, a ref can become LIST-visible later than `SettleWindow`
   assumes and be skipped silently.
-- **Ref-PUT budget against `SettleWindow`.** On strong levels the
-  PUT gets the full `SettleWindow` (LIST propagation is zero); on
-  the default / weak levels it gets half. See
-  [Settle window](#settle-window) for the contract and the
-  `ErrRefSettleBudgetExceeded` sentinel.
+- **Ref-PUT budget against `SettleWindow`.** The PUT gets a
+  uniform `SettleWindow / 2` timeout regardless of consistency
+  level — the other half is reserved for the post-PUT HEAD and
+  any LIST propagation. See [Settle window](#settle-window) for
+  the contract and the `ErrRefSettleBudgetExceeded` sentinel.
 
 ### Zombie writers and orchestrators
 
@@ -1485,17 +1485,29 @@ cover the PUT's own network time plus LIST propagation on the
 backend.
 
 The write path enforces this: the ref PUT is wrapped in a context
-timeout derived from the configured `ConsistencyControl`, and a
-post-hoc check compares elapsed time against `SettleWindow`.
+timeout of `SettleWindow / 2`, and a post-hoc check compares
+elapsed time (re-measured after the disambiguation HEAD) against
+`SettleWindow`.
 
-- **Strong consistency (`strong-global` / `strong-site` / `all`):**
-  LIST is linearized with the PUT, so zero propagation budget is
-  needed — the PUT gets the full `SettleWindow`.
-- **Default / `read-after-new-write` / `available` / unknown:**
-  half of `SettleWindow` reserved for LIST propagation; the PUT
-  gets the other half. Conservative default because
-  `ConsistencyControl == ""` is ambiguous (strong on AWS / MinIO,
-  weak on StorageGRID) and the library can't tell them apart.
+The reserved half covers two sources of additional delay that
+would otherwise push the ref's effective visibility time past
+`SettleWindow`:
+
+- **HEAD time** on the post-PUT disambiguation. Nonzero on every
+  backend. Without headroom, a PUT that completes at exactly
+  `SettleWindow` lands the HEAD past the budget.
+- **LIST propagation** between the node that accepted the PUT
+  and the node a concurrent `Poll` hits. Zero on strong-
+  consistency backends, nonzero on weak ones.
+
+Real PUT latencies (tens of ms) fit comfortably inside
+`SettleWindow / 2` for any reasonable `SettleWindow`, so the
+halved budget doesn't cost the happy path anything. The budget
+does **not** vary with `ConsistencyControl` — an earlier version
+handed strong-consistency writers the full `SettleWindow` based
+on "zero LIST propagation", but that ignored HEAD time and forced
+unnecessary recovery on borderline-slow PUTs that actually
+landed in budget.
 
 If the ref PUT's elapsed time exceeds `SettleWindow`, the stale
 `refTsMicros` sits at an offset some consumers may already have
@@ -1541,14 +1553,13 @@ configure reader dedup (`EntityKeyOf + VersionOf`) — the rare
 duplicates produced by recovery's narrow gap all share
 `(entity, version)` and dedup collapses them.
 
-**AWS S3 / MinIO users on strong consistency**: set
-`ConsistencyControl: s3store.ConsistencyStrongGlobal` on the
-`Config` to claim the full SettleWindow budget for the ref PUT.
-The header is ignored by those backends but serves as the "I
-know my backend is strongly consistent" signal the budget
-computation uses. Leaving it empty (default) halves the PUT
-budget, which usually doesn't matter (real PUTs finish in ~tens
-of ms vs. the default 5 s window).
+**AWS S3 / MinIO users**: `ConsistencyControl` doesn't change the
+ref-PUT budget — it's a uniform `SettleWindow / 2` regardless.
+The header remains useful on StorageGRID for the data-PUT
+overwrite-prevention and the scoped retry LIST, but for the ref
+PUT specifically there's no strong-vs-weak distinction. Real PUT
+latencies (tens of ms) fit comfortably inside the halved budget
+for any reasonable `SettleWindow`.
 
 ## Durability guarantees
 
