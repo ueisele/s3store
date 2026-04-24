@@ -101,10 +101,18 @@ type S3Target struct {
 	// patterns are validated against this order.
 	PartitionKeyParts []string
 
-	// SettleWindow is how far behind the live tip Poll, PollRecords,
-	// and Index.Lookup read. Default (zero): 5s. Keeps readers
-	// consistent with near-tip writers whose refs may not yet be
-	// visible in S3 LIST.
+	// SettleWindow is how far behind the live tip Poll,
+	// PollRecords, and Index.Lookup read, and the total budget the
+	// ref PUT must fit inside (the ref-PUT timeout is SettleWindow
+	// / 2; see refPutBudget). Keeps readers consistent with near-
+	// tip writers whose refs may not yet be visible in S3 LIST.
+	//
+	// Default (zero value): 5s. Zero is treated as "use library
+	// default", not "disable settle" — consumer correctness and
+	// ref-PUT budgeting both depend on a non-zero value, so there
+	// is no disabled mode. Set explicitly if you want a different
+	// window (e.g. 30s on a slow backend, 500ms for low-latency
+	// testing).
 	SettleWindow time.Duration
 
 	// DisableRefStream opts the dataset out of writing stream ref
@@ -176,10 +184,16 @@ func (t S3Target) ValidateLookup() error {
 	return nil
 }
 
-// EffectiveSettleWindow returns the resolved window, defaulting
-// the zero value to 5s so near-tip readers don't race writers
-// that haven't yet shown up in LIST. Exported so both s3parquet
-// and s3sql read the same resolved value from a shared S3Target.
+// EffectiveSettleWindow returns the configured SettleWindow, or
+// 5s when it's unset (zero value). Zero is deliberately mapped
+// to the default rather than "disabled" — a zero window would
+// collapse both Poll's cutoff and the ref-PUT budget, which has
+// no valid use case (consumers and writers would both skip
+// their consistency safeguards).
+//
+// Exported so both s3parquet and s3sql read the same resolved
+// value from a shared S3Target — callers that want the raw
+// configured value can read .SettleWindow directly.
 func (t S3Target) EffectiveSettleWindow() time.Duration {
 	if t.SettleWindow > 0 {
 		return t.SettleWindow

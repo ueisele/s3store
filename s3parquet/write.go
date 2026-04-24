@@ -18,11 +18,26 @@ import (
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// writeCleanupTimeout bounds best-effort cleanup work (HEAD /
-// DELETE) on the ref-PUT failure path, so the caller's context
-// being cancelled doesn't prevent us from either confirming a
-// lost ack or removing an orphan parquet.
-const writeCleanupTimeout = 5 * time.Second
+// writeCleanupTimeout bounds the detached cleanup work on the
+// write failure paths:
+//
+//   - HEAD to disambiguate a ref PUT that errored client-side
+//     but may have landed server-side.
+//   - DELETE of a stale ref after a successful budget-recovery
+//     PUT.
+//   - DELETE of an orphan data file after a marker or ref PUT
+//     failed.
+//
+// Detached from the caller's context so cleanup still completes
+// when the caller cancels — we already committed to the best-
+// effort cleanup before the cancellation, and bailing halfway
+// leaves worse state than finishing.
+//
+// 30s is generous: it accommodates a large-file DELETE on a
+// slow backend (MB+ parquet files can take seconds to remove on
+// StorageGRID) without pathologically extending the lifetime of
+// a failed Write if the backend is truly unreachable.
+const writeCleanupTimeout = 30 * time.Second
 
 // refPutBudget returns the client-side timeout for a ref PUT:
 // half of SettleWindow, regardless of ConsistencyControl. The
@@ -462,7 +477,7 @@ func (s *Writer[T]) commitMarkers(
 	dataKey string, idempotent bool,
 ) error {
 	if err := s.putMarkersParallel(ctx, markerPaths); err != nil {
-		s.cleanupOrphanData(dataKey, idempotent)
+		_ = s.cleanupOrphanData(dataKey, idempotent)
 		return fmt.Errorf(
 			"s3parquet: put index markers: %w", err)
 	}
@@ -588,20 +603,15 @@ func (s *Writer[T]) commitRefOrRecover(
 			id, dataTsMicros, hiveKey, settle, refKey)
 	}
 
-	if !idempotent && !s.cfg.DisableCleanup {
-		if delErr := s.cfg.Target.del(
-			cleanupCtx, dataKey,
-		); delErr != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: put ref: %w (orphan data at %s: %v)",
-				putErr, dataKey, delErr)
-		}
+	// Idempotent writes and DisableCleanup make cleanupOrphanData a
+	// no-op by design: retrying with the same token reuses the data
+	// path (overwrite-prevention triggers, no body re-upload), and
+	// DisableCleanup preserves orphans for lifecycle policies.
+	if delErr := s.cleanupOrphanData(dataKey, idempotent); delErr != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: put ref: %w (orphan data at %s: %v)",
+			putErr, dataKey, delErr)
 	}
-	// Idempotent writes leave orphan data in place by design:
-	// a retry with the same token reuses the same data path and
-	// overwrite-prevention triggers, so deletion would make the
-	// retry re-upload the body. DisableCleanup likewise preserves
-	// orphans for lifecycle policies to garbage-collect.
 
 	return nil, fmt.Errorf("s3parquet: put ref: %w", putErr)
 }
@@ -779,23 +789,31 @@ func (s *Writer[T]) findExistingRef(
 }
 
 // cleanupOrphanData runs the best-effort delete for an orphaned
-// data object on the failure paths. No-op when the write is
-// idempotent (retries reuse the same path; deleting would force
-// body re-upload) or when DisableCleanup is set (operator opted
-// into lifecycle-based garbage collection).
+// data object on the failure paths. No-op (nil return) when the
+// write is idempotent (retries reuse the same path; deleting
+// would force body re-upload) or when DisableCleanup is set
+// (operator opted into lifecycle-based garbage collection).
 //
-// Errors are silently swallowed: the caller already has a richer
-// error to surface, and compounding it with a delete failure
-// obscures the root cause. Operators running without lifecycle
-// policies should monitor for orphan data/ref drift separately.
-func (s *Writer[T]) cleanupOrphanData(dataKey string, idempotent bool) {
+// Uses its own detached context so the cleanup survives caller-
+// context cancellation — the caller already decided to bail, but
+// we'd still rather not leave orphan objects behind.
+//
+// Returns the del error when the delete actually ran and failed.
+// Fire-and-forget sites (commitMarkers) discard the returned
+// error because they already have a richer error to surface and
+// compounding obscures the root cause. The ref-PUT failure path
+// folds the returned error into its user-facing message so
+// operators without lifecycle policies can find the orphan.
+func (s *Writer[T]) cleanupOrphanData(
+	dataKey string, idempotent bool,
+) error {
 	if idempotent || s.cfg.DisableCleanup {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(
 		context.Background(), writeCleanupTimeout)
 	defer cancel()
-	_ = s.cfg.Target.del(cleanupCtx, dataKey)
+	return s.cfg.Target.del(cleanupCtx, dataKey)
 }
 
 func (s *Writer[T]) groupByKey(records []T) map[string][]T {
