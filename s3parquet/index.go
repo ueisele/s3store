@@ -562,7 +562,8 @@ func BackfillIndexMany[T any, K comparable](
 		plans[j] = plan
 	}
 
-	keys, err := listDataFilesBelowUntil(ctx, target, plans, dataPath, until)
+	keys, err := listDataFilesBelowUntil(
+		ctx, target, plans, dataPath, until, def.ConsistencyControl)
 	if err != nil {
 		return stats, err
 	}
@@ -595,7 +596,7 @@ func BackfillIndexMany[T any, K comparable](
 			defer func() { <-sem }()
 
 			paths, nRecs, err := backfillMarkersForObject(
-				ctx, target, idx, def.Of, key)
+				ctx, target, idx, def.Of, key, def.ConsistencyControl)
 			if err != nil {
 				// LIST-to-GET race: a data file listed a moment
 				// ago is gone now. Skip-and-notify matches the
@@ -663,6 +664,7 @@ func listDataFilesBelowUntil(
 	plans []*readPlan,
 	dataPath string,
 	until Offset,
+	consistency ConsistencyLevel,
 ) ([]string, error) {
 	var cutoff time.Time
 	filter := false
@@ -680,7 +682,7 @@ func listDataFilesBelowUntil(
 	return runPlansConcurrent(ctx, plans,
 		func(ctx context.Context, plan *readPlan) ([]string, error) {
 			return listDataFilesForPlan(
-				ctx, target, plan, dataPath, filter, cutoff)
+				ctx, target, plan, dataPath, filter, cutoff, consistency)
 		}, identityKey)
 }
 
@@ -694,12 +696,14 @@ func listDataFilesForPlan(
 	dataPath string,
 	filter bool,
 	cutoff time.Time,
+	consistency ConsistencyLevel,
 ) ([]string, error) {
 	paginator := target.list(plan.ListPrefix)
+	opts := withConsistencyControl(consistency)
 
 	var keys []string
 	for paginator.HasMorePages() {
-		page, err := target.listPage(ctx, paginator)
+		page, err := target.listPage(ctx, paginator, opts)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: backfill list data files: %w", err)
@@ -738,8 +742,9 @@ func backfillMarkersForObject[T any, K comparable](
 	idx *Index[K],
 	of func(T) []K,
 	key string,
+	consistency ConsistencyLevel,
 ) ([]string, int, error) {
-	data, err := target.get(ctx, key)
+	data, err := target.get(ctx, key, withConsistencyControl(consistency))
 	if err != nil {
 		return nil, 0, fmt.Errorf(
 			"s3parquet: backfill get %s: %w", key, err)

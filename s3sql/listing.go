@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
 	"github.com/ueisele/s3store/internal/core"
 )
 
@@ -28,6 +29,11 @@ const listFanOutConcurrency = 8
 // pattern becomes one plan, each plan gets one LIST, and the
 // resulting file URIs go into a single read_parquet([...]) call
 // so DuckDB plans once over the full set.
+//
+// Carries ReaderConfig.ConsistencyControl on the LIST so the file
+// set linearizes with Writer-side PUTs on strong-global /
+// strong-site StorageGRID. Empty → no header → bucket default
+// (correct on AWS S3 / MinIO).
 func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *core.ReadPlan,
 ) ([]core.KeyMeta, error) {
@@ -37,9 +43,19 @@ func (s *Reader[T]) listMatchingParquet(
 			Prefix: aws.String(plan.ListPrefix),
 		})
 
+	var apiOpts []func(*middleware.Stack) error
+	if s.cfg.ConsistencyControl != "" {
+		apiOpts = []func(*middleware.Stack) error{
+			core.AddHeaderMiddleware(
+				"Consistency-Control", string(s.cfg.ConsistencyControl)),
+		}
+	}
+
 	var out []core.KeyMeta
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := paginator.NextPage(ctx, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
+		})
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3sql: list data files: %w", err)

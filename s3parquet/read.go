@@ -392,10 +392,11 @@ func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *readPlan,
 ) ([]core.KeyMeta, error) {
 	paginator := s.cfg.Target.list(plan.ListPrefix)
+	opts := withConsistencyControl(s.cfg.ConsistencyControl)
 
 	var out []core.KeyMeta
 	for paginator.HasMorePages() {
-		page, err := s.cfg.Target.listPage(ctx, paginator)
+		page, err := s.cfg.Target.listPage(ctx, paginator, opts)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: list data files: %w", err)

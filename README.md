@@ -1036,8 +1036,19 @@ consistency level. The umbrella `Config` forwards a single value to
 both halves. On AWS / MinIO the header is an unknown string and is
 ignored, so leaving `ConsistencyControl` empty is correct there.
 
-The configured `ConsistencyControl` also drives:
+The configured `ConsistencyControl` drives every
+correctness-critical S3 call on both halves:
 
+- **Write path.** Data PUT (idempotent), ref PUT, index marker
+  PUTs, and the scoped retry-LIST used by `WithIdempotencyToken`
+  to dedup refs on retry.
+- **Read path — `s3parquet`.** Data-file partition LIST, data
+  GET, row-group HEAD + ranged-GETs, `Index.Lookup` marker LIST,
+  `BackfillIndex` data LIST + data GET + marker PUT (from
+  `IndexDef.ConsistencyControl`).
+- **Read path — `s3sql`.** Partition LIST (sends the header);
+  data GET goes through DuckDB's `httpfs` and does **not** carry
+  the header — see the [DuckDB caveat](#duckdb-httpfs-has-no-per-request-header-hook).
 - **Ref-stream `Poll` LIST.** The same header is sent on the
   paginator so a newly-written ref is LIST-visible before `Poll`'s
   cutoff can advance past it on StorageGRID `strong-*`. Without
@@ -1567,7 +1578,84 @@ for any reasonable `SettleWindow`.
 
 ## Durability guarantees
 
-The contract is **at-least-once** on both sides of the wire.
+The contract is **at-least-once** on both sides of the wire, plus
+**read-after-write** on every operation except `Poll` / `PollRecords`
+/ `PollRecordsAll` (which deliberately lag the live tip by
+`SettleWindow` to tolerate S3 LIST propagation skew — see
+[Settle window](#settle-window)).
+
+### Read-after-write
+
+If `Write` (or `WriteWithKey`) returns success, every one of the
+following operations issued from any process against the same
+bucket sees the new records immediately — no sleep, no settle
+delay:
+
+| Operation | Sub-package |
+|---|---|
+| `s3parquet.Reader.Read` / `ReadIter` / `ReadIterWhere` (+ `*Many` variants) | `s3parquet` |
+| `s3parquet.Index.Lookup` / `LookupMany` | `s3parquet` |
+| `s3parquet.BackfillIndex` / `BackfillIndexMany` | `s3parquet` |
+| `s3sql.Reader.Read` / `ReadMany` | `s3sql` ¹ |
+| `s3sql.Reader.Query` / `QueryRow` / `QueryMany` / `QueryRowMany` | `s3sql` ¹ |
+| Umbrella `Store.Read` / `Query` / `QueryRow` | forwards to `s3sql` ¹ |
+
+¹ On the `s3sql` / umbrella side the **LIST** is read-after-write,
+but the **GET** of the parquet body goes through DuckDB's `httpfs`
+extension — see the [DuckDB caveat](#duckdb-httpfs-has-no-per-request-header-hook) below.
+
+`Poll` / `PollRecords` / `PollRecordsAll` are the intentional
+exceptions: they apply the `SettleWindow` cutoff so near-tip refs
+stay hidden until S3 LIST propagation has had time to settle. A
+ref that's written inside the window will be returned by a
+subsequent poll issued after one `SettleWindow` has elapsed.
+
+#### What you need to configure
+
+- **AWS S3 / MinIO.** Nothing. Both backends give strong
+  read-after-write on LIST and GET by default. Leave
+  `ConsistencyControl` unset.
+- **StorageGRID (NetApp).** Set `ConsistencyControl:
+  ConsistencyStrongGlobal` (multi-site) or `ConsistencyStrongSite`
+  (single-site) on the `Config` / `WriterConfig` / `ReaderConfig`
+  you build. The library propagates the `Consistency-Control`
+  header through every PUT, GET, HEAD, and LIST that carries a
+  correctness-critical payload (data, refs, index markers,
+  partition listings). `BackfillIndex` takes the level from
+  `IndexDef.ConsistencyControl` — set it explicitly on the def
+  when running a backfill on StorageGRID. See
+  [StorageGRID / NetApp setup](#storagegrid--netapp-setup) for
+  the full configuration, including the overwrite-prevention
+  bucket policy.
+
+#### DuckDB httpfs has no per-request header hook
+
+One caveat on the `s3sql` / umbrella read path: DuckDB reads
+parquet files through its `httpfs` extension, which supports
+`s3_endpoint` / `s3_region` / `s3_use_ssl` / `s3_url_style`
+settings but exposes **no mechanism to attach an arbitrary HTTP
+header per request**. The Go-side LIST that discovers files
+carries `Consistency-Control`, so StorageGRID returns the correct
+set of file URIs — but the subsequent DuckDB-issued GETs do not.
+
+On AWS S3 / MinIO this is a non-issue (their GET is strong
+regardless of the header). On StorageGRID with the bucket default
+at `read-after-new-write`, an `s3sql.Reader.Read` issued inside a
+few hundred milliseconds of a `Write` may fetch a stale body for
+a file whose key **is** visible in the LIST.
+
+Workarounds on StorageGRID:
+
+- **Raise the bucket's default consistency** to `strong-global`
+  / `strong-site` globally on the StorageGRID side. DuckDB's GETs
+  then inherit the strong level.
+- **Route strong-read paths through `s3parquet` directly.**
+  `s3parquet.Reader.Read` + `Index.Lookup` + `BackfillIndex` all
+  carry the header on both LIST and GET, so they stay
+  read-after-write regardless of the bucket default.
+- **Accept the lag on `s3sql`.** If stale reads within a few
+  hundred ms of write are tolerable (analytics dashboards,
+  backfilled warehousing), nothing else is required.
 
 ### Write
 
@@ -1924,6 +2012,12 @@ rush it.
   `s3sql`'s DuckDB path, which treats its input URI list as
   authoritative — a dangling ref fails the whole call. Use
   `s3parquet` directly if you need the tolerant read path.
+- **`s3sql` GET on StorageGRID can't be forced to strong**
+  (DuckDB `httpfs` has no per-request HTTP header setting, so
+  `ConsistencyControl` can't be attached to the parquet-body GET).
+  Raise the bucket-default consistency on the StorageGRID side or
+  route strong-read paths through `s3parquet` directly. AWS S3 /
+  MinIO are unaffected. See [Read-after-write](#read-after-write).
 - **Schema evolution is limited to tolerant reads.** Both packages handle
   "column added to T that isn't in an old file" by returning the Go zero
   value. Renames, splits, type changes, and row-level computed
