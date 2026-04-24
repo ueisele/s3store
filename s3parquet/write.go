@@ -916,6 +916,7 @@ func (s *Writer[T]) putMarkersParallel(
 	if len(paths) == 0 {
 		return nil
 	}
+	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -951,11 +952,18 @@ func (s *Writer[T]) putMarkersParallel(
 
 	// First real error wins; skip cancellations so we report the
 	// root-cause failure instead of the cancellation it triggered
-	// in sibling goroutines.
+	// in sibling goroutines. If every goroutine bailed with
+	// Canceled, check parentCtx so a caller-triggered cancel
+	// surfaces as an error rather than a nil-return that would
+	// misrepresent a cancelled marker commit as a successful one
+	// to any future caller refactoring this site.
 	for _, err := range errs {
 		if err == nil || errors.Is(err, context.Canceled) {
 			continue
 		}
+		return err
+	}
+	if err := parentCtx.Err(); err != nil {
 		return err
 	}
 	return nil

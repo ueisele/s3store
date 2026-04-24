@@ -572,6 +572,7 @@ func BackfillIndexMany[T any, K comparable](
 	}
 	stats.DataObjects = len(keys)
 
+	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -640,14 +641,20 @@ func BackfillIndexMany[T any, K comparable](
 	stats.Records = int(recordsTotal.Load())
 	stats.Markers = int(markersTotal.Load())
 
-	// First real error wins; skip cancellations so we report
-	// the root-cause failure rather than the cancel it
-	// triggered in sibling goroutines.
+	// First real error wins; skip cancellations so we report the
+	// root-cause failure rather than the cancel it triggered in
+	// sibling goroutines. If every goroutine bailed with Canceled,
+	// check parentCtx so a caller-triggered cancel surfaces as an
+	// error — otherwise a partial backfill looks like a completed
+	// one.
 	for _, e := range errs {
 		if e == nil || errors.Is(e, context.Canceled) {
 			continue
 		}
 		return stats, e
+	}
+	if err := parentCtx.Err(); err != nil {
+		return stats, err
 	}
 	return stats, nil
 }

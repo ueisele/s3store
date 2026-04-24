@@ -175,6 +175,7 @@ func (s *Reader[T]) downloadFilteredAll(
 	results := make([][]versionedRecord[T], len(keys))
 	errs := make([]error, len(keys))
 
+	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -203,11 +204,18 @@ func (s *Reader[T]) downloadFilteredAll(
 	}
 	wg.Wait()
 
+	// Skip sibling-cancel errors so the root-cause failure wins;
+	// if every goroutine bailed with Canceled, check parentCtx so
+	// a caller-triggered cancel surfaces as an error instead of
+	// an empty result.
 	for _, e := range errs {
 		if e == nil || errors.Is(e, context.Canceled) {
 			continue
 		}
 		return nil, e
+	}
+	if err := parentCtx.Err(); err != nil {
+		return nil, err
 	}
 
 	total := 0

@@ -497,6 +497,7 @@ func (s *Reader[T]) downloadAndDecodeAll(
 	results := make([][]versionedRecord[T], len(keys))
 	errs := make([]error, len(keys))
 
+	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -527,12 +528,19 @@ func (s *Reader[T]) downloadAndDecodeAll(
 
 	// First-error wins: we cancel on the first failure so later
 	// goroutines see ctx.Err(); return the earliest "real"
-	// error rather than a cancellation.
+	// error rather than a cancellation. If every goroutine bailed
+	// with Canceled, check parentCtx — if it was the caller
+	// cancelling (not our internal sibling-cancel), surface the
+	// cancellation so a partial empty result isn't mistaken for
+	// "no matching records".
 	for _, e := range errs {
-		if e == nil || e == context.Canceled {
+		if e == nil || errors.Is(e, context.Canceled) {
 			continue
 		}
 		return nil, e
+	}
+	if err := parentCtx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Count for preallocation.

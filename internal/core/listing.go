@@ -59,6 +59,7 @@ func RunPlansConcurrent[P any, R any](
 	results := make([][]R, len(plans))
 	errs := make([]error, len(plans))
 
+	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -87,11 +88,18 @@ func RunPlansConcurrent[P any, R any](
 	}
 	wg.Wait()
 
+	// Skip sibling-cancel errors so the root-cause failure wins;
+	// if every goroutine bailed with Canceled, check parentCtx so
+	// a caller-triggered cancel surfaces as an error rather than
+	// collapsing into an empty-and-successful result.
 	for _, e := range errs {
 		if e == nil || errors.Is(e, context.Canceled) {
 			continue
 		}
 		return nil, e
+	}
+	if err := parentCtx.Err(); err != nil {
+		return nil, err
 	}
 	return UnionKeys(results, keyOf), nil
 }
