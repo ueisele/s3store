@@ -611,6 +611,7 @@ func (t S3Target) ListDataFiles(
 				out = append(out, core.KeyMeta{
 					Key:        objKey,
 					InsertedAt: aws.ToTime(obj.LastModified),
+					Size:       aws.ToInt64(obj.Size),
 				})
 			}
 		}

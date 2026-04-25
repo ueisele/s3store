@@ -196,12 +196,7 @@ func (s *Reader[T]) ReadManyIter(
 			return
 		}
 
-		readAhead := o.ReadAheadPartitions
-		if readAhead < 0 {
-			readAhead = 0
-		}
-		s.streamByPartition(ctx, keys, o.IncludeHistory, readAhead,
-			s.downloadAndDecodeAll, yield)
+		s.streamEager(ctx, keys, &o, yield)
 	}
 }
 

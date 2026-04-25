@@ -68,6 +68,16 @@ func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }
 
+// WithReadAheadBytes caps the cumulative uncompressed parquet
+// bytes that may sit decoded in the ReadIter / ReadManyIter
+// pipeline ahead of the current yield position. Composes with
+// WithReadAheadPartitions — whichever cap binds first holds the
+// producer back. See core.WithReadAheadBytes for the full
+// contract.
+func WithReadAheadBytes(n int64) QueryOption {
+	return core.WithReadAheadBytes(n)
+}
+
 // WithIdempotentRead makes Read / ReadIter / ReadMany /
 // ReadManyIter / ReadIterWhere / ReadManyIterWhere / PollRecords
 // retry-safe: the result reflects state as of the first write of

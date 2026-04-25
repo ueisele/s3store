@@ -703,26 +703,57 @@ issue — we can follow up with a streaming fold that trades the code
 simplicity for peak memory proportional to unique entities rather
 than total records.
 
-**Prefetch with `WithReadAheadPartitions(n)`**: by default, the next
-partition's download only starts after the current partition's yield
-loop finishes. For layouts with many small partitions where S3
-round-trip latency dominates, pass `WithReadAheadPartitions(n)` to
-run a background producer that keeps up to `n` partitions prefetched
-ahead of the yield position:
+**Pipeline shape**: downloads are continuous and not partition-bound.
+A worker pool of `MaxInflightRequests` goroutines pulls files in
+partition+file order; cross-partition lookahead happens automatically.
+A separate decoder walks partitions in lex order — for each, it waits
+until all files are downloaded, parses each parquet footer to compute
+the partition's exact uncompressed size, gates on the budget, decodes,
+and pushes to the yield loop.
+
+**Two budget knobs**, evaluated together — whichever binds first
+holds the producer back:
+
+- `WithReadAheadPartitions(n)`: at most `n` decoded partitions sit
+  buffered ahead of the yield position. Default `0` is strict-serial
+  on the decode side (downloads still run ahead).
+- `WithReadAheadBytes(n int64)`: at most `n` uncompressed bytes (read
+  from each parquet file's footer — exact, not a heuristic) sit
+  decoded in the buffer. Default `0` disables the byte cap.
 
 ```go
+// Many small partitions: prefetch generously by count.
 for r, err := range store.ReadIter(ctx, "*",
-    s3parquet.WithReadAheadPartitions(4)) {
-    // ... consumer work overlaps with downloads of the next 4 partitions
-}
+    s3parquet.WithReadAheadPartitions(8)) { ... }
+
+// Skewed partition sizes (mostly tiny + a few large): cap by bytes
+// so prefetch self-throttles on the large ones. Decoded Go memory
+// typically runs 1–2× the uncompressed size depending on data
+// shape (string headers, slice/map pointer overhead).
+for r, err := range store.ReadIter(ctx, "*",
+    s3parquet.WithReadAheadBytes(2<<30)) { ... } // ≤ 2 GiB
+
+// Combine — useful when both axes matter.
+for r, err := range store.ReadIter(ctx, "*",
+    s3parquet.WithReadAheadPartitions(8),
+    s3parquet.WithReadAheadBytes(2<<30)) { ... }
 ```
 
-Trade-off: memory grows to at most `n + 2` partitions' worth of
-records (one being yielded, `n` buffered, one in the producer's hand
-while waiting to send). Speed-up is bounded by how much of your
-per-partition yield time would otherwise sit idle waiting for
-downloads. Default `0` preserves strict-serial semantics — existing
-callers see no change.
+**Trade-off**: peak memory ≈ `WithReadAheadBytes` + one in-flight
+decode + the compressed bodies for files queued ahead in the
+download stage (bounded by `MaxInflightRequests`). Speed-up is
+bounded by how much of your per-partition yield time would
+otherwise sit idle waiting for downloads.
+
+**Single oversized partition**: if one partition's uncompressed
+total exceeds `WithReadAheadBytes` on its own, that partition still
+flows (the cap can't bind below partition granularity without
+row-group-level streaming). The cap only prevents *additional*
+partitions from joining the buffer.
+
+`WithReadAheadBytes` is a no-op on `ReadIterWhere` — that path uses
+ranged GETs and never holds whole bodies in memory, so the byte
+budget concept doesn't apply.
 
 ### Snapshot — row-group pruning (`ReadIterWhere`)
 

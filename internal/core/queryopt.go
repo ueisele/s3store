@@ -25,6 +25,16 @@ type QueryOpts struct {
 	// Ignored by read paths that don't partition work this way
 	// (s3sql, which streams through DuckDB).
 	ReadAheadPartitions int
+	// ReadAheadBytes caps the cumulative uncompressed parquet
+	// bytes that may sit decoded in the streaming read pipeline
+	// ahead of the current yield position. Zero disables the cap
+	// (only ReadAheadPartitions binds). The value is checked
+	// against the sum of each buffered partition's
+	// total_uncompressed_size as reported by the parquet footer
+	// — exact, not a heuristic. Decoded Go memory typically runs
+	// 1–2× the uncompressed size depending on data shape (string
+	// headers, slice/map pointer overhead).
+	ReadAheadBytes int64
 	// IdempotentReadToken, when set, filters the LIST result so
 	// the Read returns state as of the first write of the given
 	// idempotency token — the caller's own prior attempts are
@@ -88,6 +98,37 @@ func WithUntilOffset(until Offset) QueryOption {
 func WithReadAheadPartitions(n int) QueryOption {
 	return func(o *QueryOpts) {
 		o.ReadAheadPartitions = n
+	}
+}
+
+// WithReadAheadBytes caps the cumulative uncompressed parquet
+// bytes that may sit decoded in the ReadIter / ReadManyIter
+// pipeline ahead of the current yield position. Zero (default)
+// disables the cap; only WithReadAheadPartitions binds.
+//
+// Composes with WithReadAheadPartitions — both are evaluated and
+// whichever cap binds first holds the producer back. Useful when
+// partition sizes are skewed: a tiny WithReadAheadPartitions(1)
+// is too conservative for many small partitions but a larger
+// value risks OOM on a few large ones; a byte cap auto-tunes
+// across both.
+//
+// The byte total is read from each parquet file's footer
+// (total_uncompressed_size summed across row groups), so the
+// cap is exact, not a heuristic. Decoded Go memory typically
+// runs 1–2× the uncompressed size depending on data shape.
+//
+// Per-partition guarantee: if a single partition's uncompressed
+// size exceeds the cap, that one partition still decodes (the
+// cap can't be enforced below the partition granularity without
+// row-group-level streaming). The cap only prevents *additional*
+// partitions from joining the buffer.
+//
+// No-op on read paths that don't stream partition-by-partition
+// (s3sql, ReadIterWhere).
+func WithReadAheadBytes(n int64) QueryOption {
+	return func(o *QueryOpts) {
+		o.ReadAheadBytes = n
 	}
 }
 
