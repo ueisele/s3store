@@ -1871,6 +1871,79 @@ func TestPollRecordsIter_EarlyBreak(t *testing.T) {
 	}
 }
 
+// TestPollRecordsIter_SnapshotsLiveTipCutoff guards the
+// snapshot-at-entry contract for OffsetUnbounded(until):
+// writes that land AFTER the iter starts must not appear in the
+// yielded records. Without the snapshot, sustained writes during
+// the walk would keep the now-SettleWindow cutoff advancing and
+// the loop could expose them — defeating the "single-pass over
+// the stream as of this call" guarantee.
+func TestPollRecordsIter_SnapshotsLiveTipCutoff(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// Phase 1: pre-existing writes.
+	for i := range 3 {
+		if _, err := store.WriteWithKey(ctx,
+			fmt.Sprintf("period=2026-03-17/customer=pre%d", i),
+			[]Rec{{Period: "2026-03-17",
+				Customer: fmt.Sprintf("pre%d", i),
+				SKU:      "s1", Value: int64(i)}},
+		); err != nil {
+			t.Fatalf("Write pre %d: %v", i, err)
+		}
+	}
+	// Wait past the settle window so the pre-writes are visible.
+	time.Sleep(400 * time.Millisecond)
+
+	// Phase 2: start the iter, then write more concurrently. The
+	// concurrent writes are timed AFTER iter entry — the snapshot
+	// must exclude them.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Small head-start so iter has definitely entered before
+		// the post-writes land.
+		time.Sleep(50 * time.Millisecond)
+		for i := range 5 {
+			if _, err := store.WriteWithKey(ctx,
+				fmt.Sprintf("period=2026-03-17/customer=post%d", i),
+				[]Rec{{Period: "2026-03-17",
+					Customer: fmt.Sprintf("post%d", i),
+					SKU:      "s1", Value: int64(100 + i)}},
+			); err != nil {
+				t.Errorf("Write post %d: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	// Drain — should only see the 3 pre-writes, not the 5 post-writes.
+	got := map[string]bool{}
+	for r, err := range store.PollRecordsIter(ctx,
+		s3parquet.OffsetUnbounded, s3parquet.OffsetUnbounded) {
+		if err != nil {
+			t.Fatalf("PollRecordsIter: %v", err)
+		}
+		got[r.Customer] = true
+	}
+	wg.Wait()
+
+	for i := range 3 {
+		want := fmt.Sprintf("pre%d", i)
+		if !got[want] {
+			t.Errorf("expected %q in iter output, missing", want)
+		}
+	}
+	for i := range 5 {
+		bad := fmt.Sprintf("post%d", i)
+		if got[bad] {
+			t.Errorf("post-iter-entry write %q leaked into iter output", bad)
+		}
+	}
+}
+
 // ParquetField is a named int8 enum, mirroring the shape a
 // go-enum generator would produce. Declared at package scope
 // so Store[T] generic instantiation works at integration-test

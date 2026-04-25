@@ -30,11 +30,14 @@ type Offset string
 // on which parameter it's passed to:
 //
 //   - As `since`: start at the stream head (earliest available).
-//   - As `until`: walk to the live tip (now - SettleWindow). This
-//     does NOT tail — the iter / call terminates once the cutoff
-//     is reached. New writes that land after the walk completes
-//     are not picked up; call again from the last offset to keep
-//     up.
+//   - As `until`: walk to the live tip (now - SettleWindow) as
+//     of the call. PollRecordsIter snapshots this cutoff at
+//     entry, so the walk has a stable upper bound and terminates
+//     even under sustained writes — writes landing after the
+//     call started are NOT picked up. Single-call APIs (Poll,
+//     PollRecords) likewise return entries up to the call-time
+//     cutoff. To keep up with new writes, call again from the
+//     last offset.
 //
 // Equivalent to Offset("") — use the named constant at call sites
 // for self-documenting intent.

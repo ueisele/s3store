@@ -170,13 +170,13 @@ func (s *Reader[T]) PollRecords(
 //
 // Pass OffsetUnbounded for since to start at the stream head;
 // pass OffsetUnbounded for until to walk to the settle-window
-// cutoff (= live tip as of the call). Single-pass: terminates
-// when the walk catches up to the cutoff, does NOT tail. Each
-// internal Poll computes its own now-based cutoff, so writes
-// landing during the walk may still be picked up; writes landing
-// after termination are not. To keep up with new writes, call
-// PollRecordsIter (or PollRecords) again with the last seen
-// offset. Combine with OffsetAt for time windows.
+// cutoff (= live tip as of the call). The cutoff is snapshotted
+// at call entry, so the walk has a stable upper bound and
+// terminates even under sustained writes — writes landing
+// after the call started are NOT picked up. To keep up with new
+// writes, call again from the last seen offset (use PollRecords
+// for offset checkpointing). Combine with OffsetAt for time
+// windows.
 //
 // Dedup semantics match ReadIter: per-partition (refs are
 // grouped into partitions by Hive key inside streamEager). If
@@ -196,6 +196,19 @@ func (s *Reader[T]) PollRecordsIter(
 	since, until Offset,
 	opts ...QueryOption,
 ) iter.Seq2[T, error] {
+	// Snapshot the live-tip cutoff at call entry when the caller
+	// asked for "until live tip". Without this, a busy writer
+	// could keep the walk running indefinitely: each internal Poll
+	// computes its own now-SettleWindow cutoff, which advances as
+	// time passes during the walk, so writes landing in that
+	// window keep getting exposed and the loop never sees an
+	// empty page. Snapshotting freezes the upper bound at "the
+	// stream as of this call".
+	if until == OffsetUnbounded {
+		settleAt := time.Now().Add(
+			-s.cfg.Target.EffectiveSettleWindow())
+		until = s.OffsetAt(settleAt)
+	}
 	// Append Until last so it wins over any WithUntilOffset the
 	// caller snuck in via opts — the `until` parameter is the
 	// method's contract.
