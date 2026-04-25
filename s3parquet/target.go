@@ -229,18 +229,9 @@ func (t S3Target) S3Client() *s3.Client { return t.cfg.S3Client }
 // PartitionKeyParts returns the configured Hive-partition keys.
 func (t S3Target) PartitionKeyParts() []string { return t.cfg.PartitionKeyParts }
 
-// SettleWindow returns the configured SettleWindow as-is (zero
-// when unset). Use EffectiveSettleWindow for the resolved value.
-func (t S3Target) SettleWindow() time.Duration { return t.cfg.SettleWindow }
-
 // DisableRefStream reports whether the dataset is configured to
 // skip ref-stream emission.
 func (t S3Target) DisableRefStream() bool { return t.cfg.DisableRefStream }
-
-// MaxInflightRequests returns the configured cap as-is (zero
-// when unset). Use EffectiveMaxInflightRequests for the resolved
-// value.
-func (t S3Target) MaxInflightRequests() int { return t.cfg.MaxInflightRequests }
 
 // EffectiveSettleWindow forwards to S3TargetConfig.EffectiveSettleWindow.
 func (t S3Target) EffectiveSettleWindow() time.Duration {
