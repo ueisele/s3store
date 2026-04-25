@@ -153,13 +153,12 @@ func (s *Reader[T]) PollRecords(
 // streaming, cross-file pipelining, and per-partition dedup.
 //
 // Memory: streamEager bounds in-flight body memory via
-// WithReadAheadBytes (uncompressed-byte cap) and
-// WithReadAheadPartitions (partition-count cap) — both default
-// to 0 (strict-serial decode, but downloads still run ahead).
-// Both apply here just as on ReadIter (no-op on the older
-// slice-batch shape). KeyMeta slice is small (~100 bytes per
-// ref), so even windows of 100k+ refs stay well under MB of
-// metadata before streaming begins.
+// WithReadAheadPartitions (partition-count cap, default 1 = one
+// partition lookahead) and WithReadAheadBytes (uncompressed-byte
+// cap, default 0 = uncapped). Both apply here just as on
+// ReadIter. KeyMeta slice is small (~100 bytes per ref), so even
+// windows of 100k+ refs stay well under MB of metadata before
+// streaming begins.
 //
 // Latency note: walking refs upfront means LIST completes before
 // the first record yields. For typical windows (last hour, last

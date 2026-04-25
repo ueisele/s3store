@@ -550,10 +550,10 @@ The range is half-open `[since, until)`, matching Kafka offset semantics.
 `PollRecordsIter` is the entry point for bounded windows. It returns
 an `iter.Seq2[T, error]` backed by the same `streamEager` pipeline
 that powers `ReadIter` — partition prefetch
-(`WithReadAheadPartitions`, default 0 = strict-serial), byte-budget
-streaming (`WithReadAheadBytes`, default 0 = uncapped), cross-file
-pipelining, per-partition dedup. Memory is bounded by whichever cap
-binds first (or by the largest single partition if both are 0):
+(`WithReadAheadPartitions`, default 1 = one partition lookahead),
+byte-budget streaming (`WithReadAheadBytes`, default 0 = uncapped),
+cross-file pipelining, per-partition dedup. Memory is bounded by
+whichever cap binds first:
 
 ```go
 // All records written on 2026-04-17 (UTC).
@@ -723,8 +723,10 @@ and pushes to the yield loop.
 holds the producer back:
 
 - `WithReadAheadPartitions(n)`: at most `n` decoded partitions sit
-  buffered ahead of the yield position. Default `0` is strict-serial
-  on the decode side (downloads still run ahead).
+  buffered ahead of the yield position. Default `1` — one-partition
+  lookahead so decode of N+1 overlaps yield of N. Values < 1 are
+  floored to 1 (strict-serial decode is no longer offered as a
+  public mode; use the byte cap for tighter bounds).
 - `WithReadAheadBytes(n int64)`: at most `n` uncompressed bytes (read
   from each parquet file's footer — exact, not a heuristic) sit
   decoded in the buffer. Default `0` disables the byte cap.

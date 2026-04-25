@@ -62,7 +62,8 @@ func WithUntilOffset(until Offset) QueryOption {
 
 // WithReadAheadPartitions tells ReadIter / ReadManyIter /
 // PollRecordsIter to prefetch n partitions ahead of the yield
-// position. Default (n == 0) is strict-serial. See
+// position. Default is 1 (one partition lookahead so decode of
+// N+1 overlaps yield of N). Values < 1 are floored to 1. See
 // core.WithReadAheadPartitions for the full contract.
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)

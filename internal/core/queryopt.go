@@ -82,20 +82,21 @@ func WithUntilOffset(until Offset) QueryOption {
 
 // WithReadAheadPartitions tells ReadIter / ReadManyIter /
 // PollRecordsIter to prefetch n partitions ahead of the current
-// yield position. Each
-// partition is downloaded + decoded into a single buffered batch;
-// a background producer keeps the pipeline topped up to n ahead
-// while the main goroutine yields records from the current batch.
+// yield position. Default is 1 — minimum useful lookahead so
+// decode of partition N+1 overlaps yield of partition N. Pass a
+// larger value for more aggressive prefetch on consumers that do
+// non-trivial per-record work; combine with WithReadAheadBytes
+// to bound stacking of skewed-size partitions. Values < 1 are
+// floored to 1 (strict-serial decode is no longer offered as a
+// public mode — the byte cap handles bounded-memory pipelines).
 //
-// Default (n == 0) is strict-serial: one partition downloaded,
-// fully yielded, then the next. n >= 1 hides the consumer's
-// per-partition work time behind the next partition's download,
-// at O(n+1 partitions) memory (current + n prefetched). Good
-// default for workloads with many small partitions where S3
-// round-trip latency dominates wall time.
+// Each partition is downloaded + decoded into a single buffered
+// batch; a background decoder keeps the pipeline topped up to n
+// ahead while the main goroutine yields records from the current
+// batch. Memory: O((n+1) partitions) — current + n prefetched.
 //
-// Negative values are clamped to 0. No-op on read paths that
-// don't stream partition-by-partition (s3sql).
+// No-op on read paths that don't stream partition-by-partition
+// (s3sql).
 func WithReadAheadPartitions(n int) QueryOption {
 	return func(o *QueryOpts) {
 		o.ReadAheadPartitions = n

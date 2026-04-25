@@ -125,11 +125,11 @@ func (s *Reader[T]) ReadMany(
 // within each partition on both paths.
 //
 // Prefetch: WithReadAheadPartitions(n) runs a background
-// producer that downloads up to n partitions ahead of the yield
-// position. Default 0 = strict-serial. Useful when the consumer
-// does non-trivial per-record work — hides the next partition's
-// S3 round trips behind the current partition's yield loop at
-// O((n+1) partitions) peak memory.
+// decoder that holds up to n partitions ahead of the yield
+// position. Default 1 — minimum useful lookahead so decode of
+// N+1 overlaps yield of N. Larger values help when the consumer
+// does non-trivial per-record work, at O((n+1) partitions) peak
+// memory.
 func (s *Reader[T]) ReadIter(
 	ctx context.Context, keyPattern string, opts ...QueryOption,
 ) iter.Seq2[T, error] {

@@ -110,9 +110,12 @@ func (s *Reader[T]) streamEager(
 	})
 
 	// Stage 3: decoder. Channel cap = ReadAheadPartitions so the
-	// pipeline buffers up to N decoded partitions ahead. ≥0
-	// guarantees a usable buffer even at the default.
-	readAheadParts := max(0, opts.ReadAheadPartitions)
+	// pipeline buffers up to N decoded partitions ahead. Floor at
+	// 1 so the default (zero value) gets one-partition lookahead —
+	// decode of partition N+1 overlaps yield of partition N, the
+	// minimum useful pipeline shape. To bound stacking when N>1,
+	// use WithReadAheadBytes.
+	readAheadParts := max(1, opts.ReadAheadPartitions)
 	decodedCh := make(chan decodedBatch[T], readAheadParts)
 	wg.Go(func() { s.runDecoder(ctx, state, opts, decodedCh) })
 
