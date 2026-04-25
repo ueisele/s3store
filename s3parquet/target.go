@@ -109,16 +109,19 @@ type S3TargetConfig struct {
 	// so the cap holds across every fan-out axis (partitions,
 	// files, patterns, markers) without per-axis tuning.
 	//
-	// Zero → default (8), matching the AWS SDK's default
-	// http.Transport.MaxConnsPerHost so the library cap doesn't
-	// outrun the connection pool.
+	// Zero → default (8). The cap is per S3Target: one Writer +
+	// one Reader sharing the same constructed S3Target share the
+	// cap; two Targets do not.
 	//
-	// The cap is per S3Target (one Writer + one Reader sharing the
-	// same constructed S3Target share the cap; two Targets do not).
-	// If you raise this above ~10 or run many Targets concurrently,
-	// raise http.Transport.MaxConnsPerHost on the *s3.Client to
-	// match — otherwise excess requests queue at the transport
-	// layer instead of running in parallel.
+	// The AWS SDK v2's default HTTP transport leaves
+	// MaxConnsPerHost unlimited (Go default 0) and sets
+	// MaxIdleConnsPerHost to 100, so this library cap is what
+	// bounds parallelism for stock-configured clients — no
+	// transport tuning is needed at the defaults. Only if you've
+	// explicitly set a non-zero MaxConnsPerHost on your
+	// *s3.Client's transport does it need to be >=
+	// MaxInflightRequests, otherwise excess requests queue at the
+	// transport layer instead of running in parallel.
 	MaxInflightRequests int
 }
 

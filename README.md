@@ -452,10 +452,16 @@ the ones that succeeded.
 
 > The cap is per `S3Target`, not library-wide. A Writer and a
 > Reader built from the same `S3Target` share the cap. Two
-> Targets do not. If you raise this above ~10 or run many Targets
-> concurrently, raise `http.Transport.MaxConnsPerHost` on your
-> `*s3.Client` (default ~10) to match, or excess requests will
-> queue at the transport layer instead of running in parallel.
+> Targets do not.
+>
+> The AWS SDK v2's default HTTP transport leaves
+> `MaxConnsPerHost` unlimited and sets `MaxIdleConnsPerHost` to
+> 100, so the library cap is what bounds parallelism for
+> stock-configured clients — no transport tuning needed. Only if
+> you've explicitly set a non-zero `MaxConnsPerHost` on your
+> `*s3.Client`'s transport, make sure it's ≥ `MaxInflightRequests`
+> (or excess requests queue at the transport instead of running
+> in parallel).
 
 ### Stream — refs only
 
