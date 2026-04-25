@@ -434,11 +434,14 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	if err != nil {
 		return nil, fmt.Errorf("s3parquet: decode %s: %w", key, err)
 	}
-	return s.wrapVersioned(recs, fileName, km.InsertedAt), nil
+	return s.wrapVersioned(
+		make([]versionedRecord[T], 0, len(recs)),
+		recs, fileName, km.InsertedAt), nil
 }
 
-// wrapVersioned attaches each decoded record to its
-// versionedRecord envelope. insertedAt source priority:
+// wrapVersioned appends a wrapped versionedRecord per element of
+// recs onto out and returns the grown slice. insertedAt source
+// priority per record:
 //
 //  1. When InsertedAtField is configured AND the decoded column
 //     value is non-zero, use it — the writer-populated wall clock,
@@ -448,13 +451,17 @@ func (s *Reader[T]) downloadAndDecodeOne(
 //     sort + DefaultVersionOf monotonic during an InsertedAtField
 //     rollout without forcing a rewrite of historical data.
 //
-// Used by every decode path so the field-stamping rule lives in
-// one place.
+// Taking out as a parameter (rather than returning a fresh slice)
+// avoids the per-file intermediate in streaming reads —
+// decodePartition passes its pre-sized partition-wide slice and
+// each wrapped record lands directly there, no copy. Synchronous
+// callers pass an empty slice with cap = len(recs); same single
+// allocation but no internal intermediate.
 func (s *Reader[T]) wrapVersioned(
-	recs []T, fileName string, fallbackTime time.Time,
+	out []versionedRecord[T], recs []T,
+	fileName string, fallbackTime time.Time,
 ) []versionedRecord[T] {
-	out := make([]versionedRecord[T], len(recs))
-	for j, r := range recs {
+	for j := range recs {
 		ia := fallbackTime
 		if s.insertedAtFieldIndex != nil {
 			colVal := reflect.ValueOf(&recs[j]).Elem().
@@ -464,11 +471,11 @@ func (s *Reader[T]) wrapVersioned(
 				ia = colVal
 			}
 		}
-		out[j] = versionedRecord[T]{
-			rec:        r,
+		out = append(out, versionedRecord[T]{
+			rec:        recs[j],
 			insertedAt: ia,
 			fileName:   fileName,
-		}
+		})
 	}
 	return out
 }
