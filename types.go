@@ -116,7 +116,7 @@ type Config[T any] struct {
 	// files under <Prefix>/_stream/refs/. Saves one S3 PUT per
 	// distinct partition key touched by a Write. Read / Query /
 	// ReadMany / QueryMany are unaffected; Poll / PollRecords /
-	// PollRecordsAll return ErrRefStreamDisabled. OffsetAt still
+	// PollRecordsIter return ErrRefStreamDisabled. OffsetAt still
 	// works (pure timestamp encoding).
 	DisableRefStream bool
 
@@ -142,7 +142,7 @@ type Config[T any] struct {
 }
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /
-// PollRecordsAll when Config.DisableRefStream is set. Aliased
+// PollRecordsIter when Config.DisableRefStream is set. Aliased
 // to the shared sentinel so errors.Is matches regardless of
 // which sub-handle produced the error.
 var ErrRefStreamDisabled = s3parquet.ErrRefStreamDisabled

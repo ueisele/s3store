@@ -21,7 +21,7 @@ import (
 //
 //   - Write, WriteWithKey, PartitionKey           → s3parquet.Writer
 //   - Read, ReadMany, ReadIter, ReadManyIter,
-//     Poll, OffsetAt, PollRecords, PollRecordsAll → s3parquet.Reader
+//     Poll, OffsetAt, PollRecords, PollRecordsIter → s3parquet.Reader
 //   - Query, QueryMany                            → s3sql.Reader
 //
 // Importing this package transitively pulls in DuckDB (cgo). For
@@ -223,13 +223,15 @@ func (s *Store[T]) PollRecords(
 	return s.parquetReader.PollRecords(ctx, since, maxEntries, opts...)
 }
 
-// PollRecordsAll reads every record in [since, until) via
-// repeated PollRecords calls. Convenience wrapper for bounded
-// windows. Pair with OffsetAt for time-based windows.
-func (s *Store[T]) PollRecordsAll(
+// PollRecordsIter streams every record in [since, until) as an
+// iter.Seq2[T, error]. Lazy: each batch's PollRecords call only
+// fires when the consumer drains the previous batch. Memory
+// scales with one batch (~pollAllBatch refs), not the full
+// window. Pair with OffsetAt for time-based windows.
+func (s *Store[T]) PollRecordsIter(
 	ctx context.Context,
 	since, until Offset,
 	opts ...QueryOption,
-) ([]T, error) {
-	return s.parquetReader.PollRecordsAll(ctx, since, until, opts...)
+) iter.Seq2[T, error] {
+	return s.parquetReader.PollRecordsIter(ctx, since, until, opts...)
 }

@@ -3,6 +3,7 @@ package s3parquet
 import (
 	"context"
 	"fmt"
+	"iter"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -13,7 +14,7 @@ import (
 // s3ListMaxKeys is the per-request page-size cap enforced by S3.
 const s3ListMaxKeys int32 = 1000
 
-// pollAllBatch is the inner batch size used by PollRecordsAll.
+// pollAllBatch is the inner batch size used by PollRecordsIter.
 // Tuned for S3 LIST page size so the inner paginator does one
 // LIST per iteration at steady state.
 const pollAllBatch int32 = 1000
@@ -149,11 +150,13 @@ func (s *Reader[T]) PollRecords(
 	return s.sortAndCollect(records, o.IncludeHistory), newOffset, nil
 }
 
-// PollRecordsAll reads every record in [since, until) in one
-// call. Internally loops PollRecords until the window is drained,
-// so memory scales with window size rather than stream length
-// and any S3 / decode error surfaces from the batch where it
-// happened.
+// PollRecordsIter streams every record in [since, until) as an
+// iter.Seq2[T, error]. Each batch is fetched lazily — the next
+// PollRecords call only fires when the consumer drains the
+// current batch, so memory scales with one batch's worth of
+// records (≈ pollAllBatch refs) rather than the full window.
+// A consumer that breaks out of the range loop cleanly stops
+// further polling.
 //
 // Pass Offset("") for since to start at the stream head;
 // pass Offset("") for until to read to the settle-window
@@ -162,40 +165,51 @@ func (s *Reader[T]) PollRecords(
 // Dedup semantics match PollRecords: per-batch. If you need
 // window-global latest-per-entity, pass WithHistory and dedup
 // client-side.
-func (s *Reader[T]) PollRecordsAll(
+//
+// Errors are yielded as (zero-value, err); the loop must check
+// err before using the record. The iter terminates after an
+// error.
+func (s *Reader[T]) PollRecordsIter(
 	ctx context.Context,
 	since, until Offset,
 	opts ...QueryOption,
-) ([]T, error) {
+) iter.Seq2[T, error] {
 	// Append Until last so it wins over any WithUntilOffset the
 	// caller snuck in via opts — the `until` parameter is the
 	// method's contract.
 	opts = append(opts, WithUntilOffset(until))
 
-	var all []T
-	for {
-		batch, next, err := s.PollRecords(ctx, since, pollAllBatch, opts...)
-		if err != nil {
-			return nil, err
+	return func(yield func(T, error) bool) {
+		for {
+			batch, next, err := s.PollRecords(
+				ctx, since, pollAllBatch, opts...)
+			if err != nil {
+				yield(*new(T), err)
+				return
+			}
+			if len(batch) == 0 {
+				return
+			}
+			for _, r := range batch {
+				if !yield(r, nil) {
+					return
+				}
+			}
+			since = next
 		}
-		if len(batch) == 0 {
-			return all, nil
-		}
-		all = append(all, batch...)
-		since = next
 	}
 }
 
 // OffsetAt returns the stream offset corresponding to wall-clock
 // time t: any ref written at or after t sorts >= the returned
 // offset, any ref written before t sorts <. Pure computation —
-// no S3 call. Pair with WithUntilOffset (or PollRecordsAll's
+// no S3 call. Pair with WithUntilOffset (or PollRecordsIter's
 // until parameter) to read records within a time window. To
 // cover a full day, until is the start of the *next* day:
 //
 //	start := store.OffsetAt(time.Date(y, m, d,   0,0,0,0, loc))
 //	end   := store.OffsetAt(time.Date(y, m, d+1, 0,0,0,0, loc))
-//	records, _ := store.PollRecordsAll(ctx, start, end)
+//	for r, err := range store.PollRecordsIter(ctx, start, end) { ... }
 func (s *Reader[T]) OffsetAt(t time.Time) Offset {
 	return Offset(core.RefCutoff(s.refPath, t, 0))
 }

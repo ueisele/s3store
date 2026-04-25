@@ -42,7 +42,7 @@ type ReaderConfig[T any] struct {
 }
 
 // Reader is the read-side half of a Store. Owns Read / Poll /
-// PollRecords / PollRecordsAll / OffsetAt. Construct directly
+// PollRecords / PollRecordsIter / OffsetAt. Construct directly
 // via NewReader in read-only services, or via
 // NewReaderFromWriter / NewReaderFromStore for a (possibly
 // narrower-T) Reader over a Writer's / Store's data.

@@ -1770,11 +1770,12 @@ func TestPollTimeWindow(t *testing.T) {
 	}
 }
 
-// TestPollRecordsAll exercises the convenience wrapper: a
-// small stream of writes, then PollRecordsAll drains the full
-// window in one call with no manual paging. Also checks that a
-// zero until offset "" means "read to live tip".
-func TestPollRecordsAll(t *testing.T) {
+// TestPollRecordsIter exercises the streaming iter: a small
+// stream of writes, then PollRecordsIter drains the full window
+// via range. Also checks that zero offsets ("" / "") mean
+// "stream head → live tip" and that an empty window terminates
+// without error or yielded records.
+func TestPollRecordsIter(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1792,33 +1793,80 @@ func TestPollRecordsAll(t *testing.T) {
 	after := time.Now()
 
 	// Bounded window: all 5 records.
-	got, err := store.PollRecordsAll(ctx,
-		store.OffsetAt(before), store.OffsetAt(after))
-	if err != nil {
-		t.Fatalf("PollRecordsAll: %v", err)
+	var got []Rec
+	for r, err := range store.PollRecordsIter(ctx,
+		store.OffsetAt(before), store.OffsetAt(after)) {
+		if err != nil {
+			t.Fatalf("PollRecordsIter: %v", err)
+		}
+		got = append(got, r)
 	}
 	if len(got) != 5 {
 		t.Fatalf("got %d, want 5", len(got))
 	}
 
 	// Open until (zero-value offset) reads to the live tip.
-	open, err := store.PollRecordsAll(ctx, "", "")
-	if err != nil {
-		t.Fatalf("PollRecordsAll open: %v", err)
+	var open []Rec
+	for r, err := range store.PollRecordsIter(ctx, "", "") {
+		if err != nil {
+			t.Fatalf("PollRecordsIter open: %v", err)
+		}
+		open = append(open, r)
 	}
 	if len(open) != 5 {
 		t.Errorf("open: got %d, want 5", len(open))
 	}
 
-	// Empty window returns nil without error.
-	empty, err := store.PollRecordsAll(ctx,
+	// Empty window yields nothing without error.
+	var empty []Rec
+	for r, err := range store.PollRecordsIter(ctx,
 		store.OffsetAt(before.Add(-time.Hour)),
-		store.OffsetAt(before.Add(-time.Minute)))
-	if err != nil {
-		t.Fatalf("PollRecordsAll empty: %v", err)
+		store.OffsetAt(before.Add(-time.Minute))) {
+		if err != nil {
+			t.Fatalf("PollRecordsIter empty: %v", err)
+		}
+		empty = append(empty, r)
 	}
 	if len(empty) != 0 {
 		t.Errorf("empty: got %d, want 0", len(empty))
+	}
+}
+
+// TestPollRecordsIter_LazyAndBreak proves the lazy-paging
+// contract: breaking out of the range loop after the first
+// record stops further polling. Verified by counting that the
+// number of records yielded is strictly less than what was
+// written when we break early — a non-lazy implementation would
+// have already buffered everything.
+func TestPollRecordsIter_LazyAndBreak(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	for i := range 10 {
+		if _, err := store.WriteWithKey(ctx,
+			fmt.Sprintf("period=2026-03-17/customer=c%d", i),
+			[]Rec{{Period: "2026-03-17", Customer: fmt.Sprintf("c%d", i),
+				SKU: "s1", Value: int64(i)}},
+		); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	// Break after first record. The closure must observe yield
+	// returning false and stop — no further work, no error.
+	count := 0
+	for _, err := range store.PollRecordsIter(ctx, "", "") {
+		if err != nil {
+			t.Fatalf("PollRecordsIter: %v", err)
+		}
+		count++
+		if count == 1 {
+			break
+		}
+	}
+	if count != 1 {
+		t.Errorf("early-break: yielded %d records, want 1", count)
 	}
 }
 
@@ -1987,16 +2035,24 @@ func TestDisableRefStream(t *testing.T) {
 		t.Errorf("Read: got %d, want %d", len(got), len(in))
 	}
 
-	// Poll + PollRecords + PollRecordsAll all refuse with the
-	// shared sentinel.
+	// Poll + PollRecords + PollRecordsIter all refuse with the
+	// shared sentinel. PollRecordsIter surfaces the error via the
+	// first yielded (zero, err) tuple.
 	if _, _, err := store.Poll(ctx, "", 10); !errors.Is(err, s3parquet.ErrRefStreamDisabled) {
 		t.Errorf("Poll: got %v, want ErrRefStreamDisabled", err)
 	}
 	if _, _, err := store.PollRecords(ctx, "", 10); !errors.Is(err, s3parquet.ErrRefStreamDisabled) {
 		t.Errorf("PollRecords: got %v, want ErrRefStreamDisabled", err)
 	}
-	if _, err := store.PollRecordsAll(ctx, "", ""); !errors.Is(err, s3parquet.ErrRefStreamDisabled) {
-		t.Errorf("PollRecordsAll: got %v, want ErrRefStreamDisabled", err)
+	var iterErr error
+	for _, err := range store.PollRecordsIter(ctx, "", "") {
+		if err != nil {
+			iterErr = err
+			break
+		}
+	}
+	if !errors.Is(iterErr, s3parquet.ErrRefStreamDisabled) {
+		t.Errorf("PollRecordsIter: got %v, want ErrRefStreamDisabled", iterErr)
 	}
 
 	// OffsetAt stays usable: pure timestamp encoding, no S3

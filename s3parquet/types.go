@@ -8,7 +8,7 @@ import (
 )
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /
-// PollRecordsAll when the Target has DisableRefStream set. The
+// PollRecordsIter when the Target has DisableRefStream set. The
 // dataset was written without ref files, so there is no stream
 // to tail. OffsetAt stays usable (pure timestamp encoding).
 //
@@ -16,7 +16,7 @@ import (
 // matches whether the caller imported s3store or s3parquet.
 var ErrRefStreamDisabled = errors.New(
 	"ref stream disabled on this Store; " +
-		"Poll/PollRecords/PollRecordsAll unavailable")
+		"Poll/PollRecords/PollRecordsIter unavailable")
 
 // Offset represents a position in the stream.
 type Offset = core.Offset

@@ -137,7 +137,7 @@ type Config[T any] struct {
 
 	// DisableRefStream opts this dataset out of writing stream ref
 	// files. Saves one S3 PUT per distinct partition key touched
-	// by a Write. Poll / PollRecords / PollRecordsAll return
+	// by a Write. Poll / PollRecords / PollRecordsIter return
 	// ErrRefStreamDisabled when set. See S3Target.DisableRefStream
 	// for the full contract.
 	DisableRefStream bool

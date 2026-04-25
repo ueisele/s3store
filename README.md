@@ -547,15 +547,24 @@ To read only records written within a time window (e.g. "yesterday's
 activity"), use `OffsetAt` to turn a wall-clock time into a stream offset.
 The range is half-open `[since, until)`, matching Kafka offset semantics.
 
-`PollRecordsAll` is the convenience entry point for bounded windows —
-one call, internal batching, no manual paging:
+`PollRecordsIter` is the entry point for bounded windows. It returns
+an `iter.Seq2[T, error]` that lazily fetches the next batch only when
+the consumer drains the previous one — memory scales with one batch
+(~1000 refs' worth of records), not the full window:
 
 ```go
 // All records written on 2026-04-17 (UTC).
 start := store.OffsetAt(time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC))
 end   := store.OffsetAt(time.Date(2026, 4, 18, 0, 0, 0, 0, time.UTC))
-records, err := store.PollRecordsAll(ctx, start, end)
+for r, err := range store.PollRecordsIter(ctx, start, end) {
+    if err != nil { return err }
+    // process r
+}
 ```
+
+Breaking out of the range loop cleanly stops further polling (no extra
+LIST). If you genuinely want a slice of everything in the window,
+`slices.Collect2` it; the iter form is the primitive.
 
 Half-open boundary semantics:
 
@@ -574,8 +583,8 @@ Pass `s3store.Offset("")` (or `s3parquet.Offset("")` / `s3sql.Offset("")`
 when using the sub-packages directly) for `since` to start at the stream
 head, or for `until` to read to the live tip (settle-window cutoff).
 
-For streaming (bounded memory on long windows, or processing in batches),
-use `PollRecords` with `WithUntilOffset`:
+For manual paging (e.g. checkpointing offsets between batches), use
+`PollRecords` with `WithUntilOffset`:
 
 ```go
 start := store.OffsetAt(yesterdayStart)
@@ -593,7 +602,7 @@ for {
 `OffsetAt` is pure computation — no S3 call. `WithUntilOffset` breaks
 the paginator early once offsets reach `until`, so long streams aren't
 scanned past the window of interest. All three APIs — `OffsetAt`,
-`WithUntilOffset`, `PollRecordsAll` — are available on the umbrella,
+`WithUntilOffset`, `PollRecordsIter` — are available on the umbrella,
 `s3parquet`, and `s3sql`.
 
 ### Stream — opting out (`DisableRefStream`)
@@ -620,9 +629,10 @@ Effect on each method:
 - **`Read` / `ReadMany` / `ReadIter` / `ReadManyIter` / `Query` /
   `QueryMany` / `Lookup` / `BackfillIndex`** — unaffected. They
   LIST `data/` (or `_index/<name>/`) directly and never consult refs.
-- **`Poll` / `PollRecords` / `PollRecordsAll`** — return
+- **`Poll` / `PollRecords` / `PollRecordsIter`** — return
   `s3store.ErrRefStreamDisabled` (shared sentinel, matches
-  `errors.Is` across packages).
+  `errors.Is` across packages). `PollRecordsIter` surfaces the
+  error via the first yielded `(zero, err)` tuple.
 - **`OffsetAt`** — still works. It's pure timestamp encoding with no
   S3 dependency, so it keeps returning well-formed offsets even
   though there's no stream to compare them against.
@@ -1113,7 +1123,7 @@ not diverging ones).
 **Scope** — accepted by every read path:
 
 - `s3parquet.Reader`: `Read`, `ReadIter`, `ReadMany`,
-  `ReadManyIter`, `PollRecords`, `PollRecordsAll`.
+  `ReadManyIter`, `PollRecords`, `PollRecordsIter`.
 - `s3sql.Reader`: `Query`, `QueryMany`.
 - Umbrella `Store`: all of the above forward through.
 
@@ -1478,7 +1488,7 @@ for any reasonable `SettleWindow`.
 
 The contract is **at-least-once** on both sides of the wire, plus
 **read-after-write** on every operation except `Poll` / `PollRecords`
-/ `PollRecordsAll` (which deliberately lag the live tip by
+/ `PollRecordsIter` (which deliberately lag the live tip by
 `SettleWindow` to tolerate S3 LIST propagation skew — see
 [Settle window](#settle-window)).
 
@@ -1507,7 +1517,7 @@ GET sees the committed bytes regardless. See the
 [DuckDB note](#duckdb-httpfs-has-no-per-request-header-hook) for
 the full reasoning.
 
-`Poll` / `PollRecords` / `PollRecordsAll` are the intentional
+`Poll` / `PollRecords` / `PollRecordsIter` are the intentional
 exceptions: they apply the `SettleWindow` cutoff so near-tip refs
 stay hidden until S3 LIST propagation has had time to settle. A
 ref that's written inside the window will be returned by a
