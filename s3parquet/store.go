@@ -156,7 +156,7 @@ type Config[T any] struct {
 	ConsistencyControl ConsistencyLevel
 
 	// MaxInflightRequests caps S3 requests in flight per call.
-	// Zero → default (8). Forwarded onto the shared S3Target
+	// Zero → default (32). Forwarded onto the shared S3Target
 	// so both Writer and Reader see the same cap. See
 	// S3Target.MaxInflightRequests for the full contract.
 	MaxInflightRequests int

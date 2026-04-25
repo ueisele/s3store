@@ -109,7 +109,7 @@ type S3TargetConfig struct {
 	// so the cap holds across every fan-out axis (partitions,
 	// files, patterns, markers) without per-axis tuning.
 	//
-	// Zero → default (8). The cap is per S3Target: one Writer +
+	// Zero → default (32). The cap is per S3Target: one Writer +
 	// one Reader sharing the same constructed S3Target share the
 	// cap; two Targets do not.
 	//
@@ -139,12 +139,18 @@ func (c S3TargetConfig) EffectiveSettleWindow() time.Duration {
 }
 
 // EffectiveMaxInflightRequests returns the configured
-// MaxInflightRequests, or 8 when unset.
+// MaxInflightRequests, or 32 when unset. 32 utilises typical S3
+// backends (~50 ms request latency → ~640 req/s sustained per
+// Target) while staying comfortably below per-project concurrency
+// caps published by managed S3 vendors (typically several hundred
+// concurrent operations). Tune lower for small MinIO setups or
+// very large parquet files (memory cost = 32 × largest parquet
+// body).
 func (c S3TargetConfig) EffectiveMaxInflightRequests() int {
 	if c.MaxInflightRequests > 0 {
 		return c.MaxInflightRequests
 	}
-	return 8
+	return 32
 }
 
 // Validate runs the full check for constructors that operate on

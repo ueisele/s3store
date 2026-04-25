@@ -40,7 +40,7 @@ type WriterConfig[T any] struct {
 	// marker or ref PUT failure). When true, orphan objects
 	// remain at their S3 keys for bucket lifecycle policies to
 	// garbage-collect. Set when the writer lacks DELETE permission
-	// (common in STACKIT / StorageGRID deployments with a narrowly-
+	// (common in StorageGRID deployments with a narrowly-
 	// scoped service account).
 	DisableCleanup bool
 

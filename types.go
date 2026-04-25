@@ -105,7 +105,7 @@ type Config[T any] struct {
 	DisableRefStream bool
 
 	// MaxInflightRequests caps S3 requests in flight per library
-	// call. Zero → default (8). Forwarded to the shared
+	// call. Zero → default (32). Forwarded to the shared
 	// s3parquet.S3Target so Writer and Reader share one cap. See
 	// s3parquet.S3Target.MaxInflightRequests for the full contract
 	// and the http.Transport.MaxConnsPerHost interaction.

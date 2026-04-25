@@ -436,7 +436,7 @@ Typical pairing: one day's worth of multi-customer data in one file,
 read back one customer at a time.
 
 `Write` fans out per-partition work in parallel, bounded by the
-`S3Target`-level `MaxInflightRequests` semaphore (default 8). The
+`S3Target`-level `MaxInflightRequests` semaphore (default 32). The
 semaphore is acquired by every PUT/GET/HEAD/LIST inside the
 target, so net in-flight S3 requests stay ≤ `MaxInflightRequests`
 regardless of fan-out axis — the partition fan-out balances

@@ -67,7 +67,7 @@ func refPutBudget(settleWindow time.Duration) time.Duration {
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
 // key in parallel (bounded by Target.MaxInflightRequests,
-// default 8). Returns one WriteResult per partition that
+// default 32). Returns one WriteResult per partition that
 // completed, in sorted-key order regardless of completion order.
 //
 // On failure, cancels remaining partitions and returns whatever

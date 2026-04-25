@@ -322,7 +322,7 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 
 // TestEffectiveMaxInflightRequests guards the fan-out cap
 // resolution: positive user values win, zero falls back to the
-// default (8). Negative gets the default too — NewS3Target sizes
+// default (32). Negative gets the default too — NewS3Target sizes
 // the semaphore from the same value, so the cap shows up at every
 // fan-out site uniformly.
 func TestEffectiveMaxInflightRequests(t *testing.T) {
@@ -331,9 +331,9 @@ func TestEffectiveMaxInflightRequests(t *testing.T) {
 		set  int
 		want int
 	}{
-		{"zero uses default", 0, 8},
-		{"negative uses default", -1, 8},
-		{"positive wins", 32, 32},
+		{"zero uses default", 0, 32},
+		{"negative uses default", -1, 32},
+		{"positive wins", 64, 64},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

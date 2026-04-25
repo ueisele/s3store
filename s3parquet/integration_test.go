@@ -2166,7 +2166,7 @@ func TestWrite_ParallelResultsSorted(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	// More partitions than the default MaxInflightRequests (8) to force
+	// 10 partitions exercises the partition fan-out path even though it
 	// semaphore contention and scheduling variance across runs.
 	periods := []string{
 		"2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04",
