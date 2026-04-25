@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
@@ -390,17 +391,12 @@ func (s *Writer[T]) findExistingRef(
 	lo, hi := core.RefRangeForRetry(s.refPath, now, maxRetryAge)
 	settleCutoffUs := now.Add(
 		-s.cfg.Target.EffectiveSettleWindow()).UnixMicro()
-	paginator := s.cfg.Target.listRange(s.refPath+"/", lo)
-	for paginator.HasMorePages() {
-		page, err := s.cfg.Target.listPage(
-			ctx, paginator,
-			s.cfg.ConsistencyControl)
-		if err != nil {
-			return "", err
-		}
-		for _, obj := range page.Contents {
+	var found string
+	err := s.cfg.Target.listEach(ctx, s.refPath+"/", lo, 0,
+		s.cfg.ConsistencyControl,
+		func(obj s3types.Object) (bool, error) {
 			if obj.Key == nil {
-				continue
+				return true, nil
 			}
 			if *obj.Key > hi {
 				// Past the retry window. Lex compare holds because
@@ -408,7 +404,7 @@ func (s *Writer[T]) findExistingRef(
 				// (16 digits post-2001), so lex order matches
 				// numeric order — same assumption RefCutoff and
 				// RefRangeForRetry's lo already rely on.
-				return "", nil
+				return false, nil
 			}
 			_, refTsMicros, id, _, err := core.ParseRefKey(*obj.Key)
 			if err != nil {
@@ -416,10 +412,10 @@ func (s *Writer[T]) findExistingRef(
 				// future schema the parser doesn't understand)
 				// aren't our retry target — skip rather than fail
 				// the write.
-				continue
+				return true, nil //nolint:nilerr // intentional: skip malformed
 			}
 			if id != token {
-				continue
+				return true, nil
 			}
 			if refTsMicros < settleCutoffUs {
 				// Stale match: the ref sits past the settle cutoff
@@ -427,12 +423,15 @@ func (s *Writer[T]) findExistingRef(
 				// some consumers may have advanced past it. Skip,
 				// so the caller emits a fresh ref that every
 				// consumer can still yield.
-				continue
+				return true, nil
 			}
-			return *obj.Key, nil
-		}
+			found = *obj.Key
+			return false, nil
+		})
+	if err != nil {
+		return "", err
 	}
-	return "", nil
+	return found, nil
 }
 
 // cleanupOrphanData runs the best-effort delete for an orphaned

@@ -448,44 +448,14 @@ func (t S3Target) del(ctx context.Context, key string) error {
 	})
 }
 
-// list returns a paginator over objects under a prefix. Callers
-// iterate via HasMorePages + listPage; no in-memory accumulation
-// here — large prefixes must stream. The paginator itself does
-// no I/O — listPage is what acquires the semaphore on each page
-// fetch.
-func (t S3Target) list(prefix string) *s3.ListObjectsV2Paginator {
-	return s3.NewListObjectsV2Paginator(
-		t.cfg.S3Client, &s3.ListObjectsV2Input{
-			Bucket: aws.String(t.cfg.Bucket),
-			Prefix: aws.String(prefix),
-		})
-}
-
-// listRange returns a paginator over objects in the lexical
-// string range [startAfter, endInclusive]. Used by the
-// idempotent-retry path: bounded LIST on the ref stream scoped
-// to [now - MaxRetryAge, now] keeps the scan cost independent of
-// stream length. StartAfter is exclusive on the S3 side, which
-// is fine — the caller pads the lower bound into a tsMicros
-// prefix that never matches a real ref key directly.
-func (t S3Target) listRange(
-	prefix, startAfter string,
-) *s3.ListObjectsV2Paginator {
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(t.cfg.Bucket),
-		Prefix: aws.String(prefix),
-	}
-	if startAfter != "" {
-		input.StartAfter = aws.String(startAfter)
-	}
-	return s3.NewListObjectsV2Paginator(t.cfg.S3Client, input)
-}
-
 // listPage fetches the next page from p, wrapping NextPage in
 // the standard transient-error retry loop. Acquires a semaphore
 // slot for the duration of the fetch. A failed NextPage does not
 // advance the paginator's continuation token, so retrying
 // re-requests the same page cleanly.
+//
+// Internal building block of listEach — no current direct caller
+// outside this file.
 func (t S3Target) listPage(
 	ctx context.Context, p *s3.ListObjectsV2Paginator,
 	consistency ConsistencyLevel,
@@ -506,6 +476,59 @@ func (t S3Target) listPage(
 	return out, err
 }
 
+// listEach iterates objects under prefix in S3 lex order,
+// invoking fn for each. fn returns cont=false to stop early; an
+// fn error short-circuits and surfaces unwrapped to the caller.
+// Each page fetch goes through listPage (semaphore + retry +
+// Consistency-Control header).
+//
+// startAfter is the S3 StartAfter (exclusive lower bound; ""
+// starts at the prefix's lex head). pageSize caps MaxKeys per
+// request (0 leaves it at the S3 default of 1000); useful when
+// the caller knows it only needs a few hundred objects so a
+// single page round-trip suffices.
+//
+// Single LIST primitive across the library — partition LIST,
+// index marker LIST, ref-stream LIST (Poll), and the bounded
+// retry-dedup LIST (findExistingRef) all funnel through here so
+// the "semaphore + retry + consistency header" wrapping is
+// implemented once.
+func (t S3Target) listEach(
+	ctx context.Context,
+	prefix, startAfter string,
+	pageSize int32,
+	consistency ConsistencyLevel,
+	fn func(s3types.Object) (cont bool, err error),
+) error {
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(t.cfg.Bucket),
+		Prefix: aws.String(prefix),
+	}
+	if startAfter != "" {
+		input.StartAfter = aws.String(startAfter)
+	}
+	if pageSize > 0 {
+		input.MaxKeys = aws.Int32(pageSize)
+	}
+	paginator := s3.NewListObjectsV2Paginator(t.cfg.S3Client, input)
+	for paginator.HasMorePages() {
+		page, err := t.listPage(ctx, paginator, consistency)
+		if err != nil {
+			return err
+		}
+		for _, obj := range page.Contents {
+			cont, err := fn(obj)
+			if err != nil {
+				return err
+			}
+			if !cont {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
 // ListDataFiles returns every parquet object under the plan's
 // ListPrefix whose Hive key matches the plan's predicate, each
 // carrying S3 LastModified so downstream filters
@@ -524,22 +547,16 @@ func (t S3Target) ListDataFiles(
 	consistency ConsistencyLevel,
 ) ([]core.KeyMeta, error) {
 	dataPath := core.DataPath(t.cfg.Prefix)
-	paginator := t.list(plan.ListPrefix)
-
 	var out []core.KeyMeta
-	for paginator.HasMorePages() {
-		page, err := t.listPage(ctx, paginator, consistency)
-		if err != nil {
-			return nil, fmt.Errorf("list data files: %w", err)
-		}
-		for _, obj := range page.Contents {
+	err := t.listEach(ctx, plan.ListPrefix, "", 0, consistency,
+		func(obj s3types.Object) (bool, error) {
 			objKey := aws.ToString(obj.Key)
 			if !strings.HasSuffix(objKey, ".parquet") {
-				continue
+				return true, nil
 			}
 			hiveKey, ok := core.HiveKeyOfDataFile(objKey, dataPath)
 			if !ok {
-				continue
+				return true, nil
 			}
 			if plan.Match(hiveKey) {
 				out = append(out, core.KeyMeta{
@@ -548,7 +565,10 @@ func (t S3Target) ListDataFiles(
 					Size:       aws.ToInt64(obj.Size),
 				})
 			}
-		}
+			return true, nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("list data files: %w", err)
 	}
 	return out, nil
 }

@@ -379,30 +379,26 @@ func (i *Index[K]) valuesToEntry(values []string) K {
 func (i *Index[K]) listMatchingMarkers(
 	ctx context.Context, plan *core.ReadPlan,
 ) ([]string, error) {
-	paginator := i.target.list(plan.ListPrefix)
-
-	var keys []string
 	suffix := "/" + core.IndexMarkerFilename
-	for paginator.HasMorePages() {
-		page, err := i.target.listPage(
-			ctx, paginator, i.consistency)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: index %q list: %w", i.name, err)
-		}
-		for _, obj := range page.Contents {
+	var keys []string
+	err := i.target.listEach(ctx, plan.ListPrefix, "", 0, i.consistency,
+		func(obj s3types.Object) (bool, error) {
 			key := aws.ToString(obj.Key)
 			if !strings.HasSuffix(key, suffix) {
-				continue
+				return true, nil
 			}
 			hiveKey, ok := hiveKeyOfMarker(key, i.indexPath)
 			if !ok {
-				continue
+				return true, nil
 			}
 			if plan.Match(hiveKey) {
 				keys = append(keys, key)
 			}
-		}
+			return true, nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: index %q list: %w", i.name, err)
 	}
 	return keys, nil
 }
@@ -653,34 +649,30 @@ func listDataFilesForPlan(
 	cutoff time.Time,
 	consistency ConsistencyLevel,
 ) ([]string, error) {
-	paginator := target.list(plan.ListPrefix)
-
 	var keys []string
-	for paginator.HasMorePages() {
-		page, err := target.listPage(
-			ctx, paginator, consistency)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: backfill list data files: %w", err)
-		}
-		for _, obj := range page.Contents {
+	err := target.listEach(ctx, plan.ListPrefix, "", 0, consistency,
+		func(obj s3types.Object) (bool, error) {
 			objKey := aws.ToString(obj.Key)
 			if !strings.HasSuffix(objKey, ".parquet") {
-				continue
+				return true, nil
 			}
 			hiveKey, ok := core.HiveKeyOfDataFile(objKey, dataPath)
 			if !ok {
-				continue
+				return true, nil
 			}
 			if !plan.Match(hiveKey) {
-				continue
+				return true, nil
 			}
 			if filter && obj.LastModified != nil &&
 				!obj.LastModified.Before(cutoff) {
-				continue
+				return true, nil
 			}
 			keys = append(keys, objKey)
-		}
+			return true, nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: backfill list data files: %w", err)
 	}
 	return keys, nil
 }

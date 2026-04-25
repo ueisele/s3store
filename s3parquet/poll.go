@@ -6,8 +6,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go/middleware"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ueisele/s3store/internal/core"
 )
 
@@ -53,60 +52,27 @@ func (s *Reader[T]) Poll(
 	cutoffPrefix := core.RefCutoff(s.refPath, time.Now(),
 		s.cfg.Target.EffectiveSettleWindow())
 
-	pageSize := min(maxEntries, s3ListMaxKeys)
-
-	input := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(s.cfg.Target.Bucket()),
-		Prefix:  aws.String(s.refPath + "/"),
-		MaxKeys: aws.Int32(pageSize),
-	}
-	if since != "" {
-		input.StartAfter = aws.String(string(since))
-	}
-
-	paginator := s3.NewListObjectsV2Paginator(
-		s.cfg.Target.S3Client(), input)
-
-	// Consistency-Control header surfaces here (and only here) for
-	// the ref-stream LIST. Empty value sends no header — correct on
-	// AWS S3 / MinIO; required on StorageGRID strong-global to
-	// linearize the LIST with concurrent ref PUTs.
-	var apiOpts []func(*middleware.Stack) error
-	if s.cfg.ConsistencyControl != "" {
-		apiOpts = []func(*middleware.Stack) error{
-			core.AddHeaderMiddleware(
-				"Consistency-Control",
-				string(s.cfg.ConsistencyControl)),
-		}
-	}
-
 	var entries []StreamEntry
 	var lastKey string
 
-outer:
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx, func(o *s3.Options) {
-			o.APIOptions = append(o.APIOptions, apiOpts...)
-		})
-		if err != nil {
-			return nil, since,
-				fmt.Errorf("s3parquet: list refs: %w", err)
-		}
-		for _, obj := range page.Contents {
+	err := s.cfg.Target.listEach(ctx,
+		s.refPath+"/", string(since),
+		min(maxEntries, s3ListMaxKeys),
+		s.cfg.ConsistencyControl,
+		func(obj s3types.Object) (bool, error) {
 			if int32(len(entries)) >= maxEntries {
-				break outer
+				return false, nil
 			}
 			objKey := aws.ToString(obj.Key)
 			if objKey > cutoffPrefix {
-				break outer
+				return false, nil
 			}
 			if o.Until != "" && objKey >= string(o.Until) {
-				break outer
+				return false, nil
 			}
 			key, _, id, dataTsMicros, err := core.ParseRefKey(objKey)
 			if err != nil {
-				return nil, since,
-					fmt.Errorf("s3parquet: parse ref: %w", err)
+				return false, fmt.Errorf("parse ref: %w", err)
 			}
 			entries = append(entries, StreamEntry{
 				Offset:     Offset(objKey),
@@ -116,7 +82,10 @@ outer:
 				InsertedAt: time.UnixMicro(dataTsMicros),
 			})
 			lastKey = objKey
-		}
+			return true, nil
+		})
+	if err != nil {
+		return nil, since, fmt.Errorf("s3parquet: list refs: %w", err)
 	}
 
 	if lastKey != "" {
