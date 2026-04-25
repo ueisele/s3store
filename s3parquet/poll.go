@@ -14,10 +14,19 @@ import (
 // s3ListMaxKeys is the per-request page-size cap enforced by S3.
 const s3ListMaxKeys int32 = 1000
 
-// pollAllBatch is the inner batch size used by PollRecordsIter.
-// Tuned for S3 LIST page size so the inner paginator does one
-// LIST per iteration at steady state.
-const pollAllBatch int32 = 1000
+// pollIterBatch returns the inner batch size used by
+// PollRecordsIter: 2 * EffectiveMaxInflightRequests, capped at
+// the S3 LIST page size. The 2× headroom lets the pipeline
+// producer stage the next batch while the consumer drains the
+// previous one without ballooning the in-memory record count;
+// the cap on s3ListMaxKeys stays inside the LIST page-size limit.
+//
+// At MaxInflightRequests=32 (default) this is 64 — far below the
+// previous static 1000, which materialized up to 1000 decoded
+// files at once.
+func pollIterBatch(t S3Target) int32 {
+	return min(int32(2*t.EffectiveMaxInflightRequests()), s3ListMaxKeys)
+}
 
 // Poll returns up to maxEntries stream entries (refs only) after
 // the given offset, up to now - SettleWindow. Issues one or more
@@ -151,12 +160,23 @@ func (s *Reader[T]) PollRecords(
 }
 
 // PollRecordsIter streams every record in [since, until) as an
-// iter.Seq2[T, error]. Each batch is fetched lazily — the next
-// PollRecords call only fires when the consumer drains the
-// current batch, so memory scales with one batch's worth of
-// records (≈ pollAllBatch refs) rather than the full window.
-// A consumer that breaks out of the range loop cleanly stops
-// further polling.
+// iter.Seq2[T, error]. A background producer goroutine drives
+// PollRecords with batch size = 2 × MaxInflightRequests (capped
+// at the LIST page size) and pushes results onto a buffered
+// channel; the consumer pulls one batch at a time and iterates
+// records out. Steady state pipelines: producer fetches batch
+// N+1 while consumer drains batch N, hiding the LIST + download
+// latency.
+//
+// Memory peak: 2 batches' worth of decoded records (one staged
+// in the channel, one being iterated). With the default
+// MaxInflightRequests=32 that's ~128 files' worth of records,
+// orders of magnitude below the older 1000-files-per-batch
+// shape that risked OOM on wide windows.
+//
+// A consumer that breaks out of the range loop cancels the
+// producer's context via defer; the in-flight LIST/download
+// bails on ctx, the producer exits, the channel closes.
 //
 // Pass Offset("") for since to start at the stream head;
 // pass Offset("") for until to read to the settle-window
@@ -178,24 +198,50 @@ func (s *Reader[T]) PollRecordsIter(
 	// caller snuck in via opts — the `until` parameter is the
 	// method's contract.
 	opts = append(opts, WithUntilOffset(until))
+	batch := pollIterBatch(s.cfg.Target)
 
 	return func(yield func(T, error) bool) {
-		for {
-			batch, next, err := s.PollRecords(
-				ctx, since, pollAllBatch, opts...)
-			if err != nil {
-				yield(*new(T), err)
+		// Cancel propagates to producer when consumer breaks.
+		pollCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		type batchResult struct {
+			recs []T
+			next Offset
+			err  error
+		}
+		// Buffer=1: producer can stage one batch ahead. Larger
+		// would multiply memory; 0 would serialize (no pipeline).
+		ch := make(chan batchResult, 1)
+
+		go func() {
+			defer close(ch)
+			cur := since
+			for {
+				recs, next, err := s.PollRecords(
+					pollCtx, cur, batch, opts...)
+				select {
+				case ch <- batchResult{recs: recs, next: next, err: err}:
+				case <-pollCtx.Done():
+					return
+				}
+				if err != nil || len(recs) == 0 {
+					return
+				}
+				cur = next
+			}
+		}()
+
+		for b := range ch {
+			if b.err != nil {
+				yield(*new(T), b.err)
 				return
 			}
-			if len(batch) == 0 {
-				return
-			}
-			for _, r := range batch {
+			for _, r := range b.recs {
 				if !yield(r, nil) {
 					return
 				}
 			}
-			since = next
 		}
 	}
 }
