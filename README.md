@@ -498,26 +498,38 @@ Whether dedup actually runs depends on which read path you use:
 
 `WithHistory()` forces the no-dedup path in every case.
 
-**Deterministic tie-break on equal versions.** When two writes share
-the same version for the same entity key — common on an at-least-once
-retry that replays a batch with the same domain timestamp — both paths
-resolve the tie the same way: **lex-later filename wins**.
+**Tie-break on equal max version (default dedup, no
+`WithHistory`).** When two writes share the same version for the
+same entity key — common on an at-least-once retry that replays a
+batch with the same domain timestamp — both backends resolve the
+tie the same way: **lex-later filename wins**.
 
-- **`s3parquet`**: input is sorted by `(entityKey, versionOf)` stable
-  on ties; preparePartitions feeds files in lex order, so within a
-  tied (entity, version) group the lex-later file's record is the
-  last one and dedupLatestSeq's `pending` advances onto it.
+- **`s3parquet`**: input is sorted by `(entityKey, versionOf)`
+  stable on ties; preparePartitions feeds files in lex order, so
+  within a tied group the lex-later file's record is the last one
+  and dedupLatestSeq's `pending` advances onto it.
 - **`s3sql`**: secondary `ORDER BY filename DESC` in the dedup CTE
   picks the lex-later filename explicitly.
 
 For the auto-generated `{tsMicros}-{shortID}` id, lex-later =
 wrote-later, so this is "wrote-later wins" in practice. With
 `WithIdempotencyToken` the filename is the caller's token; the
-tie-break follows the token's lex order rather than wall-clock order.
-Use a time-sortable token format (e.g. `{ISO-timestamp}-{suffix}`) if
-you rely on chronological tie-breaking. Stable across repeated reads
-either way. To make ties impossible, ensure `VersionColumn` /
-`VersionOf` strictly increases per write.
+tie-break follows the token's lex order rather than wall-clock
+order. Use a time-sortable token format
+(e.g. `{ISO-timestamp}-{suffix}`) if you rely on chronological
+tie-breaking. Stable across repeated reads either way. To make
+ties impossible, ensure `VersionColumn` / `VersionOf` strictly
+increases per write.
+
+**Replicas under `WithHistory`.** Records that share
+`(entity, version)` describe the same logical write — a retry,
+zombie, or cross-node race — and are by definition equivalent.
+Both backends collapse them to one record; *which physical
+instance is yielded is implementation-defined* because the
+contract treats them as equivalent. If your writer can produce
+records that share `(entity, version)` but differ in content,
+that's a writer-side data quality issue and dedup can't paper
+over it.
 
 ### Per-record "when was this inserted"
 

@@ -92,12 +92,7 @@ func (s *Reader[T]) ReadMany(
 	if err != nil {
 		return nil, err
 	}
-
-	out := make([]T, 0, len(records))
-	for r := range s.sortAndIterate(records, o.IncludeHistory) {
-		out = append(out, r)
-	}
-	return out, nil
+	return s.sortAndCollect(records, o.IncludeHistory), nil
 }
 
 // ReadIter returns an iter.Seq2[T, error] yielding records one
@@ -287,12 +282,16 @@ func sortKeyMetasByKey(files []core.KeyMeta) {
 //   - dedup disabled (sortCmp == nil): yields records in input
 //     order — no sort, no allocation.
 //   - WithHistory + dedup enabled: dedupReplicasSeq collapses
-//     records that share (entity, version) to one (first-seen
-//     wins on ties), preserving distinct versions.
-//   - default: dedupLatestSeq emits the LAST record of each
-//     entity group (sort places max-version last per entity);
-//     replicas collapse as a side effect since ties on version
-//     keep the first-seen via stable sort.
+//     records that share (entity, version) to one. Replicas are
+//     by definition equivalent (same logical write) so the
+//     specific record yielded is implementation-defined.
+//   - default: dedupLatestSeq emits the highest-version record
+//     per entity. Sort places that record LAST in each entity
+//     group; the walker's `pending` advances on every iteration
+//     so when multiple records share the max version (replicas of
+//     the latest write) the LAST one wins — which is the
+//     lex-later filename, matching s3sql's
+//     `ORDER BY filename DESC`.
 //
 // Used by ReadMany / PollRecords (sync, collect into a pre-sized
 // []T) and emitPartition (streaming, yield directly). Returning
@@ -331,6 +330,29 @@ func (s *Reader[T]) emitPartition(
 		}
 	}
 	return true
+}
+
+// sortAndCollect is the sync-caller wrapper around sortAndIterate
+// that materialises the result into a []T. When dedup is disabled
+// (sortCmp == nil) the input slice is returned as-is — no copy,
+// no allocation — since sortAndIterate would just yield each
+// record back unchanged. When dedup is enabled the result is
+// collected into a slice pre-sized to len(records) (an upper
+// bound; the actual size after dedup is ≤ len(records)).
+//
+// Used by ReadMany and PollRecords. Streaming callers
+// (emitPartition) still iterate sortAndIterate directly.
+func (s *Reader[T]) sortAndCollect(
+	records []T, includeHistory bool,
+) []T {
+	if s.sortCmp == nil {
+		return records
+	}
+	out := make([]T, 0, len(records))
+	for r := range s.sortAndIterate(records, includeHistory) {
+		out = append(out, r)
+	}
+	return out
 }
 
 // identityKey is the keyOf function for []string fan-outs — the
@@ -452,16 +474,18 @@ func decodeParquet[T any](data []byte) ([]T, error) {
 }
 
 // dedupReplicasSeq collapses records that share (entity, version)
-// to one, keeping the first occurrence per group. Input MUST be
-// pre-sorted by (entity, version) ascending so equal pairs land
-// adjacent and the one-pass walk works with O(1) state. Only
-// called on the WithHistory path; without WithHistory,
-// dedupLatestSeq absorbs replicas as a side effect of picking
-// the per-entity tail.
+// to one. Input MUST be pre-sorted by (entity, version) ascending
+// so equal pairs land adjacent and the one-pass walk works with
+// O(1) state. Only called on the WithHistory path; without
+// WithHistory, dedupLatestSeq does its own per-entity reduction.
 //
-// "First occurrence" is deterministic because the upstream
-// sort.SliceStable preserves input order for equal-key elements,
-// and the upstream input is in file lex order.
+// Which physical record is yielded for a (entity, version) tied
+// group is implementation-defined: under the WithHistory contract
+// replicas describe the same logical write (a retry, zombie, or
+// cross-node race) and are equivalent, so any pick is correct.
+// This implementation happens to yield the first one and skip
+// the rest — cheaper than tracking a `pending` and emitting on
+// transition — but callers must not rely on that.
 func dedupReplicasSeq[T any](
 	records []T,
 	entityKey func(T) string,
@@ -490,18 +514,24 @@ func dedupReplicasSeq[T any](
 	}
 }
 
-// dedupLatestSeq keeps the record with the maximum version per
-// entity, emitting one record per entity in entity-sort order
-// (ascending). Input MUST be pre-sorted by (entity, version)
-// ascending — the LAST record in each contiguous entity group is
-// then the latest version for that entity, so a single pass with
-// O(1) state suffices: hold the current "pending" record, emit
-// it on entity transition, emit the final pending after the loop.
+// dedupLatestSeq keeps the highest-version record per entity,
+// emitting one record per entity in entity-sort order (ascending).
+// Input MUST be pre-sorted by (entity, version) ascending — the
+// LAST record in each contiguous entity group is then the latest
+// version for that entity, so a single pass with O(1) state
+// suffices: hold the current "pending" record, emit it on entity
+// transition, emit the final pending after the loop.
+//
+// Tie-break on equal max version: `pending = r` advances on every
+// iteration, so when multiple records share the highest version
+// the LAST one wins. With stable sort + lex-ordered input
+// (preparePartitions sorts files by S3 key) this means the
+// lex-later filename wins — same rule as s3sql's
+// `ORDER BY filename DESC`.
 //
 // versionOf isn't called inside the walk — sort already placed
-// records in version order. Kept on the signature for API
-// symmetry with dedupReplicasSeq and to document the
-// pre-condition.
+// records in version order. Not on the signature; the
+// pre-condition is documented above.
 func dedupLatestSeq[T any](
 	records []T, entityKey func(T) string,
 ) iter.Seq[T] {

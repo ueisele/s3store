@@ -104,12 +104,7 @@ func (s *Reader[T]) PollRecords(
 	if err != nil {
 		return nil, since, err
 	}
-
-	out := make([]T, 0, len(records))
-	for r := range s.sortAndIterate(records, o.IncludeHistory) {
-		out = append(out, r)
-	}
-	return out, newOffset, nil
+	return s.sortAndCollect(records, o.IncludeHistory), newOffset, nil
 }
 
 // PollRecordsAll reads every record in [since, until) in one
