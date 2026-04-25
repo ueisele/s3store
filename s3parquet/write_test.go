@@ -1,7 +1,6 @@
 package s3parquet
 
 import (
-	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -136,7 +135,7 @@ func TestEncodeParquet_Compression(t *testing.T) {
 // TestNew_CompressionValidation guards that New() rejects an
 // unknown Compression value before any S3 work.
 func TestNew_CompressionValidation(t *testing.T) {
-	_, err := New(context.Background(), Config[testRec]{
+	_, err := New(Config[testRec]{
 		Bucket:            "b",
 		Prefix:            "p",
 		PartitionKeyParts: []string{"period", "customer"},

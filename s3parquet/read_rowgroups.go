@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"maps"
 	"path"
 	"reflect"
-	"slices"
 	"sync"
 	"time"
 
@@ -94,67 +92,13 @@ func (s *Reader[T]) ReadManyIterWhere(
 		if readAhead < 0 {
 			readAhead = 0
 		}
-		s.streamByPartitionFiltered(
-			ctx, keys, o.IncludeHistory, readAhead, predicate, yield)
-	}
-}
-
-// streamByPartitionFiltered mirrors streamByPartition but uses
-// the row-group-filtered file reader for each partition's files.
-// Inlined here rather than factored through streamByPartition so
-// the filtered code path stays fully separated from the
-// unfiltered one — zero risk of regressing existing Read/
-// ReadIter behavior.
-func (s *Reader[T]) streamByPartitionFiltered(
-	ctx context.Context, keys []core.KeyMeta,
-	includeHistory bool, readAhead int,
-	predicate RowGroupPredicate, yield func(T, error) bool,
-) {
-	byPartition := s.groupKeysByPartition(keys)
-	partitions := slices.Sorted(maps.Keys(byPartition))
-
-	if readAhead <= 0 {
-		for _, p := range partitions {
-			files := byPartition[p]
-			sortKeyMetasByKey(files)
-			recs, err := s.downloadFilteredAll(ctx, files, predicate)
-			if err != nil {
-				yield(*new(T), err)
-				return
-			}
-			if !s.emitPartition(recs, includeHistory, yield) {
-				return
-			}
+		downloadOne := func(
+			ctx context.Context, files []core.KeyMeta,
+		) ([]versionedRecord[T], error) {
+			return s.downloadFilteredAll(ctx, files, predicate)
 		}
-		return
-	}
-
-	pipeline := make(chan partitionBatch[T], readAhead)
-	go func() {
-		defer close(pipeline)
-		for _, p := range partitions {
-			files := byPartition[p]
-			sortKeyMetasByKey(files)
-			recs, err := s.downloadFilteredAll(ctx, files, predicate)
-			select {
-			case pipeline <- partitionBatch[T]{recs: recs, err: err}:
-			case <-ctx.Done():
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	for b := range pipeline {
-		if b.err != nil {
-			yield(*new(T), b.err)
-			return
-		}
-		if !s.emitPartition(b.recs, includeHistory, yield) {
-			return
-		}
+		s.streamByPartition(
+			ctx, keys, o.IncludeHistory, readAhead, downloadOne, yield)
 	}
 }
 

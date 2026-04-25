@@ -144,53 +144,6 @@ func TestPutIfAbsent_403ThenHeadMissing(t *testing.T) {
 	}
 }
 
-// TestHeadThenPut_Fresh: object missing (HEAD 404), PUT fires
-// with the body. Two requests total.
-func TestHeadThenPut_Fresh(t *testing.T) {
-	stubBackoff(t)
-	srv, count := headServer(t,
-		func(w http.ResponseWriter, _ *http.Request, _ int) {
-			w.WriteHeader(200)
-		},
-		func(w http.ResponseWriter, _ *http.Request, _ int) {
-			w.WriteHeader(404)
-		})
-	tgt := newTestTarget(t, srv.URL)
-
-	err := tgt.headThenPut(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil)
-	if err != nil {
-		t.Fatalf("headThenPut: %v", err)
-	}
-	if got := count.Load(); got != 2 {
-		t.Errorf("want 2 requests (HEAD + PUT), got %d", got)
-	}
-}
-
-// TestHeadThenPut_Retry: object exists (HEAD 200), so no body is
-// uploaded. Returns ErrAlreadyExists. One request total.
-func TestHeadThenPut_Retry(t *testing.T) {
-	stubBackoff(t)
-	srv, count := headServer(t,
-		func(w http.ResponseWriter, _ *http.Request, _ int) {
-			t.Errorf("PUT must not fire when HEAD says object exists")
-			w.WriteHeader(500)
-		},
-		func(w http.ResponseWriter, _ *http.Request, _ int) {
-			w.WriteHeader(200)
-		})
-	tgt := newTestTarget(t, srv.URL)
-
-	err := tgt.headThenPut(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil)
-	if !errors.Is(err, ErrAlreadyExists) {
-		t.Fatalf("want ErrAlreadyExists, got %v", err)
-	}
-	if got := count.Load(); got != 1 {
-		t.Errorf("want 1 request (HEAD only), got %d", got)
-	}
-}
-
 // TestConsistencyControl_HeaderSentOnPUT: the withConsistencyControl
 // option plumbs through to a Consistency-Control HTTP header on the
 // outgoing PUT. Confirms the middleware attach point.

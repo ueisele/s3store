@@ -930,59 +930,51 @@ default — pick based on your retry SLA.
 Tokens older than `maxRetryAge` produce a duplicate ref on retry
 (documented tradeoff). Reader dedup absorbs it.
 
-### Backend detection strategies
+### Retry-detection mechanism
 
-The writer detects "this retry already landed" via one of three
-strategies, selected at construction:
+Idempotent writes always go through `If-None-Match: *` on the
+data PUT. Three backend behaviours collapse onto the same
+`ErrAlreadyExists` outcome:
 
-```go
-s3store.Config[T]{
-    // ...
-    DuplicateWriteDetection: s3parquet.DuplicateWriteDetectionByProbe(true),
-}
-```
+- **AWS S3 / recent MinIO** honour `If-None-Match: *` natively
+  and return 412 on a re-PUT.
+- **StorageGRID with the `s3:PutOverwriteObject` deny policy
+  applied** ignores the header but rejects the re-PUT with 403;
+  the writer follows the 403 with a HEAD that confirms the
+  object exists and returns the same `ErrAlreadyExists`.
+- **Backends with neither mechanism** silently accept the re-PUT.
+  No `ErrAlreadyExists` fires; the data file is overwritten with
+  byte-identical content (deterministic encoding under a token),
+  the markers re-PUT to byte-identical paths, and a fresh ref
+  emits — reader dedup absorbs the rare visible duplicate.
 
-| Factory | What it does |
-|---|---|
-| `DuplicateWriteDetectionByProbe(deleteScratch bool)` | **Default.** At `NewWriter` time, PUTs a scratch object at `{prefix}/_probe/overwrite-prevention` twice and observes whether the second PUT is rejected. Caches the result. `deleteScratch=true` removes the probe object after; `false` leaves it (use when the service account lacks DELETE). |
-| `DuplicateWriteDetectionByOverwritePrevention()` | Skip probe. Always send `If-None-Match: *` on the data PUT. Use when you know the backend enforces overwrite prevention (AWS, recent MinIO, or StorageGRID with the deny policy applied). |
-| `DuplicateWriteDetectionByHEAD()` | Skip probe. Pre-flight HEAD on every idempotent write — 200 skips the body upload, 404 proceeds. Use when neither `If-None-Match` nor a deny policy is available. |
+In all three cases the data file at the token-derived path
+matches the caller's bytes after the write returns. The only
+behavioural difference is whether retries skip the body upload
+(yes on the first two, no on the third) — a bandwidth concern,
+not a correctness one.
 
-**Picking the right one:**
-
-| Deployment | `DuplicateWriteDetection` | `DisableCleanup` |
-|---|---|---|
-| AWS S3, full permissions | default (`Probe(true)`) | `false` |
-| STACKIT / StorageGRID, full permissions, bucket policy applied | default (`Probe(true)`) | `false` |
-| STACKIT / StorageGRID, no DELETE permission | `OverwritePrevention()` or `Probe(false)` | `true` |
-| Old MinIO, full permissions | default (`Probe(true)` auto-falls-back to HEAD) | `false` |
-| Old MinIO, no DELETE permission | `HEAD()` | `true` |
-
-**Trust contract for `OverwritePrevention()`**: picking this
-strategy is an assertion that the backend rejects re-PUTs. If the
-assertion is wrong, retries silently produce duplicates (at-least-
-once fallback). `Probe(...)` auto-detects and is safer when you're
-not sure.
+There's no probe at constructor time, no detection-strategy
+config knob, and no DELETE permission required for retry
+detection.
 
 ### StorageGRID / NetApp setup
 
 StorageGRID doesn't honor `If-None-Match: *` directly; instead,
 apply a bucket policy that denies `s3:PutOverwriteObject` — but
-**scope the deny to `{prefix}/data/*` + `{prefix}/_probe/*` only**,
-not the whole bucket:
+**scope the deny to `{prefix}/data/*` only**, not the whole bucket:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "DenyDataAndProbeOverwrite",
+      "Sid": "DenyDataOverwrite",
       "Effect": "Deny",
       "Principal": "*",
       "Action": ["s3:PutOverwriteObject"],
       "Resource": [
-        "arn:aws:s3:::YOUR-BUCKET/YOUR-PREFIX/data/*",
-        "arn:aws:s3:::YOUR-BUCKET/YOUR-PREFIX/_probe/*"
+        "arn:aws:s3:::YOUR-BUCKET/YOUR-PREFIX/data/*"
       ]
     }
   ]
@@ -1008,11 +1000,6 @@ s3.put_bucket_policy(Bucket="YOUR-BUCKET", Policy=json.dumps(policy))
 >   `403 AccessDenied` and breaks index writes entirely.
 > - `_stream/refs/` — ref files. Unique per-PUT keys (refTsMicros
 >   prefix), so they never overwrite either way.
->
-> The `_probe/` scratch key the Probe strategy uses is also included
-> in the deny so capability detection at `NewWriter` works as
-> intended — without it, the probe observes "second PUT succeeded"
-> and falls back to HEAD-before-PUT mode.
 >
 > **Symptom of an over-scoped deny**: data writes succeed, then
 > markers fail with `403 AccessDenied` as soon as any `(col, value)`
@@ -1765,11 +1752,9 @@ type Config[T any] struct {
     Compression CompressionCodec
 
     // Idempotent-write knobs (optional; see "Idempotent writes"
-    // for the full contract). Only consulted when a Write call
-    // carries WithIdempotencyToken.
-    DuplicateWriteDetection s3parquet.DuplicateWriteDetection
-    DisableCleanup          bool
-    ConsistencyControl      s3parquet.ConsistencyLevel
+    // for the full contract).
+    DisableCleanup     bool
+    ConsistencyControl s3parquet.ConsistencyLevel
 
     // DuckDB extras
     ExtraInitSQL []string                 // SET / CREATE SECRET / LOAD
@@ -1794,36 +1779,36 @@ the exact fields.
 
 Breaking changes in the idempotent-write release:
 
-- **`s3store.New`, `s3parquet.New`, `s3parquet.NewWriter` now take
-  `context.Context` as the first argument.** Construction runs an
-  eager capability probe against the S3 bucket when the default
-  `DuplicateWriteDetection` strategy is active, so the constructor
-  surfaces misconfigurations (bad credentials, wrong region,
-  missing bucket) at startup instead of on first write. The probe
-  is bounded by an internal 10s timeout layered onto the caller's
-  ctx. `NewReader` and `s3sql.NewReader` are unchanged — they do
-  no construction-time I/O.
+- **`DuplicateWriteDetection` config field + factory functions
+  (`DuplicateWriteDetectionByOverwritePrevention`,
+  `DuplicateWriteDetectionByHEAD`,
+  `DuplicateWriteDetectionByProbe`) removed.** Idempotent writes
+  always use `If-None-Match: *` now (with the StorageGRID
+  403+HEAD fallback inside `putIfAbsent`) — the constructor
+  no longer probes the backend. On backends that don't enforce
+  any overwrite prevention, retries silently re-PUT byte-identical
+  data; reader dedup absorbs the harmless extra ref. Drop the
+  field from your config; nothing else changes.
+
+- **`s3store.New`, `s3parquet.New`, `s3parquet.NewWriter` no
+  longer take `context.Context`** — the constructor performs no
+  S3 I/O, so the parameter is gone. `NewReader` /
+  `s3sql.NewReader` were already context-free.
 
   ```go
   // Before
-  store, err := s3store.New[T](cfg)
+  store, err := s3store.New[T](ctx, cfg)
 
   // After
-  store, err := s3store.New[T](ctx, cfg)
+  store, err := s3store.New[T](cfg)
   ```
 
-  Tests that construct a Writer against a fake S3 client should set
-  `DuplicateWriteDetection` explicitly to skip the probe:
-
-  ```go
-  cfg := s3store.Config[T]{
-      // ...
-      DuplicateWriteDetection: s3parquet.DuplicateWriteDetectionByHEAD(),
-  }
-  ```
+- **`s3sql.WithReadAheadPartitions` removed.** Was a documented
+  no-op on the s3sql read path. The umbrella + s3parquet exports
+  remain. Drop the call site if you had one.
 
 - **`Write`, `WriteWithKey`, `WriteRowGroupsBy`,
-  `WriteWithKeyRowGroupsBy` now accept a variadic `...WriteOption`
+  `WriteWithKeyRowGroupsBy` accept a variadic `...WriteOption`
   tail** for `WithIdempotencyToken`. Existing callers that don't
   pass options compile unchanged — the tail is variadic.
 

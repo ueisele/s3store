@@ -110,13 +110,6 @@ type Config[T any] struct {
 	// guidance; forwarded there verbatim.
 	PartitionWriteConcurrency int
 
-	// DuplicateWriteDetection selects the retry-detection strategy
-	// for idempotent writes (WithIdempotencyToken). Forwarded to
-	// s3parquet.WriterConfig. Nil resolves to
-	// s3parquet.DuplicateWriteDetectionByProbe(true) — auto-detect
-	// and clean up the scratch object.
-	DuplicateWriteDetection s3parquet.DuplicateWriteDetection
-
 	// DisableCleanup disables best-effort orphan cleanup on the
 	// write path's failure branches. Forwarded to
 	// s3parquet.WriterConfig; see that field for the full contract.

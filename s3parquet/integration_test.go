@@ -46,7 +46,7 @@ type storeOpts struct {
 func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 	t.Helper()
 	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](context.Background(), s3parquet.Config[Rec]{
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -160,7 +160,7 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 func TestIndex_LookupReadAfterWrite(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
-	store, err := s3parquet.New(ctx, s3parquet.Config[Rec]{
+	store, err := s3parquet.New(s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -531,7 +531,7 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 		missedMu sync.Mutex
 		missed   []string
 	)
-	store, err := s3parquet.New(ctx, s3parquet.Config[Rec]{
+	store, err := s3parquet.New(s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -630,7 +630,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := s3parquet.New[RecWithMeta](ctx, s3parquet.Config[RecWithMeta]{
+	store, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -735,16 +735,14 @@ func TestInsertedAtField_Validation(t *testing.T) {
 	}
 
 	t.Run("no such field", func(t *testing.T) {
-		_, err := s3parquet.New[Rec](
-			context.Background(), mkCfgRec("Nonexistent"))
+		_, err := s3parquet.New[Rec](mkCfgRec("Nonexistent"))
 		if err == nil || !strings.Contains(err.Error(), "no such field") {
 			t.Fatalf("want %q error, got %v", "no such field", err)
 		}
 	})
 	t.Run("wrong type", func(t *testing.T) {
 		// Period is string, not time.Time.
-		_, err := s3parquet.New[Rec](
-			context.Background(), mkCfgRec("Period"))
+		_, err := s3parquet.New[Rec](mkCfgRec("Period"))
 		if err == nil || !strings.Contains(err.Error(), "must be time.Time") {
 			t.Fatalf("want %q error, got %v", "must be time.Time", err)
 		}
@@ -752,8 +750,7 @@ func TestInsertedAtField_Validation(t *testing.T) {
 	t.Run("parquet dash tag rejected", func(t *testing.T) {
 		// Ignored is time.Time but tagged parquet:"-" — rejected
 		// because the value must be persisted as a real column.
-		_, err := s3parquet.New[RecIgnoredMeta](
-			context.Background(), mkCfgIgnored("Ignored"))
+		_, err := s3parquet.New[RecIgnoredMeta](mkCfgIgnored("Ignored"))
 		if err == nil || !strings.Contains(err.Error(), "non-empty, non-\"-\" parquet tag") {
 			t.Fatalf("want non-empty/non-\"-\" error, got %v", err)
 		}
@@ -788,7 +785,7 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 	}
 
 	f := testutil.New(t)
-	store, err := s3parquet.New[FullRec](ctx, s3parquet.Config[FullRec]{
+	store, err := s3parquet.New[FullRec](s3parquet.Config[FullRec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -1632,7 +1629,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
 
-	wNarrow, err := s3parquet.New[RecNarrow](ctx, s3parquet.Config[RecNarrow]{
+	wNarrow, err := s3parquet.New[RecNarrow](s3parquet.Config[RecNarrow]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -1654,7 +1651,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	rWide, err := s3parquet.New[Rec](ctx, s3parquet.Config[Rec]{
+	rWide, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -1906,7 +1903,7 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
 
-	store, err := s3parquet.New[ParquetRec](ctx, s3parquet.Config[ParquetRec]{
+	store, err := s3parquet.New[ParquetRec](s3parquet.Config[ParquetRec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -1974,7 +1971,7 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 func TestDisableRefStream(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](ctx, s3parquet.Config[Rec]{
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2056,7 +2053,7 @@ func TestDisableRefStream(t *testing.T) {
 func TestDisableRefStream_WriteWithKey(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](ctx, s3parquet.Config[Rec]{
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:             f.Bucket,
 		Prefix:             "store",
 		S3Client:           f.S3Client,
@@ -2105,7 +2102,7 @@ func TestDisableRefStream_WriteWithKey(t *testing.T) {
 func TestDisableRefStream_IndexLookup(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](ctx, s3parquet.Config[Rec]{
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2603,7 +2600,7 @@ func TestWriteWithKeyRowGroupsBy_PruneReadPath(t *testing.T) {
 func TestWriteWithKeyRowGroupsBy_RowGroupCount(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](ctx, s3parquet.Config[Rec]{
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2748,7 +2745,7 @@ func TestWriteRowGroupsBy_EmptyAndNil(t *testing.T) {
 	// Fresh bucket + Writer without PartitionKeyOf to assert
 	// the nil-PartitionKeyOf error.
 	f := testutil.New(t)
-	writerNoPKO, err := s3parquet.NewWriter[Rec](ctx, s3parquet.WriterConfig[Rec]{
+	writerNoPKO, err := s3parquet.NewWriter[Rec](s3parquet.WriterConfig[Rec]{
 		Target: s3parquet.S3Target{
 			Bucket:            f.Bucket,
 			Prefix:            "store",
@@ -2858,7 +2855,7 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := s3parquet.New[RecWithMeta](ctx, s3parquet.Config[RecWithMeta]{
+	store, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2920,7 +2917,7 @@ func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := s3parquet.New[RecWithMeta](ctx, s3parquet.Config[RecWithMeta]{
+	store, err := s3parquet.New[RecWithMeta](s3parquet.Config[RecWithMeta]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -3188,16 +3185,13 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 }
 
 // newIdempotentStore builds a Store with idempotency-specific
-// config: HEAD-based detection (safe regardless of whether MinIO
-// supports If-None-Match natively) and entity-key dedup so a
-// retry that leaks through produces at-most-one record at the
-// reader layer. Used by the Phase 3 end-to-end tests below.
-func newIdempotentStore(
-	t *testing.T, detection s3parquet.DuplicateWriteDetection,
-) *s3parquet.Store[Rec] {
+// config: entity-key dedup so a retry that leaks through
+// produces at-most-one record at the reader layer. Used by the
+// Phase 3 end-to-end tests below.
+func newIdempotentStore(t *testing.T) *s3parquet.Store[Rec] {
 	t.Helper()
 	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](context.Background(), s3parquet.Config[Rec]{
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -3210,8 +3204,7 @@ func newIdempotentStore(
 		// MinIO is in fact strongly consistent; the claim keeps
 		// idempotent writes on the conditional-PUT path and lets
 		// the scoped retry LIST linearize against prior writes.
-		ConsistencyControl:      s3parquet.ConsistencyStrongGlobal,
-		DuplicateWriteDetection: detection,
+		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		EntityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
@@ -3236,7 +3229,7 @@ func newIdempotentStore(
 //     exercised, because no duplicate data/ref lands.
 func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	ctx := context.Background()
-	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+	store := newIdempotentStore(t)
 
 	key := "period=2026-04-22/customer=alice"
 	rec := []Rec{{
@@ -3303,8 +3296,7 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 // the end-to-end retry-dedup property must hold.
 func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 	ctx := context.Background()
-	store := newIdempotentStore(t,
-		s3parquet.DuplicateWriteDetectionByProbe(true))
+	store := newIdempotentStore(t)
 
 	key := "period=2026-04-22/customer=bob"
 	rec := []Rec{{
@@ -3352,7 +3344,7 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 // correctness primitive" contract.
 func TestWriteWithIdempotencyToken_MaxRetryAgeZero(t *testing.T) {
 	ctx := context.Background()
-	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+	store := newIdempotentStore(t)
 
 	key := "period=2026-04-22/customer=carol"
 	rec := []Rec{{
@@ -3397,7 +3389,7 @@ func TestWriteWithIdempotencyToken_MaxRetryAgeZero(t *testing.T) {
 // site without touching S3.
 func TestWriteWithIdempotencyToken_RejectsBadToken(t *testing.T) {
 	ctx := context.Background()
-	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+	store := newIdempotentStore(t)
 
 	key := "period=2026-04-22/customer=bad"
 	rec := []Rec{{
@@ -3431,7 +3423,7 @@ func TestWriteWithIdempotencyToken_RejectsBadToken(t *testing.T) {
 // same bytes (idempotently, thanks to the token).
 func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 	ctx := context.Background()
-	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+	store := newIdempotentStore(t)
 
 	key := "period=2026-04-22/customer=alice"
 	partition := []Rec{{
@@ -3516,7 +3508,7 @@ func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 // full.
 func TestIdempotentRead_PerPartitionIsolation(t *testing.T) {
 	ctx := context.Background()
-	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+	store := newIdempotentStore(t)
 
 	keyA := "period=2026-04-22/customer=alice"
 	keyB := "period=2026-04-22/customer=bob"
@@ -3591,7 +3583,7 @@ func TestIdempotentRead_PerPartitionIsolation(t *testing.T) {
 // a clear error, before any S3 GET.
 func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 	ctx := context.Background()
-	store := newIdempotentStore(t, s3parquet.DuplicateWriteDetectionByHEAD())
+	store := newIdempotentStore(t)
 
 	if _, err := store.Read(ctx, "period=2026-04-22/customer=*",
 		s3parquet.WithIdempotentRead("has/slash")); err == nil {
@@ -3631,7 +3623,7 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 func TestWrite_RefSettleBudgetEnforced(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
-	store, err := s3parquet.New[Rec](ctx, s3parquet.Config[Rec]{
+	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -3642,9 +3634,8 @@ func TestWrite_RefSettleBudgetEnforced(t *testing.T) {
 		},
 		// 1ms SettleWindow: real MinIO PUT is a few ms, so every
 		// ref write exceeds the budget one way or another.
-		SettleWindow:            1 * time.Millisecond,
-		ConsistencyControl:      s3parquet.ConsistencyStrongGlobal,
-		DuplicateWriteDetection: s3parquet.DuplicateWriteDetectionByHEAD(),
+		SettleWindow:       1 * time.Millisecond,
+		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)

@@ -42,10 +42,8 @@ type Store[T any] struct {
 // halves share one S3Target so they can't drift on Bucket /
 // Prefix / PartitionKeyParts / SettleWindow / DisableRefStream.
 //
-// ctx bounds the underlying s3parquet.NewWriter probe; see that
-// constructor for the full contract. The s3sql Reader does no
-// construction-time I/O.
-func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
+// Performs no S3 I/O at construction time.
+func New[T any](cfg Config[T]) (*Store[T], error) {
 	target := s3parquet.S3Target{
 		Bucket:            cfg.Bucket,
 		Prefix:            cfg.Prefix,
@@ -54,13 +52,12 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		SettleWindow:      cfg.SettleWindow,
 		DisableRefStream:  cfg.DisableRefStream,
 	}
-	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[T]{
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[T]{
 		Target:                    target,
 		PartitionKeyOf:            cfg.PartitionKeyOf,
 		Compression:               cfg.Compression,
 		PartitionWriteConcurrency: cfg.PartitionWriteConcurrency,
 		InsertedAtField:           cfg.InsertedAtField,
-		DuplicateWriteDetection:   cfg.DuplicateWriteDetection,
 		DisableCleanup:            cfg.DisableCleanup,
 		ConsistencyControl:        cfg.ConsistencyControl,
 	})

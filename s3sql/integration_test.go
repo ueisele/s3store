@@ -76,7 +76,7 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	// scoped retry LIST linearize against prior writes. Ref-PUT
 	// budget is SettleWindow/2 regardless of this flag.
 	const testConsistency = s3parquet.ConsistencyStrongGlobal
-	w, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[Rec]{
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
 		Target:             target,
 		PartitionKeyOf:     partitionKeyOfRec,
 		ConsistencyControl: testConsistency,
@@ -163,7 +163,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
 	}
-	w, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[RecWithMeta]{
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecWithMeta]{
 		Target: target,
 		PartitionKeyOf: func(r RecWithMeta) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -731,7 +731,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
 	}
-	wOld, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[RecNarrow]{
+	wOld, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecNarrow]{
 		Target: target,
 		PartitionKeyOf: func(r RecNarrow) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -806,7 +806,7 @@ func TestRead_SliceField(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
 	}
-	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[TagRec]{
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[TagRec]{
 		Target: target,
 		PartitionKeyOf: func(r TagRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -902,7 +902,7 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
 	}
-	w, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[JobRec]{
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[JobRec]{
 		Target: target,
 		PartitionKeyOf: func(r JobRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
@@ -1348,7 +1348,7 @@ func TestDisableRefStream_s3sql(t *testing.T) {
 		SettleWindow:      300 * time.Millisecond,
 		DisableRefStream:  true,
 	}
-	writer, err := s3parquet.NewWriter(ctx, s3parquet.WriterConfig[Rec]{
+	writer, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
 		Target:             target,
 		PartitionKeyOf:     partitionKeyOfRec,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
@@ -1556,11 +1556,10 @@ func newIdempotentFixture(t *testing.T) *testFixture {
 	// ref PUT gets the full 10ms SettleWindow as its budget. See
 	// newFixture for the rationale.
 	const testConsistency = s3parquet.ConsistencyStrongGlobal
-	w, err := s3parquet.NewWriter(context.Background(), s3parquet.WriterConfig[Rec]{
-		Target:                  target,
-		PartitionKeyOf:          partitionKeyOfRec,
-		DuplicateWriteDetection: s3parquet.DuplicateWriteDetectionByHEAD(),
-		ConsistencyControl:      testConsistency,
+	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
+		Target:             target,
+		PartitionKeyOf:     partitionKeyOfRec,
+		ConsistencyControl: testConsistency,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.NewWriter: %v", err)

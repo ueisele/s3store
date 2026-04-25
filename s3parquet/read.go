@@ -235,7 +235,8 @@ func (s *Reader[T]) ReadManyIter(
 		if readAhead < 0 {
 			readAhead = 0
 		}
-		s.streamByPartition(ctx, keys, o.IncludeHistory, readAhead, yield)
+		s.streamByPartition(ctx, keys, o.IncludeHistory, readAhead,
+			s.downloadAndDecodeAll, yield)
 	}
 }
 
@@ -248,7 +249,8 @@ type partitionBatch[T any] struct {
 }
 
 // streamByPartition processes keys one Hive partition at a time
-// in lex order. Two execution modes:
+// in lex order, using downloadOne to fetch each partition's files.
+// Two execution modes:
 //
 //   - readAhead == 0 (default): strict-serial. Download the
 //     current partition's files, yield every record, move on.
@@ -259,15 +261,16 @@ type partitionBatch[T any] struct {
 //     one batch at a time. Consumer work on partition N overlaps
 //     with downloads for N+1 … N+readAhead, hiding S3 round-trip
 //     latency when the consumer does real work per record.
-//     Memory: up to readAhead + 2 partitions worth of records
-//     (one being yielded, readAhead buffered in the channel, one
-//     in the producer's hand while its send is blocked).
+//     Memory: up to readAhead + 2 partitions worth of records.
 //
 // Dedup/no-dedup handling is identical across both modes and
-// lives in emitPartition.
+// lives in emitPartition. The downloadOne function lets the
+// row-group-filtered read path (ReadIterWhere) reuse this same
+// orchestrator with a different per-partition fetcher.
 func (s *Reader[T]) streamByPartition(
 	ctx context.Context, keys []core.KeyMeta,
 	includeHistory bool, readAhead int,
+	downloadOne func(ctx context.Context, files []core.KeyMeta) ([]versionedRecord[T], error),
 	yield func(T, error) bool,
 ) {
 	byPartition := s.groupKeysByPartition(keys)
@@ -277,7 +280,7 @@ func (s *Reader[T]) streamByPartition(
 		for _, p := range partitions {
 			files := byPartition[p]
 			sortKeyMetasByKey(files)
-			recs, err := s.downloadAndDecodeAll(ctx, files)
+			recs, err := downloadOne(ctx, files)
 			if err != nil {
 				yield(*new(T), err)
 				return
@@ -298,7 +301,7 @@ func (s *Reader[T]) streamByPartition(
 		for _, p := range partitions {
 			files := byPartition[p]
 			sortKeyMetasByKey(files)
-			recs, err := s.downloadAndDecodeAll(ctx, files)
+			recs, err := downloadOne(ctx, files)
 			select {
 			case pipeline <- partitionBatch[T]{recs: recs, err: err}:
 			case <-ctx.Done():

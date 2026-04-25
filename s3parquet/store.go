@@ -1,7 +1,6 @@
 package s3parquet
 
 import (
-	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -150,11 +149,6 @@ type Config[T any] struct {
 	// for when to tune it.
 	PartitionWriteConcurrency int
 
-	// DuplicateWriteDetection selects the retry-detection strategy
-	// for idempotent writes (WithIdempotencyToken). Forwarded to
-	// WriterConfig; see WriterConfig.DuplicateWriteDetection.
-	DuplicateWriteDetection DuplicateWriteDetection
-
 	// DisableCleanup disables best-effort orphan cleanup on the
 	// write path's failure branches. Forwarded to WriterConfig;
 	// see WriterConfig.DisableCleanup.
@@ -213,11 +207,9 @@ func (s *Store[T]) Target() S3Target {
 // new code that only writes or only reads should prefer
 // NewWriter / NewReader directly.
 //
-// ctx bounds the underlying NewWriter probe; see NewWriter for the
-// full contract. NewReader does not consult ctx — the read side
-// performs no construction-time I/O.
-func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
-	w, err := NewWriter(ctx, writerConfigFrom(cfg))
+// Performs no S3 I/O at construction time.
+func New[T any](cfg Config[T]) (*Store[T], error) {
+	w, err := NewWriter(writerConfigFrom(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +244,6 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 		Compression:               c.Compression,
 		PartitionWriteConcurrency: c.PartitionWriteConcurrency,
 		InsertedAtField:           c.InsertedAtField,
-		DuplicateWriteDetection:   c.DuplicateWriteDetection,
 		DisableCleanup:            c.DisableCleanup,
 		ConsistencyControl:        c.ConsistencyControl,
 	}
@@ -292,12 +283,14 @@ func resolveCompression(c CompressionCodec) (compress.Codec, error) {
 			"zstd, gzip, or uncompressed)", c)
 }
 
-// validateInsertedAtField resolves Config.InsertedAtField to a
-// struct-field index on T. Rejects typos (no such field), wrong
-// type (not time.Time), and — critically — a missing or "-"
-// parquet tag, because the field now carries a real parquet column
-// populated by the writer; the reader decodes it back through the
-// normal parquet schema. Returns nil when name is empty.
+// validateInsertedAtField resolves an InsertedAtField name (from
+// either WriterConfig or ReaderConfig) to a struct-field index on
+// T. Rejects typos (no such field), wrong type (not time.Time),
+// and a missing or "-" parquet tag — the field carries a real
+// parquet column the writer populates and the reader decodes
+// through the normal parquet schema, so the tag has to be present
+// for both sides to round-trip the value. Returns nil when name
+// is empty.
 func validateInsertedAtField[T any](name string) ([]int, error) {
 	if name == "" {
 		return nil, nil
@@ -324,9 +317,8 @@ func validateInsertedAtField[T any](name string) ([]int, error) {
 	if name0 == "" || name0 == "-" {
 		return nil, fmt.Errorf(
 			"s3parquet: InsertedAtField %q: must carry a non-empty, "+
-				"non-\"-\" parquet tag so the reader can decode it "+
-				"from the writer-populated column (got %q)",
-			name, tag)
+				"non-\"-\" parquet tag so the value persists as a real "+
+				"parquet column (got %q)", name, tag)
 	}
 	return f.Index, nil
 }

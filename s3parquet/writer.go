@@ -1,23 +1,12 @@
 package s3parquet
 
 import (
-	"context"
 	"fmt"
 	"log"
-	"reflect"
-	"strings"
-	"time"
 
 	"github.com/parquet-go/parquet-go/compress"
 	"github.com/ueisele/s3store/internal/core"
 )
-
-// probeTimeout caps the wall-clock duration of the eager
-// overwrite-prevention probe in NewWriter. Defends against a
-// misconfigured endpoint that would otherwise hang construction
-// indefinitely. 10s leaves room for a slow first TLS handshake +
-// 2-3 S3 round-trips while still failing fast on a real outage.
-const probeTimeout = 10 * time.Second
 
 // WriterConfig is the narrower Config form for constructing a
 // Writer directly (without a Reader). Holds the S3-wiring bundle
@@ -57,28 +46,6 @@ type WriterConfig[T any] struct {
 	// write-time stamp surfaced at read time must set both sides.
 	InsertedAtField string
 
-	// DuplicateWriteDetection selects the strategy for detecting
-	// retries of idempotent writes. Only consulted when a write
-	// carries WithIdempotencyToken — without a token the field is
-	// irrelevant and the writer never probes.
-	//
-	// Three options (see the DuplicateWriteDetectionBy* factory
-	// functions for details):
-	//
-	//   - DuplicateWriteDetectionByOverwritePrevention(): always
-	//     send If-None-Match: *. Use when you know the backend
-	//     rejects overwrites (AWS, recent MinIO, or StorageGRID
-	//     with the s3:PutOverwriteObject deny policy).
-	//   - DuplicateWriteDetectionByHEAD(): pre-flight HEAD on
-	//     every idempotent write. Use when the backend has no
-	//     overwrite prevention.
-	//   - DuplicateWriteDetectionByProbe(deleteScratch): auto-
-	//     detect on the first idempotent write. Default.
-	//
-	// Nil resolves to DuplicateWriteDetectionByProbe(true) —
-	// auto-detect, clean up the scratch object after probing.
-	DuplicateWriteDetection DuplicateWriteDetection
-
 	// DisableCleanup opts out of the best-effort DeleteObject
 	// calls on partial-write failure paths (orphan data after a
 	// marker or ref PUT failure). When true, orphan objects
@@ -86,12 +53,6 @@ type WriterConfig[T any] struct {
 	// garbage-collect. Set when the writer lacks DELETE permission
 	// (common in STACKIT / StorageGRID deployments with a narrowly-
 	// scoped service account).
-	//
-	// Independent of DuplicateWriteDetectionByProbe's deleteScratch
-	// flag: probe cleanup and write-orphan cleanup are separate
-	// concerns. Pair DisableCleanup=true with Probe(false) (or
-	// an explicit OverwritePrevention() / HEAD() strategy) when
-	// DELETE is withheld globally.
 	DisableCleanup bool
 
 	// ConsistencyControl sets the Consistency-Control HTTP header
@@ -105,9 +66,10 @@ type WriterConfig[T any] struct {
 	// default applies. On AWS S3 / MinIO that's strongly
 	// consistent by default so the field can stay empty. On
 	// NetApp StorageGRID the bucket default is typically
-	// read-after-new-write, which is insufficient for Phase 3's
-	// correctness conditions — set ConsistencyStrongGlobal (multi-
-	// site) or ConsistencyStrongSite (single-site) explicitly.
+	// read-after-new-write, which is insufficient for the library's
+	// at-least-once correctness conditions — set
+	// ConsistencyStrongGlobal (multi-site) or ConsistencyStrongSite
+	// (single-site) explicitly.
 	//
 	// NetApp requires PUT and paired GET to use matching
 	// consistency levels, so WriterConfig.ConsistencyControl and
@@ -147,21 +109,6 @@ type Writer[T any] struct {
 	// the write hot path doesn't re-parse the type. nil when unset
 	// — populateInsertedAt is then skipped entirely.
 	insertedAtFieldIndex []int
-
-	// overwritePreventionActive is the resolved capability decided
-	// by NewWriter from the configured DuplicateWriteDetection:
-	//
-	//   - DuplicateWriteDetectionByOverwritePrevention(): always true
-	//     (caller asserted backend support; no probe).
-	//   - DuplicateWriteDetectionByHEAD(): always false (caller opted
-	//     into pre-flight HEAD; no probe).
-	//   - DuplicateWriteDetectionByProbe(deleteScratch): result of the
-	//     eager probe NewWriter ran against the bucket. true means
-	//     putIfAbsent path; false falls back to headThenPut.
-	//
-	// Read by the idempotent write path; never mutated after
-	// NewWriter returns, so no synchronisation needed.
-	overwritePreventionActive bool
 }
 
 // indexWriter is the internal, entry-type-erased contract
@@ -205,8 +152,8 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 }
 
 // NewWriter constructs a Writer directly from WriterConfig. Use
-// this in services that only write; use New(ctx, Config) when the
-// same process also reads through a Reader/Store.
+// this in services that only write; use New(Config) when the same
+// process also reads through a Reader/Store.
 //
 // Validation mirrors the writer-side half of New: the Target
 // must carry Bucket / Prefix / S3Client / PartitionKeyParts;
@@ -214,18 +161,15 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 // PartitionKeyOf is optional at construction — Write errors if
 // called without it, but WriteWithKey works regardless.
 //
-// ctx bounds the optional overwrite-prevention probe: when
-// DuplicateWriteDetection is the default Probe strategy, NewWriter
-// runs an eager probe against the bucket so the capability is
-// known before the first write. The probe is wrapped in an
-// internal 10s timeout (probeTimeout) layered onto ctx so a
-// caller-supplied context.Background() doesn't hang construction
-// indefinitely on a misconfigured endpoint. The other two
-// strategies (OverwritePrevention, HEAD) skip the probe entirely
-// — ctx is consulted only by the probe path.
-func NewWriter[T any](
-	ctx context.Context, cfg WriterConfig[T],
-) (*Writer[T], error) {
+// Constructor performs no S3 I/O. Idempotent writes always go
+// through If-None-Match: * (handled by S3Target.putIfAbsent),
+// which AWS / MinIO honour natively and StorageGRID deployments
+// honour via the s3:PutOverwriteObject deny policy. On backends
+// without either mechanism the conditional PUT silently succeeds
+// on retries — the data path is deterministic + the body is
+// byte-identical, so the duplicate write is harmless and any
+// extra ref it produces is absorbed by reader dedup.
+func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err := cfg.Target.Validate(); err != nil {
 		return nil, err
 	}
@@ -239,7 +183,7 @@ func NewWriter[T any](
 	if err != nil {
 		return nil, err
 	}
-	insertedAtIdx, err := validateWriterInsertedAtField[T](cfg.InsertedAtField)
+	insertedAtIdx, err := validateInsertedAtField[T](cfg.InsertedAtField)
 	if err != nil {
 		return nil, err
 	}
@@ -251,97 +195,11 @@ func NewWriter[T any](
 				"sent verbatim; verify the backend accepts it",
 			cfg.ConsistencyControl)
 	}
-	detection := asConcrete(cfg.DuplicateWriteDetection)
-	active, err := resolveOverwritePreventionActive(
-		ctx, cfg.Target, detection, cfg.ConsistencyControl)
-	if err != nil {
-		return nil, err
-	}
 	return &Writer[T]{
-		cfg:                       cfg,
-		dataPath:                  core.DataPath(cfg.Target.Prefix),
-		refPath:                   core.RefPath(cfg.Target.Prefix),
-		compressionCodec:          codec,
-		insertedAtFieldIndex:      insertedAtIdx,
-		overwritePreventionActive: active,
+		cfg:                  cfg,
+		dataPath:             core.DataPath(cfg.Target.Prefix),
+		refPath:              core.RefPath(cfg.Target.Prefix),
+		compressionCodec:     codec,
+		insertedAtFieldIndex: insertedAtIdx,
 	}, nil
-}
-
-// resolveOverwritePreventionActive runs at NewWriter time to
-// resolve the configured DuplicateWriteDetection strategy into a
-// concrete capability:
-//
-//   - ByOverwritePrevention: returns true unconditionally; the
-//     caller asserted that the backend rejects re-PUTs.
-//   - ByHEAD: returns false unconditionally; the caller wants
-//     pre-flight HEAD on every idempotent write.
-//   - ByProbe: PUTs a scratch object twice against the bucket and
-//     observes whether the second PUT is rejected. Wrapped in a
-//     probeTimeout-bounded context so a misconfigured endpoint
-//     doesn't hang NewWriter.
-//
-// The probe call carries the Writer's configured
-// ConsistencyControl so StorageGRID deployments that gate the
-// overwrite-deny policy on strong consistency see the same
-// header on the probe.
-func resolveOverwritePreventionActive(
-	ctx context.Context,
-	target S3Target,
-	detection duplicateWriteDetection,
-	consistency ConsistencyLevel,
-) (bool, error) {
-	switch detection.kind {
-	case detectKindOverwritePrevention:
-		return true, nil
-	case detectKindHEAD:
-		return false, nil
-	case detectKindProbe:
-		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-		defer cancel()
-		return target.probeOverwritePrevention(
-			probeCtx, detection.deleteScratch,
-			withConsistencyControl(consistency))
-	}
-	return false, fmt.Errorf(
-		"s3parquet: unhandled DuplicateWriteDetection kind %d",
-		detection.kind)
-}
-
-// validateWriterInsertedAtField resolves WriterConfig.InsertedAtField
-// to a struct-field index on T. Mirrors the reader's
-// validateInsertedAtField but enforces the *column* contract: the
-// field must exist, be time.Time, and carry a non-empty, non-"-"
-// parquet tag, because the writer persists the value as a real
-// parquet column (not library-managed metadata). Returns nil when
-// name is empty.
-func validateWriterInsertedAtField[T any](name string) ([]int, error) {
-	if name == "" {
-		return nil, nil
-	}
-	rt := reflect.TypeFor[T]()
-	if rt.Kind() != reflect.Struct {
-		return nil, fmt.Errorf(
-			"s3parquet: InsertedAtField requires T to be a struct, got %s",
-			rt)
-	}
-	f, ok := rt.FieldByName(name)
-	if !ok {
-		return nil, fmt.Errorf(
-			"s3parquet: InsertedAtField %q: no such field on %s",
-			name, rt)
-	}
-	if f.Type != reflect.TypeFor[time.Time]() {
-		return nil, fmt.Errorf(
-			"s3parquet: InsertedAtField %q: must be time.Time, got %s",
-			name, f.Type)
-	}
-	tag := f.Tag.Get("parquet")
-	name0, _, _ := strings.Cut(tag, ",")
-	if name0 == "" || name0 == "-" {
-		return nil, fmt.Errorf(
-			"s3parquet: InsertedAtField %q: must carry a non-empty, "+
-				"non-\"-\" parquet tag so the writer can populate it "+
-				"as a real parquet column (got %q)", name, tag)
-	}
-	return f.Index, nil
 }
