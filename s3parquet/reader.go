@@ -48,22 +48,6 @@ func (c ReaderConfig[T]) dedupEnabled() bool {
 	return c.EntityKeyOf != nil
 }
 
-// ReaderExtras carries the read-side-only knobs — everything on
-// ReaderConfig except the Target. Used by NewReaderFromWriter
-// and NewReaderFromStore: the Target comes from the Writer /
-// Store; the user supplies just the read-specific fields here.
-//
-// Drift guard: every field below must also appear on ReaderConfig
-// with an identical name and type (enforced by a reflect-based
-// unit test).
-type ReaderExtras[T any] struct {
-	EntityKeyOf        func(T) string
-	VersionOf          func(T, time.Time) int64
-	InsertedAtField    string
-	OnMissingData      func(dataPath string)
-	ConsistencyControl ConsistencyLevel
-}
-
 // Reader is the read-side half of a Store. Owns Read / Poll /
 // PollRecords / PollRecordsAll / OffsetAt. Construct directly
 // via NewReader in read-only services, or via
@@ -174,28 +158,23 @@ func resolveSortCmp[T any](
 // Writer[U] produces. T may equal U (same-shape read) or differ
 // from U — typically a narrower struct that omits heavy
 // write-only columns (parquet-go skips unlisted columns on
-// decode). The Writer's Target (Bucket, Prefix, S3Client,
-// PartitionKeyParts, SettleWindow) carries over; the user
-// supplies read-side knobs via ReaderExtras[T].
+// decode). The Writer's Target overrides whatever Target cfg
+// carries (or doesn't); read-side knobs (EntityKeyOf, VersionOf,
+// InsertedAtField, OnMissingData, ConsistencyControl) come from
+// cfg.
 //
 // Dedup closures (EntityKeyOf / VersionOf) on the Writer are
 // typed over U and cannot be auto-transformed to T; the caller
-// re-declares them in extras when dedup is needed.
+// re-declares them in cfg when dedup is needed.
 func NewReaderFromWriter[T, U any](
-	w *Writer[U], extras ReaderExtras[T],
+	w *Writer[U], cfg ReaderConfig[T],
 ) (*Reader[T], error) {
 	if w == nil {
 		return nil, fmt.Errorf(
 			"s3parquet: NewReaderFromWriter: writer is nil")
 	}
-	return NewReader(ReaderConfig[T]{
-		Target:             w.cfg.Target,
-		EntityKeyOf:        extras.EntityKeyOf,
-		VersionOf:          extras.VersionOf,
-		InsertedAtField:    extras.InsertedAtField,
-		OnMissingData:      extras.OnMissingData,
-		ConsistencyControl: extras.ConsistencyControl,
-	})
+	cfg.Target = w.cfg.Target
+	return NewReader(cfg)
 }
 
 // NewReaderFromStore is NewReaderFromWriter with a Store[U]
@@ -204,11 +183,11 @@ func NewReaderFromWriter[T, U any](
 // NewReaderFromStore calls produce narrow Readers for hot-path
 // reads without respecifying the shared config.
 func NewReaderFromStore[T, U any](
-	s *Store[U], extras ReaderExtras[T],
+	s *Store[U], cfg ReaderConfig[T],
 ) (*Reader[T], error) {
 	if s == nil {
 		return nil, fmt.Errorf(
 			"s3parquet: NewReaderFromStore: store is nil")
 	}
-	return NewReaderFromWriter(s.Writer, extras)
+	return NewReaderFromWriter(s.Writer, cfg)
 }

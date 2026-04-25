@@ -811,7 +811,7 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 	}
 
 	view, err := s3parquet.NewReaderFromStore(
-		store, s3parquet.ReaderExtras[NarrowRec]{})
+		store, s3parquet.ReaderConfig[NarrowRec]{})
 	if err != nil {
 		t.Fatalf("NewReaderFromStore: %v", err)
 	}

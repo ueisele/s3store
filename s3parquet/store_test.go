@@ -303,31 +303,6 @@ func TestWriterConfigMirroredInConfig(t *testing.T) {
 	}
 }
 
-// TestReaderExtrasMirrorsReaderConfig guards the drift-guard:
-// every read-side field on ReaderExtras must also appear on
-// ReaderConfig with the same name and type. Without this, adding
-// a new read knob to one struct and forgetting the other would
-// silently go unnoticed — NewReaderFromWriter users would
-// see different behavior from direct NewReader users.
-func TestReaderExtrasMirrorsReaderConfig(t *testing.T) {
-	extras := reflect.TypeFor[ReaderExtras[testRec]]()
-	cfg := reflect.TypeFor[ReaderConfig[testRec]]()
-
-	for i := range extras.NumField() {
-		ef := extras.Field(i)
-		cf, ok := cfg.FieldByName(ef.Name)
-		if !ok {
-			t.Errorf("ReaderExtras field %q missing from ReaderConfig",
-				ef.Name)
-			continue
-		}
-		if ef.Type != cf.Type {
-			t.Errorf("ReaderExtras.%s type %s != ReaderConfig.%s type %s",
-				ef.Name, ef.Type, cf.Name, cf.Type)
-		}
-	}
-}
-
 // TestNewSkipsDefaultWhenNoEntityKey guards that New does not
 // assign VersionOf when the user hasn't asked for dedup
 // (EntityKeyOf nil). Unnecessary allocation and a subtle
