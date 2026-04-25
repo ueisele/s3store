@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"reflect"
 	"slices"
 	"sync"
-	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
@@ -63,6 +61,20 @@ func (s *Reader[T]) streamEager(
 
 	ctx, cancel := context.WithCancel(ctx)
 	concurrency := s.cfg.Target.EffectiveMaxInflightRequests()
+	// bodyCap bounds the in-memory compressed-body footprint:
+	// downloaders block before fetching the next file once cap
+	// slots are held; the decoder releases slots as it nils each
+	// body. Floor at the largest partition's file count so a
+	// single oversized partition still fits in the pool —
+	// otherwise its last few files would block on the cap and
+	// the decoder would block on those files, producing a
+	// deadlock.
+	bodyCap := concurrency
+	for _, p := range parts {
+		if n := len(p.files); n > bodyCap {
+			bodyCap = n
+		}
+	}
 
 	// Shared state: per-partition download progress + buffered
 	// uncompressed byte total.
@@ -86,7 +98,7 @@ func (s *Reader[T]) streamEager(
 	wg.Go(func() { s.runProducer(ctx, jobsCh, parts) })
 	for range concurrency {
 		wg.Go(func() {
-			s.runDownloader(ctx, jobsCh, state, cancel)
+			s.runDownloader(ctx, jobsCh, state, bodyCap, cancel)
 		})
 	}
 	// Wake up any goroutine sleeping on state.cond when ctx
@@ -171,16 +183,18 @@ func (s *Reader[T]) runProducer(
 }
 
 // runDownloader is one worker in the download pool. Each job
-// fetches one parquet body and stores the result in the
-// per-partition slot. NoSuchKey is treated as a soft skip
-// (records the missing-data callback, leaves body nil); other
-// errors trigger ctx cancel so siblings bail promptly.
+// acquires one body-pool slot (back-pressuring the producer when
+// the pool is full), fetches the parquet body, and stores it in
+// the per-partition slot. The slot stays held until the decoder
+// nils the body. NoSuchKey and hard errors release the slot
+// immediately since no body is materialised.
 func (s *Reader[T]) runDownloader(
 	ctx context.Context, jobsCh <-chan downloadJob,
-	state *streamState, cancel context.CancelFunc,
+	state *streamState, bodyCap int,
+	cancel context.CancelFunc,
 ) {
 	for job := range jobsCh {
-		if ctx.Err() != nil {
+		if !state.acquireBodySlot(ctx, bodyCap) {
 			state.markComplete(job.partIdx, job.fileIdx, nil, ctx.Err())
 			continue
 		}
@@ -188,6 +202,8 @@ func (s *Reader[T]) runDownloader(
 		body, err := s.cfg.Target.get(
 			ctx, key, s.cfg.ConsistencyControl)
 		if err != nil {
+			// No body materialised — return the slot.
+			state.releaseBodySlots(1)
 			if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
 				if s.cfg.OnMissingData != nil {
 					s.cfg.OnMissingData(key)
@@ -200,6 +216,8 @@ func (s *Reader[T]) runDownloader(
 			cancel()
 			continue
 		}
+		// Slot stays held; decoder releases it when bodies are
+		// nil'd in decodePartition.
 		state.markComplete(job.partIdx, job.fileIdx, body, nil)
 	}
 }
@@ -226,9 +244,10 @@ func (s *Reader[T]) runDecoder(
 			return
 		}
 
-		// Sum exact uncompressed bytes from each file's footer.
-		// Missing files (nil body) contribute zero.
-		uncomp, err := footerUncompressedSum(ps)
+		// Parse footers once: exact uncompressed total for the
+		// byte budget AND total row count for pre-allocating the
+		// decoded slice. Missing files (nil body) contribute zero.
+		uncomp, totalRows, err := footerStats(ps)
 		if err != nil {
 			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
 			return
@@ -241,11 +260,9 @@ func (s *Reader[T]) runDecoder(
 			return
 		}
 
-		recs, err := s.decodePartition(ps)
-		// Drop the compressed bodies as soon as decode finishes
-		// so the GC can reclaim the bytes while the partition
-		// sits in the decoded buffer.
-		ps.bodies = nil
+		recs, err := s.decodePartition(state, ps, totalRows)
+		// decodePartition nils each body + releases its body-pool
+		// slot per-file; just clear the errs slice here.
 		ps.errs = nil
 		if err != nil {
 			state.releaseBytes(uncomp)
@@ -266,37 +283,35 @@ func (s *Reader[T]) runDecoder(
 // ps and returns the concatenated versionedRecords. Files that
 // were missing on download (body == nil, err == nil) are
 // skipped — OnMissingData was already invoked by the downloader.
+//
+// Each body is nil'd and its body-pool slot released as soon as
+// the file is decoded, so the compressed-byte footprint inside
+// a single partition's decode shrinks to ~one body instead of
+// holding every file's compressed bytes for the full loop.
+//
+// The output slice is pre-sized to totalRows (summed from
+// row-group metadata in footerStats) so growth-doubling doesn't
+// inflate the transient allocation peak.
 func (s *Reader[T]) decodePartition(
-	ps *partState,
+	state *streamState, ps *partState, totalRows int64,
 ) ([]versionedRecord[T], error) {
-	var out []versionedRecord[T]
+	out := make([]versionedRecord[T], 0, totalRows)
 	for fi, body := range ps.bodies {
 		if body == nil {
 			continue
 		}
 		recs, err := decodeParquet[T](body)
+		// Free the body and return its slot regardless of decode
+		// outcome — we're done with it either way.
+		ps.bodies[fi] = nil
+		state.releaseBodySlots(1)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: decode %s: %w", ps.files[fi].Key, err)
 		}
-		fileName := path.Base(ps.files[fi].Key)
-		fallbackTime := ps.files[fi].InsertedAt
-		for j, r := range recs {
-			ia := fallbackTime
-			if s.insertedAtFieldIndex != nil {
-				colVal := reflect.ValueOf(&recs[j]).Elem().
-					FieldByIndex(s.insertedAtFieldIndex).
-					Interface().(time.Time)
-				if !colVal.IsZero() {
-					ia = colVal
-				}
-			}
-			out = append(out, versionedRecord[T]{
-				rec:        r,
-				insertedAt: ia,
-				fileName:   fileName,
-			})
-		}
+		out = append(out, s.wrapVersioned(
+			recs, path.Base(ps.files[fi].Key),
+			ps.files[fi].InsertedAt)...)
 	}
 	return out, nil
 }
@@ -332,13 +347,54 @@ func (p *partState) firstError() error {
 
 // streamState carries the shared mutable state of the pipeline:
 // per-partition download counters, the decoded-bytes reservation,
-// and the cond var used by both downloaders (signaling completion)
-// and the yield loop (signaling buffer release).
+// the in-memory compressed-body counter, and the cond var used
+// to signal across stages (download completion, body slot
+// release, decoded-byte release, ctx cancellation).
 type streamState struct {
-	mu            sync.Mutex
-	cond          *sync.Cond
-	parts         []*partState
-	bufferedBytes int64
+	mu                sync.Mutex
+	cond              *sync.Cond
+	parts             []*partState
+	bufferedBytes     int64
+	outstandingBodies int
+}
+
+// acquireBodySlot reserves one slot in the compressed-body pool
+// against cap. Blocks while the pool is full and ctx is alive.
+// Returns false if ctx is cancelled while waiting. cap == 0
+// disables the cap (no back-pressure).
+//
+// The pool counts compressed parquet bodies that downloaders
+// have stored into per-partition slots and the decoder has not
+// yet cleared. It bounds the worst-case compressed-byte
+// footprint of the pipeline to roughly cap × largest_compressed_size.
+func (s *streamState) acquireBodySlot(
+	ctx context.Context, cap int,
+) bool {
+	if cap <= 0 {
+		return ctx.Err() == nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.outstandingBodies >= cap {
+		if ctx.Err() != nil {
+			return false
+		}
+		s.cond.Wait()
+	}
+	s.outstandingBodies++
+	return true
+}
+
+// releaseBodySlots returns n slots to the pool and wakes any
+// blocked downloader (or the watchdog if ctx fires concurrently).
+func (s *streamState) releaseBodySlots(n int) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.outstandingBodies -= n
+	s.cond.Broadcast()
+	s.mu.Unlock()
 }
 
 // markComplete is the downloader-side update: store the result
@@ -433,27 +489,32 @@ func sendBatch[T any](
 	}
 }
 
-// footerUncompressedSum opens each non-nil body via parquet-go's
-// footer parser and sums per-row-group total_byte_size, which
-// the parquet spec defines as the total uncompressed size of all
-// column data in the row group. Metadata is parsed once per file
+// footerStats opens each non-nil body via parquet-go's footer
+// parser and returns the partition's totals: uncompressed bytes
+// (per-row-group total_byte_size, which the parquet spec defines
+// as the total uncompressed size of all column data in the row
+// group) and total row count. Metadata is parsed once per file
 // (~10–100KB of footer bytes); the body is already in memory so
 // this is essentially free.
-func footerUncompressedSum(p *partState) (int64, error) {
-	var total int64
+//
+// The uncompressed total drives the byte-budget gate; the row
+// count drives pre-sizing of the decoded slice so its growth
+// doesn't double-allocate at decode time.
+func footerStats(p *partState) (uncomp, totalRows int64, err error) {
 	for fi, body := range p.bodies {
 		if body == nil {
 			continue
 		}
-		f, err := parquet.OpenFile(
+		f, openErr := parquet.OpenFile(
 			bytes.NewReader(body), int64(len(body)))
-		if err != nil {
-			return 0, fmt.Errorf(
-				"s3parquet: open %s: %w", p.files[fi].Key, err)
+		if openErr != nil {
+			return 0, 0, fmt.Errorf(
+				"s3parquet: open %s: %w", p.files[fi].Key, openErr)
 		}
 		for _, rg := range f.Metadata().RowGroups {
-			total += rg.TotalByteSize
+			uncomp += rg.TotalByteSize
+			totalRows += rg.NumRows
 		}
 	}
-	return total, nil
+	return uncomp, totalRows, nil
 }

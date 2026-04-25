@@ -134,6 +134,89 @@ func TestReserveBytes_CtxCancellation(t *testing.T) {
 	}
 }
 
+// TestAcquireBodySlot_BlocksUntilRelease verifies the body-pool
+// back-pressure: once cap slots are held, the next acquire blocks
+// until releaseBodySlots returns one.
+func TestAcquireBodySlot_BlocksUntilRelease(t *testing.T) {
+	s := newTestStreamState()
+	const cap = 2
+
+	if !s.acquireBodySlot(context.Background(), cap) {
+		t.Fatal("first acquire should succeed")
+	}
+	if !s.acquireBodySlot(context.Background(), cap) {
+		t.Fatal("second acquire should succeed")
+	}
+
+	// Third must block — pool is full.
+	done := make(chan struct{})
+	go func() {
+		s.acquireBodySlot(context.Background(), cap)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("third acquire should have blocked")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Release one — third unblocks.
+	s.releaseBodySlots(1)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("third acquire should have unblocked after release")
+	}
+
+	if s.outstandingBodies != 2 {
+		t.Errorf("outstandingBodies = %d, want 2", s.outstandingBodies)
+	}
+}
+
+// TestAcquireBodySlot_NoCap returns true immediately and does
+// not touch the counter.
+func TestAcquireBodySlot_NoCap(t *testing.T) {
+	s := newTestStreamState()
+	if !s.acquireBodySlot(context.Background(), 0) {
+		t.Fatal("acquireBodySlot with cap=0 should return true")
+	}
+	if s.outstandingBodies != 0 {
+		t.Errorf("outstandingBodies = %d, want 0", s.outstandingBodies)
+	}
+}
+
+// TestAcquireBodySlot_CtxCancellation guards that a blocked
+// acquire returns false when ctx is cancelled (paired with the
+// watchdog broadcast in the live pipeline).
+func TestAcquireBodySlot_CtxCancellation(t *testing.T) {
+	s := newTestStreamState()
+	const cap = 1
+	if !s.acquireBodySlot(context.Background(), cap) {
+		t.Fatal("first acquire should succeed")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan bool, 1)
+	go func() {
+		got <- s.acquireBodySlot(ctx, cap)
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	cancel()
+	s.mu.Lock()
+	s.cond.Broadcast()
+	s.mu.Unlock()
+
+	select {
+	case ok := <-got:
+		if ok {
+			t.Error("acquireBodySlot should return false on ctx cancel")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acquireBodySlot did not return after ctx cancel")
+	}
+}
+
 // TestWaitForPartition_BlocksUntilComplete verifies that the
 // decoder's wait actually unblocks when downloaders finish.
 func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {

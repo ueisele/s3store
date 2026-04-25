@@ -434,9 +434,28 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	if err != nil {
 		return nil, fmt.Errorf("s3parquet: decode %s: %w", key, err)
 	}
-	versioned := make([]versionedRecord[T], len(recs))
+	return s.wrapVersioned(recs, fileName, km.InsertedAt), nil
+}
+
+// wrapVersioned attaches each decoded record to its
+// versionedRecord envelope. insertedAt source priority:
+//
+//  1. When InsertedAtField is configured AND the decoded column
+//     value is non-zero, use it — the writer-populated wall clock,
+//     exact and identical across every read path.
+//  2. Otherwise fall back to fallbackTime (S3 LastModified on the
+//     Read path, ref dataTsMicros on the PollRecords path). Keeps
+//     sort + DefaultVersionOf monotonic during an InsertedAtField
+//     rollout without forcing a rewrite of historical data.
+//
+// Used by every decode path so the field-stamping rule lives in
+// one place.
+func (s *Reader[T]) wrapVersioned(
+	recs []T, fileName string, fallbackTime time.Time,
+) []versionedRecord[T] {
+	out := make([]versionedRecord[T], len(recs))
 	for j, r := range recs {
-		ia := km.InsertedAt
+		ia := fallbackTime
 		if s.insertedAtFieldIndex != nil {
 			colVal := reflect.ValueOf(&recs[j]).Elem().
 				FieldByIndex(s.insertedAtFieldIndex).
@@ -445,13 +464,13 @@ func (s *Reader[T]) downloadAndDecodeOne(
 				ia = colVal
 			}
 		}
-		versioned[j] = versionedRecord[T]{
+		out[j] = versionedRecord[T]{
 			rec:        r,
 			insertedAt: ia,
 			fileName:   fileName,
 		}
 	}
-	return versioned, nil
+	return out
 }
 
 // groupKeysByPartition splits a flat list of data-file KeyMetas

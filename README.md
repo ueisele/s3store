@@ -739,11 +739,17 @@ for r, err := range store.ReadIter(ctx, "*",
     s3parquet.WithReadAheadBytes(2<<30)) { ... }
 ```
 
-**Trade-off**: peak memory ≈ `WithReadAheadBytes` + one in-flight
-decode + the compressed bodies for files queued ahead in the
-download stage (bounded by `MaxInflightRequests`). Speed-up is
-bounded by how much of your per-partition yield time would
-otherwise sit idle waiting for downloads.
+**Trade-off**: peak memory ≈ `WithReadAheadBytes` (decoded
+uncompressed bytes) + at most `max(MaxInflightRequests,
+largest_partition_file_count)` compressed parquet bodies waiting
+to be decoded + one in-flight decode. Downloaders apply
+back-pressure when the compressed-body pool is full so the
+"downloaded but not yet decoded" backlog can't grow without
+bound; the floor at `largest_partition_file_count` guarantees
+the largest partition can always be downloaded in full (the
+decoder needs every file before the partition can be decoded).
+Speed-up is bounded by how much of your per-partition yield time
+would otherwise sit idle waiting for downloads.
 
 **Single oversized partition**: if one partition's uncompressed
 total exceeds `WithReadAheadBytes` on its own, that partition still
