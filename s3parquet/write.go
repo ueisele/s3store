@@ -336,7 +336,7 @@ func (s *Writer[T]) writeEncodedPayload(
 		map[string]string{
 			"created-at": writeStartTime.Format(time.RFC3339Nano),
 		},
-		withConsistencyControl(s.cfg.ConsistencyControl))
+		s.cfg.ConsistencyControl)
 	isRetry := errors.Is(putErr, ErrAlreadyExists)
 	if putErr != nil && !isRetry {
 		return nil, fmt.Errorf("s3parquet: put data: %w", putErr)
@@ -494,7 +494,7 @@ func (s *Writer[T]) putRefWithBudget(
 	defer cancel()
 	err = s.cfg.Target.put(
 		putCtx, refKey, []byte{}, "application/octet-stream",
-		withConsistencyControl(s.cfg.ConsistencyControl))
+		s.cfg.ConsistencyControl)
 	return time.Since(refCaptureTime), err
 }
 
@@ -608,7 +608,7 @@ func (s *Writer[T]) findExistingRef(
 	for paginator.HasMorePages() {
 		page, err := s.cfg.Target.listPage(
 			ctx, paginator,
-			withConsistencyControl(s.cfg.ConsistencyControl))
+			s.cfg.ConsistencyControl)
 		if err != nil {
 			return "", err
 		}
@@ -799,7 +799,7 @@ func (s *Writer[T]) putMarkersParallel(
 
 			if err := s.cfg.Target.put(
 				ctx, p, nil, "application/octet-stream",
-				withConsistencyControl(s.cfg.ConsistencyControl),
+				s.cfg.ConsistencyControl,
 			); err != nil {
 				errs[i] = err
 				cancel()

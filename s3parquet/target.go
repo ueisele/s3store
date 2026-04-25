@@ -23,52 +23,18 @@ import (
 // stream to decide whether the ref also needs re-emission.
 var ErrAlreadyExists = errors.New("s3parquet: object already exists")
 
-// s3CallOpt configures a single S3 target call. Used to thread
-// optional per-operation headers (currently Consistency-Control)
-// through put / get / head / list without widening method
-// signatures with scalar parameters that are empty on every call
-// today. Unexported — callers use the `with...` helpers below.
-type s3CallOpt func(*s3CallOpts)
-
-// s3CallOpts is the resolved per-call option set.
-type s3CallOpts struct {
-	// consistencyControl is the value for the Consistency-Control
-	// HTTP header when non-empty; unknown to AWS S3 and MinIO
-	// (ignored), honoured by NetApp StorageGRID.
-	consistencyControl string
-}
-
-// applyS3CallOpts folds a variadic s3CallOpt chain into an
-// s3CallOpts value.
-func applyS3CallOpts(opts []s3CallOpt) s3CallOpts {
-	var o s3CallOpts
-	for _, opt := range opts {
-		opt(&o)
-	}
-	return o
-}
-
-// withConsistencyControl sets the Consistency-Control header on
-// the target call. Zero-length values (ConsistencyDefault) become
-// no-ops so callers can forward their config value unconditionally
-// without guarding on emptiness at every site.
-func withConsistencyControl(level ConsistencyLevel) s3CallOpt {
-	return func(o *s3CallOpts) {
-		o.consistencyControl = string(level)
-	}
-}
-
-// apiOptionsForOpts returns the aws.Config.APIOptions slice the
-// current call should pass to the SDK. Today it contains at most
-// one middleware — the Consistency-Control header setter — and
-// returns nil when no header is requested.
-func apiOptionsForOpts(o s3CallOpts) []func(*middleware.Stack) error {
-	if o.consistencyControl == "" {
+// consistencyAPIOpts returns the SDK APIOptions slice that
+// installs the Consistency-Control header for an S3 call. Empty
+// level → nil → no header, which is the correct behaviour on
+// AWS S3 / MinIO; on NetApp StorageGRID callers pass the
+// configured ConsistencyLevel through their target methods.
+func consistencyAPIOpts(level ConsistencyLevel) []func(*middleware.Stack) error {
+	if level == "" {
 		return nil
 	}
 	return []func(*middleware.Stack) error{
 		core.AddHeaderMiddleware(
-			"Consistency-Control", o.consistencyControl),
+			"Consistency-Control", string(level)),
 	}
 }
 
@@ -209,10 +175,9 @@ func (t S3Target) EffectiveSettleWindow() time.Duration {
 // path (Read, PollRecords) and by BackfillIndex when scanning
 // historical parquet data.
 func (t S3Target) get(
-	ctx context.Context, key string, opts ...s3CallOpt,
+	ctx context.Context, key string, consistency ConsistencyLevel,
 ) ([]byte, error) {
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
+	apiOpts := consistencyAPIOpts(consistency)
 	var data []byte
 	err := retry(ctx, func() error {
 		resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
@@ -236,10 +201,9 @@ func (t S3Target) get(
 // emission.
 func (t S3Target) put(
 	ctx context.Context, key string, data []byte, contentType string,
-	opts ...s3CallOpt,
+	consistency ConsistencyLevel,
 ) error {
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
+	apiOpts := consistencyAPIOpts(consistency)
 	return retry(ctx, func() error {
 		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.Bucket),
@@ -273,10 +237,9 @@ func (t S3Target) put(
 func (t S3Target) putIfAbsent(
 	ctx context.Context, key string, data []byte,
 	contentType string, meta map[string]string,
-	opts ...s3CallOpt,
+	consistency ConsistencyLevel,
 ) error {
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
+	apiOpts := consistencyAPIOpts(consistency)
 	putErr := retry(ctx, func() error {
 		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.Bucket),
@@ -306,11 +269,10 @@ func (t S3Target) putIfAbsent(
 			// Could be overwrite-deny (StorageGRID bucket policy)
 			// or a real permission error. Disambiguate via HEAD.
 			//
-			// The HEAD uses the same APIOptions so it carries the
-			// same Consistency-Control header — NetApp's rule is
-			// that paired PUT and follow-up operations must match
-			// on consistency.
-			ok, headErr := t.exists(ctx, key, opts...)
+			// The HEAD reuses the same consistency level so it
+			// pairs with the PUT under NetApp's "same consistency
+			// for paired operations" rule.
+			ok, headErr := t.exists(ctx, key, consistency)
 			if headErr == nil && ok {
 				return ErrAlreadyExists
 			}
@@ -328,10 +290,9 @@ func (t S3Target) putIfAbsent(
 // to (false, nil) so callers can distinguish "missing" from real
 // failures without pattern-matching the error at every site.
 func (t S3Target) exists(
-	ctx context.Context, key string, opts ...s3CallOpt,
+	ctx context.Context, key string, consistency ConsistencyLevel,
 ) (bool, error) {
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
+	apiOpts := consistencyAPIOpts(consistency)
 	err := retry(ctx, func() error {
 		_, err := t.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(t.Bucket),
@@ -365,10 +326,9 @@ func (t S3Target) del(ctx context.Context, key string) error {
 // row-group-filtered read path to size the io.ReaderAt parquet-
 // go opens the file through.
 func (t S3Target) size(
-	ctx context.Context, key string, opts ...s3CallOpt,
+	ctx context.Context, key string, consistency ConsistencyLevel,
 ) (int64, error) {
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
+	apiOpts := consistencyAPIOpts(consistency)
 	var resp *s3.HeadObjectOutput
 	err := retry(ctx, func() error {
 		var err error
@@ -395,13 +355,12 @@ func (t S3Target) size(
 // row-group-filtered parquet reader.
 func (t S3Target) getRange(
 	ctx context.Context, key string, start, end int64,
-	opts ...s3CallOpt,
+	consistency ConsistencyLevel,
 ) ([]byte, error) {
 	if end <= start {
 		return nil, nil
 	}
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
+	apiOpts := consistencyAPIOpts(consistency)
 	var data []byte
 	err := retry(ctx, func() error {
 		resp, err := t.S3Client.GetObject(ctx, &s3.GetObjectInput{
@@ -458,10 +417,9 @@ func (t S3Target) listRange(
 // retrying re-requests the same page cleanly.
 func (t S3Target) listPage(
 	ctx context.Context, p *s3.ListObjectsV2Paginator,
-	opts ...s3CallOpt,
+	consistency ConsistencyLevel,
 ) (*s3.ListObjectsV2Output, error) {
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
+	apiOpts := consistencyAPIOpts(consistency)
 	var out *s3.ListObjectsV2Output
 	err := retry(ctx, func() error {
 		var err error

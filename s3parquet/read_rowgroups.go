@@ -188,7 +188,7 @@ func (s *Reader[T]) downloadFilteredOne(
 	fileName := path.Base(key)
 
 	size, err := s.cfg.Target.size(
-		ctx, key, withConsistencyControl(s.cfg.ConsistencyControl))
+		ctx, key, s.cfg.ConsistencyControl)
 	if err != nil {
 		if _, ok := errors.AsType[*s3types.NotFound](err); ok {
 			if s.cfg.OnMissingData != nil {
@@ -291,7 +291,7 @@ func (r *s3ReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	}
 	body, err := r.target.getRange(
 		r.ctx, r.key, off, off+int64(len(p)),
-		withConsistencyControl(r.consistency))
+		r.consistency)
 	if err != nil {
 		return 0, err
 	}

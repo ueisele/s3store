@@ -220,7 +220,7 @@ func TestTarget_PutRetriesOn5xx(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	if err := tgt.put(context.Background(), "key",
-		[]byte("x"), "application/octet-stream"); err != nil {
+		[]byte("x"), "application/octet-stream", ""); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if got := count.Load(); got != 3 {
@@ -234,7 +234,7 @@ func TestTarget_PutRetriesOn429(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	if err := tgt.put(context.Background(), "key",
-		[]byte("x"), "application/octet-stream"); err != nil {
+		[]byte("x"), "application/octet-stream", ""); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if got := count.Load(); got != 2 {
@@ -248,7 +248,7 @@ func TestTarget_PutNoRetryOn404(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.put(context.Background(), "key",
-		[]byte("x"), "application/octet-stream")
+		[]byte("x"), "application/octet-stream", "")
 	if err == nil {
 		t.Fatal("want error on 404, got nil")
 	}
@@ -276,7 +276,7 @@ func TestTarget_GetRetriesOn5xx(t *testing.T) {
 	t.Cleanup(srv.Close)
 	tgt := newTestTarget(t, srv.URL)
 
-	got, err := tgt.get(context.Background(), "key")
+	got, err := tgt.get(context.Background(), "key", "")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

@@ -386,12 +386,12 @@ func (i *Index[K]) listMatchingMarkers(
 	ctx context.Context, plan *core.ReadPlan,
 ) ([]string, error) {
 	paginator := i.target.list(plan.ListPrefix)
-	opts := withConsistencyControl(i.consistency)
 
 	var keys []string
 	suffix := "/" + core.IndexMarkerFilename
 	for paginator.HasMorePages() {
-		page, err := i.target.listPage(ctx, paginator, opts)
+		page, err := i.target.listPage(
+			ctx, paginator, i.consistency)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: index %q list: %w", i.name, err)
@@ -624,7 +624,7 @@ func BackfillIndexMany[T any, K comparable](
 			for _, p := range paths {
 				if err := target.put(
 					ctx, p, nil, "application/octet-stream",
-					withConsistencyControl(def.ConsistencyControl),
+					def.ConsistencyControl,
 				); err != nil {
 					errs[n] = fmt.Errorf(
 						"s3parquet: backfill index %q: put marker: %w",
@@ -706,11 +706,11 @@ func listDataFilesForPlan(
 	consistency ConsistencyLevel,
 ) ([]string, error) {
 	paginator := target.list(plan.ListPrefix)
-	opts := withConsistencyControl(consistency)
 
 	var keys []string
 	for paginator.HasMorePages() {
-		page, err := target.listPage(ctx, paginator, opts)
+		page, err := target.listPage(
+			ctx, paginator, consistency)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: backfill list data files: %w", err)
@@ -751,7 +751,7 @@ func backfillMarkersForObject[T any, K comparable](
 	key string,
 	consistency ConsistencyLevel,
 ) ([]string, int, error) {
-	data, err := target.get(ctx, key, withConsistencyControl(consistency))
+	data, err := target.get(ctx, key, consistency)
 	if err != nil {
 		return nil, 0, fmt.Errorf(
 			"s3parquet: backfill get %s: %w", key, err)

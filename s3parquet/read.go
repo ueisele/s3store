@@ -380,11 +380,11 @@ func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *core.ReadPlan,
 ) ([]core.KeyMeta, error) {
 	paginator := s.cfg.Target.list(plan.ListPrefix)
-	opts := withConsistencyControl(s.cfg.ConsistencyControl)
 
 	var out []core.KeyMeta
 	for paginator.HasMorePages() {
-		page, err := s.cfg.Target.listPage(ctx, paginator, opts)
+		page, err := s.cfg.Target.listPage(
+			ctx, paginator, s.cfg.ConsistencyControl)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: list data files: %w", err)
@@ -569,7 +569,7 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	fileName := path.Base(key)
 
 	data, err := s.cfg.Target.get(
-		ctx, key, withConsistencyControl(s.cfg.ConsistencyControl))
+		ctx, key, s.cfg.ConsistencyControl)
 	if err != nil {
 		if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
 			if s.cfg.OnMissingData != nil {

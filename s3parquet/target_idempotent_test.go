@@ -57,7 +57,7 @@ func TestPutIfAbsent_Fresh_OK(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil)
+		[]byte("x"), "application/octet-stream", nil, "")
 	if err != nil {
 		t.Fatalf("putIfAbsent: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestPutIfAbsent_412(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil)
+		[]byte("x"), "application/octet-stream", nil, "")
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("want ErrAlreadyExists, got %v", err)
 	}
@@ -108,7 +108,7 @@ func TestPutIfAbsent_403ThenHeadFound(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil)
+		[]byte("x"), "application/octet-stream", nil, "")
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("want ErrAlreadyExists, got %v", err)
 	}
@@ -132,7 +132,7 @@ func TestPutIfAbsent_403ThenHeadMissing(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil)
+		[]byte("x"), "application/octet-stream", nil, "")
 	if err == nil {
 		t.Fatal("want non-nil error")
 	}
@@ -160,7 +160,7 @@ func TestConsistencyControl_HeaderSentOnPUT(t *testing.T) {
 
 	err := tgt.put(context.Background(), "k",
 		[]byte("x"), "application/octet-stream",
-		withConsistencyControl(ConsistencyStrongGlobal))
+		ConsistencyStrongGlobal)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestConsistencyControl_EmptyOmitsHeader(t *testing.T) {
 
 	err := tgt.put(context.Background(), "k",
 		[]byte("x"), "application/octet-stream",
-		withConsistencyControl(ConsistencyDefault))
+		ConsistencyDefault)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestConsistencyControl_HeaderSentOnGET(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	_, err := tgt.get(context.Background(), "k",
-		withConsistencyControl(ConsistencyStrongSite))
+		ConsistencyStrongSite)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
