@@ -100,13 +100,12 @@ store, err := s3parquet.New[CostRecord](ctx, s3parquet.Config[CostRecord]{
             r.ChargePeriod, r.CustomerID)
     },
     // Optional: enable latest-per-entity dedup on Read / PollRecords.
-    // With only EntityKeyOf set, VersionOf defaults to DefaultVersionOf
-    // (wrote-last-wins using the parquet file's write time).
+    // EntityKeyOf and VersionOf are required together — both or
+    // neither. NewReader rejects partial config.
     EntityKeyOf: func(r CostRecord) string {
         return r.CustomerID + "|" + r.SKU
     },
-    // Optional: override the default with a business timestamp.
-    VersionOf: func(r CostRecord, insertedAt time.Time) int64 {
+    VersionOf: func(r CostRecord) int64 {
         return r.CalculatedAt.UnixNano()
     },
 })
@@ -178,7 +177,7 @@ recs, _ := view.Read(ctx, "*") // []NarrowRec — ProcessLog not fetched
 ```
 
 The narrow `ReaderConfig[T']` carries the read-side knobs
-(`EntityKeyOf`, `VersionOf`, `InsertedAtField`, `OnMissingData`,
+(`EntityKeyOf`, `VersionOf`, `OnMissingData`,
 `ConsistencyControl`); the constructor overwrites the `Target`
 field from the source Writer/Store so `SettleWindow` and the
 S3 wiring are inherited automatically. Dedup closures are typed
@@ -489,9 +488,9 @@ records, newOffset, err = store.PollRecords(ctx, lastOffset, 100,
 Whether dedup actually runs depends on which read path you use:
 
 - **`s3parquet.PollRecords` / `Read` / `ReadIter` (and the umbrella
-  delegations)** — dedup when `EntityKeyOf` is set. If `VersionOf` is
-  nil, it defaults to `DefaultVersionOf` (the file's write time). When
-  `EntityKeyOf` is nil, every record passes through.
+  delegations)** — dedup when `EntityKeyOf` AND `VersionOf` are both
+  set (NewReader rejects partial config). When neither is set, every
+  record passes through in decode order.
 - **`s3sql.Query` / `QueryMany` (and the umbrella delegations)** —
   dedup when `EntityKeyColumns` + `VersionColumn` are both set (DuckDB
   `QUALIFY ROW_NUMBER()` CTE). When either is empty, every record
@@ -499,24 +498,25 @@ Whether dedup actually runs depends on which read path you use:
 
 `WithHistory()` forces the no-dedup path in every case.
 
-**Deterministic tie-break on equal versions.** When two writes share the
-same version for the same entity key — common on an at-least-once retry
-that replays a batch with the same domain timestamp — both paths resolve
-the tie deterministically:
+**Deterministic tie-break on equal versions.** When two writes share
+the same version for the same entity key — common on an at-least-once
+retry that replays a batch with the same domain timestamp — both paths
+resolve the tie the same way: **lex-later filename wins**.
 
-- **`s3parquet`**: first write wins (first occurrence, stable across
-  repeated reads).
-- **`s3sql`**: later write wins (secondary `ORDER BY filename DESC` in
-  the dedup CTE). Holds for the auto-generated `{tsMicros}-{shortID}`
-  id — lex-later = wrote-later. With `WithIdempotencyToken` the
-  filename is the caller's token, so the tie-break follows the token's
-  lex order rather than wall-clock order; use a time-sortable token
-  format (e.g. `{ISO-timestamp}-{suffix}`) if you rely on this. Stable
-  across repeated reads either way.
+- **`s3parquet`**: input is sorted by `(entityKey, versionOf)` stable
+  on ties; preparePartitions feeds files in lex order, so within a
+  tied (entity, version) group the lex-later file's record is the
+  last one and dedupLatestSeq's `pending` advances onto it.
+- **`s3sql`**: secondary `ORDER BY filename DESC` in the dedup CTE
+  picks the lex-later filename explicitly.
 
-The two packages differ in *which* record wins, but each is deterministic
-on its own. Pick the package whose tie-break matches your retry
-semantics — or make the tie impossible by ensuring `VersionColumn` /
+For the auto-generated `{tsMicros}-{shortID}` id, lex-later =
+wrote-later, so this is "wrote-later wins" in practice. With
+`WithIdempotencyToken` the filename is the caller's token; the
+tie-break follows the token's lex order rather than wall-clock order.
+Use a time-sortable token format (e.g. `{ISO-timestamp}-{suffix}`) if
+you rely on chronological tie-breaking. Stable across repeated reads
+either way. To make ties impossible, ensure `VersionColumn` /
 `VersionOf` strictly increases per write.
 
 ### Per-record "when was this inserted"
@@ -547,8 +547,16 @@ recs, _ := store.Read(ctx, "*")
 Works on every typed read path (`s3parquet.Read`, `ReadIter`,
 `PollRecords`) and on the SQL side too — DuckDB decodes the
 column natively via `SELECT *` (s3sql exposes it as a regular
-column on the `*sql.Rows` cursor). Zero reflection cost when
-unset.
+column on the `*sql.Rows` cursor). The reader has no special
+handling: the column round-trips like any other parquet field.
+Zero reflection cost when unset.
+
+To use the writer-stamped time as the dedup version, reference
+the field from `VersionOf`:
+
+```go
+VersionOf: func(r Event) int64 { return r.InsertedAt.UnixMicro() }
+```
 
 ### Stream — time window
 
@@ -893,11 +901,13 @@ files and runs `QUALIFY` over the full result, so dedup is global
 regardless of how rows are streamed back.
 
 **Order**: `s3parquet.Reader.ReadIter` visits partitions in lex order
-and downloads files within a partition in lex order; the user-visible
-emission order inside each partition is then decided by the reader's
-sort cascade — `(entity, version)` when `EntityKeyOf` is set, else
-`(insertedAt, fileName)`. SQL queries return rows in DuckDB's query
-order — add `ORDER BY` in your `Query` call if you need stability.
+and downloads files within a partition in lex order. Within a
+partition the user-visible emission order is `(entity, version)`
+ascending when `EntityKeyOf` is set; when no dedup is configured the
+sort is skipped entirely and records emit in decode order (file lex
+order, then parquet row order). SQL queries return rows in DuckDB's
+query order — add `ORDER BY` in your `Query` call if you need
+stability.
 
 ### SQL query (umbrella or `s3sql`)
 
@@ -1768,8 +1778,14 @@ type Config[T any] struct {
     // Required for Write
     PartitionKeyOf func(T) string         // derive key from record (Write)
 
-    // SQL-side dedup (used by Read / PollRecords / Query).
-    // Both or neither — explicit opt-in, no default.
+    // Parquet-side dedup (used by Read / ReadIter / PollRecords).
+    // Both or neither — explicit opt-in, no default. NewReader
+    // rejects partial config.
+    EntityKeyOf func(T) string            // identifies a unique entity
+    VersionOf   func(T) int64             // monotonic version per entity
+
+    // SQL-side dedup (used by Query / QueryMany via DuckDB CTE).
+    // Both or neither.
     EntityKeyColumns []string             // columns that identify an entity
     VersionColumn    string               // column to ORDER BY for latest
 
@@ -1779,8 +1795,11 @@ type Config[T any] struct {
     // Optional write-time column: if set, the writer populates
     // this field on T (must be `time.Time` with a non-empty,
     // non-"-" parquet tag like `parquet:"inserted_at"`) with
-    // its wall-clock at write-start, and Read / PollRecords
-    // surface the value back from the parquet column.
+    // its wall-clock at write-start. The reader has no special
+    // handling — the column round-trips on T like any parquet
+    // field. Reference it from VersionOf to use the writer's
+    // stamp as the dedup version:
+    //   VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
     InsertedAtField string
 
     // Parquet compression codec (default snappy).
