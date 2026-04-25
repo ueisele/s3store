@@ -1058,10 +1058,12 @@ correctness-critical S3 call on both halves:
   this, a ref can become LIST-visible later than `SettleWindow`
   assumes and be skipped silently.
 - **Ref-PUT budget against `SettleWindow`.** The PUT gets a
-  uniform `SettleWindow / 2` timeout regardless of consistency
-  level — the other half is reserved for the post-PUT HEAD and
-  any LIST propagation. See [Settle window](#settle-window) for
-  the contract and the `ErrRefSettleBudgetExceeded` sentinel.
+  uniform `SettleWindow / 2` client-side timeout regardless of
+  consistency level — the other half is reserved for LIST
+  propagation between writer and consumer nodes. A PUT that
+  misses the deadline returns a wrapped error so the caller
+  retries; see [Settle window](#settle-window) for the full
+  contract.
 
 ### Zombie writers and orchestrators
 
@@ -1502,73 +1504,40 @@ just before the ref PUT (not after), so `SettleWindow` has to
 cover the PUT's own network time plus LIST propagation on the
 backend.
 
-The write path enforces this: the ref PUT is wrapped in a context
-timeout of `SettleWindow / 2`, and a post-hoc check compares
-elapsed time (re-measured after the disambiguation HEAD) against
-`SettleWindow`.
-
-The reserved half covers two sources of additional delay that
-would otherwise push the ref's effective visibility time past
-`SettleWindow`:
-
-- **HEAD time** on the post-PUT disambiguation. Nonzero on every
-  backend. Without headroom, a PUT that completes at exactly
-  `SettleWindow` lands the HEAD past the budget.
-- **LIST propagation** between the node that accepted the PUT
-  and the node a concurrent `Poll` hits. Zero on strong-
-  consistency backends, nonzero on weak ones.
+The write path enforces this with a `SettleWindow / 2`
+client-side timeout on the ref PUT. The reserved half covers
+LIST propagation between the node that accepted the PUT and the
+node a concurrent `Poll` hits — zero on strong-consistency
+backends, nonzero on weak ones.
 
 Real PUT latencies (tens of ms) fit comfortably inside
 `SettleWindow / 2` for any reasonable `SettleWindow`, so the
 halved budget doesn't cost the happy path anything. The budget
-does **not** vary with `ConsistencyControl` — an earlier version
-handed strong-consistency writers the full `SettleWindow` based
-on "zero LIST propagation", but that ignored HEAD time and forced
-unnecessary recovery on borderline-slow PUTs that actually
-landed in budget.
+does **not** vary with `ConsistencyControl`.
 
-If the ref PUT's elapsed time exceeds `SettleWindow`, the stale
-`refTsMicros` sits at an offset some consumers may already have
-advanced past (after yielding fresher refs from other partitions).
-The library recovers automatically before returning success:
-
-1. Write a **fresh ref** with a new `refTsMicros` well inside the
-   SettleWindow budget.
-2. **Best-effort delete** the stale ref to narrow the window where
-   both are LIST-visible.
-
-Consumers who polled after the recovery delete see only the fresh
-ref. Consumers who polled between "stale ref landed" and "delete
-took effect" see both and process the same idempotent data file
-twice — reader-layer `EntityKeyOf + VersionOf` dedup collapses
-them to one record. This duplicate-absorbed-by-dedup tradeoff is
-deliberate: the alternative ("return success pointing at the stale
-ref") silently misses the write for every consumer who advanced
-past that offset, which is strictly worse.
-
-`ErrRefSettleBudgetExceeded` is raised only when **both** the
-initial PUT and the recovery PUT miss budget — a persistent
-backend-slowness signal rather than a one-off glitch:
+If the ref PUT misses the deadline (or fails for any other
+reason), the call returns a wrapped error and the orphan data
+file is best-effort deleted. The caller retries — under
+`WithIdempotencyToken` the retry is deterministic (same data
+path); `findExistingRef`'s freshness filter ignores any stale
+ref a previous attempt may have left behind, so the retry emits
+a fresh in-budget ref rather than silently matching the stale
+one.
 
 ```go
-if _, err := store.Write(ctx, recs, s3store.WithIdempotencyToken(token, time.Hour)); err != nil {
-    if errors.Is(err, s3parquet.ErrRefSettleBudgetExceeded) {
-        // Initial PUT and internal recovery both missed budget.
-        // Retry — with WithIdempotencyToken the retry is
-        // deterministic (same data path); the retry's scoped-LIST
-        // freshness filter ignores the stale ref so a fresh one
-        // is emitted rather than silently matching the stale.
-        return retry(...)
-    }
-    return err
+if _, err := store.Write(ctx, recs,
+    s3store.WithIdempotencyToken(token, time.Hour),
+); err != nil {
+    // ctx.DeadlineExceeded indicates the ref PUT missed its
+    // SettleWindow/2 budget; any wrapped put error means the
+    // ref didn't land. Retry with the same token.
+    return retry(...)
 }
 ```
 
-The sentinel lets callers distinguish budget-exceeded writes from
-other failures (permission errors, etc.) without parsing error
-strings. For **exactly-once at the consumer** through this path,
-configure reader dedup (`EntityKeyOf + VersionOf`) — the rare
-duplicates produced by recovery's narrow gap all share
+For **exactly-once at the consumer**, configure reader dedup
+(`EntityKeyOf + VersionOf`) — the rare duplicates produced by
+the narrow ack-loss-after-server-persist window all share
 `(entity, version)` and dedup collapses them.
 
 **AWS S3 / MinIO users**: `ConsistencyControl` doesn't change the
@@ -1693,10 +1662,9 @@ To make retries produce deterministic data paths at the storage
 layer (no duplicate bytes, no duplicate refs within a bounded
 window), pass `WithIdempotencyToken` — see
 [Idempotent writes](#idempotent-writes). The ref PUT itself is
-budgeted against `SettleWindow`; a slow write that exceeds the
-budget returns `ErrRefSettleBudgetExceeded` (see
-[Settle window](#settle-window) for the contract and an idiomatic
-retry).
+budgeted at `SettleWindow / 2`; a slow write that misses the
+deadline returns a wrapped put-ref error so the caller retries
+(see [Settle window](#settle-window)).
 
 ### Read
 

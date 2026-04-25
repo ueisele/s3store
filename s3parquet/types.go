@@ -1,7 +1,6 @@
 package s3parquet
 
 import (
-	"errors"
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
@@ -16,40 +15,6 @@ import (
 // Aliased to the shared sentinel in internal/refstream so
 // errors.Is matches across s3parquet, s3sql, and the umbrella.
 var ErrRefStreamDisabled = refstream.ErrDisabled
-
-// ErrRefSettleBudgetExceeded is returned from the write path when
-// the initial ref PUT blew SettleWindow AND the internal recovery
-// PUT (a second attempt with a fresh refTsMicros) also missed its
-// budget. The stale refTsMicros sits past the settle cutoff a
-// concurrent Poll would compute, so consumers who advanced past
-// it can't observe the write — and the library gave up trying to
-// publish a fresher one on its own.
-//
-// Normal budget-blown path (no sentinel): the library detects the
-// first PUT's elapsed > SettleWindow, runs the recovery PUT with
-// a new refTsMicros, and best-effort deletes the stale ref. The
-// write returns success with the fresh RefPath / Offset. A rare
-// duplicate lands when a consumer polled during the "stale ref
-// landed → delete propagated" gap; reader-layer (entity, version)
-// dedup absorbs it.
-//
-// Sentinel path: both the initial PUT and the recovery PUT missed
-// budget — typically indicates persistent backend slowness or a
-// mis-sized SettleWindow. Callers should treat this as a failed
-// write and retry; with WithIdempotencyToken the retry is
-// deterministic (same data path, scoped-LIST dedup on the ref
-// side). On retry, findExistingRef's freshness filter rejects the
-// now-stale ref as a dedup target so the retry emits a fresh ref
-// rather than silently matching the stale one.
-//
-// Real PUT failures where HEAD also reports the ref absent (PUT
-// didn't land, caller ctx cancelled, etc.) surface as a wrapped
-// put-ref error — not this sentinel — because the ref is known-
-// absent and the caller can retry without the freshness concern.
-var ErrRefSettleBudgetExceeded = errors.New(
-	"s3parquet: ref PUT exceeded SettleWindow on initial and " +
-		"recovery attempts; retry (with WithIdempotencyToken for " +
-		"deterministic recovery)")
 
 // Offset represents a position in the stream.
 type Offset = core.Offset

@@ -69,9 +69,9 @@ type S3TargetConfig struct {
 
 	// SettleWindow is how far behind the live tip Poll and
 	// PollRecords read, and the total budget the ref PUT must fit
-	// inside (the ref-PUT timeout is SettleWindow / 2; see
-	// refPutBudget). Keeps readers consistent with near-tip writers
-	// whose refs may not yet be visible in S3 LIST.
+	// inside (the ref-PUT timeout is SettleWindow / 2). Keeps
+	// readers consistent with near-tip writers whose refs may not
+	// yet be visible in S3 LIST.
 	//
 	// Does not apply to Index.Lookup: marker visibility is
 	// delegated to the storage layer via ConsistencyControl, so a

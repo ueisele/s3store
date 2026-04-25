@@ -3334,53 +3334,21 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 	}
 }
 
-// TestWriteWithIdempotencyToken_MaxRetryAgeZero: passing
-// maxRetryAge=0 explicitly disables the scoped LIST on retry, so
-// the retry writes a new ref at a new timestamp. The data file is
-// still deduped (same token → same path → putIfAbsent rejects).
-// Reader-side dedup (EntityKeyOf + VersionOf) collapses the
-// doubled ref to one logical record — documenting the
-// "token alone reduces storage replicas but Phase 1.5 is the
-// correctness primitive" contract.
-func TestWriteWithIdempotencyToken_MaxRetryAgeZero(t *testing.T) {
+// TestWriteWithIdempotencyToken_RejectsZeroMaxRetryAge guards
+// the resolveWriteOpts validation: passing maxRetryAge=0 with an
+// idempotency token is a config error, since the write path
+// always needs a positive scoped-LIST window to dedup the ref on
+// retry.
+func TestWriteWithIdempotencyToken_RejectsZeroMaxRetryAge(t *testing.T) {
 	ctx := context.Background()
 	store := newIdempotentStore(t)
 
-	key := "period=2026-04-22/customer=carol"
-	rec := []Rec{{
-		Period: "2026-04-22", Customer: "carol",
-		SKU: "sku1", Value: 99, Ts: time.UnixMilli(1),
-	}}
-	const token = "job-disable-list"
-
-	first, err := store.WriteWithKey(ctx, key, rec,
-		s3parquet.WithIdempotencyToken(token, 0))
-	if err != nil {
-		t.Fatalf("fresh write: %v", err)
-	}
-	second, err := store.WriteWithKey(ctx, key, rec,
-		s3parquet.WithIdempotencyToken(token, 0))
-	if err != nil {
-		t.Fatalf("retry write: %v", err)
-	}
-	if second.DataPath != first.DataPath {
-		t.Errorf("data path should match on retry; fresh=%q retry=%q",
-			first.DataPath, second.DataPath)
-	}
-	if second.RefPath == first.RefPath {
-		t.Errorf("with maxRetryAge=0 the retry should produce a " +
-			"new ref (scope-LIST disabled)")
-	}
-
-	// Reader dedup brings the doubled refs back to one record.
-	time.Sleep(400 * time.Millisecond)
-	got, err := store.Read(ctx, key)
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("reader dedup should collapse to 1 record, got %d",
-			len(got))
+	_, err := store.WriteWithKey(ctx, "period=2026-04-22/customer=carol",
+		[]Rec{{Period: "2026-04-22", Customer: "carol",
+			SKU: "sku1", Value: 99, Ts: time.UnixMilli(1)}},
+		s3parquet.WithIdempotencyToken("job-zero", 0))
+	if err == nil {
+		t.Fatal("expected validation error for maxRetryAge=0, got nil")
 	}
 }
 
@@ -3595,25 +3563,14 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 // initial ref PUT exceeds SettleWindow is handled correctly — the
 // library never silently returns success with a stale ref.
 //
-// Three outcomes are all correct under the budget-enforcement
-// contract (the library picks based on timing):
+// Two outcomes are correct under the simplified budget contract:
 //
-//   - Success: the initial PUT blew budget but the internal
-//     recovery PUT (a second attempt with a fresh refTsMicros)
-//     landed inside budget. The returned RefPath / Offset points
-//     at the fresh ref; the stale one is best-effort deleted.
-//   - ErrRefSettleBudgetExceeded: both the initial PUT and the
-//     recovery PUT missed budget. Caller retries.
-//   - Wrapped put-ref error (ctx.DeadlineExceeded, generic PUT
-//     failure): initial PUT failed and didn't land; recovery
-//     wasn't attempted because HEAD confirmed the ref absent and
-//     putErr was non-nil. Orphan-cleanup path took over.
-//
-// With a 1ms SettleWindow the recovery PUT typically also misses
-// budget, so the sentinel is the dominant outcome on MinIO. The
-// contract being enforced is "never silently succeed with a stale
-// ref", which the new recovery path plus findExistingRef's
-// freshness filter make unreachable by construction.
+//   - Success: the PUT happened to land inside the SettleWindow/2
+//     deadline despite the tight budget (rare on MinIO at 1ms but
+//     not impossible).
+//   - Wrapped put-ref error (typically ctx.DeadlineExceeded): the
+//     PUT was cancelled by the client-side timeout. Orphan-cleanup
+//     ran; the caller retries.
 //
 // Strong consistency is declared via ConsistencyControl so the
 // idempotent data-PUT and retry LIST take the strong path. The

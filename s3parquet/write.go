@@ -18,52 +18,6 @@ import (
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// writeCleanupTimeout bounds the detached cleanup work on the
-// write failure paths:
-//
-//   - HEAD to disambiguate a ref PUT that errored client-side
-//     but may have landed server-side.
-//   - DELETE of a stale ref after a successful budget-recovery
-//     PUT.
-//   - DELETE of an orphan data file after a marker or ref PUT
-//     failed.
-//
-// Detached from the caller's context so cleanup still completes
-// when the caller cancels — we already committed to the best-
-// effort cleanup before the cancellation, and bailing halfway
-// leaves worse state than finishing.
-//
-// 30s is generous: it accommodates a large-file DELETE on a
-// slow backend (MB+ parquet files can take seconds to remove on
-// StorageGRID) without pathologically extending the lifetime of
-// a failed Write if the backend is truly unreachable.
-const writeCleanupTimeout = 30 * time.Second
-
-// refPutBudget returns the client-side timeout for a ref PUT:
-// half of SettleWindow, regardless of ConsistencyControl. The
-// reserved half covers two things that otherwise push the ref's
-// effective visibility time past SettleWindow:
-//
-//   - HEAD time on the post-PUT disambiguation. Non-zero on every
-//     backend. Without headroom, even a PUT that genuinely
-//     completes at exactly SettleWindow lands the HEAD past the
-//     budget, forcing unnecessary recovery.
-//   - LIST propagation between the node that accepted the PUT
-//     and the node a concurrent Poll hits. Zero on strong
-//     consistency, nonzero on weak backends.
-//
-// An earlier version gated this on ConsistencyControl and handed
-// strong-consistency writers the full SettleWindow. That only
-// accounted for LIST propagation and ignored HEAD, so borderline-
-// slow PUTs that actually landed in budget triggered the recovery
-// path anyway. Uniform settle/2 is simpler and strictly safer —
-// real PUT latencies (tens of ms) fit comfortably inside settle/2
-// for any reasonable SettleWindow, so the halved budget doesn't
-// cost the happy path anything.
-func refPutBudget(settleWindow time.Duration) time.Duration {
-	return settleWindow / 2
-}
-
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
 // key in parallel (bounded by Target.MaxInflightRequests,
@@ -111,10 +65,10 @@ func resolveWriteOpts(opts []WriteOption) (core.WriteOpts, error) {
 			w.IdempotencyToken); err != nil {
 			return core.WriteOpts{}, err
 		}
-		if w.MaxRetryAge < 0 {
+		if w.MaxRetryAge <= 0 {
 			return core.WriteOpts{}, fmt.Errorf(
-				"s3parquet: MaxRetryAge must be >= 0 (got %s); "+
-					"zero disables scoped-LIST ref dedup",
+				"s3parquet: MaxRetryAge must be > 0 (got %s) "+
+					"when IdempotencyToken is set",
 				w.MaxRetryAge)
 		}
 	}
@@ -352,7 +306,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// best-effort cleanup of the orphan data (non-idempotent
 	// writes only; idempotent retries reuse the same data file).
 	if err := s.putMarkers(ctx, markerPaths); err != nil {
-		_ = s.cleanupOrphanData(dataKey, idempotent)
+		_ = s.cleanupOrphanData(ctx, dataKey, idempotent)
 		return nil, fmt.Errorf(
 			"s3parquet: put index markers: %w", err)
 	}
@@ -369,176 +323,65 @@ func (s *Writer[T]) writeEncodedPayload(
 		}, nil
 	}
 
-	// Phase 4: ref PUT under a SettleWindow/2 budget, with
-	// internal budget-exceeded recovery — see commitRefOrRecover.
-	return s.commitRefOrRecover(
+	// Phase 4: ref PUT under a SettleWindow/2 client-side timeout.
+	return s.commitRef(
 		ctx, dataKey, id, tsMicros, key, writeStartTime, idempotent)
 }
 
-// commitRefOrRecover is phase 4 of writeEncodedPayload: PUT the
-// ref under a SettleWindow/2 budget. Three branches, in order:
+// commitRef is phase 4 of writeEncodedPayload: PUT the ref under
+// a SettleWindow/2 client-side timeout. On success returns the
+// WriteResult; on PUT failure (timeout, transport error, etc.)
+// runs best-effort orphan-data cleanup and surfaces the wrapped
+// error so the caller retries.
 //
-//  1. Happy path — PUT returned nil and elapsed <= settle:
-//     ref's refTsMicros is fresh enough that any concurrent Poll
-//     respecting SettleWindow will yield it. Return success.
-//  2. Slow path — PUT returned nil but elapsed > settle: the
-//     ref's refTsMicros sits at an offset some Poll may have
-//     already advanced past. Recover via a fresh in-budget ref +
-//     best-effort delete of the stale one. Reader dedup absorbs
-//     the rare visible duplicate.
-//  3. Hard failure — PUT returned an error: cleanup the orphan
-//     data (non-idempotent only) and return the wrapped error.
-//     The caller's retry — under WithIdempotencyToken — picks up
-//     a previously-landed ref via findExistingRef; without a
-//     token the retry writes fresh data + ref and any
-//     dangling-ref left behind by a server-side-success +
-//     client-side-error case is silently absorbed by the
-//     OnMissingData skip-on-NoSuchKey contract.
+// refCaptureTime is captured just before the PUT so the ref
+// filename's refTsMicros reflects publication time, not
+// write-start. SettleWindow only needs to cover ref-PUT latency
+// + LIST propagation, independent of marker count.
 //
-// The library deliberately does not do post-hoc HEAD on a
-// PUT-failure to disambiguate lost-ack — under any backend
-// honouring read-after-new-write (i.e. anything we support), the
-// caller's retry path achieves the same outcome with one extra
-// round-trip on a rare event, in exchange for a much simpler
-// commit phase. A weakly-consistent backend would defeat the
-// HEAD too; correctness on this library requires
-// ConsistencyStrongGlobal / ConsistencyStrongSite when running
-// on backends like StorageGRID.
+// The library does not do post-hoc HEAD on a PUT failure to
+// disambiguate lost-ack: under any backend honouring
+// read-after-new-write (which we require), the caller's retry
+// achieves the same outcome with one extra round-trip on a rare
+// event. A weakly-consistent backend would defeat the HEAD too;
+// correctness requires ConsistencyStrongGlobal /
+// ConsistencyStrongSite on StorageGRID-style backends.
 //
 // At-least-once invariant on nil return: the returned RefPath is
-// LIST-visible and its refTsMicros was captured < SettleWindow
-// ago, so any Poll whose `since` is lex-earlier will yield it.
-// On ErrRefSettleBudgetExceeded, findExistingRef's freshness
-// filter ensures the caller's retry emits a fresh ref rather
-// than silently matching the stale one.
-func (s *Writer[T]) commitRefOrRecover(
+// LIST-visible and its refTsMicros was captured under SettleWindow/2
+// ago, well inside any concurrent Poll's cutoff.
+func (s *Writer[T]) commitRef(
 	ctx context.Context,
 	dataKey, id string, dataTsMicros int64, hiveKey string,
 	writeStartTime time.Time, idempotent bool,
 ) (*WriteResult, error) {
-	// Capture a second timestamp immediately before the ref PUT so
-	// the ref filename reflects publication time (when the ref
-	// became visible) rather than write-start time. SettleWindow
-	// then only needs to cover ref-PUT latency + LIST propagation,
-	// independent of marker count.
 	refCaptureTime := time.Now()
 	refTsMicros := refCaptureTime.UnixMicro()
 	refKey := core.EncodeRefKey(
 		s.refPath, refTsMicros, id, dataTsMicros, hiveKey)
 
-	result := &WriteResult{
+	settle := s.cfg.Target.EffectiveSettleWindow()
+	putCtx, cancel := context.WithTimeout(ctx, settle/2)
+	defer cancel()
+
+	if err := s.cfg.Target.put(
+		putCtx, refKey, []byte{}, "application/octet-stream",
+		s.cfg.ConsistencyControl,
+	); err != nil {
+		if delErr := s.cleanupOrphanData(ctx, dataKey, idempotent); delErr != nil {
+			return nil, fmt.Errorf(
+				"s3parquet: put ref: %w (orphan data at %s: %v)",
+				err, dataKey, delErr)
+		}
+		return nil, fmt.Errorf("s3parquet: put ref: %w", err)
+	}
+
+	return &WriteResult{
 		Offset:     Offset(refKey),
 		DataPath:   dataKey,
 		RefPath:    refKey,
 		InsertedAt: writeStartTime,
-	}
-
-	settle := s.cfg.Target.EffectiveSettleWindow()
-	elapsed, putErr := s.putRefWithBudget(ctx, refKey, settle, refCaptureTime)
-
-	switch {
-	case putErr == nil && elapsed <= settle:
-		return result, nil
-	case putErr == nil:
-		// PUT succeeded but past budget — recover with a fresh in-
-		// budget ref so a concurrent Poll's cutoff can't have
-		// advanced past it.
-		return s.recoverRefAfterBudgetExceeded(
-			ctx, result, id, dataTsMicros, hiveKey, settle, refKey)
-	}
-
-	// Hard failure: PUT errored. Cleanup orphan data (non-idempotent
-	// only) and surface the wrapped error so the caller retries.
-	if delErr := s.cleanupOrphanData(dataKey, idempotent); delErr != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: put ref: %w (orphan data at %s: %v)",
-			putErr, dataKey, delErr)
-	}
-	return nil, fmt.Errorf("s3parquet: put ref: %w", putErr)
-}
-
-// putRefWithBudget issues the empty-body ref PUT under a
-// SettleWindow/2 client-side timeout and returns the PUT error
-// plus the elapsed time measured from refCaptureTime. The post-
-// hoc elapsed check guards against cases where the timeout was
-// ignored or masked by SDK internals — caller branches on
-// elapsed > settle even when putErr == nil.
-//
-// Shared by the initial commit and the budget-recovery PUT so
-// both paths see identical budgeting + consistency-header
-// semantics.
-func (s *Writer[T]) putRefWithBudget(
-	ctx context.Context, refKey string,
-	settle time.Duration, refCaptureTime time.Time,
-) (elapsed time.Duration, err error) {
-	putCtx, cancel := context.WithTimeout(ctx, refPutBudget(settle))
-	defer cancel()
-	err = s.cfg.Target.put(
-		putCtx, refKey, []byte{}, "application/octet-stream",
-		s.cfg.ConsistencyControl)
-	return time.Since(refCaptureTime), err
-}
-
-// recoverRefAfterBudgetExceeded runs the settle-budget recovery
-// path: the initial ref PUT took longer than SettleWindow, so its
-// refTsMicros sits at an offset some consumers may have already
-// advanced past. Write a fresh ref with a new refTsMicros well
-// inside budget so subsequent polls pick it up, then best-effort
-// delete the stale one to narrow the duplicate window for any
-// consumer that polled between "stale ref landed" and "delete
-// took effect".
-//
-// Duplicate semantics: when a consumer reads both the stale and
-// the fresh ref, both point at the same idempotent data file. The
-// records share (entity, version), so reader-layer dedup
-// (EntityKeyOf + VersionOf) collapses them to one. Callers without
-// reader dedup see the raw duplicate — documented tradeoff; the
-// library explicitly chooses "rare duplicate absorbed by dedup"
-// over "silent missed write" here.
-//
-// On failure of the recovery PUT (error or its own budget blown),
-// returns ErrRefSettleBudgetExceeded so the caller retries. A
-// caller retry's findExistingRef filters stale refs out of the
-// dedup window (by refTsMicros age), so the retry writes cleanly
-// rather than matching the already-stale ref and silently
-// succeeding.
-//
-// Mirrors commitRefOrRecover's PUT semantics via putRefWithBudget
-// — same client-side timeout + consistency header — so initial
-// and recovery paths share their critical-section behaviour.
-func (s *Writer[T]) recoverRefAfterBudgetExceeded(
-	ctx context.Context,
-	result *WriteResult,
-	id string, dataTsMicros int64, hiveKey string,
-	settle time.Duration, staleRefKey string,
-) (*WriteResult, error) {
-	refCaptureTime := time.Now()
-	refTsMicros := refCaptureTime.UnixMicro()
-	newRefKey := core.EncodeRefKey(
-		s.refPath, refTsMicros, id, dataTsMicros, hiveKey)
-
-	elapsed, putErr := s.putRefWithBudget(
-		ctx, newRefKey, settle, refCaptureTime)
-
-	if putErr != nil || elapsed > settle {
-		// Recovery PUT also missed budget. Surface the sentinel so
-		// the caller retries; their retry's scoped LIST rejects the
-		// stale ref by age and writes a fresh one.
-		return result, ErrRefSettleBudgetExceeded
-	}
-
-	// Best-effort delete. S3 DeleteObject is idempotent (204 even
-	// for missing keys), so this is safe whether the stale ref
-	// actually landed or not. A failing DELETE leaves a garbage ref
-	// that reader dedup absorbs — not a correctness problem.
-	cleanupCtx, cancel := context.WithTimeout(
-		context.Background(), writeCleanupTimeout)
-	defer cancel()
-	_ = s.cfg.Target.del(cleanupCtx, staleRefKey)
-
-	result.RefPath = newRefKey
-	result.Offset = Offset(newRefKey)
-	return result, nil
+	}, nil
 }
 
 // findExistingRef scans the ref stream for a ref whose id field
@@ -562,25 +405,21 @@ func (s *Writer[T]) recoverRefAfterBudgetExceeded(
 //     consumers may have advanced past. Treating it as a dedup
 //     match would silently miss those consumers, so the scan
 //     skips stale matches and lets the caller emit a fresh ref.
-//     The in-flight settle-budget recovery (see
-//     recoverRefAfterBudgetExceeded) normally prevents a stale
-//     ref from existing at all; this filter is the backstop for
-//     the cascading-failure case where recovery also failed and
-//     the caller retried.
-//
-// When maxRetryAge == 0 the function returns "" immediately — the
-// caller explicitly disabled ref dedup for this retry.
+//     A stale ref can only exist when an earlier attempt's PUT
+//     ack was lost after server-side persistence; the retry then
+//     emits a fresh in-budget ref.
 //
 // Uses the Writer's ConsistencyControl on the LIST so the scan
 // sees all prior refs on StorageGRID-style backends — a weak-
 // consistency LIST can miss a ref the writer just published on
 // another node, silently breaking dedup.
+//
+// resolveWriteOpts validates that maxRetryAge > 0 when an
+// idempotency token is set, so callers never reach here with a
+// non-positive value.
 func (s *Writer[T]) findExistingRef(
 	ctx context.Context, token string, maxRetryAge time.Duration,
 ) (string, error) {
-	if maxRetryAge <= 0 {
-		return "", nil
-	}
 	now := time.Now()
 	lo, hi := core.RefRangeForRetry(s.refPath, now, maxRetryAge)
 	settleCutoffUs := now.Add(
@@ -636,9 +475,9 @@ func (s *Writer[T]) findExistingRef(
 // would force body re-upload) or when DisableCleanup is set
 // (operator opted into lifecycle-based garbage collection).
 //
-// Uses its own detached context so the cleanup survives caller-
-// context cancellation — the caller already decided to bail, but
-// we'd still rather not leave orphan objects behind.
+// Uses the caller's ctx — if the caller cancels, the DELETE is
+// interrupted and the orphan stays for bucket lifecycle to
+// collect. Same posture as DisableCleanup, just opportunistic.
 //
 // Returns the del error when the delete actually ran and failed.
 // Fire-and-forget sites (commitMarkers) discard the returned
@@ -647,15 +486,12 @@ func (s *Writer[T]) findExistingRef(
 // folds the returned error into its user-facing message so
 // operators without lifecycle policies can find the orphan.
 func (s *Writer[T]) cleanupOrphanData(
-	dataKey string, idempotent bool,
+	ctx context.Context, dataKey string, idempotent bool,
 ) error {
 	if idempotent || s.cfg.DisableCleanup {
 		return nil
 	}
-	cleanupCtx, cancel := context.WithTimeout(
-		context.Background(), writeCleanupTimeout)
-	defer cancel()
-	return s.cfg.Target.del(cleanupCtx, dataKey)
+	return s.cfg.Target.del(ctx, dataKey)
 }
 
 func (s *Writer[T]) groupByKey(records []T) map[string][]T {

@@ -31,13 +31,8 @@ type WriteOpts struct {
 	// for an entry whose id matches IdempotencyToken — found means
 	// a prior attempt already published the ref, skip the write.
 	//
-	// Zero disables the scoped LIST entirely: retry always writes
-	// a duplicate ref and relies on reader-side Phase 1.5 replica
-	// dedup to collapse it at read time. Useful when the caller
-	// has some other dedup guarantee and wants to minimise retry
-	// latency.
-	//
-	// Ignored when IdempotencyToken is empty.
+	// Required (> 0) when IdempotencyToken is set. Ignored
+	// otherwise.
 	MaxRetryAge time.Duration
 }
 
@@ -66,14 +61,13 @@ func (o *WriteOpts) Apply(opts ...WriteOption) {
 // write path.
 //
 // maxRetryAge bounds how far back the scoped LIST scans on the
-// retry path. Pick based on your retry SLA:
+// retry path. Required (> 0); pick based on your retry SLA:
 //
 //   - 1h for fast-retry streaming workloads.
 //   - 6h for same-day recovery.
 //   - 24h for cross-day orchestrator recovery.
 //
-// Zero disables scoped-LIST dedup (see WriteOpts.MaxRetryAge). No
-// library default is imposed — cost is workload-dependent and
+// No library default is imposed — cost is workload-dependent and
 // there is no universally-right value.
 //
 // Returns a no-op option if token is empty (convenience for
