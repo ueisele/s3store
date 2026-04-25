@@ -23,6 +23,11 @@
 //   - QueryMany: single SQL query over the deduplicated union
 //     of files matching every pattern. Aggregations and ORDER
 //     BY apply across the full set.
+//   - ScanAll[T]: optional helper that materializes a *sql.Rows
+//     into []T by parquet tag, NULL-safe, with composite
+//     (LIST/STRUCT/MAP) decode via mapstructure. Use when typed
+//     records are convenient; skip for raw aggregation pipelines
+//     that prefer to drive *sql.Rows themselves.
 //
 // For typed reads, change-stream polling, and a cgo-free option,
 // use github.com/ueisele/s3store/s3parquet.
