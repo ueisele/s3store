@@ -38,13 +38,11 @@ import (
 //     Frees the partition's reserved bytes on completion so the
 //     decoder can proceed.
 //
-// Compared with streamByPartition (which still backs
-// ReadIterWhere): downloads are continuously in flight
-// regardless of decode pace, the budget gate uses exact
-// uncompressed sizes from parquet footers rather than partition
-// counts, and a single oversized partition still flows (the cap
-// can't bind below partition granularity without row-group-level
-// streaming).
+// Downloads are continuously in flight regardless of decode pace,
+// the budget gate uses exact uncompressed sizes from parquet
+// footers rather than partition counts, and a single oversized
+// partition still flows (the cap can't bind below partition
+// granularity without row-group-level streaming).
 func (s *Reader[T]) streamEager(
 	ctx context.Context, keys []core.KeyMeta,
 	opts *core.QueryOpts, yield func(T, error) bool,

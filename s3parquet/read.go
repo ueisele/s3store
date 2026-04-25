@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"maps"
 	"slices"
 	"sort"
 
@@ -178,90 +177,6 @@ func (s *Reader[T]) ReadManyIter(
 		}
 
 		s.streamEager(ctx, keys, &o, yield)
-	}
-}
-
-// partitionBatch is one partition's download result, passed from
-// the background producer to the yield loop over the pipeline
-// channel in the readAhead>0 path.
-type partitionBatch[T any] struct {
-	recs []T
-	err  error
-}
-
-// streamByPartition processes keys one Hive partition at a time
-// in lex order, using downloadOne to fetch each partition's files.
-// Two execution modes:
-//
-//   - readAhead == 0 (default): strict-serial. Download the
-//     current partition's files, yield every record, move on.
-//     Memory: O(one partition's records).
-//   - readAhead > 0: pipelined. A background producer downloads
-//     partitions sequentially and pushes each decoded batch onto
-//     a buffered channel (size readAhead); the yield loop pulls
-//     one batch at a time. Consumer work on partition N overlaps
-//     with downloads for N+1 … N+readAhead, hiding S3 round-trip
-//     latency when the consumer does real work per record.
-//     Memory: up to readAhead + 2 partitions worth of records.
-//
-// Dedup/no-dedup handling is identical across both modes and
-// lives in emitPartition. The downloadOne function lets the
-// row-group-filtered read path (ReadIterWhere) reuse this same
-// orchestrator with a different per-partition fetcher.
-func (s *Reader[T]) streamByPartition(
-	ctx context.Context, keys []core.KeyMeta,
-	includeHistory bool, readAhead int,
-	downloadOne func(ctx context.Context, files []core.KeyMeta) ([]T, error),
-	yield func(T, error) bool,
-) {
-	byPartition := s.groupKeysByPartition(keys)
-	partitions := slices.Sorted(maps.Keys(byPartition))
-
-	if readAhead <= 0 {
-		for _, p := range partitions {
-			files := byPartition[p]
-			sortKeyMetasByKey(files)
-			recs, err := downloadOne(ctx, files)
-			if err != nil {
-				yield(*new(T), err)
-				return
-			}
-			if !s.emitPartition(recs, includeHistory, yield) {
-				return
-			}
-		}
-		return
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	pipeline := make(chan partitionBatch[T], readAhead)
-	go func() {
-		defer close(pipeline)
-		for _, p := range partitions {
-			files := byPartition[p]
-			sortKeyMetasByKey(files)
-			recs, err := downloadOne(ctx, files)
-			select {
-			case pipeline <- partitionBatch[T]{recs: recs, err: err}:
-			case <-ctx.Done():
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	for b := range pipeline {
-		if b.err != nil {
-			yield(*new(T), b.err)
-			return
-		}
-		if !s.emitPartition(b.recs, includeHistory, yield) {
-			return
-		}
 	}
 }
 

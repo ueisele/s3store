@@ -405,35 +405,6 @@ check to detect lost-ack).
 For retry-safe writes (orchestrator failover, crash-and-resume), see
 [Idempotent writes](#idempotent-writes).
 
-For layouts where you want one parquet file to contain records from
-multiple logical entities but still prune at query time, use
-`WriteWithKeyRowGroupsBy` (explicit partition key) or `WriteRowGroupsBy`
-(auto-grouped by `PartitionKeyOf`, same shape as `Write`):
-
-```go
-// Explicit key — useful when one batch = one partition.
-_, err := store.WriteWithKeyRowGroupsBy(ctx,
-    "charge_period_start=2026-03-17",
-    records,
-    func(r UsageRecord) string { return r.Customer },
-)
-
-// Auto-keyed — batch spans many partitions, each file gets its
-// own row-group-per-customer layout.
-results, err := store.WriteRowGroupsBy(ctx,
-    records,
-    func(r UsageRecord) string { return r.Customer },
-)
-```
-
-Records are sorted by the flush key, then the parquet writer emits one
-row group per distinct value. The resulting file has tight per-row-
-group min/max statistics on whichever column the flush key reads from,
-so `ReadIterWhere` with an `EqualsString` / `InStrings` / `TimestampRange`
-predicate on that column fetches only the matching row group's bytes.
-Typical pairing: one day's worth of multi-customer data in one file,
-read back one customer at a time.
-
 `Write` fans out per-partition work in parallel, bounded by the
 `S3Target`-level `MaxInflightRequests` semaphore (default 32). The
 semaphore is acquired by every PUT/GET/HEAD/LIST inside the
@@ -777,123 +748,6 @@ flows (the cap can't bind below partition granularity without
 row-group-level streaming). The cap only prevents *additional*
 partitions from joining the buffer.
 
-`WithReadAheadBytes` is a no-op on `ReadIterWhere` — that path uses
-ranged GETs and never holds whole bodies in memory, so the byte
-budget concept doesn't apply.
-
-### Snapshot — row-group pruning (`ReadIterWhere`)
-
-`s3parquet.Reader.ReadIterWhere` and `ReadManyIterWhere` are the
-row-group-filtered siblings of `ReadIter`. Instead of downloading
-every matching parquet file in full, they open each file with
-ranged GETs (footer first, then per-column-chunk reads only for
-accepted row groups):
-
-```go
-for r, err := range reader.ReadIterWhere(ctx,
-    "charge_period_start=2026-03-17",
-    s3parquet.EqualsString("customer", "abc")) {
-    // ...
-}
-```
-
-The predicate is evaluated against each row group's chunk-level
-min/max statistics. If your files are written with **one row group
-per customer** (sort records by customer before writing and flush
-the writer on customer boundaries), a single-customer predicate
-fetches only that customer's row group — the rest of the file
-never crosses the wire.
-
-**Predicate helpers**:
-
-- `s3parquet.EqualsString(column, value)` — the common "one
-  customer out of hundreds" case.
-- `s3parquet.InStrings(column, values)` — multi-value equality.
-- `s3parquet.TimestampRange(column, from, to)` — half-open range
-  on a microsecond-resolution timestamp column.
-- `s3parquet.And(...)` / `s3parquet.Or(...)` — compose predicates.
-
-For predicates outside these helpers, implement
-`s3parquet.RowGroupPredicate` directly against
-`s3parquet.RowGroup` + `ColumnStats`. No `parquet-go` import
-needed in the caller — the wrapper types fully cover the public
-surface.
-
-**When to use vs. plain `ReadIter`**: the filtered path costs 1
-HEAD + several ranged GETs per file vs. 1 full GET. It wins when
-file size × fraction-not-fetched > 1 round-trip's worth. Rule of
-thumb: profitable above ~10 MB files with ~30% selectivity or
-better; a pessimization for tiny files. It's a separate method
-rather than an option precisely because the cost trade-off is
-different enough that it deserves an explicit opt-in at the call
-site.
-
-**No-op on missing stats**: a predicate that consults stats but
-the column index is missing (some writers don't emit it) falls
-back to accepting the row group — safer than dropping records.
-That means a file without stats effectively performs a full scan
-even via `ReadIterWhere`; use `ReadIter` for those.
-
-**Caveats**: same per-partition dedup contract as `ReadIter`
-applies. The filtered path is **not available on s3sql** — use
-`Query` with a SQL `WHERE` and let DuckDB plan the prune instead.
-
-### Snapshot — row-group pruning + narrow reads composed
-
-`ReadIterWhere` composes with [narrow-T reads](#narrow-t-reads)
-for nothing extra: pair a `Reader[NarrowT]` with a predicate and
-both row-group pruning **and** column pruning apply. parquet-go
-only fetches the accepted row groups, and within each row group
-only the column chunks that correspond to fields on `NarrowT`.
-
-```go
-// Full write-side record with 20+ columns
-type UsageRecord struct {
-    ChargePeriodStart time.Time       `parquet:"charge_period_start,timestamp(microsecond)"`
-    CausingCustomer   string          `parquet:"causing_customer"`
-    InstanceID        string          `parquet:"instance_id"`
-    SkuID             string          `parquet:"sku_id"`
-    ProjectID         string          `parquet:"project_id"`
-    Amount            decimal.Decimal `parquet:"amount"`
-    // ... many more
-}
-
-// Narrow record for an aggregation that only needs 4 columns
-type AggregationRec struct {
-    CausingCustomer string          `parquet:"causing_customer"`
-    SkuID           string          `parquet:"sku_id"`
-    ProjectID       string          `parquet:"project_id"`
-    Amount          decimal.Decimal `parquet:"amount"`
-}
-
-narrow, _ := s3parquet.NewReaderFromStore[AggregationRec](store,
-    s3parquet.ReaderConfig[AggregationRec]{})
-
-for r, err := range narrow.ReadIterWhere(ctx,
-    "charge_period_start=2026-03-17",
-    s3parquet.EqualsString("causing_customer", target)) {
-    if err != nil { return err }
-    aggregate(r)
-}
-```
-
-For a 500 MB day-file with per-customer row groups (500
-customers) and 20 columns in the schema, needing one customer's
-4 columns: row-group pruning fetches 1/500 of the rows, column
-pruning fetches 4/20 of those columns, so total wire transfer
-≈ `500 MB × 1/500 × 4/20 ≈ 200 KB` — roughly 2500× smaller than
-a full read.
-
-**Dedup caveat for narrow-T reads**: if you configure
-`EntityKeyOf` in `ReaderConfig`, the narrow struct must still
-carry every field the closure reads. If the full record's entity
-key is `Customer + SKU + Project` but your narrow struct drops
-`Project`, the closure compiles but sees an empty string for
-every record — dedup silently collapses to one-per-customer-per-SKU.
-Either keep every entity-key field on the narrow struct, or
-pass `WithHistory()` / leave `EntityKeyOf` unset on the narrow
-reader and do your own dedup after aggregation.
-
 **Per-partition dedup contract on `s3parquet.Reader.ReadIter`**: differs
 from `Read`'s global dedup. The iter path buffers one partition at a
 time, dedups within that partition, yields, then drops it. **Correct
@@ -1130,7 +984,7 @@ correctness-critical S3 call on both halves:
   PUTs, and the scoped retry-LIST used by `WithIdempotencyToken`
   to dedup refs on retry.
 - **Read path — `s3parquet`.** Data-file partition LIST, data
-  GET, row-group HEAD + ranged-GETs, `Index.Lookup` marker LIST,
+  GET, `Index.Lookup` marker LIST,
   `BackfillIndex` data LIST + data GET + marker PUT (from
   `IndexDef.ConsistencyControl`).
 - **Read path — `s3sql`.** Partition LIST (sends the header);
@@ -1259,8 +1113,7 @@ not diverging ones).
 **Scope** — accepted by every read path:
 
 - `s3parquet.Reader`: `Read`, `ReadIter`, `ReadMany`,
-  `ReadManyIter`, `ReadIterWhere`, `ReadManyIterWhere`,
-  `PollRecords`, `PollRecordsAll`.
+  `ReadManyIter`, `PollRecords`, `PollRecordsAll`.
 - `s3sql.Reader`: `Query`, `QueryMany`.
 - Umbrella `Store`: all of the above forward through.
 
@@ -1638,7 +1491,7 @@ delay:
 
 | Operation | Sub-package |
 |---|---|
-| `s3parquet.Reader.Read` / `ReadIter` / `ReadIterWhere` (+ `*Many` variants) | `s3parquet` |
+| `s3parquet.Reader.Read` / `ReadIter` (+ `*Many` variants) | `s3parquet` |
 | `s3parquet.Index.Lookup` / `LookupMany` | `s3parquet` |
 | `s3parquet.BackfillIndex` / `BackfillIndexMany` | `s3parquet` |
 | `s3sql.Reader.Query` / `QueryMany` | `s3sql` |
@@ -1942,8 +1795,7 @@ Breaking changes in the idempotent-write release:
   no-op on the s3sql read path. The umbrella + s3parquet exports
   remain. Drop the call site if you had one.
 
-- **`Write`, `WriteWithKey`, `WriteRowGroupsBy`,
-  `WriteWithKeyRowGroupsBy` accept a variadic `...WriteOption`
+- **`Write`, `WriteWithKey` accept a variadic `...WriteOption`
   tail** for `WithIdempotencyToken`. Existing callers that don't
   pass options compile unchanged — the tail is variadic.
 

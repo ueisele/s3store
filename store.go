@@ -19,8 +19,7 @@ import (
 //
 // Method forwarding:
 //
-//   - Write, WriteWithKey, WriteRowGroupsBy,
-//     WriteWithKeyRowGroupsBy, PartitionKey       → s3parquet.Writer
+//   - Write, WriteWithKey, PartitionKey           → s3parquet.Writer
 //   - Read, ReadMany, ReadIter, ReadManyIter,
 //     Poll, OffsetAt, PollRecords, PollRecordsAll → s3parquet.Reader
 //   - Query, QueryMany                            → s3sql.Reader
@@ -134,29 +133,6 @@ func (s *Store[T]) WriteWithKey(
 	ctx context.Context, key string, records []T, opts ...WriteOption,
 ) (*WriteResult, error) {
 	return s.writer.WriteWithKey(ctx, key, records, opts...)
-}
-
-// WriteWithKeyRowGroupsBy delegates to the Writer. See
-// s3parquet.Writer.WriteWithKeyRowGroupsBy for the full contract —
-// produces one row group per distinct flushKeyOf value so a
-// later ReadIterWhere can prune via chunk-level stats.
-func (s *Store[T]) WriteWithKeyRowGroupsBy(
-	ctx context.Context, key string, records []T,
-	flushKeyOf func(T) string, opts ...WriteOption,
-) (*WriteResult, error) {
-	return s.writer.WriteWithKeyRowGroupsBy(
-		ctx, key, records, flushKeyOf, opts...)
-}
-
-// WriteRowGroupsBy delegates to the Writer. Auto-keyed sibling
-// of WriteWithKeyRowGroupsBy: groups records by PartitionKeyOf,
-// and within each partition produces one row group per distinct
-// flushKeyOf value.
-func (s *Store[T]) WriteRowGroupsBy(
-	ctx context.Context, records []T,
-	flushKeyOf func(T) string, opts ...WriteOption,
-) ([]WriteResult, error) {
-	return s.writer.WriteRowGroupsBy(ctx, records, flushKeyOf, opts...)
 }
 
 // PartitionKey delegates to the Writer. Handy when paired with

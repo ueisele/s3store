@@ -74,9 +74,9 @@ func resolveWriteOpts(opts []WriteOption) (core.WriteOpts, error) {
 	return w, nil
 }
 
-// writeGroupedFanOut is the partition-level fan-out shared by
-// Write and WriteRowGroupsBy. Groups records by PartitionKeyOf,
-// runs perPartition through core.FanOut bounded by
+// writeGroupedFanOut is the partition-level fan-out used by
+// Write. Groups records by PartitionKeyOf, runs perPartition
+// through core.FanOut bounded by
 // Target.MaxInflightRequests. Returns results in sorted-key order
 // regardless of completion order; first real (non-cancel) failure
 // wins; caller-cancel surfaces as an error even when no real
@@ -181,9 +181,9 @@ func (s *Writer[T]) writeWithKeyResolved(
 		ctx, key, records, parquetBytes, writeStartTime, opts)
 }
 
-// writeEncodedPayload is the post-encode orchestration shared
-// between WriteWithKey and WriteWithKeyRowGroupsBy. The body is
-// a four-phase commit sequence — data → retry-dedup → markers →
+// writeEncodedPayload is the post-encode orchestration for
+// WriteWithKey. The body is a four-phase commit sequence —
+// data → retry-dedup → markers →
 // ref — so the at-least-once contract can be checked phase by
 // phase. Phase 4 still lives in commitRefOrRecover because it
 // owns the SettleWindow/2 budget logic and the budget-exceeded
@@ -560,11 +560,9 @@ func (s *Writer[T]) putMarkers(
 }
 
 // populateInsertedAt reflectively writes t into every record's
-// InsertedAtField (at path fieldIdx). Called by both
-// WriteWithKey and WriteWithKeyRowGroupsBy before parquet encode
-// so the value lands in the file as a real column. Package-
-// level rather than a method so the row-groups writer can reuse
-// it without giving a reflective helper Writer[T] access.
+// InsertedAtField (at path fieldIdx). Called by WriteWithKey
+// before parquet encode so the value lands in the file as a real
+// column.
 //
 // fieldIdx must not be nil — callers guard on s.insertedAtFieldIndex
 // at the call site.

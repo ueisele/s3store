@@ -28,8 +28,8 @@ type StreamEntry = core.StreamEntry
 type WriteResult = core.WriteResult
 
 // WriteOption configures write-path behavior (today:
-// WithIdempotencyToken). Accepted by Write / WriteWithKey /
-// WriteRowGroupsBy / WriteWithKeyRowGroupsBy as a variadic tail.
+// WithIdempotencyToken). Accepted by Write / WriteWithKey as a
+// variadic tail.
 type WriteOption = core.WriteOption
 
 // WithIdempotencyToken marks a write as a retry-safe logical unit.
@@ -79,11 +79,11 @@ func WithReadAheadBytes(n int64) QueryOption {
 }
 
 // WithIdempotentRead makes Read / ReadIter / ReadMany /
-// ReadManyIter / ReadIterWhere / ReadManyIterWhere / PollRecords
-// retry-safe: the result reflects state as of the first write of
-// the given idempotency token. Pair with WithIdempotencyToken on
-// the write side so one token drives both sides of the retry.
-// See core.WithIdempotentRead for the full contract.
+// ReadManyIter / PollRecords retry-safe: the result reflects
+// state as of the first write of the given idempotency token.
+// Pair with WithIdempotencyToken on the write side so one token
+// drives both sides of the retry. See core.WithIdempotentRead
+// for the full contract.
 func WithIdempotentRead(token string) QueryOption {
 	return core.WithIdempotentRead(token)
 }

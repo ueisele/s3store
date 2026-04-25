@@ -125,7 +125,7 @@ func WithReadAheadPartitions(n int) QueryOption {
 // partitions from joining the buffer.
 //
 // No-op on read paths that don't stream partition-by-partition
-// (s3sql, ReadIterWhere).
+// (s3sql).
 func WithReadAheadBytes(n int64) QueryOption {
 	return func(o *QueryOpts) {
 		o.ReadAheadBytes = n
