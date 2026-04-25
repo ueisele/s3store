@@ -25,6 +25,17 @@ const RefSeparator = ";"
 // Offset represents a position in the stream.
 type Offset string
 
+// OffsetUnbounded is the "no bound on this side" sentinel used by
+// Poll / PollRecords / PollRecordsIter. The interpretation depends
+// on which parameter it's passed to:
+//
+//   - As `since`: start at the stream head (earliest available).
+//   - As `until`: read to the live tip (settle-window cutoff).
+//
+// Equivalent to Offset("") — use the named constant at call sites
+// for self-documenting intent.
+const OffsetUnbounded Offset = ""
+
 // StreamEntry is a lightweight ref.
 //
 //   - Offset and RefPath carry the same underlying S3 key string.

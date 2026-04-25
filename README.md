@@ -586,8 +586,8 @@ are encoded from `time.UnixMicro()`). `time.Date(..., time.UTC)` gives
 UTC-day boundaries; `time.Date(..., loc)` gives local-day boundaries —
 both work, as long as `start` and `end` use the same timezone.
 
-Pass `s3store.Offset("")` (or `s3parquet.Offset("")` / `s3sql.Offset("")`
-when using the sub-packages directly) for `since` to start at the stream
+Pass `s3store.OffsetUnbounded` (or `s3parquet.OffsetUnbounded` when
+using the sub-package directly) for `since` to start at the stream
 head, or for `until` to read to the live tip (settle-window cutoff).
 
 For manual paging (e.g. checkpointing offsets between batches), use
@@ -1360,8 +1360,8 @@ partition. A migration job can shard itself by partition
 instead of running a single multi-hour call. The `until` bound
 lets the live writer and the migration job cooperate without
 overlap: live markers for everything from T0, backfill markers
-for everything before. Pass `s3store.Offset("")` to disable the
-bound (covers every file currently present — harmless but
+for everything before. Pass `s3store.OffsetUnbounded` to disable
+the bound (covers every file currently present — harmless but
 redundant if the live writer has been up for a while, since PUT
 is idempotent).
 

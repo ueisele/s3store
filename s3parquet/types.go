@@ -21,6 +21,11 @@ var ErrRefStreamDisabled = errors.New(
 // Offset represents a position in the stream.
 type Offset = core.Offset
 
+// OffsetUnbounded is the "no bound on this side" sentinel for
+// Poll / PollRecords / PollRecordsIter. As `since` it means
+// stream head; as `until` it means live tip. See core.OffsetUnbounded.
+const OffsetUnbounded = core.OffsetUnbounded
+
 // StreamEntry is a lightweight ref returned by Poll.
 type StreamEntry = core.StreamEntry
 

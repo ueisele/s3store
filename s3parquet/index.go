@@ -467,10 +467,10 @@ type BackfillStats struct {
 // until is an exclusive upper bound on data-file LastModified.
 // Typical use: until = OffsetAt(deployTime_of_live_writer), so
 // backfill covers historical gaps (< deploy) while the live
-// writer covers everything from deploy onward. Passing an empty
-// Offset("") disables the bound — backfill covers every file
-// currently present, at the cost of redundant PUTs for data the
-// live writer has already marked (harmless because PUT is
+// writer covers everything from deploy onward. Passing
+// OffsetUnbounded disables the bound — backfill covers every
+// file currently present, at the cost of redundant PUTs for data
+// the live writer has already marked (harmless because PUT is
 // idempotent).
 //
 // onMissingData is invoked when a data-file GET returns S3
@@ -606,8 +606,8 @@ func BackfillIndexMany[T any, K comparable](
 // and returns those whose S3 LastModified is strictly before the
 // time encoded in until. An empty until disables the filter.
 // A non-empty but unparseable until is an error — callers should
-// pass Offset("") to mean "no bound" rather than relying on
-// silent fallthrough.
+// pass OffsetUnbounded to mean "no bound" rather than relying
+// on silent fallthrough.
 func listDataFilesBelowUntil(
 	ctx context.Context,
 	target S3Target,

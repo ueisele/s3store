@@ -168,8 +168,8 @@ func (s *Reader[T]) PollRecords(
 // Consumer break cancels ctx via defer in streamEager, stopping
 // in-flight downloads cleanly.
 //
-// Pass Offset("") for since to start at the stream head;
-// pass Offset("") for until to read to the settle-window
+// Pass OffsetUnbounded for since to start at the stream head;
+// pass OffsetUnbounded for until to read to the settle-window
 // cutoff (= live tip). Combine with OffsetAt for time windows.
 //
 // Dedup semantics match ReadIter: per-partition (refs are
