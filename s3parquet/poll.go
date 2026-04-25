@@ -169,8 +169,14 @@ func (s *Reader[T]) PollRecords(
 // in-flight downloads cleanly.
 //
 // Pass OffsetUnbounded for since to start at the stream head;
-// pass OffsetUnbounded for until to read to the settle-window
-// cutoff (= live tip). Combine with OffsetAt for time windows.
+// pass OffsetUnbounded for until to walk to the settle-window
+// cutoff (= live tip as of the call). Single-pass: terminates
+// when the walk catches up to the cutoff, does NOT tail. Each
+// internal Poll computes its own now-based cutoff, so writes
+// landing during the walk may still be picked up; writes landing
+// after termination are not. To keep up with new writes, call
+// PollRecordsIter (or PollRecords) again with the last seen
+// offset. Combine with OffsetAt for time windows.
 //
 // Dedup semantics match ReadIter: per-partition (refs are
 // grouped into partitions by Hive key inside streamEager). If

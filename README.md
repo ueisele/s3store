@@ -588,7 +588,11 @@ both work, as long as `start` and `end` use the same timezone.
 
 Pass `s3store.OffsetUnbounded` (or `s3parquet.OffsetUnbounded` when
 using the sub-package directly) for `since` to start at the stream
-head, or for `until` to read to the live tip (settle-window cutoff).
+head, or for `until` to walk to the live tip (settle-window cutoff
+as of the call). `PollRecordsIter` is single-pass: it terminates
+when the walk reaches the cutoff and does **not** tail. To keep up
+with new writes, call again from the last seen offset
+(`PollRecords` exposes the next offset between batches).
 
 For manual paging (e.g. checkpointing offsets between batches), use
 `PollRecords` with `WithUntilOffset`:

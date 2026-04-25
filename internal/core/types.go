@@ -30,7 +30,11 @@ type Offset string
 // on which parameter it's passed to:
 //
 //   - As `since`: start at the stream head (earliest available).
-//   - As `until`: read to the live tip (settle-window cutoff).
+//   - As `until`: walk to the live tip (now - SettleWindow). This
+//     does NOT tail — the iter / call terminates once the cutoff
+//     is reached. New writes that land after the walk completes
+//     are not picked up; call again from the last offset to keep
+//     up.
 //
 // Equivalent to Offset("") — use the named constant at call sites
 // for self-documenting intent.
