@@ -111,19 +111,18 @@ type Config[T any] struct {
 
 	// InsertedAtField names a time.Time field on T that the writer
 	// populates with its wall-clock time.Now() captured just before
-	// parquet encoding; Read and PollRecords then surface the same
-	// value back to the caller. The field must carry a non-empty,
-	// non-"-" parquet tag (e.g. `parquet:"inserted_at"`) — the value
-	// is a real parquet column persisted on disk, not library-
-	// managed metadata. Empty disables the feature; there is no
-	// reflection cost when unset.
+	// parquet encoding. The field must carry a non-empty, non-"-"
+	// parquet tag (e.g. `parquet:"inserted_at"`) — the value is a
+	// real parquet column persisted on disk. Empty disables the
+	// feature; no reflection cost when unset.
 	//
-	// Motivating case: a stream consumer needs a per-record "when
-	// was this written" stamp that is identical across every read
-	// path (s3parquet Read / ReadIter / PollRecords, s3sql Read /
-	// PollRecords). Sourcing the value from a writer-populated
-	// parquet column makes it exact — S3 LastModified would drift
-	// by the ref-PUT-vs-data-PUT delta.
+	// On the read side the column shows up on T as a normal field
+	// — no special handling. Use it from VersionOf when you want
+	// the writer's stamp to drive dedup ordering:
+	//
+	//	VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
+	//
+	// Forwarded to WriterConfig only.
 	InsertedAtField string
 
 	// Compression selects the parquet compression codec used on

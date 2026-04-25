@@ -303,26 +303,32 @@ func TestResolveSortCmp_EntityAndExplicitVersion(t *testing.T) {
 // TestResolveSortCmp_LastModifiedFallback covers the
 // "EntityKeyOf nil" branch: per-file chronological. Equal
 // LastModified values resolve via sort.SliceStable preserving
-// input order — in production, preparePartitions ensures input
-// order is file lex order, so the effective tiebreak is fileName
-// ASC even though no fileName field exists on versionedRecord.
+// input order — in production, preparePartitions feeds records
+// in file lex order, so the effective tiebreak is fileName ASC.
+//
+// To exercise the stable-sort guarantee (not just sortedness),
+// input is shuffled across timestamp groups: timestamps still
+// flow late→early so the sort has to swap, but input order
+// WITHIN each timestamp group must survive the reshuffle.
 func TestResolveSortCmp_LastModifiedFallback(t *testing.T) {
 	cmp := resolveSortCmp[dedupRec](nil, nil)
 
 	early := time.UnixMicro(1_000_000)
 	late := time.UnixMicro(2_000_000)
-	// Input order simulates production's file-lex-sorted feed:
-	// for each LastModified group, the lexically-first filename's
-	// records appear first.
+	// Within "early" group, input order is (early-b, early-a)
+	// — NOT alphabetical, so a non-stable sort would be free to
+	// reorder them. Stable sort must preserve this.
 	recs := []versionedRecord[dedupRec]{
-		vrf("x", 0, "early-a", early),
+		vrf("x", 0, "late-b", late),
 		vrf("x", 0, "early-b", early),
 		vrf("x", 0, "late-a", late),
-		vrf("x", 0, "late-b", late),
+		vrf("x", 0, "early-a", early),
 	}
 	sortWith(recs, cmp)
-	// Stable sort preserves input order within each timestamp.
-	wantOrder := []string{"early-a", "early-b", "late-a", "late-b"}
+	// "early" group: input order (early-b, early-a) preserved.
+	// "late" group: input order (late-b, late-a) preserved.
+	// Sort by insertedAt asc places early before late.
+	wantOrder := []string{"early-b", "early-a", "late-b", "late-a"}
 	for i, want := range wantOrder {
 		if recs[i].rec.payload != want {
 			t.Errorf("[%d] got %q, want %q",

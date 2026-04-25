@@ -28,9 +28,12 @@ type WriterConfig[T any] struct {
 	// persisted on disk, not library-managed metadata. Empty
 	// disables the feature; there is no reflection cost when unset.
 	//
-	// Paired with ReaderConfig.InsertedAtField so the same struct
-	// field round-trips unchanged end-to-end. Callers that want the
-	// write-time stamp surfaced at read time must set both sides.
+	// On the read side the column shows up on T like any other
+	// parquet field — no special reader configuration needed.
+	// Reference it from VersionOf to use the write-time stamp as
+	// the dedup version:
+	//
+	//	VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
 	InsertedAtField string
 
 	// DisableCleanup opts out of the best-effort DeleteObject

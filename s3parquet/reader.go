@@ -143,8 +143,7 @@ func resolveSortCmp[T any](
 // write-only columns (parquet-go skips unlisted columns on
 // decode). The Writer's Target overrides whatever Target cfg
 // carries (or doesn't); read-side knobs (EntityKeyOf, VersionOf,
-// InsertedAtField, OnMissingData, ConsistencyControl) come from
-// cfg.
+// OnMissingData, ConsistencyControl) come from cfg.
 //
 // Dedup closures (EntityKeyOf / VersionOf) on the Writer are
 // typed over U and cannot be auto-transformed to T; the caller
