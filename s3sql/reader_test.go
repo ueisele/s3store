@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/ueisele/s3store/internal/core"
 	"github.com/ueisele/s3store/s3parquet"
 )
 
@@ -141,5 +142,17 @@ func TestSettleWindowDefault(t *testing.T) {
 	var target s3parquet.S3Target
 	if got := target.EffectiveSettleWindow(); got.String() != "5s" {
 		t.Errorf("default: got %v", got)
+	}
+}
+
+// TestWithHistory guards that the re-exported WithHistory
+// produces the same QueryOpts state as core.WithHistory. The
+// re-export exists so callers who only import s3sql never need
+// to reach into internal/core.
+func TestWithHistory(t *testing.T) {
+	var o core.QueryOpts
+	WithHistory()(&o)
+	if !o.IncludeHistory {
+		t.Error("WithHistory didn't set IncludeHistory=true")
 	}
 }
