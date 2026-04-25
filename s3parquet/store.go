@@ -193,10 +193,9 @@ type Store[T any] struct {
 }
 
 // Target returns the untyped S3Target the Store was built with.
-// The embedded Writer and Reader share a byte-identical Target
-// (both projected from the unified Config at New()), so the
-// forwarding choice is cosmetic — delegating to Reader keeps the
-// picker consistent with NewIndex / BackfillIndex, which read.
+// The Writer and Reader share one S3Target value (set once in
+// New) so the choice of which embedded half to delegate to is
+// cosmetic.
 func (s *Store[T]) Target() S3Target {
 	return s.Reader.Target()
 }

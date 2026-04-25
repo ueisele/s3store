@@ -1,8 +1,6 @@
 package s3parquet
 
 import (
-	"log"
-
 	"github.com/parquet-go/parquet-go/compress"
 	"github.com/ueisele/s3store/internal/core"
 )
@@ -170,14 +168,7 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.ConsistencyControl != "" && !cfg.ConsistencyControl.IsKnown() {
-		log.Printf(
-			"s3parquet: WriterConfig.ConsistencyControl %q is not one "+
-				"of the known levels (all, strong-global, strong-site, "+
-				"read-after-new-write, available) — header will be "+
-				"sent verbatim; verify the backend accepts it",
-			cfg.ConsistencyControl)
-	}
+	warnIfUnknownConsistency(cfg.ConsistencyControl, "WriterConfig")
 	return &Writer[T]{
 		cfg:                  cfg,
 		dataPath:             core.DataPath(cfg.Target.Prefix()),

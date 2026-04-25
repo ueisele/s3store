@@ -3,7 +3,6 @@ package s3parquet
 import (
 	"cmp"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
@@ -97,13 +96,7 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.ConsistencyControl != "" && !cfg.ConsistencyControl.IsKnown() {
-		log.Printf(
-			"s3parquet: ReaderConfig.ConsistencyControl %q is not one "+
-				"of the known levels — header will be sent verbatim; "+
-				"verify the backend accepts it",
-			cfg.ConsistencyControl)
-	}
+	warnIfUnknownConsistency(cfg.ConsistencyControl, "ReaderConfig")
 	return &Reader[T]{
 		cfg:                  cfg,
 		dataPath:             core.DataPath(cfg.Target.Prefix()),

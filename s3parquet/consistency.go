@@ -1,5 +1,7 @@
 package s3parquet
 
+import "log"
+
 // ConsistencyLevel is the value passed in the Consistency-Control
 // HTTP header on S3 requests that require stronger-than-default
 // consistency. NetApp StorageGRID defines the header; AWS S3 and
@@ -75,4 +77,23 @@ func (c ConsistencyLevel) IsKnown() bool {
 		return true
 	}
 	return false
+}
+
+// warnIfUnknownConsistency logs a warning when c is non-empty
+// but doesn't match any named ConsistencyLevel constant. configKind
+// names the surrounding config struct ("WriterConfig",
+// "ReaderConfig") so the message points at the right
+// construction site. Forward-compatible levels (e.g. a
+// StorageGRID release adding a new value) still pass through —
+// this is just a typo guard.
+func warnIfUnknownConsistency(c ConsistencyLevel, configKind string) {
+	if c == "" || c.IsKnown() {
+		return
+	}
+	log.Printf(
+		"s3parquet: %s.ConsistencyControl %q is not one of the "+
+			"known levels (all, strong-global, strong-site, "+
+			"read-after-new-write, available) — header will be "+
+			"sent verbatim; verify the backend accepts it",
+		configKind, c)
 }
