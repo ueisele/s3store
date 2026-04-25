@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -573,30 +572,9 @@ func BackfillIndexMany[T any, K comparable](
 	}
 	stats.DataObjects = len(keys)
 
-	parentCtx := ctx
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	var recordsTotal, markersTotal atomic.Int64
-	errs := make([]error, len(keys))
-	sem := make(chan struct{}, target.EffectiveMaxInflightRequests())
-	var wg sync.WaitGroup
-
-	for n, key := range keys {
-		wg.Add(1)
-		go func(n int, key string) {
-			defer wg.Done()
-			// Acquire inside the goroutine so a parent-ctx
-			// cancel or sibling failure unblocks waiters
-			// promptly instead of backlogging the queue.
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[n] = ctx.Err()
-				return
-			}
-			defer func() { <-sem }()
-
+	err = core.FanOut(ctx, keys, target.EffectiveMaxInflightRequests(),
+		func(ctx context.Context, _ int, key string) error {
 			paths, nRecs, err := backfillMarkersForObject(
 				ctx, target, idx, def.Of, key, def.ConsistencyControl)
 			if err != nil {
@@ -609,55 +587,33 @@ func BackfillIndexMany[T any, K comparable](
 					if onMissingData != nil {
 						onMissingData(key)
 					}
-					return
+					return nil
 				}
-				errs[n] = err
-				cancel()
-				return
+				return err
 			}
 			recordsTotal.Add(int64(nRecs))
 
-			// Serial PUTs within the object. Across objects we
-			// already run pollDownloadConcurrency-wide, so per-
-			// object fan-out would compound to concurrency² and
-			// overwhelm the SDK connection pool. Net in-flight ≈
-			// concurrency.
+			// Serial marker PUTs within the object — the per-target
+			// MaxInflightRequests semaphore on target.put already
+			// caps net in-flight, so per-object fan-out would just
+			// queue at the semaphore.
 			for _, p := range paths {
 				if err := target.put(
 					ctx, p, nil, "application/octet-stream",
 					def.ConsistencyControl,
 				); err != nil {
-					errs[n] = fmt.Errorf(
+					return fmt.Errorf(
 						"s3parquet: backfill index %q: put marker: %w",
 						idx.name, err)
-					cancel()
-					return
 				}
 			}
 			markersTotal.Add(int64(len(paths)))
-		}(n, key)
-	}
-	wg.Wait()
+			return nil
+		})
 
 	stats.Records = int(recordsTotal.Load())
 	stats.Markers = int(markersTotal.Load())
-
-	// First real error wins; skip cancellations so we report the
-	// root-cause failure rather than the cancel it triggered in
-	// sibling goroutines. If every goroutine bailed with Canceled,
-	// check parentCtx so a caller-triggered cancel surfaces as an
-	// error — otherwise a partial backfill looks like a completed
-	// one.
-	for _, e := range errs {
-		if e == nil || errors.Is(e, context.Canceled) {
-			continue
-		}
-		return stats, e
-	}
-	if err := parentCtx.Err(); err != nil {
-		return stats, err
-	}
-	return stats, nil
+	return stats, err
 }
 
 // listDataFilesBelowUntil LISTs parquet data files matching plan

@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -77,11 +76,14 @@ func resolveWriteOpts(opts []WriteOption) (core.WriteOpts, error) {
 
 // writeGroupedFanOut is the partition-level fan-out shared by
 // Write and WriteRowGroupsBy. Groups records by PartitionKeyOf,
-// spawns up to Target.MaxInflightRequests goroutines, each
-// invoking perPartition with its key and records. Returns results
-// in sorted-key order regardless of completion order; first real
-// (non-cancel) failure wins; caller-cancel surfaces as an error
-// even when no real failure occurred.
+// runs perPartition through core.FanOut bounded by
+// Target.MaxInflightRequests. Returns results in sorted-key order
+// regardless of completion order; first real (non-cancel) failure
+// wins; caller-cancel surfaces as an error even when no real
+// failure occurred (handled in core.FanOut).
+//
+// Partial success is the accepted outcome: on error, results that
+// committed before the cancel still appear in the returned slice.
 func (s *Writer[T]) writeGroupedFanOut(
 	ctx context.Context, records []T,
 	perPartition func(
@@ -91,67 +93,31 @@ func (s *Writer[T]) writeGroupedFanOut(
 	grouped := s.groupByKey(records)
 	keys := slices.Sorted(maps.Keys(grouped))
 
-	// Slot i holds the result for keys[i], so completion order
+	// Slot i holds the result for keys[i] so completion order
 	// cannot leak into the returned slice even under parallel
 	// execution.
 	results := make([]*WriteResult, len(keys))
-	errs := make([]error, len(keys))
 
-	parentCtx := ctx
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sem := make(chan struct{}, s.cfg.Target.EffectiveMaxInflightRequests())
-	var wg sync.WaitGroup
-	for i, key := range keys {
-		wg.Add(1)
-		go func(i int, key string) {
-			defer wg.Done()
-			// Acquire inside the goroutine so a sibling failure
-			// or caller cancel unblocks us promptly rather than
-			// letting the main loop dispatch every partition
-			// upfront.
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[i] = ctx.Err()
-				return
-			}
-			defer func() { <-sem }()
-
+	err := core.FanOut(ctx, keys,
+		s.cfg.Target.EffectiveMaxInflightRequests(),
+		func(ctx context.Context, i int, key string) error {
 			r, err := perPartition(ctx, key, grouped[key])
 			if err != nil {
-				errs[i] = err
-				cancel()
-				return
+				return err
 			}
 			results[i] = r
-		}(i, key)
-	}
-	wg.Wait()
+			return nil
+		})
 
-	// Compact successful results in sorted-key order.
+	// Compact successful results in sorted-key order regardless
+	// of err — partial success on failure is documented behaviour.
 	var out []WriteResult
 	for i := range keys {
 		if results[i] != nil {
 			out = append(out, *results[i])
 		}
 	}
-
-	// Prefer a real failure over the cancel it triggered in
-	// siblings. If no real failure surfaced but the caller's
-	// context was cancelled, report that — otherwise callers
-	// could mistake a partial write for full success.
-	for _, err := range errs {
-		if err == nil || errors.Is(err, context.Canceled) {
-			continue
-		}
-		return out, err
-	}
-	if err := parentCtx.Err(); err != nil {
-		return out, err
-	}
-	return out, nil
+	return out, err
 }
 
 // WriteWithKey encodes records as Parquet, uploads to S3, and

@@ -13,7 +13,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -461,51 +460,16 @@ func (s *Reader[T]) downloadAndDecodeAll(
 	sortKeyMetasByKey(keys)
 
 	results := make([][]versionedRecord[T], len(keys))
-	errs := make([]error, len(keys))
-
-	parentCtx := ctx
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sem := make(chan struct{}, s.cfg.Target.EffectiveMaxInflightRequests())
-	var wg sync.WaitGroup
-	for i, km := range keys {
-		wg.Add(1)
-		go func(i int, km core.KeyMeta) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[i] = ctx.Err()
-				return
-			}
-			defer func() { <-sem }()
-
+	if err := core.FanOut(ctx, keys,
+		s.cfg.Target.EffectiveMaxInflightRequests(),
+		func(ctx context.Context, i int, km core.KeyMeta) error {
 			recs, err := s.downloadAndDecodeOne(ctx, km)
 			if err != nil {
-				errs[i] = err
-				cancel()
-				return
+				return err
 			}
 			results[i] = recs
-		}(i, km)
-	}
-	wg.Wait()
-
-	// First-error wins: we cancel on the first failure so later
-	// goroutines see ctx.Err(); return the earliest "real"
-	// error rather than a cancellation. If every goroutine bailed
-	// with Canceled, check parentCtx — if it was the caller
-	// cancelling (not our internal sibling-cancel), surface the
-	// cancellation so a partial empty result isn't mistaken for
-	// "no matching records".
-	for _, e := range errs {
-		if e == nil || errors.Is(e, context.Canceled) {
-			continue
-		}
-		return nil, e
-	}
-	if err := parentCtx.Err(); err != nil {
+			return nil
+		}); err != nil {
 		return nil, err
 	}
 

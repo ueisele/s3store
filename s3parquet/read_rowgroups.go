@@ -8,7 +8,6 @@ import (
 	"iter"
 	"path"
 	"reflect"
-	"sync"
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -103,10 +102,10 @@ func (s *Reader[T]) ReadManyIterWhere(
 }
 
 // downloadFilteredAll is the filtered counterpart of
-// downloadAndDecodeAll: fans out one goroutine per file, each
-// opens the file through a ranged-GET ReaderAt, applies the
-// row-group predicate, and decodes only the accepted row
-// groups. Sorts input by key for deterministic download order.
+// downloadAndDecodeAll: fans out one goroutine per file (via
+// core.FanOut), each opens the file through a ranged-GET ReaderAt,
+// applies the row-group predicate, and decodes only the accepted
+// row groups. Sorts input by key for deterministic download order.
 func (s *Reader[T]) downloadFilteredAll(
 	ctx context.Context, keys []core.KeyMeta, predicate RowGroupPredicate,
 ) ([]versionedRecord[T], error) {
@@ -117,48 +116,16 @@ func (s *Reader[T]) downloadFilteredAll(
 	sortKeyMetasByKey(keys)
 
 	results := make([][]versionedRecord[T], len(keys))
-	errs := make([]error, len(keys))
-
-	parentCtx := ctx
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sem := make(chan struct{}, s.cfg.Target.EffectiveMaxInflightRequests())
-	var wg sync.WaitGroup
-	for i, km := range keys {
-		wg.Add(1)
-		go func(i int, km core.KeyMeta) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[i] = ctx.Err()
-				return
-			}
-			defer func() { <-sem }()
-
+	if err := core.FanOut(ctx, keys,
+		s.cfg.Target.EffectiveMaxInflightRequests(),
+		func(ctx context.Context, i int, km core.KeyMeta) error {
 			recs, err := s.downloadFilteredOne(ctx, km, predicate)
 			if err != nil {
-				errs[i] = err
-				cancel()
-				return
+				return err
 			}
 			results[i] = recs
-		}(i, km)
-	}
-	wg.Wait()
-
-	// Skip sibling-cancel errors so the root-cause failure wins;
-	// if every goroutine bailed with Canceled, check parentCtx so
-	// a caller-triggered cancel surfaces as an error instead of
-	// an empty result.
-	for _, e := range errs {
-		if e == nil || errors.Is(e, context.Canceled) {
-			continue
-		}
-		return nil, e
-	}
-	if err := parentCtx.Err(); err != nil {
+			return nil
+		}); err != nil {
 		return nil, err
 	}
 
