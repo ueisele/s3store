@@ -254,34 +254,6 @@ func (t S3Target) put(
 	})
 }
 
-// putWithMeta is put with user-supplied S3 object metadata.
-// The AWS SDK transforms each entry into an x-amz-meta-<key>
-// HTTP header; values are preserved verbatim. Used by the data
-// PUT to stamp x-amz-meta-created-at so external tooling can
-// see the writer's wall-clock time alongside the in-file
-// InsertedAtField column. Marker and ref PUTs stay on the
-// plain put — they don't carry writer metadata.
-func (t S3Target) putWithMeta(
-	ctx context.Context, key string, data []byte,
-	contentType string, meta map[string]string,
-	opts ...s3CallOpt,
-) error {
-	callOpts := applyS3CallOpts(opts)
-	apiOpts := apiOptionsForOpts(callOpts)
-	return retry(ctx, func() error {
-		_, err := t.S3Client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:      aws.String(t.Bucket),
-			Key:         aws.String(key),
-			Body:        bytes.NewReader(data),
-			ContentType: aws.String(contentType),
-			Metadata:    meta,
-		}, func(o *s3.Options) {
-			o.APIOptions = append(o.APIOptions, apiOpts...)
-		})
-		return err
-	})
-}
-
 // putIfAbsent PUTs data at key with an If-None-Match: * header so
 // the PUT is rejected by the backend when the object already
 // exists. Returns ErrAlreadyExists on:
@@ -296,7 +268,9 @@ func (t S3Target) putWithMeta(
 //
 // Any other error propagates as-is. On success returns nil with
 // the object written. meta is attached as x-amz-meta-<k> headers
-// when non-nil; mirrors putWithMeta for the idempotent data PUT.
+// when non-nil — used by the data PUT to stamp
+// x-amz-meta-created-at so external tooling sees the writer's
+// wall-clock alongside the in-file InsertedAtField column.
 func (t S3Target) putIfAbsent(
 	ctx context.Context, key string, data []byte,
 	contentType string, meta map[string]string,

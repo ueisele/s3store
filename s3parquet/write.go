@@ -345,8 +345,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	}
 
 	// Phase 1: data.
-	isRetry, err := s.writeData(
-		ctx, dataKey, parquetBytes, meta, idempotent)
+	isRetry, err := s.writeData(ctx, dataKey, parquetBytes, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -388,9 +387,12 @@ func (s *Writer[T]) writeEncodedPayload(
 }
 
 // writeData is phase 1 of writeEncodedPayload: PUT the parquet
-// bytes to dataKey. Routes through the overwrite-prevention
-// detection path (putIfAbsent or headThenPut) when idempotent is
-// true, or a plain metadata-carrying PUT when it isn't.
+// bytes to dataKey via putIfAbsent. Always uses the conditional
+// PUT — for non-token writes the dataKey is auto-generated with a
+// {tsMicros}-{shortID} tail and is therefore unique per attempt,
+// so the conditional check trivially passes; for token writes
+// the conditional PUT detects retries and surfaces them via
+// ErrAlreadyExists.
 //
 // Returns isRetry=true when the data object already existed,
 // signalling that markers and ref may already have been emitted
@@ -403,28 +405,17 @@ func (s *Writer[T]) writeEncodedPayload(
 // same logical content).
 func (s *Writer[T]) writeData(
 	ctx context.Context, dataKey string, parquetBytes []byte,
-	meta map[string]string, idempotent bool,
+	meta map[string]string,
 ) (isRetry bool, err error) {
-	opts := withConsistencyControl(s.cfg.ConsistencyControl)
-	if idempotent {
-		putErr := s.cfg.Target.putIfAbsent(
-			ctx, dataKey, parquetBytes,
-			"application/octet-stream", meta, opts)
-		switch {
-		case errors.Is(putErr, ErrAlreadyExists):
-			return true, nil
-		case putErr != nil:
-			return false, fmt.Errorf(
-				"s3parquet: put data: %w", putErr)
-		}
-		return false, nil
-	}
-	if err := s.cfg.Target.putWithMeta(
+	putErr := s.cfg.Target.putIfAbsent(
 		ctx, dataKey, parquetBytes,
-		"application/octet-stream", meta, opts,
-	); err != nil {
-		return false, fmt.Errorf(
-			"s3parquet: put data: %w", err)
+		"application/octet-stream", meta,
+		withConsistencyControl(s.cfg.ConsistencyControl))
+	switch {
+	case errors.Is(putErr, ErrAlreadyExists):
+		return true, nil
+	case putErr != nil:
+		return false, fmt.Errorf("s3parquet: put data: %w", putErr)
 	}
 	return false, nil
 }
