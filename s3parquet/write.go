@@ -64,28 +64,9 @@ func refPutBudget(settleWindow time.Duration) time.Duration {
 	return settleWindow / 2
 }
 
-// defaultPartitionWriteConcurrency is the fallback cap on how
-// many partitions Write fans out in parallel when
-// WriterConfig.PartitionWriteConcurrency is zero. Each partition
-// runs an independent encode + PUT(data) + PUT(markers…) +
-// PUT(ref) sequence, so the cap bounds in-flight memory (sum of
-// parquet buffers) and outbound S3 request rate. Matches
-// markerPutConcurrency.
-const defaultPartitionWriteConcurrency = 8
-
-// partitionConcurrency returns the effective fan-out cap — the
-// user-supplied WriterConfig.PartitionWriteConcurrency when set
-// to a positive value, otherwise the default.
-func (s *Writer[T]) partitionConcurrency() int {
-	if s.cfg.PartitionWriteConcurrency > 0 {
-		return s.cfg.PartitionWriteConcurrency
-	}
-	return defaultPartitionWriteConcurrency
-}
-
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
-// key in parallel (bounded by WriterConfig.PartitionWriteConcurrency,
+// key in parallel (bounded by Target.MaxInflightRequests,
 // default 8). Returns one WriteResult per partition that
 // completed, in sorted-key order regardless of completion order.
 //
@@ -142,9 +123,9 @@ func resolveWriteOpts(opts []WriteOption) (core.WriteOpts, error) {
 
 // writeGroupedFanOut is the partition-level fan-out shared by
 // Write and WriteRowGroupsBy. Groups records by PartitionKeyOf,
-// spawns up to partitionConcurrency() goroutines, each invoking
-// perPartition with its key and records. Returns results in
-// sorted-key order regardless of completion order; first real
+// spawns up to Target.MaxInflightRequests goroutines, each
+// invoking perPartition with its key and records. Returns results
+// in sorted-key order regardless of completion order; first real
 // (non-cancel) failure wins; caller-cancel surfaces as an error
 // even when no real failure occurred.
 func (s *Writer[T]) writeGroupedFanOut(
@@ -166,7 +147,7 @@ func (s *Writer[T]) writeGroupedFanOut(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, s.partitionConcurrency())
+	sem := make(chan struct{}, s.cfg.Target.EffectiveMaxInflightRequests())
 	var wg sync.WaitGroup
 	for i, key := range keys {
 		wg.Add(1)
@@ -370,7 +351,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// commit semantics are unchanged. On marker-PUT failure,
 	// best-effort cleanup of the orphan data (non-idempotent
 	// writes only; idempotent retries reuse the same data file).
-	if err := s.putMarkersParallel(ctx, markerPaths); err != nil {
+	if err := s.putMarkers(ctx, markerPaths); err != nil {
 		_ = s.cleanupOrphanData(dataKey, idempotent)
 		return nil, fmt.Errorf(
 			"s3parquet: put index markers: %w", err)
@@ -724,12 +705,6 @@ func (s *Writer[T]) validateKey(key string) error {
 	return nil
 }
 
-// markerPutConcurrency caps the number of parallel marker PUTs
-// per WriteWithKey. Markers are tiny (empty objects), so request
-// rate rather than bandwidth is the limit. 8 matches the AWS SDK
-// default MaxConnsPerHost, mirroring pollDownloadConcurrency.
-const markerPutConcurrency = 8
-
 // collectIndexMarkerPaths iterates every registered index over
 // every record in the batch and returns the deduplicated set of
 // marker S3 keys. Dedup is via map[string]struct{} on the full
@@ -762,67 +737,23 @@ func (s *Writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 	return out, nil
 }
 
-// putMarkersParallel issues PUTs for every path with bounded
-// concurrency and cancel-on-first-error. Returns the earliest
-// real (non-cancellation) error observed; already-started PUTs
-// run to completion, those still blocked on the semaphore see
-// the cancelled context and bail. Partial success is an accepted
-// outcome — Lookup tolerates orphan markers.
-func (s *Writer[T]) putMarkersParallel(
+// putMarkers issues marker PUTs serially. Net in-flight S3
+// requests stays bounded by Target.MaxInflightRequests at the
+// outer partition fan-out (one partition per slot); compounding
+// with intra-partition concurrency would multiply the cap and
+// overshoot http.Transport.MaxConnsPerHost. Returns the first
+// PUT error; partial success on failure is accepted — orphan
+// markers are tolerated at Lookup time.
+func (s *Writer[T]) putMarkers(
 	ctx context.Context, paths []string,
 ) error {
-	if len(paths) == 0 {
-		return nil
-	}
-	parentCtx := ctx
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sem := make(chan struct{}, markerPutConcurrency)
-	errs := make([]error, len(paths))
-	var wg sync.WaitGroup
-	for i, p := range paths {
-		wg.Add(1)
-		go func(i int, p string) {
-			defer wg.Done()
-			// Acquire the semaphore inside the goroutine so a
-			// parent-ctx cancel or sibling-goroutine failure
-			// unblocks us promptly instead of letting the main
-			// loop keep spawning PUTs.
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[i] = ctx.Err()
-				return
-			}
-			defer func() { <-sem }()
-
-			if err := s.cfg.Target.put(
-				ctx, p, nil, "application/octet-stream",
-				s.cfg.ConsistencyControl,
-			); err != nil {
-				errs[i] = err
-				cancel()
-			}
-		}(i, p)
-	}
-	wg.Wait()
-
-	// First real error wins; skip cancellations so we report the
-	// root-cause failure instead of the cancellation it triggered
-	// in sibling goroutines. If every goroutine bailed with
-	// Canceled, check parentCtx so a caller-triggered cancel
-	// surfaces as an error rather than a nil-return that would
-	// misrepresent a cancelled marker commit as a successful one
-	// to any future caller refactoring this site.
-	for _, err := range errs {
-		if err == nil || errors.Is(err, context.Canceled) {
-			continue
+	for _, p := range paths {
+		if err := s.cfg.Target.put(
+			ctx, p, nil, "application/octet-stream",
+			s.cfg.ConsistencyControl,
+		); err != nil {
+			return err
 		}
-		return err
-	}
-	if err := parentCtx.Err(); err != nil {
-		return err
 	}
 	return nil
 }

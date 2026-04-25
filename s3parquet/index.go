@@ -421,7 +421,8 @@ func (i *Index[K]) listMatchingMarkers(
 func (i *Index[K]) listAllMatchingMarkers(
 	ctx context.Context, plans []*core.ReadPlan,
 ) ([]string, error) {
-	return runPlansConcurrent(ctx, plans,
+	return core.RunPlansConcurrent(ctx, plans,
+		i.target.EffectiveMaxInflightRequests(),
 		i.listMatchingMarkers, identityKey)
 }
 
@@ -578,7 +579,7 @@ func BackfillIndexMany[T any, K comparable](
 
 	var recordsTotal, markersTotal atomic.Int64
 	errs := make([]error, len(keys))
-	sem := make(chan struct{}, pollDownloadConcurrency)
+	sem := make(chan struct{}, target.EffectiveMaxInflightRequests())
 	var wg sync.WaitGroup
 
 	for n, key := range keys {
@@ -686,7 +687,8 @@ func listDataFilesBelowUntil(
 		filter = true
 	}
 
-	return runPlansConcurrent(ctx, plans,
+	return core.RunPlansConcurrent(ctx, plans,
+		target.EffectiveMaxInflightRequests(),
 		func(ctx context.Context, plan *core.ReadPlan) ([]string, error) {
 			return listDataFilesForPlan(
 				ctx, target, plan, dataPath, filter, cutoff, consistency)

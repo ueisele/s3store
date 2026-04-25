@@ -320,42 +320,28 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 	}
 }
 
-// TestPartitionConcurrency guards the fan-out cap resolution:
-// positive user values win, zero falls back to the default.
-// Negative is rejected upfront in NewWriter (see
-// TestNewWriterRejectsNegativeConcurrency), so by the time a
-// Writer exists the cfg value is always >= 0.
-func TestPartitionConcurrency(t *testing.T) {
+// TestEffectiveMaxInflightRequests guards the fan-out cap
+// resolution: positive user values win, zero falls back to the
+// default (8). Negative gets the default too — there's no
+// up-front rejection because S3Target is a plain struct with no
+// constructor validation.
+func TestEffectiveMaxInflightRequests(t *testing.T) {
 	cases := []struct {
 		name string
 		set  int
 		want int
 	}{
-		{"zero uses default", 0, defaultPartitionWriteConcurrency},
+		{"zero uses default", 0, 8},
+		{"negative uses default", -1, 8},
 		{"positive wins", 32, 32},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w := &Writer[testRec]{cfg: WriterConfig[testRec]{
-				PartitionWriteConcurrency: tc.set,
-			}}
-			if got := w.partitionConcurrency(); got != tc.want {
-				t.Errorf("partitionConcurrency: got %d, want %d",
+			tgt := S3Target{MaxInflightRequests: tc.set}
+			if got := tgt.EffectiveMaxInflightRequests(); got != tc.want {
+				t.Errorf("EffectiveMaxInflightRequests: got %d, want %d",
 					got, tc.want)
 			}
 		})
-	}
-}
-
-// TestNewWriterRejectsNegativeConcurrency guards that NewWriter
-// fails fast on a negative PartitionWriteConcurrency instead of
-// silently defaulting. A negative value is almost certainly a
-// caller bug (off-by-one, a decrement that underflowed);
-// surfacing it at construction beats swallowing it.
-func TestNewWriterRejectsNegativeConcurrency(t *testing.T) {
-	cfg := writerConfigFrom(validConfig())
-	cfg.PartitionWriteConcurrency = -1
-	if _, err := NewWriter(cfg); err == nil {
-		t.Fatal("NewWriter: expected error, got nil")
 	}
 }

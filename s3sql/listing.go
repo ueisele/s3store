@@ -11,12 +11,6 @@ import (
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// listFanOutConcurrency caps parallel LIST calls in the *Many
-// multi-pattern path. Matches s3parquet's pollDownloadConcurrency
-// — well below S3's 5500 LIST/s-per-prefix limit and the AWS SDK
-// default MaxConnsPerHost.
-const listFanOutConcurrency = 8
-
 // listMatchingParquet LISTs every parquet object under the
 // plan's ListPrefix and returns the subset whose Hive key
 // matches the plan's predicate, carrying each object's
@@ -108,7 +102,8 @@ func (s *Reader[T]) listAllMatchingURIs(
 	}
 
 	keys, err := core.RunPlansConcurrent(ctx, plans,
-		listFanOutConcurrency, s.listMatchingParquet,
+		s.cfg.Target.EffectiveMaxInflightRequests(),
+		s.listMatchingParquet,
 		func(k core.KeyMeta) string { return k.Key })
 	if err != nil {
 		return nil, err

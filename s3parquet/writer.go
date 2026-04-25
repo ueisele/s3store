@@ -1,7 +1,6 @@
 package s3parquet
 
 import (
-	"fmt"
 	"log"
 
 	"github.com/parquet-go/parquet-go/compress"
@@ -23,15 +22,6 @@ type WriterConfig[T any] struct {
 	Target         S3Target
 	PartitionKeyOf func(T) string
 	Compression    CompressionCodec
-
-	// PartitionWriteConcurrency caps how many partitions Write
-	// fans out in parallel per call. Zero → default (8). Raise
-	// for workloads with many small partitions per Write (a
-	// single poll from a DB fanning out to dozens of Hive keys)
-	// where the default leaves S3 I/O idle. Lower if parquet
-	// buffers are large enough that N × buffer-size would
-	// dominate memory.
-	PartitionWriteConcurrency int
 
 	// InsertedAtField names a time.Time field on T that the writer
 	// populates with its wall-clock time.Now() just before parquet
@@ -172,12 +162,6 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err := cfg.Target.Validate(); err != nil {
 		return nil, err
-	}
-	if cfg.PartitionWriteConcurrency < 0 {
-		return nil, fmt.Errorf(
-			"s3parquet: PartitionWriteConcurrency must be "+
-				">= 0 (got %d); zero means default",
-			cfg.PartitionWriteConcurrency)
 	}
 	codec, err := resolveCompression(cfg.Compression)
 	if err != nil {

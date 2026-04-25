@@ -123,7 +123,7 @@ func (s *Reader[T]) downloadFilteredAll(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, pollDownloadConcurrency)
+	sem := make(chan struct{}, s.cfg.Target.EffectiveMaxInflightRequests())
 	var wg sync.WaitGroup
 	for i, km := range keys {
 		wg.Add(1)

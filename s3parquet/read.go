@@ -22,12 +22,6 @@ import (
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// pollDownloadConcurrency caps the number of parquet files
-// downloaded + decoded in parallel by Read and PollRecords.
-// 8 matches the AWS SDK's default MaxConnsPerHost so the cap
-// doesn't outrun the underlying transport's connection pool.
-const pollDownloadConcurrency = 8
-
 // versionedRecord carries a decoded record together with the
 // write time of the parquet file it came from. The library
 // passes insertedAt to Config.VersionOf, which can use it as
@@ -418,7 +412,8 @@ func (s *Reader[T]) listMatchingParquet(
 func (s *Reader[T]) listAllMatchingParquet(
 	ctx context.Context, plans []*core.ReadPlan,
 ) ([]core.KeyMeta, error) {
-	return runPlansConcurrent(ctx, plans,
+	return core.RunPlansConcurrent(ctx, plans,
+		s.cfg.Target.EffectiveMaxInflightRequests(),
 		s.listMatchingParquet, keyMetaKey)
 }
 
@@ -444,20 +439,6 @@ func (s *Reader[T]) applyIdempotentRead(
 
 // keyMetaKey is the keyOf function for KeyMeta fan-outs.
 func keyMetaKey(k core.KeyMeta) string { return k.Key }
-
-// runPlansConcurrent forwards to core.RunPlansConcurrent,
-// pinning the per-package concurrency cap. Kept as a package-
-// local name so the existing call sites don't have to pass
-// pollDownloadConcurrency every time.
-func runPlansConcurrent[P any, R any](
-	ctx context.Context,
-	plans []P,
-	listOne func(ctx context.Context, p P) ([]R, error),
-	keyOf func(R) string,
-) ([]R, error) {
-	return core.RunPlansConcurrent(
-		ctx, plans, pollDownloadConcurrency, listOne, keyOf)
-}
 
 // identityKey is the keyOf function for []string fan-outs — the
 // element is itself the dedup key. Used by the index/backfill
@@ -486,7 +467,7 @@ func (s *Reader[T]) downloadAndDecodeAll(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, pollDownloadConcurrency)
+	sem := make(chan struct{}, s.cfg.Target.EffectiveMaxInflightRequests())
 	var wg sync.WaitGroup
 	for i, km := range keys {
 		wg.Add(1)

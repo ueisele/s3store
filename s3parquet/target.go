@@ -100,6 +100,30 @@ type S3Target struct {
 	// make Poll see historical writes. Set only for datasets that
 	// are read purely via Read / Query.
 	DisableRefStream bool
+
+	// MaxInflightRequests caps the number of S3 requests one library
+	// call may have outstanding at once. Applies at the widest
+	// fan-out axis of each operation:
+	//
+	//   - Write / WriteRowGroupsBy: across partitions (work inside
+	//     a single partition — data PUT, marker PUTs, ref PUT —
+	//     runs serially so the cap isn't compounded).
+	//   - Read / PollRecords / BackfillIndex: across data files.
+	//   - Index.LookupMany / s3sql *Many / BackfillIndexMany: across
+	//     patterns (one LIST per pattern).
+	//
+	// Zero → default (8), matching the AWS SDK's default
+	// http.Transport.MaxConnsPerHost so the library cap doesn't
+	// outrun the connection pool. Raise for many-small-files
+	// workloads where partition fan-out dominates wall time.
+	//
+	// The cap is per call, not library-wide. Concurrent goroutines
+	// each calling Write / Read see in-flight up to N ×
+	// MaxInflightRequests. If you raise this above ~10 or run many
+	// parallel callers, raise http.Transport.MaxConnsPerHost on the
+	// *s3.Client to match — otherwise excess requests queue at the
+	// transport layer instead of running in parallel.
+	MaxInflightRequests int
 }
 
 // NewS3Target constructs an S3Target with required fields. Use
@@ -169,6 +193,16 @@ func (t S3Target) EffectiveSettleWindow() time.Duration {
 		return t.SettleWindow
 	}
 	return 5 * time.Second
+}
+
+// EffectiveMaxInflightRequests returns the configured
+// MaxInflightRequests, or 8 when unset. Used by every fan-out
+// site so all read/write paths converge on one cap.
+func (t S3Target) EffectiveMaxInflightRequests() int {
+	if t.MaxInflightRequests > 0 {
+		return t.MaxInflightRequests
+	}
+	return 8
 }
 
 // get downloads a single object into memory. Used by the read

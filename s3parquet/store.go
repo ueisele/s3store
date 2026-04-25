@@ -143,12 +143,6 @@ type Config[T any] struct {
 	// for the full contract.
 	DisableRefStream bool
 
-	// PartitionWriteConcurrency caps how many partitions a single
-	// Write fans out in parallel. Zero → default (8). Forwarded
-	// to WriterConfig. See WriterConfig.PartitionWriteConcurrency
-	// for when to tune it.
-	PartitionWriteConcurrency int
-
 	// DisableCleanup disables best-effort orphan cleanup on the
 	// write path's failure branches. Forwarded to WriterConfig;
 	// see WriterConfig.DisableCleanup.
@@ -160,6 +154,12 @@ type Config[T any] struct {
 	// halves of the Store share the same value. See
 	// WriterConfig.ConsistencyControl for the contract.
 	ConsistencyControl ConsistencyLevel
+
+	// MaxInflightRequests caps S3 requests in flight per call.
+	// Zero → default (8). Forwarded onto the shared S3Target
+	// so both Writer and Reader see the same cap. See
+	// S3Target.MaxInflightRequests for the full contract.
+	MaxInflightRequests int
 }
 
 // DefaultVersionOf returns insertedAt in microseconds. The
@@ -225,12 +225,13 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 // so the two halves see a byte-identical Target.
 func targetFrom[T any](c Config[T]) S3Target {
 	return S3Target{
-		Bucket:            c.Bucket,
-		Prefix:            c.Prefix,
-		S3Client:          c.S3Client,
-		PartitionKeyParts: c.PartitionKeyParts,
-		SettleWindow:      c.SettleWindow,
-		DisableRefStream:  c.DisableRefStream,
+		Bucket:              c.Bucket,
+		Prefix:              c.Prefix,
+		S3Client:            c.S3Client,
+		PartitionKeyParts:   c.PartitionKeyParts,
+		SettleWindow:        c.SettleWindow,
+		DisableRefStream:    c.DisableRefStream,
+		MaxInflightRequests: c.MaxInflightRequests,
 	}
 }
 
@@ -239,13 +240,12 @@ func targetFrom[T any](c Config[T]) S3Target {
 // is easy to spot.
 func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 	return WriterConfig[T]{
-		Target:                    targetFrom(c),
-		PartitionKeyOf:            c.PartitionKeyOf,
-		Compression:               c.Compression,
-		PartitionWriteConcurrency: c.PartitionWriteConcurrency,
-		InsertedAtField:           c.InsertedAtField,
-		DisableCleanup:            c.DisableCleanup,
-		ConsistencyControl:        c.ConsistencyControl,
+		Target:             targetFrom(c),
+		PartitionKeyOf:     c.PartitionKeyOf,
+		Compression:        c.Compression,
+		InsertedAtField:    c.InsertedAtField,
+		DisableCleanup:     c.DisableCleanup,
+		ConsistencyControl: c.ConsistencyControl,
 	}
 }
 

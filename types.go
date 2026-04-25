@@ -104,11 +104,12 @@ type Config[T any] struct {
 	// encoding). Forwarded to both sub-stores.
 	DisableRefStream bool
 
-	// PartitionWriteConcurrency caps how many partitions a single
-	// Write fans out in parallel. Zero → default (8). See
-	// s3parquet.WriterConfig.PartitionWriteConcurrency for tuning
-	// guidance; forwarded there verbatim.
-	PartitionWriteConcurrency int
+	// MaxInflightRequests caps S3 requests in flight per library
+	// call. Zero → default (8). Forwarded to the shared
+	// s3parquet.S3Target so Writer and Reader share one cap. See
+	// s3parquet.S3Target.MaxInflightRequests for the full contract
+	// and the http.Transport.MaxConnsPerHost interaction.
+	MaxInflightRequests int
 
 	// DisableCleanup disables best-effort orphan cleanup on the
 	// write path's failure branches. Forwarded to
