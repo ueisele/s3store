@@ -1361,43 +1361,6 @@ func TestDedupExplicit(t *testing.T) {
 	}
 }
 
-// TestDedupDefault omits VersionOf: New() populates it with
-// DefaultVersionOf, so dedup falls back to the source file's
-// insertedAt. The second write to the same entity must win
-// because its parquet file has a later tsMicros.
-func TestDedupDefault(t *testing.T) {
-	ctx := context.Background()
-	store := newStore(t, storeOpts{
-		entityKeyOf: func(r Rec) string {
-			return r.Customer + "|" + r.SKU
-		},
-	})
-
-	key := "period=2026-03-17/customer=abc"
-	if _, err := store.WriteWithKey(ctx, key, []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10},
-	}); err != nil {
-		t.Fatalf("first Write: %v", err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	if _, err := store.WriteWithKey(ctx, key, []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 99},
-	}); err != nil {
-		t.Fatalf("second Write: %v", err)
-	}
-
-	got, err := store.Read(ctx, key)
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("got %d records, want 1", len(got))
-	}
-	if got[0].Value != 99 {
-		t.Errorf("got Value=%d, want 99 (later file wins)", got[0].Value)
-	}
-}
-
 // TestReplicaDedup_CollapsesSameEntityVersion proves Phase 1.5's
 // core contract: two writes that produce the same (entity,
 // version) pair — i.e. byte-identical replicas from a retry,
@@ -2276,6 +2239,7 @@ func TestReadIter_WithHistory_Order(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
+		versionOf: func(r Rec) int64 { return r.Value },
 	})
 
 	key := "period=2026-03-17/customer=abc"
@@ -2388,6 +2352,7 @@ func TestReadIter_ReadAheadPartitions(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Period + "|" + r.Customer + "|" + r.SKU
 		},
+		versionOf: func(r Rec) int64 { return r.Value },
 	})
 
 	in := []Rec{
@@ -2459,6 +2424,7 @@ func TestReadIter_MultiPartition(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Period + "|" + r.Customer + "|" + r.SKU
 		},
+		versionOf: func(r Rec) int64 { return r.Value },
 	})
 
 	if _, err := store.Write(ctx, []Rec{
