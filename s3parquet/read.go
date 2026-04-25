@@ -10,29 +10,11 @@ import (
 	"maps"
 	"slices"
 	"sort"
-	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
 )
-
-// versionedRecord carries a decoded record together with the
-// write time of the parquet file it came from. The library
-// passes insertedAt to Config.VersionOf, which can use it as
-// a fallback or ignore it in favor of a domain-level version.
-// insertedAt is sourced from the writer-populated
-// InsertedAtField column when the reader has InsertedAtField
-// configured, else from the S3 object's LastModified.
-//
-// Records flow into sortAndDedup in deterministic input order
-// (file lex order, then parquet row order); sort.SliceStable
-// preserves that on ties, so no per-record fileName is needed
-// as a tiebreaker.
-type versionedRecord[T any] struct {
-	rec        T
-	insertedAt time.Time
-}
 
 // Read returns all records whose data files match the given
 // key pattern, optionally deduplicated to latest-per-entity
@@ -106,12 +88,16 @@ func (s *Reader[T]) ReadMany(
 		return nil, nil
 	}
 
-	versioned, err := s.downloadAndDecodeAll(ctx, keys)
+	records, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, err
 	}
 
-	return s.sortAndDedup(versioned, o.IncludeHistory), nil
+	out := make([]T, 0, len(records))
+	for r := range s.sortAndIterate(records, o.IncludeHistory) {
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // ReadIter returns an iter.Seq2[T, error] yielding records one
@@ -204,7 +190,7 @@ func (s *Reader[T]) ReadManyIter(
 // the background producer to the yield loop over the pipeline
 // channel in the readAhead>0 path.
 type partitionBatch[T any] struct {
-	recs []versionedRecord[T]
+	recs []T
 	err  error
 }
 
@@ -230,7 +216,7 @@ type partitionBatch[T any] struct {
 func (s *Reader[T]) streamByPartition(
 	ctx context.Context, keys []core.KeyMeta,
 	includeHistory bool, readAhead int,
-	downloadOne func(ctx context.Context, files []core.KeyMeta) ([]versionedRecord[T], error),
+	downloadOne func(ctx context.Context, files []core.KeyMeta) ([]T, error),
 	yield func(T, error) bool,
 ) {
 	byPartition := s.groupKeysByPartition(keys)
@@ -294,50 +280,52 @@ func sortKeyMetasByKey(files []core.KeyMeta) {
 	})
 }
 
-// sortAndDedup runs the reader's resolved sortCmp over versioned,
-// then dispatches on (dedupEnabled, includeHistory) to produce the
-// user-visible []T. Shared by ReadMany, PollRecords, and
-// emitPartition so all three emission paths agree on order,
-// replica handling, and latest-per-entity reduction.
+// sortAndIterate sorts records in place by the reader's resolved
+// sortCmp (when dedup is enabled) and yields them through the
+// dedup cascade as an iter.Seq[T]:
 //
-// Branches:
+//   - dedup disabled (sortCmp == nil): yields records in input
+//     order — no sort, no allocation.
+//   - WithHistory + dedup enabled: dedupReplicasSeq collapses
+//     records that share (entity, version) to one (first-seen
+//     wins on ties), preserving distinct versions.
+//   - default: dedupLatestSeq emits the LAST record of each
+//     entity group (sort places max-version last per entity);
+//     replicas collapse as a side effect since ties on version
+//     keep the first-seen via stable sort.
 //
-//   - dedup disabled (no EntityKeyOf): strip versions and return.
-//   - WithHistory + dedup enabled: collapse (entity, version)
-//     replicas, keep distinct versions.
-//   - default: dedupLatest reduces to one record per entity; it
-//     absorbs replicas as a side effect (ties tie on version,
-//     first-seen wins) so no replica pre-pass is needed.
-func (s *Reader[T]) sortAndDedup(
-	versioned []versionedRecord[T], includeHistory bool,
-) []T {
-	sort.SliceStable(versioned, func(i, j int) bool {
-		return s.sortCmp(versioned[i], versioned[j]) < 0
+// Used by ReadMany / PollRecords (sync, collect into a pre-sized
+// []T) and emitPartition (streaming, yield directly). Returning
+// iter.Seq[T] lets the streaming caller skip the per-partition
+// []T materialization that the old slice-returning helper
+// allocated.
+func (s *Reader[T]) sortAndIterate(
+	records []T, includeHistory bool,
+) iter.Seq[T] {
+	if s.sortCmp == nil {
+		return slices.Values(records)
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		return s.sortCmp(records[i], records[j]) < 0
 	})
-	if !s.cfg.dedupEnabled() {
-		return stripVersions(versioned)
-	}
 	if includeHistory {
-		return stripVersions(dedupReplicas(versioned,
-			s.cfg.EntityKeyOf, s.cfg.VersionOf))
+		return dedupReplicasSeq(records,
+			s.cfg.EntityKeyOf, s.cfg.VersionOf)
 	}
-	return dedupLatest(versioned, s.cfg.EntityKeyOf, s.cfg.VersionOf)
+	return dedupLatestSeq(records, s.cfg.EntityKeyOf)
 }
 
 // emitPartition yields one partition's records to the consumer
-// through the shared sortAndDedup pipeline, so the iter paths
-// observe the same order / replica-collapse / latest-per-entity
-// semantics as the materialised Read paths. Returns false when
-// the consumer asked to stop (yield returned false), so the
-// outer loop can break cleanly.
+// through sortAndIterate, so the iter paths observe the same
+// order / replica-collapse / latest-per-entity semantics as the
+// materialised Read paths. Returns false when the consumer asked
+// to stop (yield returned false), so the outer loop can break
+// cleanly.
 func (s *Reader[T]) emitPartition(
-	recs []versionedRecord[T], includeHistory bool,
+	recs []T, includeHistory bool,
 	yield func(T, error) bool,
 ) bool {
-	if len(recs) == 0 {
-		return true
-	}
-	for _, r := range s.sortAndDedup(recs, includeHistory) {
+	for r := range s.sortAndIterate(recs, includeHistory) {
 		if !yield(r, nil) {
 			return false
 		}
@@ -352,20 +340,19 @@ func identityKey(s string) string { return s }
 
 // downloadAndDecodeAll fans out a bounded set of parallel
 // downloads, decodes each parquet file into []T, and returns
-// the concatenated result wrapped with each source file's
-// insertedAt (sourced from LastModified). The input is sorted
-// by S3 key for deterministic download order; user-visible
-// emission order is set later by the caller's sort.
+// the concatenated result. The input is sorted by S3 key for
+// deterministic download order; user-visible emission order is
+// set later by the caller's sortAndIterate.
 func (s *Reader[T]) downloadAndDecodeAll(
 	ctx context.Context, keys []core.KeyMeta,
-) ([]versionedRecord[T], error) {
+) ([]T, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
 
 	sortKeyMetasByKey(keys)
 
-	results := make([][]versionedRecord[T], len(keys))
+	results := make([][]T, len(keys))
 	if err := core.FanOut(ctx, keys,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
 		func(ctx context.Context, i int, km core.KeyMeta) error {
@@ -384,7 +371,7 @@ func (s *Reader[T]) downloadAndDecodeAll(
 	for _, r := range results {
 		total += len(r)
 	}
-	out := make([]versionedRecord[T], 0, total)
+	out := make([]T, 0, total)
 	for _, r := range results {
 		out = append(out, r...)
 	}
@@ -393,19 +380,14 @@ func (s *Reader[T]) downloadAndDecodeAll(
 
 // downloadAndDecodeOne is the per-file body shared by
 // downloadAndDecodeAll and the iter streaming paths. Pulls one
-// parquet object from S3, decodes it, and wraps each record with
-// km.InsertedAt (S3 LastModified on the Read path, ref
-// dataTsMicros on the PollRecords path) — used by the no-dedup
-// sort cascade. Records' own time fields, if any, surface
-// natively as parquet columns on T and are user-visible
-// independently of this stamping.
+// parquet object from S3 and decodes it into []T.
 //
 // Returns (nil, nil) when the object is missing — a dangling ref
 // or a LIST-to-GET race. The OnMissingData hook is invoked so
 // the caller can log/count without failing the read.
 func (s *Reader[T]) downloadAndDecodeOne(
 	ctx context.Context, km core.KeyMeta,
-) ([]versionedRecord[T], error) {
+) ([]T, error) {
 	key := km.Key
 
 	data, err := s.cfg.Target.get(
@@ -423,34 +405,7 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	if err != nil {
 		return nil, fmt.Errorf("s3parquet: decode %s: %w", key, err)
 	}
-	return s.wrapVersioned(
-		make([]versionedRecord[T], 0, len(recs)),
-		recs, km.InsertedAt), nil
-}
-
-// wrapVersioned appends a wrapped versionedRecord per element of
-// recs onto out and returns the grown slice. Every record gets
-// the same fallbackTime — S3 LastModified on the Read path, ref
-// dataTsMicros on the PollRecords path. Used by the no-dedup
-// sort cascade.
-//
-// Taking out as a parameter (rather than returning a fresh slice)
-// avoids the per-file intermediate in streaming reads —
-// decodePartition passes its pre-sized partition-wide slice and
-// each wrapped record lands directly there, no copy. Synchronous
-// callers pass an empty slice with cap = len(recs); same single
-// allocation but no internal intermediate.
-func (s *Reader[T]) wrapVersioned(
-	out []versionedRecord[T], recs []T,
-	fallbackTime time.Time,
-) []versionedRecord[T] {
-	for j := range recs {
-		out = append(out, versionedRecord[T]{
-			rec:        recs[j],
-			insertedAt: fallbackTime,
-		})
-	}
-	return out
+	return recs, nil
 }
 
 // groupKeysByPartition splits a flat list of data-file KeyMetas
@@ -496,97 +451,78 @@ func decodeParquet[T any](data []byte) ([]T, error) {
 	return out[:n], nil
 }
 
-// stripVersions drops the per-record insertedAt metadata when
-// the caller didn't ask for dedup. Works on the already-decoded
-// slice so we don't pay an extra allocation per record.
-func stripVersions[T any](in []versionedRecord[T]) []T {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]T, len(in))
-	for i, v := range in {
-		out[i] = v.rec
-	}
-	return out
-}
-
-// dedupReplicas collapses records that share (entity, version)
-// down to one, keeping the first-seen occurrence. Two records
-// with identical (entity, version) describe the same logical
-// write (a retry, zombie, or cross-node race); emitting both as
-// "distinct versions" would mislead callers.
+// dedupReplicasSeq collapses records that share (entity, version)
+// to one, keeping the first occurrence per group. Input MUST be
+// pre-sorted by (entity, version) ascending so equal pairs land
+// adjacent and the one-pass walk works with O(1) state. Only
+// called on the WithHistory path; without WithHistory,
+// dedupLatestSeq absorbs replicas as a side effect of picking
+// the per-entity tail.
 //
-// Only called on the WithHistory path. Without WithHistory,
-// dedupLatest already collapses replicas as a side effect of
-// its max-version-per-entity reduction (first-seen wins on ties,
-// and replicas tie on version).
-//
-// Runs after the reader's sort, so "first-seen" is deterministic:
-// input order is (entity, version) ascending, tiebroken by the
-// lex-first source filename via sort stability.
-func dedupReplicas[T any](
-	records []versionedRecord[T],
+// "First occurrence" is deterministic because the upstream
+// sort.SliceStable preserves input order for equal-key elements,
+// and the upstream input is in file lex order.
+func dedupReplicasSeq[T any](
+	records []T,
 	entityKey func(T) string,
 	versionOf func(T) int64,
-) []versionedRecord[T] {
-	if len(records) == 0 {
-		return nil
-	}
-	type key struct {
-		entity  string
-		version int64
-	}
-	seen := make(map[key]struct{}, len(records))
-	out := make([]versionedRecord[T], 0, len(records))
-	for _, vr := range records {
-		k := key{
-			entity:  entityKey(vr.rec),
-			version: versionOf(vr.rec),
+) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		if len(records) == 0 {
+			return
 		}
-		if _, ok := seen[k]; ok {
-			continue
+		var prevEntity string
+		var prevVersion int64
+		first := true
+		for _, r := range records {
+			e := entityKey(r)
+			v := versionOf(r)
+			if !first && e == prevEntity && v == prevVersion {
+				continue
+			}
+			if !yield(r) {
+				return
+			}
+			prevEntity = e
+			prevVersion = v
+			first = false
 		}
-		seen[k] = struct{}{}
-		out = append(out, vr)
 	}
-	return out
 }
 
-// dedupLatest keeps the record with the maximum version per
-// entity, in the order each entity was first seen. Stable under
-// equal versions: earlier occurrences win ties, so callers who
-// rely on first-write semantics aren't surprised by later
-// duplicates.
-func dedupLatest[T any](
-	records []versionedRecord[T],
-	entityKey func(T) string,
-	versionOf func(T) int64,
-) []T {
-	if len(records) == 0 {
-		return nil
-	}
-	type slot struct {
-		index   int
-		version int64
-	}
-	seen := make(map[string]slot, len(records))
-	order := make([]string, 0, len(records))
-	for i, vr := range records {
-		k := entityKey(vr.rec)
-		v := versionOf(vr.rec)
-		cur, ok := seen[k]
-		if !ok {
-			seen[k] = slot{index: i, version: v}
-			order = append(order, k)
-			continue
+// dedupLatestSeq keeps the record with the maximum version per
+// entity, emitting one record per entity in entity-sort order
+// (ascending). Input MUST be pre-sorted by (entity, version)
+// ascending — the LAST record in each contiguous entity group is
+// then the latest version for that entity, so a single pass with
+// O(1) state suffices: hold the current "pending" record, emit
+// it on entity transition, emit the final pending after the loop.
+//
+// versionOf isn't called inside the walk — sort already placed
+// records in version order. Kept on the signature for API
+// symmetry with dedupReplicasSeq and to document the
+// pre-condition.
+func dedupLatestSeq[T any](
+	records []T, entityKey func(T) string,
+) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		if len(records) == 0 {
+			return
 		}
-		if v > cur.version {
-			seen[k] = slot{index: i, version: v}
+		var prevEntity string
+		var pending T
+		first := true
+		for _, r := range records {
+			e := entityKey(r)
+			if !first && e != prevEntity {
+				if !yield(pending) {
+					return
+				}
+			}
+			pending = r
+			prevEntity = e
+			first = false
 		}
+		yield(pending)
 	}
-	out := make([]T, len(order))
-	for i, k := range order {
-		out[i] = records[seen[k].index].rec
-	}
-	return out
 }

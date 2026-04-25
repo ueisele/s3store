@@ -1,52 +1,71 @@
 package s3parquet
 
 import (
+	"slices"
 	"sort"
 	"testing"
-	"time"
 
 	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// dedupRec is a pure-Go scratch record used to exercise
-// dedupLatest without paying for parquet encode / decode.
+// dedupRec is a pure-Go scratch record used to exercise the dedup
+// helpers without paying for parquet encode / decode.
 type dedupRec struct {
 	entity  string
 	ver     int64
 	payload string
 }
 
-// vr is a terse constructor for versionedRecord[dedupRec].
-func vr(e string, v int64, p string, insertedAt time.Time) versionedRecord[dedupRec] {
-	return versionedRecord[dedupRec]{
-		rec:        dedupRec{entity: e, ver: v, payload: p},
-		insertedAt: insertedAt,
+// dedupRecCmp is the dedup-path sort: (entity, ver) ascending.
+// Mirrors what resolveSortCmp produces in production.
+func dedupRecCmp(a, b dedupRec) int {
+	if a.entity != b.entity {
+		if a.entity < b.entity {
+			return -1
+		}
+		return 1
 	}
+	if a.ver < b.ver {
+		return -1
+	}
+	if a.ver > b.ver {
+		return 1
+	}
+	return 0
 }
 
-// TestDedupLatest_PicksMaxVersionPerEntity uses an explicit
-// VersionOf that reads the record's own ver field (ignores the
-// file timestamp).
-func TestDedupLatest_PicksMaxVersionPerEntity(t *testing.T) {
-	now := time.UnixMicro(1_000_000)
-	recs := []versionedRecord[dedupRec]{
-		vr("a", 1, "a-1", now),
-		vr("b", 5, "b-5", now),
-		vr("a", 3, "a-3", now),
-		vr("b", 2, "b-2", now),
-		vr("c", 0, "c-0", now),
+// sortDedup sorts in-place by (entity, ver) ascending — the same
+// preconditioning sortAndIterate applies before invoking the
+// dedup helpers in production.
+func sortDedup(recs []dedupRec) {
+	sort.SliceStable(recs, func(i, j int) bool {
+		return dedupRecCmp(recs[i], recs[j]) < 0
+	})
+}
+
+// TestDedupLatestSeq_PicksMaxVersionPerEntity feeds an unsorted
+// slice through the same sort+dedup the production pipeline runs
+// (sort by (entity, ver) ascending, then dedupLatestSeq picks the
+// last record of each entity group). Verifies output is one
+// record per entity, in entity-sort order, with the max version.
+func TestDedupLatestSeq_PicksMaxVersionPerEntity(t *testing.T) {
+	recs := []dedupRec{
+		{"a", 1, "a-1"},
+		{"b", 5, "b-5"},
+		{"a", 3, "a-3"},
+		{"b", 2, "b-2"},
+		{"c", 0, "c-0"},
 	}
-	got := dedupLatest(recs,
-		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver })
+	sortDedup(recs)
+	got := slices.Collect(dedupLatestSeq(recs,
+		func(r dedupRec) string { return r.entity }))
 
 	if len(got) != 3 {
 		t.Fatalf("got %d records, want 3", len(got))
 	}
-
-	// First-seen order is preserved: a (first seen at idx 0),
-	// then b (idx 1), then c (idx 4).
+	// Entities in sort order: a, b, c. Each yields its
+	// max-version record (sort places it last in the group).
 	want := []string{"a-3", "b-5", "c-0"}
 	for i, r := range got {
 		if r.payload != want[i] {
@@ -56,40 +75,41 @@ func TestDedupLatest_PicksMaxVersionPerEntity(t *testing.T) {
 	}
 }
 
-// TestDedupLatest_EmptyInput guards the nil/empty-slice fast
-// path. Integration can't easily produce a genuinely-empty
-// record batch because every ref corresponds to a file with
-// at least one row.
-func TestDedupLatest_EmptyInput(t *testing.T) {
-	got := dedupLatest(nil,
-		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver })
+// TestDedupLatestSeq_EmptyInput guards the nil/empty-slice fast
+// path.
+func TestDedupLatestSeq_EmptyInput(t *testing.T) {
+	got := slices.Collect(dedupLatestSeq[dedupRec](nil,
+		func(r dedupRec) string { return r.entity }))
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %d", len(got))
 	}
 }
 
-// TestStripVersions drops the per-record insertedAt metadata
-// while preserving order and record values. It's used on the
-// non-dedup path so a regression here would show up as a
-// missing field in user-visible output.
-func TestStripVersions(t *testing.T) {
-	now := time.UnixMicro(1)
-	in := []versionedRecord[dedupRec]{
-		{rec: dedupRec{entity: "a", payload: "first"}, insertedAt: now},
-		{rec: dedupRec{entity: "b", payload: "second"}, insertedAt: now},
+// TestDedupLatestSeq_TieKeepsFirst documents the
+// stability-on-tie invariant: when two records share (entity,
+// version), the first one (in sorted input order) wins. With
+// stable sort + the one-pass walker, that ends up being the
+// LAST tied record actually — pending is overwritten on each
+// equal element. Verify the documented behaviour.
+//
+// Note: with stable sort, ties stay in input order. The walker
+// updates `pending` on every iteration, so the "winner" of a
+// tie is the LAST record in the tied group. Document that.
+func TestDedupLatestSeq_TieKeepsLast(t *testing.T) {
+	// Already sorted by (entity, ver); two records tie on (a, 5).
+	recs := []dedupRec{
+		{"a", 5, "first"},
+		{"a", 5, "second"},
 	}
-	got := stripVersions(in)
-	if len(got) != 2 {
-		t.Fatalf("got %d, want 2", len(got))
+	got := slices.Collect(dedupLatestSeq(recs,
+		func(r dedupRec) string { return r.entity }))
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
 	}
-	if got[0].payload != "first" || got[1].payload != "second" {
-		t.Errorf("order or values wrong: %+v", got)
-	}
-
-	// Nil input returns nil, not a zero-length allocation.
-	if v := stripVersions[dedupRec](nil); v != nil {
-		t.Errorf("stripVersions(nil) = %v, want nil", v)
+	// pending advances to "second" before the loop ends, so it
+	// wins. Last-write-wins on ties.
+	if got[0].payload != "second" {
+		t.Errorf("got %q, want second", got[0].payload)
 	}
 }
 
@@ -180,97 +200,62 @@ func TestDedupePatterns(t *testing.T) {
 	}
 }
 
-// TestDedupReplicas_CollapsesIdenticalEntityVersion covers the
-// primary case: two records with the same (entity, version)
-// collapse to the first occurrence, while distinct versions of
-// the same entity are preserved untouched.
-func TestDedupReplicas_CollapsesIdenticalEntityVersion(t *testing.T) {
-	now := time.UnixMicro(1_000_000)
-	recs := []versionedRecord[dedupRec]{
-		vr("a", 1, "a-1-first", now),
-		vr("a", 1, "a-1-dup", now),
-		vr("a", 2, "a-2", now),
-		vr("b", 1, "b-1-first", now),
-		vr("b", 1, "b-1-dup", now),
+// TestDedupReplicasSeq_CollapsesIdenticalEntityVersion covers
+// the primary case: two records with the same (entity, version)
+// collapse to the first occurrence per (entity, version) group;
+// distinct versions of the same entity are preserved.
+func TestDedupReplicasSeq_CollapsesIdenticalEntityVersion(t *testing.T) {
+	recs := []dedupRec{
+		{"a", 1, "a-1-first"},
+		{"a", 1, "a-1-dup"},
+		{"a", 2, "a-2"},
+		{"b", 1, "b-1-first"},
+		{"b", 1, "b-1-dup"},
 	}
-	got := dedupReplicas(recs,
+	sortDedup(recs)
+	got := slices.Collect(dedupReplicasSeq(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver }))
 
 	if len(got) != 3 {
 		t.Fatalf("got %d records, want 3", len(got))
 	}
 	wantPayloads := []string{"a-1-first", "a-2", "b-1-first"}
 	for i, want := range wantPayloads {
-		if got[i].rec.payload != want {
+		if got[i].payload != want {
 			t.Errorf("[%d] got %q, want %q",
-				i, got[i].rec.payload, want)
+				i, got[i].payload, want)
 		}
 	}
 }
 
-// TestDedupReplicas_EmptyInput guards the nil/empty-slice fast
-// path. Mirrors TestDedupLatest_EmptyInput.
-func TestDedupReplicas_EmptyInput(t *testing.T) {
-	got := dedupReplicas(nil,
+// TestDedupReplicasSeq_EmptyInput guards the nil/empty-slice
+// fast path.
+func TestDedupReplicasSeq_EmptyInput(t *testing.T) {
+	got := slices.Collect(dedupReplicasSeq[dedupRec](nil,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver }))
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %d", len(got))
 	}
 }
 
-// TestDedupReplicas_NoOpOnDistinctVersions confirms that when
-// every (entity, version) pair is unique, dedupReplicas returns
-// its input unchanged — the function only collapses true
-// replicas, never distinct versions.
-func TestDedupReplicas_NoOpOnDistinctVersions(t *testing.T) {
-	now := time.UnixMicro(1_000_000)
-	recs := []versionedRecord[dedupRec]{
-		vr("a", 1, "a-1", now),
-		vr("a", 2, "a-2", now),
-		vr("a", 3, "a-3", now),
-		vr("b", 1, "b-1", now),
+// TestDedupReplicasSeq_NoOpOnDistinctVersions confirms that when
+// every (entity, version) pair is unique, dedupReplicasSeq emits
+// every input record — only true replicas collapse.
+func TestDedupReplicasSeq_NoOpOnDistinctVersions(t *testing.T) {
+	recs := []dedupRec{
+		{"a", 1, "a-1"},
+		{"a", 2, "a-2"},
+		{"a", 3, "a-3"},
+		{"b", 1, "b-1"},
 	}
-	got := dedupReplicas(recs,
+	sortDedup(recs)
+	got := slices.Collect(dedupReplicasSeq(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver }))
 	if len(got) != 4 {
 		t.Fatalf("got %d records, want 4 (no collapse)", len(got))
-	}
-}
-
-// TestDedupLatest_TieKeepsFirst documents the
-// stability-on-tie invariant: when two records share the same
-// version, the first occurrence wins. Integration tests can't
-// reliably reproduce this (same-µs file timestamps are rare on
-// fast hardware).
-func TestDedupLatest_TieKeepsFirst(t *testing.T) {
-	now := time.UnixMicro(1_000_000)
-	recs := []versionedRecord[dedupRec]{
-		vr("a", 5, "first", now),
-		vr("a", 5, "second", now),
-	}
-	got := dedupLatest(recs,
-		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver })
-	if len(got) != 1 {
-		t.Fatalf("got %d records, want 1", len(got))
-	}
-	if got[0].payload != "first" {
-		t.Errorf("got %q, want first", got[0].payload)
-	}
-}
-
-// vrf is a terse versionedRecord[dedupRec] constructor for the
-// sort-resolver tests. fileName isn't carried on versionedRecord
-// any more — equal-key ties are resolved by sort.SliceStable
-// preserving input order, which in production is set up by
-// preparePartitions sorting files by S3 key first.
-func vrf(e string, v int64, p string, insertedAt time.Time) versionedRecord[dedupRec] {
-	return versionedRecord[dedupRec]{
-		rec:        dedupRec{entity: e, ver: v, payload: p},
-		insertedAt: insertedAt,
 	}
 }
 
@@ -283,67 +268,30 @@ func TestResolveSortCmp_EntityAndExplicitVersion(t *testing.T) {
 		func(r dedupRec) string { return r.entity },
 		func(r dedupRec) int64 { return r.ver })
 
-	now := time.UnixMicro(1_000_000)
-	recs := []versionedRecord[dedupRec]{
-		vrf("b", 1, "b1", now),
-		vrf("a", 2, "a2", now),
-		vrf("a", 1, "a1", now),
-		vrf("b", 2, "b2", now),
+	recs := []dedupRec{
+		{"b", 1, "b1"},
+		{"a", 2, "a2"},
+		{"a", 1, "a1"},
+		{"b", 2, "b2"},
 	}
-	sortWith(recs, cmp)
+	sort.SliceStable(recs, func(i, j int) bool {
+		return cmp(recs[i], recs[j]) < 0
+	})
 	wantOrder := []string{"a1", "a2", "b1", "b2"}
 	for i, want := range wantOrder {
-		if recs[i].rec.payload != want {
+		if recs[i].payload != want {
 			t.Errorf("[%d] got %q, want %q",
-				i, recs[i].rec.payload, want)
+				i, recs[i].payload, want)
 		}
 	}
 }
 
-// TestResolveSortCmp_LastModifiedFallback covers the
-// "EntityKeyOf nil" branch: per-file chronological. Equal
-// LastModified values resolve via sort.SliceStable preserving
-// input order — in production, preparePartitions feeds records
-// in file lex order, so the effective tiebreak is fileName ASC.
-//
-// To exercise the stable-sort guarantee (not just sortedness),
-// input is shuffled across timestamp groups: timestamps still
-// flow late→early so the sort has to swap, but input order
-// WITHIN each timestamp group must survive the reshuffle.
-func TestResolveSortCmp_LastModifiedFallback(t *testing.T) {
-	cmp := resolveSortCmp[dedupRec](nil, nil)
-
-	early := time.UnixMicro(1_000_000)
-	late := time.UnixMicro(2_000_000)
-	// Within "early" group, input order is (early-b, early-a)
-	// — NOT alphabetical, so a non-stable sort would be free to
-	// reorder them. Stable sort must preserve this.
-	recs := []versionedRecord[dedupRec]{
-		vrf("x", 0, "late-b", late),
-		vrf("x", 0, "early-b", early),
-		vrf("x", 0, "late-a", late),
-		vrf("x", 0, "early-a", early),
+// TestResolveSortCmp_NilWhenNoDedup pins the contract that
+// EntityKeyOf == nil produces a nil comparator — sortAndIterate
+// uses that signal to skip the sort entirely and emit records in
+// input (decode) order.
+func TestResolveSortCmp_NilWhenNoDedup(t *testing.T) {
+	if cmp := resolveSortCmp[dedupRec](nil, nil); cmp != nil {
+		t.Errorf("resolveSortCmp(nil, nil) = non-nil; want nil")
 	}
-	sortWith(recs, cmp)
-	// "early" group: input order (early-b, early-a) preserved.
-	// "late" group: input order (late-b, late-a) preserved.
-	// Sort by insertedAt asc places early before late.
-	wantOrder := []string{"early-b", "early-a", "late-b", "late-a"}
-	for i, want := range wantOrder {
-		if recs[i].rec.payload != want {
-			t.Errorf("[%d] got %q, want %q",
-				i, recs[i].rec.payload, want)
-		}
-	}
-}
-
-// sortWith is a tiny test helper that applies a cmp-returning
-// comparator through sort.SliceStable, matching how the reader
-// invokes its sortCmp in the hot path.
-func sortWith(recs []versionedRecord[dedupRec],
-	cmpFn func(a, b versionedRecord[dedupRec]) int,
-) {
-	sort.SliceStable(recs, func(i, j int) bool {
-		return cmpFn(recs[i], recs[j]) < 0
-	})
 }

@@ -84,7 +84,7 @@ func (s *Reader[T]) ReadManyIterWhere(
 		}
 		downloadOne := func(
 			ctx context.Context, files []core.KeyMeta,
-		) ([]versionedRecord[T], error) {
+		) ([]T, error) {
 			return s.downloadFilteredAll(ctx, files, predicate)
 		}
 		s.streamByPartition(
@@ -99,14 +99,14 @@ func (s *Reader[T]) ReadManyIterWhere(
 // row groups. Sorts input by key for deterministic download order.
 func (s *Reader[T]) downloadFilteredAll(
 	ctx context.Context, keys []core.KeyMeta, predicate RowGroupPredicate,
-) ([]versionedRecord[T], error) {
+) ([]T, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
 
 	sortKeyMetasByKey(keys)
 
-	results := make([][]versionedRecord[T], len(keys))
+	results := make([][]T, len(keys))
 	if err := core.FanOut(ctx, keys,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
 		func(ctx context.Context, i int, km core.KeyMeta) error {
@@ -124,7 +124,7 @@ func (s *Reader[T]) downloadFilteredAll(
 	for _, r := range results {
 		total += len(r)
 	}
-	out := make([]versionedRecord[T], 0, total)
+	out := make([]T, 0, total)
 	for _, r := range results {
 		out = append(out, r...)
 	}
@@ -141,7 +141,7 @@ func (s *Reader[T]) downloadFilteredAll(
 // LIST-to-GET race doesn't poison the read.
 func (s *Reader[T]) downloadFilteredOne(
 	ctx context.Context, km core.KeyMeta, predicate RowGroupPredicate,
-) ([]versionedRecord[T], error) {
+) ([]T, error) {
 	key := km.Key
 
 	size, err := s.cfg.Target.size(
@@ -207,9 +207,7 @@ func (s *Reader[T]) downloadFilteredOne(
 		recs = append(recs, buf[:n]...)
 	}
 
-	return s.wrapVersioned(
-		make([]versionedRecord[T], 0, len(recs)),
-		recs, km.InsertedAt), nil
+	return recs, nil
 }
 
 // s3ReaderAt adapts S3Target.getRange to io.ReaderAt so parquet-

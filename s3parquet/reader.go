@@ -41,13 +41,6 @@ type ReaderConfig[T any] struct {
 	ConsistencyControl ConsistencyLevel
 }
 
-// dedupEnabled reports whether latest-per-entity dedup applies.
-// Both EntityKeyOf and VersionOf are required when dedup is on,
-// validated at NewReader time.
-func (c ReaderConfig[T]) dedupEnabled() bool {
-	return c.EntityKeyOf != nil
-}
-
 // Reader is the read-side half of a Store. Owns Read / Poll /
 // PollRecords / PollRecordsAll / OffsetAt. Construct directly
 // via NewReader in read-only services, or via
@@ -58,12 +51,14 @@ type Reader[T any] struct {
 	dataPath string
 	refPath  string
 
-	// sortCmp is the resolved comparison function for emission
-	// order. Two-tier cascade:
-	//   - EntityKeyOf set: (entityKey, versionOf(rec)) asc
-	//   - else:            (insertedAt) asc, ties broken by stable
-	//     sort + input order (= file lex order)
-	sortCmp func(a, b versionedRecord[T]) int
+	// sortCmp is the resolved comparison function for the dedup
+	// path: sort by (entityKey, versionOf) ascending, so each
+	// entity's records land grouped and the latest-version record
+	// of each entity is the one that survives dedup. Nil when
+	// EntityKeyOf is unset — in that case sortAndIterate skips
+	// the sort entirely and yields records in input (decode)
+	// order.
+	sortCmp func(a, b T) int
 }
 
 // Target returns the untyped S3Target this Reader is bound to.
@@ -96,44 +91,24 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	}, nil
 }
 
-// resolveSortCmp returns the versionedRecord comparator that
-// decides the reader's emission order. The cascade is:
-//
-//   - EntityKeyOf set: sort by (entityKey, versionOf) ascending
-//     so each entity's records land grouped and in version-
-//     ascending order (newest last).
-//   - EntityKeyOf nil: sort by insertedAt ascending. Records that
-//     share a timestamp keep their input order via sort.SliceStable
-//     — input arrives in file lex order (preparePartitions sorts
-//     files by key; downloadAndDecodeAll's per-key result slots
-//     preserve that order), so the stable-sort tiebreaker is
-//     equivalent to sorting by file name explicitly.
-//
-// cmp.Compare gives a stable three-way result on int64 nanoseconds
-// so ties fall through to the secondary key cleanly.
+// resolveSortCmp returns the comparator sortAndIterate uses on
+// the dedup path: records sort by (entityKey, versionOf)
+// ascending so each entity's records land grouped and the
+// latest-version record per entity is last in the group. Returns
+// nil when EntityKeyOf is unset — sortAndIterate then skips the
+// sort and emits records in input (decode) order.
 func resolveSortCmp[T any](
 	entityKeyOf func(T) string,
 	versionOf func(T) int64,
-) func(a, b versionedRecord[T]) int {
-	if entityKeyOf != nil {
-		return func(a, b versionedRecord[T]) int {
-			if c := cmp.Compare(
-				entityKeyOf(a.rec), entityKeyOf(b.rec)); c != 0 {
-				return c
-			}
-			return cmp.Compare(
-				versionOf(a.rec),
-				versionOf(b.rec))
-		}
+) func(a, b T) int {
+	if entityKeyOf == nil {
+		return nil
 	}
-	return func(a, b versionedRecord[T]) int {
-		switch {
-		case a.insertedAt.Before(b.insertedAt):
-			return -1
-		case a.insertedAt.After(b.insertedAt):
-			return 1
+	return func(a, b T) int {
+		if c := cmp.Compare(entityKeyOf(a), entityKeyOf(b)); c != 0 {
+			return c
 		}
-		return 0
+		return cmp.Compare(versionOf(a), versionOf(b))
 	}
 }
 

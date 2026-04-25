@@ -279,9 +279,9 @@ func (s *Reader[T]) runDecoder(
 }
 
 // decodePartition parses every successfully-downloaded body in
-// ps and returns the concatenated versionedRecords. Files that
-// were missing on download (body == nil, err == nil) are
-// skipped — OnMissingData was already invoked by the downloader.
+// ps and returns the concatenated records. Files that were
+// missing on download (body == nil, err == nil) are skipped —
+// OnMissingData was already invoked by the downloader.
 //
 // Each body is nil'd and its body-pool slot released as soon as
 // the file is decoded, so the compressed-byte footprint inside
@@ -293,8 +293,8 @@ func (s *Reader[T]) runDecoder(
 // inflate the transient allocation peak.
 func (s *Reader[T]) decodePartition(
 	state *streamState, ps *partState, totalRows int64,
-) ([]versionedRecord[T], error) {
-	out := make([]versionedRecord[T], 0, totalRows)
+) ([]T, error) {
+	out := make([]T, 0, totalRows)
 	for fi, body := range ps.bodies {
 		if body == nil {
 			continue
@@ -308,7 +308,7 @@ func (s *Reader[T]) decodePartition(
 			return nil, fmt.Errorf(
 				"s3parquet: decode %s: %w", ps.files[fi].Key, err)
 		}
-		out = s.wrapVersioned(out, recs, ps.files[fi].InsertedAt)
+		out = append(out, recs...)
 	}
 	return out, nil
 }
@@ -466,7 +466,7 @@ func (s *streamState) releaseBytes(uncomp int64) {
 // uncompBytes is what the decoder reserved; the yield loop
 // returns it via releaseBytes after the records are forwarded.
 type decodedBatch[T any] struct {
-	recs        []versionedRecord[T]
+	recs        []T
 	uncompBytes int64
 	err         error
 }
