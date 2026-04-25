@@ -435,27 +435,27 @@ predicate on that column fetches only the matching row group's bytes.
 Typical pairing: one day's worth of multi-customer data in one file,
 read back one customer at a time.
 
-`Write` fans out per-partition work in parallel (bounded by
-`MaxInflightRequests`, default 8), so a single call with many groups
-completes in roughly the time of the slowest group instead of their
-sum. Raise the cap for workloads with many small partitions per
-Write (e.g. a DB poll that fans out to dozens of Hive keys at once);
-leave at the default when per-partition parquet buffers are large
-enough that N × buffer-size dominates memory. Within each partition
-the data PUT, marker PUTs, and ref PUT run serially, so net
-in-flight S3 requests per call stay bounded by `MaxInflightRequests`
-without compounding through the inner axis. Each partition is
-self-contained — on error the function cancels still-running
+`Write` fans out per-partition work in parallel, bounded by the
+`S3Target`-level `MaxInflightRequests` semaphore (default 8). The
+semaphore is acquired by every PUT/GET/HEAD/LIST inside the
+target, so net in-flight S3 requests stay ≤ `MaxInflightRequests`
+regardless of fan-out axis — the partition fan-out balances
+naturally against marker fan-out within a partition (a write
+touching one wide partition with many markers drains all 8 slots
+on those marker PUTs; a write touching 8 partitions with one
+marker each spreads the slots across partitions). Each partition
+is self-contained — on error the function cancels still-running
 partitions and returns the results that already committed in
-sorted-key order, alongside the first real error. Callers can retry
-the failed partitions via `WriteWithKey` without re-writing the ones
-that succeeded.
+sorted-key order, alongside the first real error. Callers can
+retry the failed partitions via `WriteWithKey` without re-writing
+the ones that succeeded.
 
-> The cap is per call, not library-wide. If you run many concurrent
-> Write/Read goroutines, the total in-flight count compounds — raise
-> `http.Transport.MaxConnsPerHost` on your `*s3.Client` (default ~10)
-> to match, or excess requests will queue at the transport layer
-> instead of running in parallel.
+> The cap is per `S3Target`, not library-wide. A Writer and a
+> Reader built from the same `S3Target` share the cap. Two
+> Targets do not. If you raise this above ~10 or run many Targets
+> concurrently, raise `http.Transport.MaxConnsPerHost` on your
+> `*s3.Client` (default ~10) to match, or excess requests will
+> queue at the transport layer instead of running in parallel.
 
 ### Stream — refs only
 
@@ -1789,13 +1789,45 @@ the exact fields.
 
 Breaking changes in the simplification release:
 
+- **`s3parquet.S3Target` is now a constructed live handle, not a
+  struct literal.** The user-facing config moved to a new
+  `s3parquet.S3TargetConfig` value type; `S3Target` itself holds
+  the config plus an unexported per-target semaphore (sized at
+  `MaxInflightRequests`). All public fields are gone — read via
+  accessor methods (`target.Bucket()`, `target.Prefix()`, …) or
+  the `target.Config()` getter.
+
+  ```go
+  // Before
+  target := s3parquet.S3Target{
+      Bucket:            "b",
+      Prefix:            "store",
+      S3Client:          cli,
+      PartitionKeyParts: []string{"period", "customer"},
+  }
+
+  // After
+  target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
+      Bucket:            "b",
+      Prefix:            "store",
+      S3Client:          cli,
+      PartitionKeyParts: []string{"period", "customer"},
+  })
+  ```
+
+  Pass the same `S3Target` value to `WriterConfig.Target` and
+  `ReaderConfig.Target` so the Writer and Reader share one
+  semaphore (Targets are passed by value but the chan inside is
+  a reference). `s3parquet.New(cfg)` and `s3store.New(cfg)`
+  construct the target internally — single-Config callers see no
+  change beyond the field name swap below.
+
 - **`PartitionWriteConcurrency` → `MaxInflightRequests`**, moved
   from `WriterConfig` / `Config` onto the shared
-  `s3parquet.S3Target`. One knob now caps every fan-out (Write
-  partitions, Read/PollRecords/BackfillIndex files, *Many LISTs).
-  Default is 8. Within a partition the work runs serially so the
-  cap doesn't compound through inner axes — peak in-flight per
-  call is bounded by the configured value, not by N × inner.
+  `s3parquet.S3TargetConfig`. One knob caps every fan-out
+  (partition, file, pattern, marker) via the per-target
+  semaphore — peak in-flight per Target is bounded by the
+  configured value regardless of axis.
 
   ```go
   // Before
@@ -1806,7 +1838,7 @@ Breaking changes in the simplification release:
   ```
 
   See the Write section for the `http.Transport.MaxConnsPerHost`
-  interaction when running many concurrent callers.
+  interaction when running many Targets concurrently.
 
 - **`s3parquet.ReaderExtras[T']` removed.**
   `NewReaderFromWriter` / `NewReaderFromStore` now take a full

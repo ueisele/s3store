@@ -64,7 +64,7 @@ func (s *Reader[T]) ReadManyIterWhere(
 
 		plans := make([]*core.ReadPlan, len(patterns))
 		for i, p := range patterns {
-			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts())
 			if err != nil {
 				yield(*new(T), fmt.Errorf(
 					"s3parquet: ReadManyIterWhere pattern %d %q: %w",

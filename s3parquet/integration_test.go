@@ -464,9 +464,9 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 		t.Fatalf("Write r2: %v", err)
 	}
 
-	if _, err := store.Target().S3Client.DeleteObject(ctx,
+	if _, err := store.Target().S3Client().DeleteObject(ctx,
 		&s3.DeleteObjectInput{
-			Bucket: aws.String(store.Target().Bucket),
+			Bucket: aws.String(store.Target().Bucket()),
 			Key:    aws.String(r1.DataPath),
 		}); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
@@ -2746,13 +2746,13 @@ func TestWriteRowGroupsBy_EmptyAndNil(t *testing.T) {
 	// the nil-PartitionKeyOf error.
 	f := testutil.New(t)
 	writerNoPKO, err := s3parquet.NewWriter[Rec](s3parquet.WriterConfig[Rec]{
-		Target: s3parquet.S3Target{
+		Target: s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 			Bucket:            f.Bucket,
 			Prefix:            "store",
 			S3Client:          f.S3Client,
 			PartitionKeyParts: []string{"period", "customer"},
 			SettleWindow:      300 * time.Millisecond,
-		},
+		}),
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
 	if err != nil {

@@ -174,7 +174,7 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 				"the dedup tie-breaker; rename the field")
 	}
 
-	db, err := openDuckDB(cfg.Target.S3Client, cfg.ExtraInitSQL)
+	db, err := openDuckDB(cfg.Target.S3Client(), cfg.ExtraInitSQL)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"s3sql: failed to open DuckDB: %w", err)
@@ -183,8 +183,8 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	return &Reader[T]{
 		cfg:                  cfg,
 		db:                   db,
-		dataPath:             core.DataPath(cfg.Target.Prefix),
-		refPath:              core.RefPath(cfg.Target.Prefix),
+		dataPath:             core.DataPath(cfg.Target.Prefix()),
+		refPath:              core.RefPath(cfg.Target.Prefix()),
 		binder:               b,
 		insertedAtFieldIndex: insertedAtIdx,
 	}, nil
@@ -242,7 +242,7 @@ func (s *Reader[T]) Close() error {
 
 // s3URI returns the s3:// URI for a key in the reader's bucket.
 func (s *Reader[T]) s3URI(key string) string {
-	return fmt.Sprintf("s3://%s/%s", s.cfg.Target.Bucket, key)
+	return fmt.Sprintf("s3://%s/%s", s.cfg.Target.Bucket(), key)
 }
 
 // sqlQuote returns a DuckDB single-quoted string literal with

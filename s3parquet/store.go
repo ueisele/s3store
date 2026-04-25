@@ -220,11 +220,12 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	return &Store[T]{Writer: w, Reader: r}, nil
 }
 
-// targetFrom lifts the five S3-wiring fields off a unified
-// Config[T] into an S3Target. Called by both projection helpers
-// so the two halves see a byte-identical Target.
+// targetFrom lifts the S3-wiring fields off a unified Config[T]
+// into a constructed S3Target. Called once inside New() so the
+// Writer and Reader projections share one S3Target instance —
+// and therefore one MaxInflightRequests semaphore — automatically.
 func targetFrom[T any](c Config[T]) S3Target {
-	return S3Target{
+	return NewS3Target(S3TargetConfig{
 		Bucket:              c.Bucket,
 		Prefix:              c.Prefix,
 		S3Client:            c.S3Client,
@@ -232,7 +233,7 @@ func targetFrom[T any](c Config[T]) S3Target {
 		SettleWindow:        c.SettleWindow,
 		DisableRefStream:    c.DisableRefStream,
 		MaxInflightRequests: c.MaxInflightRequests,
-	}
+	})
 }
 
 // writerConfigFrom projects a unified Config[T] onto the narrower

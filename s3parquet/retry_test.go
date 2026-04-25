@@ -189,7 +189,7 @@ func newTestTarget(t *testing.T, endpoint string) S3Target {
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
 	})
-	return S3Target{Bucket: "bucket", S3Client: cli}
+	return NewS3Target(S3TargetConfig{Bucket: "bucket", S3Client: cli})
 }
 
 // statusServer returns an httptest server that responds with

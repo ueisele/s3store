@@ -9,15 +9,14 @@ import (
 
 // WriterConfig is the narrower Config form for constructing a
 // Writer directly (without a Reader). Holds the S3-wiring bundle
-// (Target) plus write-side-only knobs. Use NewWriter(cfg) when a
-// service writes but never reads.
+// (Target — a constructed S3Target) plus write-side-only knobs.
+// Use NewWriter(cfg) when a service writes but never reads.
 //
-// Target carries Bucket / Prefix / S3Client / PartitionKeyParts /
-// SettleWindow — shared with ReaderConfig through the same type,
-// so a Writer and a Reader built from the same Target cannot
-// drift on those fields. SettleWindow sits on Target because it
-// governs marker visibility from Lookup (a read concern) but
-// needs to be expressible at a pure-write call site.
+// Target is built once via NewS3Target and can be passed to both
+// WriterConfig.Target and ReaderConfig.Target so the resulting
+// Writer and Reader share the same MaxInflightRequests semaphore
+// — net in-flight S3 requests across both halves stay bounded by
+// one cap.
 type WriterConfig[T any] struct {
 	Target         S3Target
 	PartitionKeyOf func(T) string
@@ -181,8 +180,8 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	}
 	return &Writer[T]{
 		cfg:                  cfg,
-		dataPath:             core.DataPath(cfg.Target.Prefix),
-		refPath:              core.RefPath(cfg.Target.Prefix),
+		dataPath:             core.DataPath(cfg.Target.Prefix()),
+		refPath:              core.RefPath(cfg.Target.Prefix()),
 		compressionCodec:     codec,
 		insertedAtFieldIndex: insertedAtIdx,
 	}, nil

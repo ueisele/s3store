@@ -44,7 +44,7 @@ type Store[T any] struct {
 //
 // Performs no S3 I/O at construction time.
 func New[T any](cfg Config[T]) (*Store[T], error) {
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:              cfg.Bucket,
 		Prefix:              cfg.Prefix,
 		S3Client:            cfg.S3Client,
@@ -52,7 +52,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		SettleWindow:        cfg.SettleWindow,
 		DisableRefStream:    cfg.DisableRefStream,
 		MaxInflightRequests: cfg.MaxInflightRequests,
-	}
+	})
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[T]{
 		Target:             target,
 		PartitionKeyOf:     cfg.PartitionKeyOf,

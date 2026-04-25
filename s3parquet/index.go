@@ -114,7 +114,7 @@ type Index[K comparable] struct {
 func NewIndex[K comparable](
 	target S3Target, def IndexLookupDef[K],
 ) (*Index[K], error) {
-	// Lookup never consults target.PartitionKeyParts — the
+	// Lookup never consults target.PartitionKeyParts() — the
 	// index's own Columns drive the LIST path — so we use the
 	// reduced-validation helper instead of the full Target check.
 	if err := target.ValidateLookup(); err != nil {
@@ -237,7 +237,7 @@ func buildIndex[K comparable](
 		target:       target,
 		name:         def.Name,
 		columns:      def.Columns,
-		indexPath:    core.IndexPath(target.Prefix, def.Name),
+		indexPath:    core.IndexPath(target.Prefix(), def.Name),
 		fieldIndices: fieldIndices,
 		consistency:  def.ConsistencyControl,
 	}, nil
@@ -466,10 +466,10 @@ type BackfillStats struct {
 // writer registration. The migration job constructs an S3Target
 // pointing at the same dataset the live writer uses; BackfillIndex
 // issues both GETs (parquet data) and PUTs (markers) through
-// target.S3Client.
+// target.S3Client().
 //
 // pattern uses the same grammar as Reader.Read and is evaluated
-// against target.PartitionKeyParts (NOT the index's Columns) —
+// against target.PartitionKeyParts() (NOT the index's Columns) —
 // backfill LISTs parquet data files, which are keyed by
 // partition. "*" covers everything; shard across partitions to
 // parallelize a migration.
@@ -551,10 +551,10 @@ func BackfillIndexMany[T any, K comparable](
 		return stats, err
 	}
 
-	dataPath := core.DataPath(target.Prefix)
+	dataPath := core.DataPath(target.Prefix())
 	plans := make([]*core.ReadPlan, len(patterns))
 	for j, p := range patterns {
-		plan, err := core.BuildReadPlan(p, dataPath, target.PartitionKeyParts)
+		plan, err := core.BuildReadPlan(p, dataPath, target.PartitionKeyParts())
 		if err != nil {
 			return stats, fmt.Errorf(
 				"s3parquet: BackfillIndexMany pattern %d %q: %w",

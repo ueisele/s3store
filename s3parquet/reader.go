@@ -10,14 +10,14 @@ import (
 )
 
 // ReaderConfig is the narrower Config form for constructing a
-// Reader directly. Holds the S3-wiring bundle (Target) plus
-// read-side-only knobs. Use NewReader(cfg) in read-only services
-// that have no PartitionKeyOf / Compression config to supply.
+// Reader directly. Holds the S3-wiring bundle (Target — a
+// constructed S3Target) plus read-side-only knobs. Use
+// NewReader(cfg) in read-only services that have no
+// PartitionKeyOf / Compression config to supply.
 //
-// Target carries Bucket / Prefix / S3Client / PartitionKeyParts /
-// SettleWindow — shared with WriterConfig through the same type,
-// so a Writer and a Reader built from the same Target cannot
-// drift on those fields.
+// Target is built once via NewS3Target and can be passed to both
+// WriterConfig.Target and ReaderConfig.Target so the resulting
+// Writer and Reader share the same MaxInflightRequests semaphore.
 type ReaderConfig[T any] struct {
 	Target          S3Target
 	EntityKeyOf     func(T) string
@@ -106,8 +106,8 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	}
 	return &Reader[T]{
 		cfg:                  cfg,
-		dataPath:             core.DataPath(cfg.Target.Prefix),
-		refPath:              core.RefPath(cfg.Target.Prefix),
+		dataPath:             core.DataPath(cfg.Target.Prefix()),
+		refPath:              core.RefPath(cfg.Target.Prefix()),
 		insertedAtFieldIndex: insertedAtIdx,
 		sortCmp:              resolveSortCmp(cfg.EntityKeyOf, cfg.VersionOf),
 	}, nil

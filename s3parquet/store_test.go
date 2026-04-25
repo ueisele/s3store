@@ -56,9 +56,9 @@ func TestNew_Validation(t *testing.T) {
 
 func TestValidateKey(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		Target: S3Target{
+		Target: NewS3Target(S3TargetConfig{
 			PartitionKeyParts: []string{"period", "customer"},
-		},
+		}),
 	}}
 	cases := []struct {
 		name    string
@@ -112,13 +112,13 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 }
 
 func TestSettleWindowDefault(t *testing.T) {
-	var target S3Target
-	if got := target.EffectiveSettleWindow(); got.String() != "5s" {
-		t.Errorf("S3Target default: got %v, want 5s", got)
+	var cfg S3TargetConfig
+	if got := cfg.EffectiveSettleWindow(); got.String() != "5s" {
+		t.Errorf("S3TargetConfig default: got %v, want 5s", got)
 	}
-	target.SettleWindow = 2 * time.Second
-	if got := target.EffectiveSettleWindow(); got != 2*time.Second {
-		t.Errorf("S3Target explicit: got %v, want 2s", got)
+	cfg.SettleWindow = 2 * time.Second
+	if got := cfg.EffectiveSettleWindow(); got != 2*time.Second {
+		t.Errorf("S3TargetConfig explicit: got %v, want 2s", got)
 	}
 }
 
@@ -130,9 +130,9 @@ func TestSettleWindowDefault(t *testing.T) {
 // method touches s.s3.
 func TestWriteEmptyRecords(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		Target: S3Target{
+		Target: NewS3Target(S3TargetConfig{
 			PartitionKeyParts: []string{"period", "customer"},
-		},
+		}),
 		PartitionKeyOf: func(r testRec) string {
 			return "period=" + r.Period + "/customer=" + r.Customer
 		},
@@ -322,9 +322,9 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 
 // TestEffectiveMaxInflightRequests guards the fan-out cap
 // resolution: positive user values win, zero falls back to the
-// default (8). Negative gets the default too — there's no
-// up-front rejection because S3Target is a plain struct with no
-// constructor validation.
+// default (8). Negative gets the default too — NewS3Target sizes
+// the semaphore from the same value, so the cap shows up at every
+// fan-out site uniformly.
 func TestEffectiveMaxInflightRequests(t *testing.T) {
 	cases := []struct {
 		name string
@@ -337,8 +337,8 @@ func TestEffectiveMaxInflightRequests(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tgt := S3Target{MaxInflightRequests: tc.set}
-			if got := tgt.EffectiveMaxInflightRequests(); got != tc.want {
+			cfg := S3TargetConfig{MaxInflightRequests: tc.set}
+			if got := cfg.EffectiveMaxInflightRequests(); got != tc.want {
 				t.Errorf("EffectiveMaxInflightRequests: got %d, want %d",
 					got, tc.want)
 			}

@@ -94,7 +94,7 @@ func (s *Reader[T]) ReadMany(
 
 	plans := make([]*core.ReadPlan, len(patterns))
 	for i, p := range patterns {
-		plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+		plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts())
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: ReadMany pattern %d %q: %w", i, p, err)
@@ -186,7 +186,7 @@ func (s *Reader[T]) ReadManyIter(
 
 		plans := make([]*core.ReadPlan, len(patterns))
 		for i, p := range patterns {
-			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts())
 			if err != nil {
 				yield(*new(T), fmt.Errorf(
 					"s3parquet: ReadManyIter pattern %d %q: %w",

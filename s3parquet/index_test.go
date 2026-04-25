@@ -403,12 +403,12 @@ func TestParseUntilToTime(t *testing.T) {
 // The read handle carries the expected state so Lookup paths
 // would match what a Writer-registered index produces.
 func TestNewIndex_ReadOnly(t *testing.T) {
-	target := S3Target{
+	target := NewS3Target(S3TargetConfig{
 		Bucket:            "b",
 		Prefix:            "p",
 		S3Client:          &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
-	}
+	})
 	idx, err := NewIndex(target, IndexLookupDef[SkuIndexEntry]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "period", "customer"},

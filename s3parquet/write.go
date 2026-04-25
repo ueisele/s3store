@@ -360,7 +360,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// DisableRefStream: skip the ref PUT entirely. Offset and
 	// RefPath go empty so callers can't mistake the returned value
 	// for a Poll-visible stream position.
-	if s.cfg.Target.DisableRefStream {
+	if s.cfg.Target.DisableRefStream() {
 		return &WriteResult{
 			Offset:     "",
 			DataPath:   dataKey,
@@ -679,15 +679,15 @@ func (s *Writer[T]) groupByKey(records []T) map[string][]T {
 // corrupt the S3 layout.
 func (s *Writer[T]) validateKey(key string) error {
 	segments := strings.Split(key, "/")
-	if len(segments) != len(s.cfg.Target.PartitionKeyParts) {
+	if len(segments) != len(s.cfg.Target.PartitionKeyParts()) {
 		return fmt.Errorf(
 			"s3parquet: key %q has %d segments, "+
 				"expected %d (%v)",
 			key, len(segments),
-			len(s.cfg.Target.PartitionKeyParts), s.cfg.Target.PartitionKeyParts)
+			len(s.cfg.Target.PartitionKeyParts()), s.cfg.Target.PartitionKeyParts())
 	}
 	for i, seg := range segments {
-		part := s.cfg.Target.PartitionKeyParts[i]
+		part := s.cfg.Target.PartitionKeyParts()[i]
 		prefix := part + "="
 		if !strings.HasPrefix(seg, prefix) {
 			return fmt.Errorf(

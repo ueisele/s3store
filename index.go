@@ -18,8 +18,13 @@ type IndexDef[T any, K comparable] = s3parquet.IndexDef[T, K]
 // Index is the typed read-handle for a secondary index.
 type Index[K comparable] = s3parquet.Index[K]
 
-// S3Target mirrors s3parquet.S3Target for umbrella callers that
-// need to construct a read-only Index or run BackfillIndex.
+// S3TargetConfig mirrors s3parquet.S3TargetConfig for umbrella
+// callers that need to build a Target for a read-only Index or
+// a migration-job BackfillIndex.
+type S3TargetConfig = s3parquet.S3TargetConfig
+
+// S3Target mirrors s3parquet.S3Target — the constructed live
+// handle returned by NewS3Target.
 type S3Target = s3parquet.S3Target
 
 // NewS3Target re-exports s3parquet.NewS3Target so umbrella users

@@ -64,13 +64,13 @@ type testFixture struct {
 func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	t.Helper()
 	f := testutil.New(t)
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
-	}
+	})
 	// MinIO is in fact strongly consistent; the claim keeps
 	// idempotent writes on the conditional-PUT path and lets the
 	// scoped retry LIST linearize against prior writes. Ref-PUT
@@ -156,13 +156,13 @@ func TestInsertedAtField_Populate(t *testing.T) {
 	}
 
 	f := testutil.New(t)
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
-	}
+	})
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecWithMeta]{
 		Target: target,
 		PartitionKeyOf: func(r RecWithMeta) string {
@@ -724,13 +724,13 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	testFix := testutil.New(t)
 
 	// Old-shape file: no Amount, no Currency.
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            testFix.Bucket,
 		Prefix:            "store",
 		S3Client:          testFix.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
-	}
+	})
 	wOld, err := s3parquet.NewWriter(s3parquet.WriterConfig[RecNarrow]{
 		Target: target,
 		PartitionKeyOf: func(r RecNarrow) string {
@@ -799,13 +799,13 @@ func TestRead_SliceField(t *testing.T) {
 	f := testutil.New(t)
 	ctx := context.Background()
 
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
-	}
+	})
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[TagRec]{
 		Target: target,
 		PartitionKeyOf: func(r TagRec) string {
@@ -895,13 +895,13 @@ func TestRead_NestedListOfStructsWithMap(t *testing.T) {
 	f := testutil.New(t)
 	ctx := context.Background()
 
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
-	}
+	})
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[JobRec]{
 		Target: target,
 		PartitionKeyOf: func(r JobRec) string {
@@ -1340,14 +1340,14 @@ func TestDisableRefStream_s3sql(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
 
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
 		DisableRefStream:  true,
-	}
+	})
 	writer, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
 		Target:             target,
 		PartitionKeyOf:     partitionKeyOfRec,
@@ -1545,13 +1545,13 @@ func TestReadManyIter_MultiPattern(t *testing.T) {
 func newIdempotentFixture(t *testing.T) *testFixture {
 	t.Helper()
 	f := testutil.New(t)
-	target := s3parquet.S3Target{
+	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		SettleWindow:      300 * time.Millisecond,
-	}
+	})
 	// Claim strong consistency (MinIO is strong in practice) so the
 	// ref PUT gets the full 10ms SettleWindow as its budget. See
 	// newFixture for the rationale.

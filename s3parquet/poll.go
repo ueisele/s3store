@@ -33,16 +33,16 @@ func (s *Reader[T]) Poll(
 	maxEntries int32,
 	opts ...QueryOption,
 ) ([]StreamEntry, Offset, error) {
-	if s.cfg.Target.DisableRefStream {
+	if s.cfg.Target.DisableRefStream() {
 		return nil, since, ErrRefStreamDisabled
 	}
 
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	entries, offset, err := refstream.Poll(ctx, s.cfg.Target.S3Client,
+	entries, offset, err := refstream.Poll(ctx, s.cfg.Target.S3Client(),
 		refstream.PollOpts{
-			Bucket:             s.cfg.Target.Bucket,
+			Bucket:             s.cfg.Target.Bucket(),
 			RefPath:            s.refPath,
 			DataPath:           s.dataPath,
 			Since:              since,

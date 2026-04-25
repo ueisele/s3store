@@ -15,12 +15,12 @@ type testRec struct {
 }
 
 func validTarget() s3parquet.S3Target {
-	return s3parquet.S3Target{
+	return s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            "b",
 		Prefix:            "p",
 		PartitionKeyParts: []string{"period", "customer"},
 		S3Client:          &s3.Client{},
-	}
+	})
 }
 
 func validConfig() ReaderConfig[testRec] {
@@ -31,21 +31,29 @@ func validConfig() ReaderConfig[testRec] {
 }
 
 func TestNewReader_Validation(t *testing.T) {
+	validTargetCfg := s3parquet.S3TargetConfig{
+		Bucket:            "b",
+		Prefix:            "p",
+		PartitionKeyParts: []string{"period", "customer"},
+		S3Client:          &s3.Client{},
+	}
 	cases := []struct {
 		name    string
-		mutate  func(*ReaderConfig[testRec])
+		mutate  func(*s3parquet.S3TargetConfig, *ReaderConfig[testRec])
 		wantSub string
 	}{
-		{"missing Bucket", func(c *ReaderConfig[testRec]) { c.Target.Bucket = "" }, "Bucket is required"},
-		{"missing Prefix", func(c *ReaderConfig[testRec]) { c.Target.Prefix = "" }, "Prefix is required"},
-		{"missing TableAlias", func(c *ReaderConfig[testRec]) { c.TableAlias = "" }, "TableAlias is required"},
-		{"missing S3Client", func(c *ReaderConfig[testRec]) { c.Target.S3Client = nil }, "S3Client is required"},
-		{"missing PartitionKeyParts", func(c *ReaderConfig[testRec]) { c.Target.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
+		{"missing Bucket", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.Bucket = "" }, "Bucket is required"},
+		{"missing Prefix", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.Prefix = "" }, "Prefix is required"},
+		{"missing TableAlias", func(_ *s3parquet.S3TargetConfig, c *ReaderConfig[testRec]) { c.TableAlias = "" }, "TableAlias is required"},
+		{"missing S3Client", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.S3Client = nil }, "S3Client is required"},
+		{"missing PartitionKeyParts", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			targetCfg := validTargetCfg
 			cfg := validConfig()
-			tc.mutate(&cfg)
+			tc.mutate(&targetCfg, &cfg)
+			cfg.Target = s3parquet.NewS3Target(targetCfg)
 			_, err := NewReader(cfg)
 			if err == nil {
 				t.Fatalf("expected error, got nil")

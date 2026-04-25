@@ -31,9 +31,9 @@ import (
 func (s *Reader[T]) listMatchingParquet(
 	ctx context.Context, plan *core.ReadPlan,
 ) ([]core.KeyMeta, error) {
-	paginator := s3.NewListObjectsV2Paginator(s.cfg.Target.S3Client,
+	paginator := s3.NewListObjectsV2Paginator(s.cfg.Target.S3Client(),
 		&s3.ListObjectsV2Input{
-			Bucket: aws.String(s.cfg.Target.Bucket),
+			Bucket: aws.String(s.cfg.Target.Bucket()),
 			Prefix: aws.String(plan.ListPrefix),
 		})
 
@@ -92,7 +92,7 @@ func (s *Reader[T]) listAllMatchingURIs(
 	plans := make([]*core.ReadPlan, len(patterns))
 	for i, p := range patterns {
 		plan, err := core.BuildReadPlan(
-			p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+			p, s.dataPath, s.cfg.Target.PartitionKeyParts())
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3sql: %s pattern %d %q: %w",
