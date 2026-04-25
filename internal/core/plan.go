@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 // ReadPlan describes how to execute a key-pattern read against
 // S3: a prefix to LIST under, and a per-key predicate that picks
@@ -142,4 +145,36 @@ func HiveKeyOfDataFile(s3Key, dataPath string) (string, bool) {
 		return "", false
 	}
 	return rest[:slash], true
+}
+
+// RunPlansConcurrent runs listOne across every plan via FanOut
+// and returns the deduplicated union of results in first-seen
+// order. keyOf extracts the dedup key so callers can use richer
+// result types (e.g. KeyMeta) while still deduping on the
+// underlying S3 key.
+//
+// Single source of truth for the multi-pattern LIST fan-out used
+// by s3parquet (ReadMany, LookupMany, BackfillIndexMany) and
+// s3sql (ReadMany, QueryMany).
+func RunPlansConcurrent[P any, R any](
+	ctx context.Context,
+	plans []P,
+	concurrency int,
+	listOne func(ctx context.Context, p P) ([]R, error),
+	keyOf func(R) string,
+) ([]R, error) {
+	results := make([][]R, len(plans))
+	err := FanOut(ctx, plans, concurrency,
+		func(ctx context.Context, i int, plan P) error {
+			r, err := listOne(ctx, plan)
+			if err != nil {
+				return err
+			}
+			results[i] = r
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return UnionKeys(results, keyOf), nil
 }
