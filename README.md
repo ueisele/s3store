@@ -549,9 +549,11 @@ The range is half-open `[since, until)`, matching Kafka offset semantics.
 
 `PollRecordsIter` is the entry point for bounded windows. It returns
 an `iter.Seq2[T, error]` backed by the same `streamEager` pipeline
-that powers `ReadIter` — byte-budget streaming
-(`WithReadAheadBytes`), cross-file pipelining, per-partition dedup.
-Memory is bounded by the byte budget, not by window size:
+that powers `ReadIter` — partition prefetch
+(`WithReadAheadPartitions`, default 0 = strict-serial), byte-budget
+streaming (`WithReadAheadBytes`, default 0 = uncapped), cross-file
+pipelining, per-partition dedup. Memory is bounded by whichever cap
+binds first (or by the largest single partition if both are 0):
 
 ```go
 // All records written on 2026-04-17 (UTC).

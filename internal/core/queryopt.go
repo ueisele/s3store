@@ -80,8 +80,9 @@ func WithUntilOffset(until Offset) QueryOption {
 	}
 }
 
-// WithReadAheadPartitions tells ReadIter / ReadManyIter to
-// prefetch n partitions ahead of the current yield position. Each
+// WithReadAheadPartitions tells ReadIter / ReadManyIter /
+// PollRecordsIter to prefetch n partitions ahead of the current
+// yield position. Each
 // partition is downloaded + decoded into a single buffered batch;
 // a background producer keeps the pipeline topped up to n ahead
 // while the main goroutine yields records from the current batch.

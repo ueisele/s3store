@@ -196,15 +196,17 @@ func WithUntilOffset(until Offset) QueryOption {
 }
 
 // WithReadAheadPartitions tells partition-streaming readers
-// (ReadIter / ReadManyIter) to prefetch n partitions ahead of
-// the yield position. Default is 0 (strict-serial).
+// (ReadIter / ReadManyIter / PollRecordsIter) to prefetch n
+// partitions ahead of the yield position. Default is 0
+// (strict-serial).
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
 // bytes that may sit decoded ahead of the yield position on
-// ReadIter / ReadManyIter. Composes with WithReadAheadPartitions
+// ReadIter / ReadManyIter / PollRecordsIter. Composes with
+// WithReadAheadPartitions
 // — whichever cap binds first holds the producer back. Useful
 // for skewed partition sizes. See core.WithReadAheadBytes for
 // the full contract.
