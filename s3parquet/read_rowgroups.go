@@ -61,16 +61,10 @@ func (s *Reader[T]) ReadManyIterWhere(
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		plans := make([]*core.ReadPlan, len(patterns))
-		for i, p := range patterns {
-			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts())
-			if err != nil {
-				yield(*new(T), fmt.Errorf(
-					"s3parquet: ReadManyIterWhere pattern %d %q: %w",
-					i, p, err))
-				return
-			}
-			plans[i] = plan
+		plans, err := core.BuildReadPlans(patterns, s.dataPath, s.cfg.Target.PartitionKeyParts())
+		if err != nil {
+			yield(*new(T), fmt.Errorf("s3parquet: ReadManyIterWhere %w", err))
+			return
 		}
 
 		keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
@@ -78,9 +72,9 @@ func (s *Reader[T]) ReadManyIterWhere(
 			yield(*new(T), err)
 			return
 		}
-		keys, err = s.applyIdempotentRead(keys, &o)
+		keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
 		if err != nil {
-			yield(*new(T), err)
+			yield(*new(T), fmt.Errorf("s3parquet: %w", err))
 			return
 		}
 		if len(keys) == 0 {

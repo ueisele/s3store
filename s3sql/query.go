@@ -248,16 +248,10 @@ func (s *Reader) listAllMatchingURIs(
 	ctx context.Context, patterns []string,
 	opts *core.QueryOpts, method string,
 ) ([]string, error) {
-	plans := make([]*core.ReadPlan, len(patterns))
-	for i, p := range patterns {
-		plan, err := core.BuildReadPlan(
-			p, s.dataPath, s.cfg.Target.PartitionKeyParts())
-		if err != nil {
-			return nil, fmt.Errorf(
-				"s3sql: %s pattern %d %q: %w",
-				method, i, p, err)
-		}
-		plans[i] = plan
+	plans, err := core.BuildReadPlans(
+		patterns, s.dataPath, s.cfg.Target.PartitionKeyParts())
+	if err != nil {
+		return nil, fmt.Errorf("s3sql: %s %w", method, err)
 	}
 
 	keys, err := s.cfg.Target.ListDataFilesMany(
@@ -265,9 +259,9 @@ func (s *Reader) listAllMatchingURIs(
 	if err != nil {
 		return nil, fmt.Errorf("s3sql: %w", err)
 	}
-	keys, err = s.applyIdempotentRead(keys, opts)
+	keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, opts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("s3sql: %w", err)
 	}
 	if len(keys) == 0 {
 		return nil, nil
@@ -278,23 +272,4 @@ func (s *Reader) listAllMatchingURIs(
 		uris[i] = s.s3URI(k.Key)
 	}
 	return uris, nil
-}
-
-// applyIdempotentRead validates opts.IdempotentReadToken when set
-// and filters keys accordingly. Runs at LIST time with no S3 call;
-// see core.ApplyIdempotentRead for the per-partition self-
-// exclusion + later-write-exclusion contract.
-func (s *Reader) applyIdempotentRead(
-	keys []core.KeyMeta, opts *core.QueryOpts,
-) ([]core.KeyMeta, error) {
-	if opts.IdempotentReadToken == "" {
-		return keys, nil
-	}
-	if err := core.ValidateIdempotencyToken(
-		opts.IdempotentReadToken); err != nil {
-		return nil, fmt.Errorf(
-			"s3sql: WithIdempotentRead: %w", err)
-	}
-	return core.ApplyIdempotentRead(
-		keys, s.dataPath, opts.IdempotentReadToken), nil
 }

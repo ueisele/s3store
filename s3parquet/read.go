@@ -89,23 +89,18 @@ func (s *Reader[T]) ReadMany(
 		return nil, nil
 	}
 
-	plans := make([]*core.ReadPlan, len(patterns))
-	for i, p := range patterns {
-		plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts())
-		if err != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: ReadMany pattern %d %q: %w", i, p, err)
-		}
-		plans[i] = plan
+	plans, err := core.BuildReadPlans(patterns, s.dataPath, s.cfg.Target.PartitionKeyParts())
+	if err != nil {
+		return nil, fmt.Errorf("s3parquet: ReadMany %w", err)
 	}
 
 	keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
 	if err != nil {
 		return nil, err
 	}
-	keys, err = s.applyIdempotentRead(keys, &o)
+	keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("s3parquet: %w", err)
 	}
 	if len(keys) == 0 {
 		return nil, nil
@@ -181,16 +176,10 @@ func (s *Reader[T]) ReadManyIter(
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		plans := make([]*core.ReadPlan, len(patterns))
-		for i, p := range patterns {
-			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts())
-			if err != nil {
-				yield(*new(T), fmt.Errorf(
-					"s3parquet: ReadManyIter pattern %d %q: %w",
-					i, p, err))
-				return
-			}
-			plans[i] = plan
+		plans, err := core.BuildReadPlans(patterns, s.dataPath, s.cfg.Target.PartitionKeyParts())
+		if err != nil {
+			yield(*new(T), fmt.Errorf("s3parquet: ReadManyIter %w", err))
+			return
 		}
 
 		keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
@@ -198,9 +187,9 @@ func (s *Reader[T]) ReadManyIter(
 			yield(*new(T), err)
 			return
 		}
-		keys, err = s.applyIdempotentRead(keys, &o)
+		keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
 		if err != nil {
-			yield(*new(T), err)
+			yield(*new(T), fmt.Errorf("s3parquet: %w", err))
 			return
 		}
 		if len(keys) == 0 {
@@ -359,26 +348,6 @@ func (s *Reader[T]) emitPartition(
 		}
 	}
 	return true
-}
-
-// applyIdempotentRead validates opts.IdempotentReadToken when set
-// and filters keys accordingly. The filter runs at LIST time with
-// no S3 call; cost is O(len(keys)). See core.ApplyIdempotentRead
-// for the per-partition self-exclusion + later-write-exclusion
-// contract.
-func (s *Reader[T]) applyIdempotentRead(
-	keys []core.KeyMeta, opts *core.QueryOpts,
-) ([]core.KeyMeta, error) {
-	if opts.IdempotentReadToken == "" {
-		return keys, nil
-	}
-	if err := core.ValidateIdempotencyToken(
-		opts.IdempotentReadToken); err != nil {
-		return nil, fmt.Errorf(
-			"s3parquet: WithIdempotentRead: %w", err)
-	}
-	return core.ApplyIdempotentRead(
-		keys, s.dataPath, opts.IdempotentReadToken), nil
 }
 
 // identityKey is the keyOf function for []string fan-outs — the

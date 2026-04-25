@@ -331,15 +331,10 @@ func (i *Index[K]) LookupMany(
 		return nil, nil
 	}
 
-	plans := make([]*core.ReadPlan, len(patterns))
-	for j, p := range patterns {
-		plan, err := core.BuildReadPlan(p, i.indexPath, i.columns)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: index %q LookupMany pattern %d %q: %w",
-				i.name, j, p, err)
-		}
-		plans[j] = plan
+	plans, err := core.BuildReadPlans(patterns, i.indexPath, i.columns)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"s3parquet: index %q LookupMany %w", i.name, err)
 	}
 
 	keys, err := i.listAllMatchingMarkers(ctx, plans)
@@ -551,15 +546,10 @@ func BackfillIndexMany[T any, K comparable](
 	}
 
 	dataPath := core.DataPath(target.Prefix())
-	plans := make([]*core.ReadPlan, len(patterns))
-	for j, p := range patterns {
-		plan, err := core.BuildReadPlan(p, dataPath, target.PartitionKeyParts())
-		if err != nil {
-			return stats, fmt.Errorf(
-				"s3parquet: BackfillIndexMany pattern %d %q: %w",
-				j, p, err)
-		}
-		plans[j] = plan
+	plans, err := core.BuildReadPlans(patterns, dataPath, target.PartitionKeyParts())
+	if err != nil {
+		return stats, fmt.Errorf(
+			"s3parquet: BackfillIndexMany %w", err)
 	}
 
 	keys, err := listDataFilesBelowUntil(

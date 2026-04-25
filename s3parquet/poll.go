@@ -92,9 +92,9 @@ func (s *Reader[T]) PollRecords(
 		}
 	}
 
-	keys, err = s.applyIdempotentRead(keys, &o)
+	keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
 	if err != nil {
-		return nil, since, err
+		return nil, since, fmt.Errorf("s3parquet: %w", err)
 	}
 	if len(keys) == 0 {
 		return nil, newOffset, nil

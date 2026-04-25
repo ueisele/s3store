@@ -1,9 +1,32 @@
 package core
 
 import (
+	"fmt"
 	"path"
 	"time"
 )
+
+// ApplyIdempotentReadOpts is the QueryOpts-aware wrapper around
+// ApplyIdempotentRead. When opts.IdempotentReadToken is empty
+// the input is returned unchanged. When set, the token is
+// validated via ValidateIdempotencyToken (returning a
+// "WithIdempotentRead: <err>" wrapped error so callers add only
+// their package + entry-point prefix), then the keys are filtered
+// per partition.
+//
+// Single source of truth for the validate-and-apply combo so
+// every reader (s3parquet, s3sql) gets the same behaviour.
+func ApplyIdempotentReadOpts(
+	keys []KeyMeta, dataPath string, opts *QueryOpts,
+) ([]KeyMeta, error) {
+	if opts.IdempotentReadToken == "" {
+		return keys, nil
+	}
+	if err := ValidateIdempotencyToken(opts.IdempotentReadToken); err != nil {
+		return nil, fmt.Errorf("WithIdempotentRead: %w", err)
+	}
+	return ApplyIdempotentRead(keys, dataPath, opts.IdempotentReadToken), nil
+}
 
 // ApplyIdempotentRead filters a flat LIST of data-file KeyMetas
 // so the result reflects state as of the first write of the given

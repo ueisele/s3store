@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"strings"
 )
 
@@ -18,6 +19,29 @@ import (
 type ReadPlan struct {
 	ListPrefix string
 	Match      func(hiveKey string) bool
+}
+
+// BuildReadPlans validates each pattern against the shared
+// grammar and returns one ReadPlan per input. On the first
+// validation failure returns the index, the offending pattern,
+// and the wrapped error: `pattern N "p": <err>`. Callers wrap the
+// result with their own package + method prefix so the surfaced
+// chain reads naturally (e.g. `s3parquet: ReadMany pattern N "p":
+// ...`).
+//
+// Pure Go — no S3 calls; suitable for unit-testing.
+func BuildReadPlans(
+	patterns []string, dataPath string, partitionKeyParts []string,
+) ([]*ReadPlan, error) {
+	plans := make([]*ReadPlan, len(patterns))
+	for i, p := range patterns {
+		plan, err := BuildReadPlan(p, dataPath, partitionKeyParts)
+		if err != nil {
+			return nil, fmt.Errorf("pattern %d %q: %w", i, p, err)
+		}
+		plans[i] = plan
+	}
+	return plans, nil
 }
 
 // BuildReadPlan validates a key pattern against the shared
