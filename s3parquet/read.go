@@ -8,7 +8,6 @@ import (
 	"io"
 	"iter"
 	"maps"
-	"path"
 	"reflect"
 	"slices"
 	"sort"
@@ -25,13 +24,15 @@ import (
 // a fallback or ignore it in favor of a domain-level version.
 // insertedAt is sourced from the writer-populated
 // InsertedAtField column when the reader has InsertedAtField
-// configured, else from the S3 object's LastModified. fileName
-// is the base name of the source parquet key — used as a
-// deterministic tiebreaker in the record-level sort.
+// configured, else from the S3 object's LastModified.
+//
+// Records flow into sortAndDedup in deterministic input order
+// (file lex order, then parquet row order); sort.SliceStable
+// preserves that on ties, so no per-record fileName is needed
+// as a tiebreaker.
 type versionedRecord[T any] struct {
 	rec        T
 	insertedAt time.Time
-	fileName   string
 }
 
 // Read returns all records whose data files match the given
@@ -417,7 +418,6 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	ctx context.Context, km core.KeyMeta,
 ) ([]versionedRecord[T], error) {
 	key := km.Key
-	fileName := path.Base(key)
 
 	data, err := s.cfg.Target.get(
 		ctx, key, s.cfg.ConsistencyControl)
@@ -436,7 +436,7 @@ func (s *Reader[T]) downloadAndDecodeOne(
 	}
 	return s.wrapVersioned(
 		make([]versionedRecord[T], 0, len(recs)),
-		recs, fileName, km.InsertedAt), nil
+		recs, km.InsertedAt), nil
 }
 
 // wrapVersioned appends a wrapped versionedRecord per element of
@@ -459,7 +459,7 @@ func (s *Reader[T]) downloadAndDecodeOne(
 // allocation but no internal intermediate.
 func (s *Reader[T]) wrapVersioned(
 	out []versionedRecord[T], recs []T,
-	fileName string, fallbackTime time.Time,
+	fallbackTime time.Time,
 ) []versionedRecord[T] {
 	for j := range recs {
 		ia := fallbackTime
@@ -474,7 +474,6 @@ func (s *Reader[T]) wrapVersioned(
 		out = append(out, versionedRecord[T]{
 			rec:        recs[j],
 			insertedAt: ia,
-			fileName:   fileName,
 		})
 	}
 	return out

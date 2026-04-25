@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"path"
-	"reflect"
-	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
@@ -146,7 +143,6 @@ func (s *Reader[T]) downloadFilteredOne(
 	ctx context.Context, km core.KeyMeta, predicate RowGroupPredicate,
 ) ([]versionedRecord[T], error) {
 	key := km.Key
-	fileName := path.Base(key)
 
 	size, err := s.cfg.Target.size(
 		ctx, key, s.cfg.ConsistencyControl)
@@ -211,24 +207,9 @@ func (s *Reader[T]) downloadFilteredOne(
 		recs = append(recs, buf[:n]...)
 	}
 
-	versioned := make([]versionedRecord[T], len(recs))
-	for j, r := range recs {
-		ia := km.InsertedAt
-		if s.insertedAtFieldIndex != nil {
-			colVal := reflect.ValueOf(&recs[j]).Elem().
-				FieldByIndex(s.insertedAtFieldIndex).
-				Interface().(time.Time)
-			if !colVal.IsZero() {
-				ia = colVal
-			}
-		}
-		versioned[j] = versionedRecord[T]{
-			rec:        r,
-			insertedAt: ia,
-			fileName:   fileName,
-		}
-	}
-	return versioned, nil
+	return s.wrapVersioned(
+		make([]versionedRecord[T], 0, len(recs)),
+		recs, km.InsertedAt), nil
 }
 
 // s3ReaderAt adapts S3Target.getRange to io.ReaderAt so parquet-

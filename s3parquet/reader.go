@@ -114,10 +114,12 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 //     ascending order (newest last). When VersionOf is nil the
 //     NewReader default (DefaultVersionOf = insertedAt.UnixMicro)
 //     applies, so this reduces to (entity, LastModified).
-//   - EntityKeyOf nil: sort by (insertedAt, fileName) ascending
-//     for per-file chronological output. fileName is the base
-//     name of the source parquet key — a deterministic tiebreaker
-//     when two files share a LastModified.
+//   - EntityKeyOf nil: sort by insertedAt ascending. Records that
+//     share a timestamp keep their input order via sort.SliceStable
+//     — input arrives in file lex order (preparePartitions sorts
+//     files by key; downloadAndDecodeAll's per-key result slots
+//     preserve that order), so the stable-sort tiebreaker is
+//     equivalent to sorting by file name explicitly.
 //
 // cmp.Compare gives a stable three-way result on int64 nanoseconds
 // so ties fall through to the secondary key cleanly.
@@ -143,7 +145,7 @@ func resolveSortCmp[T any](
 		case a.insertedAt.After(b.insertedAt):
 			return 1
 		}
-		return cmp.Compare(a.fileName, b.fileName)
+		return 0
 	}
 }
 

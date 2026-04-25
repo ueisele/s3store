@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
 	"slices"
 	"sync"
 
@@ -309,9 +308,7 @@ func (s *Reader[T]) decodePartition(
 			return nil, fmt.Errorf(
 				"s3parquet: decode %s: %w", ps.files[fi].Key, err)
 		}
-		out = s.wrapVersioned(out, recs,
-			path.Base(ps.files[fi].Key),
-			ps.files[fi].InsertedAt)
+		out = s.wrapVersioned(out, recs, ps.files[fi].InsertedAt)
 	}
 	return out, nil
 }

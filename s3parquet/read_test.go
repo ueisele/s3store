@@ -317,14 +317,15 @@ func TestDedupLatest_TieKeepsFirst(t *testing.T) {
 	}
 }
 
-// vrf is a terse versionedRecord[dedupRec] constructor that also
-// sets the fileName field, used by the sort-resolver tests where
-// fileName participates in the order.
-func vrf(e string, v int64, p string, insertedAt time.Time, fn string) versionedRecord[dedupRec] {
+// vrf is a terse versionedRecord[dedupRec] constructor for the
+// sort-resolver tests. fileName isn't carried on versionedRecord
+// any more — equal-key ties are resolved by sort.SliceStable
+// preserving input order, which in production is set up by
+// preparePartitions sorting files by S3 key first.
+func vrf(e string, v int64, p string, insertedAt time.Time) versionedRecord[dedupRec] {
 	return versionedRecord[dedupRec]{
 		rec:        dedupRec{entity: e, ver: v, payload: p},
 		insertedAt: insertedAt,
-		fileName:   fn,
 	}
 }
 
@@ -339,10 +340,10 @@ func TestResolveSortCmp_EntityAndExplicitVersion(t *testing.T) {
 
 	now := time.UnixMicro(1_000_000)
 	recs := []versionedRecord[dedupRec]{
-		vrf("b", 1, "b1", now, "f-b1"),
-		vrf("a", 2, "a2", now, "f-a2"),
-		vrf("a", 1, "a1", now, "f-a1"),
-		vrf("b", 2, "b2", now, "f-b2"),
+		vrf("b", 1, "b1", now),
+		vrf("a", 2, "a2", now),
+		vrf("a", 1, "a1", now),
+		vrf("b", 2, "b2", now),
 	}
 	sortWith(recs, cmp)
 	wantOrder := []string{"a1", "a2", "b1", "b2"}
@@ -366,10 +367,10 @@ func TestResolveSortCmp_EntityAndDefaultVersion(t *testing.T) {
 	early := time.UnixMicro(1_000_000)
 	late := time.UnixMicro(2_000_000)
 	recs := []versionedRecord[dedupRec]{
-		vrf("b", 0, "b-late", late, "f-b-late"),
-		vrf("a", 0, "a-late", late, "f-a-late"),
-		vrf("a", 0, "a-early", early, "f-a-early"),
-		vrf("b", 0, "b-early", early, "f-b-early"),
+		vrf("b", 0, "b-late", late),
+		vrf("a", 0, "a-late", late),
+		vrf("a", 0, "a-early", early),
+		vrf("b", 0, "b-early", early),
 	}
 	sortWith(recs, cmp)
 	wantOrder := []string{"a-early", "a-late", "b-early", "b-late"}
@@ -382,20 +383,27 @@ func TestResolveSortCmp_EntityAndDefaultVersion(t *testing.T) {
 }
 
 // TestResolveSortCmp_LastModifiedFallback covers the
-// "EntityKeyOf nil" branch: per-file chronological, tiebreak by
-// fileName for determinism across identical LastModified values.
+// "EntityKeyOf nil" branch: per-file chronological. Equal
+// LastModified values resolve via sort.SliceStable preserving
+// input order — in production, preparePartitions ensures input
+// order is file lex order, so the effective tiebreak is fileName
+// ASC even though no fileName field exists on versionedRecord.
 func TestResolveSortCmp_LastModifiedFallback(t *testing.T) {
 	cmp := resolveSortCmp[dedupRec](nil, nil)
 
 	early := time.UnixMicro(1_000_000)
 	late := time.UnixMicro(2_000_000)
+	// Input order simulates production's file-lex-sorted feed:
+	// for each LastModified group, the lexically-first filename's
+	// records appear first.
 	recs := []versionedRecord[dedupRec]{
-		vrf("x", 0, "late-b", late, "late-b.parquet"),
-		vrf("x", 0, "early-b", early, "early-b.parquet"),
-		vrf("x", 0, "late-a", late, "late-a.parquet"),
-		vrf("x", 0, "early-a", early, "early-a.parquet"),
+		vrf("x", 0, "early-a", early),
+		vrf("x", 0, "early-b", early),
+		vrf("x", 0, "late-a", late),
+		vrf("x", 0, "late-b", late),
 	}
 	sortWith(recs, cmp)
+	// Stable sort preserves input order within each timestamp.
 	wantOrder := []string{"early-a", "early-b", "late-a", "late-b"}
 	for i, want := range wantOrder {
 		if recs[i].rec.payload != want {
