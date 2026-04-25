@@ -180,57 +180,52 @@ func TestDedupEnabled(t *testing.T) {
 	}
 }
 
-// TestNewPopulatesDefaultVersionOf guards that New assigns
-// DefaultVersionOf when the user set EntityKeyOf but left
-// VersionOf nil — that's the "sensible default" behaviour.
-func TestNewPopulatesDefaultVersionOf(t *testing.T) {
-	cfg := validConfig()
-	cfg.EntityKeyOf = func(r testRec) string { return r.Customer }
-	// VersionOf deliberately nil
-
-	s, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
+// TestNewRejectsPartialDedupConfig guards that New rejects
+// EntityKeyOf without VersionOf (and vice versa) — both are
+// required for dedup to be meaningful.
+func TestNewRejectsPartialDedupConfig(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config[testRec])
+	}{
+		{
+			name: "EntityKeyOf without VersionOf",
+			mutate: func(c *Config[testRec]) {
+				c.EntityKeyOf = func(r testRec) string { return r.Customer }
+			},
+		},
+		{
+			name: "VersionOf without EntityKeyOf",
+			mutate: func(c *Config[testRec]) {
+				c.VersionOf = func(r testRec) int64 { return r.Value }
+			},
+		},
 	}
-	if s.Reader.cfg.VersionOf == nil {
-		t.Fatal("VersionOf still nil after New; expected DefaultVersionOf")
-	}
-	// Spot-check: DefaultVersionOf returns insertedAt.UnixMicro().
-	ts := time.UnixMicro(1_710_684_000_000_000)
-	if got := s.Reader.cfg.VersionOf(testRec{}, ts); got != 1_710_684_000_000_000 {
-		t.Errorf("default VersionOf returned %d, want %d",
-			got, 1_710_684_000_000_000)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(&cfg)
+			if _, err := New(cfg); err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
 	}
 }
 
-// TestNewLeavesUserVersionOfAlone guards that New does not
-// overwrite a user-supplied VersionOf.
-func TestNewLeavesUserVersionOfAlone(t *testing.T) {
+// TestNewKeepsUserVersionOf guards that New does not mutate a
+// user-supplied VersionOf.
+func TestNewKeepsUserVersionOf(t *testing.T) {
 	cfg := validConfig()
 	cfg.EntityKeyOf = func(r testRec) string { return r.Customer }
-	cfg.VersionOf = func(r testRec, _ time.Time) int64 {
-		return r.Value * 2
-	}
+	cfg.VersionOf = func(r testRec) int64 { return r.Value * 2 }
 
 	s, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	got := s.Reader.cfg.VersionOf(testRec{Value: 21}, time.Time{})
+	got := s.Reader.cfg.VersionOf(testRec{Value: 21})
 	if got != 42 {
 		t.Errorf("user VersionOf was replaced; got %d, want 42", got)
-	}
-}
-
-// TestDefaultVersionOf guards that the exported helper returns
-// insertedAt in microseconds, matching what the doc comment
-// promises. Users who reference the helper explicitly rely on
-// this contract.
-func TestDefaultVersionOf(t *testing.T) {
-	ts := time.UnixMicro(1_710_684_000_000_000)
-	got := DefaultVersionOf(testRec{}, ts)
-	if got != 1_710_684_000_000_000 {
-		t.Errorf("got %d, want %d", got, 1_710_684_000_000_000)
 	}
 }
 

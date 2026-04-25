@@ -37,7 +37,7 @@ type Rec struct {
 // contract it cares about while re-using the MinIO fixture.
 type storeOpts struct {
 	entityKeyOf func(Rec) string
-	versionOf   func(Rec, time.Time) int64
+	versionOf   func(Rec) int64
 }
 
 // newStore builds a fresh s3parquet.Store against a freshly
@@ -945,7 +945,7 @@ func TestReadMany_WithHistory(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
 		entityKeyOf: func(r Rec) string { return r.SKU },
-		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+		versionOf:   func(r Rec) int64 { return r.Value },
 	})
 
 	key := "period=2026-03-17/customer=abc"
@@ -1332,7 +1332,7 @@ func TestDedupExplicit(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
-		versionOf: func(r Rec, _ time.Time) int64 {
+		versionOf: func(r Rec) int64 {
 			return r.Ts.UnixNano()
 		},
 	})
@@ -1410,7 +1410,7 @@ func TestReplicaDedup_CollapsesSameEntityVersion(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
-		versionOf: func(r Rec, _ time.Time) int64 {
+		versionOf: func(r Rec) int64 {
 			return r.Ts.UnixNano()
 		},
 	})
@@ -1456,7 +1456,7 @@ func TestReplicaDedup_PreservesDistinctVersionsWithHistory(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
-		versionOf: func(r Rec, _ time.Time) int64 {
+		versionOf: func(r Rec) int64 {
 			return r.Ts.UnixNano()
 		},
 	})
@@ -1492,7 +1492,7 @@ func TestReadIter_ReplicaDedupWithHistory(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
-		versionOf: func(r Rec, _ time.Time) int64 {
+		versionOf: func(r Rec) int64 {
 			return r.Ts.UnixNano()
 		},
 	})
@@ -1528,7 +1528,7 @@ func TestReadWithHistory(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
 		entityKeyOf: func(r Rec) string { return r.SKU },
-		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+		versionOf:   func(r Rec) int64 { return r.Value },
 	})
 
 	key := "period=2026-03-17/customer=abc"
@@ -1691,7 +1691,7 @@ func TestPollRecords(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
-		versionOf: func(r Rec, _ time.Time) int64 {
+		versionOf: func(r Rec) int64 {
 			return r.Ts.UnixNano()
 		},
 	})
@@ -2233,7 +2233,7 @@ func TestReadIter_PerPartitionDedup(t *testing.T) {
 		entityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
-		versionOf: func(r Rec, _ time.Time) int64 {
+		versionOf: func(r Rec) int64 {
 			return r.Ts.UnixNano()
 		},
 	})
@@ -2977,56 +2977,6 @@ func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 	}
 }
 
-// TestDefaultVersionOf_UsesLastModified pins the fallback
-// behaviour when InsertedAtField is NOT configured: the dedup
-// tiebreaker (DefaultVersionOf with no explicit VersionOf) still
-// picks the record with the newer S3 LastModified. Two writes
-// land at observably different LastModified values (one-second
-// MinIO precision); dedup must keep the later one. With
-// InsertedAtField configured the path sources the column value
-// instead; this test exists specifically to cover the no-column
-// fallback.
-func TestDefaultVersionOf_UsesLastModified(t *testing.T) {
-	ctx := context.Background()
-	store := newStore(t, storeOpts{
-		entityKeyOf: func(r Rec) string {
-			return r.Period + "|" + r.Customer + "|" + r.SKU
-		},
-		// VersionOf nil → NewReader fills with DefaultVersionOf,
-		// which reads insertedAt (= LastModified).
-	})
-
-	// Value 1 writes first; sleep past one second so MinIO stamps
-	// a distinct LastModified, then write Value 2. DefaultVersionOf
-	// must pick the later file.
-	if _, err := store.Write(ctx, []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
-			Value: 1, Ts: time.UnixMilli(100)},
-	}); err != nil {
-		t.Fatalf("Write 1: %v", err)
-	}
-	time.Sleep(1100 * time.Millisecond)
-	if _, err := store.Write(ctx, []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1",
-			Value: 2, Ts: time.UnixMilli(200)},
-	}); err != nil {
-		t.Fatalf("Write 2: %v", err)
-	}
-	time.Sleep(400 * time.Millisecond)
-
-	got, err := store.Read(ctx, "*")
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("got %d, want 1 (dedup)", len(got))
-	}
-	if got[0].Value != 2 {
-		t.Errorf("dedup picked Value=%d, want 2 (newer LastModified)",
-			got[0].Value)
-	}
-}
-
 // TestSort_ByEntityKeyAndVersion covers the two-tier sort when
 // both EntityKeyOf and VersionOf are configured: records arrive
 // grouped by entity, ascending by version within each group.
@@ -3034,7 +2984,7 @@ func TestSort_ByEntityKeyAndVersion(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
 		entityKeyOf: func(r Rec) string { return r.SKU },
-		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+		versionOf:   func(r Rec) int64 { return r.Value },
 	})
 
 	// Interleaved entities + versions; write one record per call
@@ -3125,7 +3075,7 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
 		entityKeyOf: func(r Rec) string { return r.SKU },
-		versionOf:   func(r Rec, _ time.Time) int64 { return r.Value },
+		versionOf:   func(r Rec) int64 { return r.Value },
 	})
 
 	writes := []Rec{
@@ -3208,7 +3158,7 @@ func newIdempotentStore(t *testing.T) *s3parquet.Store[Rec] {
 		EntityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},
-		VersionOf: func(r Rec, _ time.Time) int64 {
+		VersionOf: func(r Rec) int64 {
 			return r.Value
 		},
 	})

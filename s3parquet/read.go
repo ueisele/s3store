@@ -8,7 +8,6 @@ import (
 	"io"
 	"iter"
 	"maps"
-	"reflect"
 	"slices"
 	"sort"
 	"time"
@@ -395,21 +394,11 @@ func (s *Reader[T]) downloadAndDecodeAll(
 // downloadAndDecodeOne is the per-file body shared by
 // downloadAndDecodeAll and the iter streaming paths. Pulls one
 // parquet object from S3, decodes it, and wraps each record with
-// its insertedAt plus the source filename for sort tiebreaking.
-//
-// insertedAt source, in priority order:
-//
-//  1. When InsertedAtField is configured AND the decoded column
-//     value is non-zero, use it — the writer-populated wall clock,
-//     exact and identical across every read path.
-//  2. Otherwise fall back to km.InsertedAt — either the S3 object's
-//     LastModified on the Read path, or the ref's dataTsMicros on
-//     the PollRecords path. Both cases covered: InsertedAtField
-//     unset, OR the column was absent from the parquet file (file
-//     written before the column existed, or by a tool that skipped
-//     it). The fallback keeps sort + DefaultVersionOf monotonic
-//     during a rollout without forcing a rewrite of historical
-//     data.
+// km.InsertedAt (S3 LastModified on the Read path, ref
+// dataTsMicros on the PollRecords path) — used by the no-dedup
+// sort cascade. Records' own time fields, if any, surface
+// natively as parquet columns on T and are user-visible
+// independently of this stamping.
 //
 // Returns (nil, nil) when the object is missing — a dangling ref
 // or a LIST-to-GET race. The OnMissingData hook is invoked so
@@ -440,16 +429,10 @@ func (s *Reader[T]) downloadAndDecodeOne(
 }
 
 // wrapVersioned appends a wrapped versionedRecord per element of
-// recs onto out and returns the grown slice. insertedAt source
-// priority per record:
-//
-//  1. When InsertedAtField is configured AND the decoded column
-//     value is non-zero, use it — the writer-populated wall clock,
-//     exact and identical across every read path.
-//  2. Otherwise fall back to fallbackTime (S3 LastModified on the
-//     Read path, ref dataTsMicros on the PollRecords path). Keeps
-//     sort + DefaultVersionOf monotonic during an InsertedAtField
-//     rollout without forcing a rewrite of historical data.
+// recs onto out and returns the grown slice. Every record gets
+// the same fallbackTime — S3 LastModified on the Read path, ref
+// dataTsMicros on the PollRecords path. Used by the no-dedup
+// sort cascade.
 //
 // Taking out as a parameter (rather than returning a fresh slice)
 // avoids the per-file intermediate in streaming reads —
@@ -462,18 +445,9 @@ func (s *Reader[T]) wrapVersioned(
 	fallbackTime time.Time,
 ) []versionedRecord[T] {
 	for j := range recs {
-		ia := fallbackTime
-		if s.insertedAtFieldIndex != nil {
-			colVal := reflect.ValueOf(&recs[j]).Elem().
-				FieldByIndex(s.insertedAtFieldIndex).
-				Interface().(time.Time)
-			if !colVal.IsZero() {
-				ia = colVal
-			}
-		}
 		out = append(out, versionedRecord[T]{
 			rec:        recs[j],
-			insertedAt: ia,
+			insertedAt: fallbackTime,
 		})
 	}
 	return out
@@ -553,7 +527,7 @@ func stripVersions[T any](in []versionedRecord[T]) []T {
 func dedupReplicas[T any](
 	records []versionedRecord[T],
 	entityKey func(T) string,
-	versionOf func(record T, insertedAt time.Time) int64,
+	versionOf func(T) int64,
 ) []versionedRecord[T] {
 	if len(records) == 0 {
 		return nil
@@ -567,7 +541,7 @@ func dedupReplicas[T any](
 	for _, vr := range records {
 		k := key{
 			entity:  entityKey(vr.rec),
-			version: versionOf(vr.rec, vr.insertedAt),
+			version: versionOf(vr.rec),
 		}
 		if _, ok := seen[k]; ok {
 			continue
@@ -583,14 +557,10 @@ func dedupReplicas[T any](
 // equal versions: earlier occurrences win ties, so callers who
 // rely on first-write semantics aren't surprised by later
 // duplicates.
-//
-// versionOf is invoked with each record and the insertedAt of
-// the source file, so a caller can fall back to file time when
-// the record has no domain-level version.
 func dedupLatest[T any](
 	records []versionedRecord[T],
 	entityKey func(T) string,
-	versionOf func(record T, insertedAt time.Time) int64,
+	versionOf func(T) int64,
 ) []T {
 	if len(records) == 0 {
 		return nil
@@ -603,7 +573,7 @@ func dedupLatest[T any](
 	order := make([]string, 0, len(records))
 	for i, vr := range records {
 		k := entityKey(vr.rec)
-		v := versionOf(vr.rec, vr.insertedAt)
+		v := versionOf(vr.rec)
 		cur, ok := seen[k]
 		if !ok {
 			seen[k] = slot{index: i, version: v}

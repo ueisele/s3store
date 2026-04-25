@@ -39,7 +39,7 @@ func TestDedupLatest_PicksMaxVersionPerEntity(t *testing.T) {
 	}
 	got := dedupLatest(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec, _ time.Time) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver })
 
 	if len(got) != 3 {
 		t.Fatalf("got %d records, want 3", len(got))
@@ -56,61 +56,6 @@ func TestDedupLatest_PicksMaxVersionPerEntity(t *testing.T) {
 	}
 }
 
-// TestDedupLatest_UsesInsertedAtFromFile exercises the
-// DefaultVersionOf-style path: VersionOf ignores the record
-// and returns insertedAt's micros, so the library's per-file
-// timestamp decides the winner.
-func TestDedupLatest_UsesInsertedAtFromFile(t *testing.T) {
-	earlier := time.UnixMicro(1_000_000)
-	later := time.UnixMicro(2_000_000)
-
-	recs := []versionedRecord[dedupRec]{
-		vr("a", 0, "earlier", earlier),
-		vr("a", 0, "later", later),
-	}
-	got := dedupLatest(recs,
-		func(r dedupRec) string { return r.entity },
-		DefaultVersionOf[dedupRec])
-
-	if len(got) != 1 {
-		t.Fatalf("got %d records, want 1", len(got))
-	}
-	if got[0].payload != "later" {
-		t.Errorf("got %q, want %q", got[0].payload, "later")
-	}
-}
-
-// TestDedupLatest_HybridVersion mixes a business timestamp with
-// insertedAt fallback: records with a non-zero ver win on ver,
-// records with zero ver fall back to insertedAt. Hard to set up
-// via integration without µs-precision timing, so lives here.
-func TestDedupLatest_HybridVersion(t *testing.T) {
-	earlier := time.UnixMicro(1_000_000)
-	later := time.UnixMicro(2_000_000)
-
-	hybrid := func(r dedupRec, insertedAt time.Time) int64 {
-		if r.ver != 0 {
-			return r.ver * 10_000_000 // push into "newer than file time" range
-		}
-		return insertedAt.UnixMicro()
-	}
-
-	recs := []versionedRecord[dedupRec]{
-		// entity a: explicit ver=1 beats a later file
-		vr("a", 1, "explicit", earlier),
-		vr("a", 0, "filetime", later),
-	}
-	got := dedupLatest(recs,
-		func(r dedupRec) string { return r.entity },
-		hybrid)
-	if len(got) != 1 {
-		t.Fatalf("got %d records, want 1", len(got))
-	}
-	if got[0].payload != "explicit" {
-		t.Errorf("got %q, want explicit", got[0].payload)
-	}
-}
-
 // TestDedupLatest_EmptyInput guards the nil/empty-slice fast
 // path. Integration can't easily produce a genuinely-empty
 // record batch because every ref corresponds to a file with
@@ -118,7 +63,7 @@ func TestDedupLatest_HybridVersion(t *testing.T) {
 func TestDedupLatest_EmptyInput(t *testing.T) {
 	got := dedupLatest(nil,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec, _ time.Time) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver })
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %d", len(got))
 	}
@@ -250,7 +195,7 @@ func TestDedupReplicas_CollapsesIdenticalEntityVersion(t *testing.T) {
 	}
 	got := dedupReplicas(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec, _ time.Time) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver })
 
 	if len(got) != 3 {
 		t.Fatalf("got %d records, want 3", len(got))
@@ -269,7 +214,7 @@ func TestDedupReplicas_CollapsesIdenticalEntityVersion(t *testing.T) {
 func TestDedupReplicas_EmptyInput(t *testing.T) {
 	got := dedupReplicas(nil,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec, _ time.Time) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver })
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %d", len(got))
 	}
@@ -289,7 +234,7 @@ func TestDedupReplicas_NoOpOnDistinctVersions(t *testing.T) {
 	}
 	got := dedupReplicas(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec, _ time.Time) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver })
 	if len(got) != 4 {
 		t.Fatalf("got %d records, want 4 (no collapse)", len(got))
 	}
@@ -308,7 +253,7 @@ func TestDedupLatest_TieKeepsFirst(t *testing.T) {
 	}
 	got := dedupLatest(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec, _ time.Time) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver })
 	if len(got) != 1 {
 		t.Fatalf("got %d records, want 1", len(got))
 	}
@@ -336,7 +281,7 @@ func vrf(e string, v int64, p string, insertedAt time.Time) versionedRecord[dedu
 func TestResolveSortCmp_EntityAndExplicitVersion(t *testing.T) {
 	cmp := resolveSortCmp[dedupRec](
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec, _ time.Time) int64 { return r.ver })
+		func(r dedupRec) int64 { return r.ver })
 
 	now := time.UnixMicro(1_000_000)
 	recs := []versionedRecord[dedupRec]{
@@ -347,33 +292,6 @@ func TestResolveSortCmp_EntityAndExplicitVersion(t *testing.T) {
 	}
 	sortWith(recs, cmp)
 	wantOrder := []string{"a1", "a2", "b1", "b2"}
-	for i, want := range wantOrder {
-		if recs[i].rec.payload != want {
-			t.Errorf("[%d] got %q, want %q",
-				i, recs[i].rec.payload, want)
-		}
-	}
-}
-
-// TestResolveSortCmp_EntityAndDefaultVersion covers the
-// "EntityKeyOf set, VersionOf defaulted to DefaultVersionOf"
-// branch: the sort picks insertedAt (= LastModified) as version,
-// so within each entity the newer LastModified lands later.
-func TestResolveSortCmp_EntityAndDefaultVersion(t *testing.T) {
-	cmp := resolveSortCmp[dedupRec](
-		func(r dedupRec) string { return r.entity },
-		DefaultVersionOf[dedupRec])
-
-	early := time.UnixMicro(1_000_000)
-	late := time.UnixMicro(2_000_000)
-	recs := []versionedRecord[dedupRec]{
-		vrf("b", 0, "b-late", late),
-		vrf("a", 0, "a-late", late),
-		vrf("a", 0, "a-early", early),
-		vrf("b", 0, "b-early", early),
-	}
-	sortWith(recs, cmp)
-	wantOrder := []string{"a-early", "a-late", "b-early", "b-late"}
 	for i, want := range wantOrder {
 		if recs[i].rec.payload != want {
 			t.Errorf("[%d] got %q, want %q",

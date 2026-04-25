@@ -16,9 +16,8 @@ import "time"
 //     wall clock at write-start), which is more accurate than
 //     the ref's LastModified.
 //
-// Both are monotonic, both serve as DefaultVersionOf fallback
-// inputs and as the sort-fallback tiebreaker when no
-// InsertedAtField column is configured.
+// Both are monotonic; consumed by the no-dedup sort cascade
+// (sort by insertedAt asc) when EntityKeyOf isn't configured.
 //
 // Size is the compressed object size from the LIST response
 // (S3's Contents.Size). Zero when the call site doesn't have

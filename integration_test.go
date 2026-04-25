@@ -45,13 +45,13 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 	// Read / PollRecords dedup matches the SQL side.
 	versionColumn := ""
 	var entityKeyOf func(IntRecord) string
-	var versionOf func(IntRecord, time.Time) int64
+	var versionOf func(IntRecord) int64
 	if len(opts.entityKeyColumns) > 0 {
 		versionColumn = "ts"
 		entityKeyOf = func(r IntRecord) string {
 			return fmt.Sprintf("%s|%s|%s", r.Period, r.Customer, r.SKU)
 		}
-		versionOf = func(r IntRecord, _ time.Time) int64 {
+		versionOf = func(r IntRecord) int64 {
 			return r.Ts.UnixMicro()
 		}
 	}

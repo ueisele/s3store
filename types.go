@@ -62,11 +62,13 @@ type Config[T any] struct {
 	EntityKeyOf func(T) string
 
 	// VersionOf returns the comparable version stamp for a record
-	// on the parquet read path. When EntityKeyOf is set but
-	// VersionOf is nil, NewReader applies DefaultVersionOf
-	// (insertedAt.UnixMicro), which gives wrote-last-wins. Ignored
-	// when EntityKeyOf is nil.
-	VersionOf func(T, time.Time) int64
+	// on the parquet read path. Required when EntityKeyOf is set,
+	// otherwise ignored. To use the writer-stamped insertedAt as
+	// the version, configure InsertedAtField on the writer side
+	// and reference the same field here:
+	//
+	//	VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
+	VersionOf func(T) int64
 
 	// VersionColumn is the column name that orders versions of
 	// the same entity on the SQL read path: the record with the
@@ -102,8 +104,11 @@ type Config[T any] struct {
 
 	// InsertedAtField names a time.Time field on T that the
 	// writer populates with its wall-clock time.Now() at write
-	// time; Read and PollRecords surface the same value back.
-	// The field must carry a non-empty, non-"-" parquet tag (e.g.
+	// time; Read and PollRecords surface the same value back as
+	// a normal parquet column on T. Forwarded to WriterConfig
+	// only — the reader has no special handling, the column
+	// just shows up on T like any other tagged field. The field
+	// must carry a non-empty, non-"-" parquet tag (e.g.
 	// `parquet:"inserted_at"`).
 	InsertedAtField string
 

@@ -79,17 +79,17 @@ type Config[T any] struct {
 	EntityKeyOf func(T) string
 
 	// VersionOf returns the monotonic version of a record for
-	// dedup ordering. The library passes an insertedAt time that
-	// defaults to the writer-populated InsertedAtField column
-	// value when configured, otherwise the source file's S3
-	// LastModified — useful as a fallback when the record has no
-	// domain-level version, or combine it with a business
-	// timestamp for hybrid strategies.
+	// dedup ordering. Required when EntityKeyOf is set; ignored
+	// otherwise. Typical implementations return a domain
+	// timestamp / sequence number from a record field
+	// (`func(r T) int64 { return r.UpdatedAt.UnixMicro() }`).
 	//
-	// Nil defaults to DefaultVersionOf (wrote-last-wins). The
-	// default is assigned inside New() when EntityKeyOf is
-	// also set, so dedupEnabled only checks EntityKeyOf.
-	VersionOf func(record T, insertedAt time.Time) int64
+	// To use the library's writer-stamped insertedAt as the
+	// version, configure InsertedAtField on the writer side and
+	// reference the same field here:
+	//
+	//	VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
+	VersionOf func(record T) int64
 
 	// OnMissingData is invoked when a data-file GET returns S3
 	// NoSuchKey (404) during Read, PollRecords, or BackfillIndex.
@@ -162,23 +162,9 @@ type Config[T any] struct {
 	MaxInflightRequests int
 }
 
-// DefaultVersionOf returns insertedAt in microseconds. The
-// reader sources insertedAt from the writer-populated
-// InsertedAtField column when configured, else from the source
-// file's S3 LastModified — either way this yields a "newer
-// wins" dedup policy. Assigned to Config.VersionOf inside New()
-// when that field is nil and EntityKeyOf is set; also exported
-// so users can reference the wrote-last-wins default explicitly
-// in their config.
-func DefaultVersionOf[T any](_ T, insertedAt time.Time) int64 {
-	return insertedAt.UnixMicro()
-}
-
 // dedupEnabled reports whether latest-per-entity dedup applies.
-// Gated solely on EntityKeyOf: New() populates VersionOf with
-// DefaultVersionOf when the user leaves it nil, so by the time
-// a Store exists the VersionOf field is always callable if
-// EntityKeyOf is set.
+// EntityKeyOf and VersionOf must be set together (both required
+// for dedup) — New / NewReader reject partial configurations.
 func (c Config[T]) dedupEnabled() bool {
 	return c.EntityKeyOf != nil
 }
@@ -250,13 +236,14 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 }
 
 // readerConfigFrom projects a unified Config[T] onto the narrower
-// ReaderConfig[T].
+// ReaderConfig[T]. InsertedAtField is writer-only — the reader
+// sees that column like any other parquet field, decoded
+// natively into T by parquet-go.
 func readerConfigFrom[T any](c Config[T]) ReaderConfig[T] {
 	return ReaderConfig[T]{
 		Target:             targetFrom(c),
 		EntityKeyOf:        c.EntityKeyOf,
 		VersionOf:          c.VersionOf,
-		InsertedAtField:    c.InsertedAtField,
 		OnMissingData:      c.OnMissingData,
 		ConsistencyControl: c.ConsistencyControl,
 	}

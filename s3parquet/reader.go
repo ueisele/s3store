@@ -3,7 +3,6 @@ package s3parquet
 import (
 	"cmp"
 	"fmt"
-	"time"
 
 	"github.com/ueisele/s3store/internal/core"
 )
@@ -17,12 +16,16 @@ import (
 // Target is built once via NewS3Target and can be passed to both
 // WriterConfig.Target and ReaderConfig.Target so the resulting
 // Writer and Reader share the same MaxInflightRequests semaphore.
+//
+// Dedup contract: EntityKeyOf and VersionOf are both set or both
+// nil — NewReader rejects partial configurations. When set,
+// records dedup to the latest-per-entity by VersionOf; when nil,
+// every record flows through.
 type ReaderConfig[T any] struct {
-	Target          S3Target
-	EntityKeyOf     func(T) string
-	VersionOf       func(T, time.Time) int64
-	InsertedAtField string
-	OnMissingData   func(dataPath string)
+	Target        S3Target
+	EntityKeyOf   func(T) string
+	VersionOf     func(T) int64
+	OnMissingData func(dataPath string)
 
 	// ConsistencyControl sets the Consistency-Control HTTP header
 	// on data-file GETs following a LIST, matching the WriterConfig
@@ -39,10 +42,8 @@ type ReaderConfig[T any] struct {
 }
 
 // dedupEnabled reports whether latest-per-entity dedup applies.
-// Gated solely on EntityKeyOf: NewReader populates VersionOf
-// with DefaultVersionOf when the user leaves it nil, so by the
-// time a Reader exists the VersionOf field is always callable if
-// EntityKeyOf is set.
+// Both EntityKeyOf and VersionOf are required when dedup is on,
+// validated at NewReader time.
 func (c ReaderConfig[T]) dedupEnabled() bool {
 	return c.EntityKeyOf != nil
 }
@@ -57,15 +58,11 @@ type Reader[T any] struct {
 	dataPath string
 	refPath  string
 
-	// insertedAtFieldIndex is the reflect struct-field path for
-	// Config.InsertedAtField, resolved once at New() so the hot
-	// path doesn't reparse the type. nil when unset.
-	insertedAtFieldIndex []int
-
 	// sortCmp is the resolved comparison function for emission
 	// order. Two-tier cascade:
-	//   - EntityKeyOf set: (entityKey, versionOf(rec, insertedAt)) asc
-	//   - else:            (insertedAt, fileName) asc
+	//   - EntityKeyOf set: (entityKey, versionOf(rec)) asc
+	//   - else:            (insertedAt) asc, ties broken by stable
+	//     sort + input order (= file lex order)
 	sortCmp func(a, b versionedRecord[T]) int
 }
 
@@ -81,28 +78,21 @@ func (r *Reader[T]) Target() S3Target {
 // Intended for read-only services that have no write-side config
 // to supply (no PartitionKeyOf / Compression).
 //
-// Validates the same read-side invariants New(Config) does:
-// required Target fields, InsertedAtField (if set) must resolve
-// on T, and a default VersionOf is assigned when EntityKeyOf is
-// set but VersionOf is nil (wrote-last-wins).
+// Validates EntityKeyOf and VersionOf are both set or both nil.
 func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	if err := cfg.Target.Validate(); err != nil {
 		return nil, err
 	}
-	if cfg.EntityKeyOf != nil && cfg.VersionOf == nil {
-		cfg.VersionOf = DefaultVersionOf[T]
-	}
-	insertedAtIdx, err := validateInsertedAtField[T](cfg.InsertedAtField)
-	if err != nil {
-		return nil, err
+	if (cfg.EntityKeyOf == nil) != (cfg.VersionOf == nil) {
+		return nil, fmt.Errorf(
+			"s3parquet: EntityKeyOf and VersionOf must be set together")
 	}
 	warnIfUnknownConsistency(cfg.ConsistencyControl, "ReaderConfig")
 	return &Reader[T]{
-		cfg:                  cfg,
-		dataPath:             core.DataPath(cfg.Target.Prefix()),
-		refPath:              core.RefPath(cfg.Target.Prefix()),
-		insertedAtFieldIndex: insertedAtIdx,
-		sortCmp:              resolveSortCmp(cfg.EntityKeyOf, cfg.VersionOf),
+		cfg:      cfg,
+		dataPath: core.DataPath(cfg.Target.Prefix()),
+		refPath:  core.RefPath(cfg.Target.Prefix()),
+		sortCmp:  resolveSortCmp(cfg.EntityKeyOf, cfg.VersionOf),
 	}, nil
 }
 
@@ -111,9 +101,7 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 //
 //   - EntityKeyOf set: sort by (entityKey, versionOf) ascending
 //     so each entity's records land grouped and in version-
-//     ascending order (newest last). When VersionOf is nil the
-//     NewReader default (DefaultVersionOf = insertedAt.UnixMicro)
-//     applies, so this reduces to (entity, LastModified).
+//     ascending order (newest last).
 //   - EntityKeyOf nil: sort by insertedAt ascending. Records that
 //     share a timestamp keep their input order via sort.SliceStable
 //     — input arrives in file lex order (preparePartitions sorts
@@ -125,7 +113,7 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 // so ties fall through to the secondary key cleanly.
 func resolveSortCmp[T any](
 	entityKeyOf func(T) string,
-	versionOf func(T, time.Time) int64,
+	versionOf func(T) int64,
 ) func(a, b versionedRecord[T]) int {
 	if entityKeyOf != nil {
 		return func(a, b versionedRecord[T]) int {
@@ -134,8 +122,8 @@ func resolveSortCmp[T any](
 				return c
 			}
 			return cmp.Compare(
-				versionOf(a.rec, a.insertedAt),
-				versionOf(b.rec, b.insertedAt))
+				versionOf(a.rec),
+				versionOf(b.rec))
 		}
 	}
 	return func(a, b versionedRecord[T]) int {

@@ -65,7 +65,6 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		Target:             target,
 		EntityKeyOf:        cfg.EntityKeyOf,
 		VersionOf:          cfg.VersionOf,
-		InsertedAtField:    cfg.InsertedAtField,
 		ConsistencyControl: cfg.ConsistencyControl,
 	})
 	if err != nil {
