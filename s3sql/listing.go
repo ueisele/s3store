@@ -28,7 +28,7 @@ import (
 // set linearizes with Writer-side PUTs on strong-global /
 // strong-site StorageGRID. Empty → no header → bucket default
 // (correct on AWS S3 / MinIO).
-func (s *Reader[T]) listMatchingParquet(
+func (s *Reader) listMatchingParquet(
 	ctx context.Context, plan *core.ReadPlan,
 ) ([]core.KeyMeta, error) {
 	paginator := s3.NewListObjectsV2Paginator(s.cfg.Target.S3Client(),
@@ -85,7 +85,7 @@ func (s *Reader[T]) listMatchingParquet(
 // point in the message. Callers should already have dropped
 // literal-duplicate patterns via core.DedupePatterns — this
 // function doesn't repeat that work.
-func (s *Reader[T]) listAllMatchingURIs(
+func (s *Reader) listAllMatchingURIs(
 	ctx context.Context, patterns []string,
 	opts *core.QueryOpts, method string,
 ) ([]string, error) {
@@ -127,7 +127,7 @@ func (s *Reader[T]) listAllMatchingURIs(
 // and filters keys accordingly. Runs at LIST time with no S3 call;
 // see core.ApplyIdempotentRead for the per-partition self-
 // exclusion + later-write-exclusion contract.
-func (s *Reader[T]) applyIdempotentRead(
+func (s *Reader) applyIdempotentRead(
 	keys []core.KeyMeta, opts *core.QueryOpts,
 ) ([]core.KeyMeta, error) {
 	if opts.IdempotentReadToken == "" {

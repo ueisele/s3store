@@ -26,7 +26,7 @@ import (
 // on strong-consistent backends. See QueryMany for the full
 // rationale on why DuckDB's glob-expansion fast path is not used
 // (httpfs cannot carry per-request consistency headers).
-func (s *Reader[T]) Query(
+func (s *Reader) Query(
 	ctx context.Context,
 	keyPattern string,
 	sqlQuery string,
@@ -63,7 +63,7 @@ func (s *Reader[T]) Query(
 // empty *sql.Rows. The synthetic empty cursor carries a single
 // NULL column; callers iterating via the standard
 // for-rows.Next-rows.Scan loop see a clean empty iteration.
-func (s *Reader[T]) QueryMany(
+func (s *Reader) QueryMany(
 	ctx context.Context,
 	patterns []string,
 	sqlQuery string,
@@ -101,7 +101,7 @@ func (s *Reader[T]) QueryMany(
 // object key is exposed as a `filename` column — used by the
 // dedup CTE as a tie-breaker on equal VersionColumn values.
 // Callers typically compute the flag via needsFilename().
-func (s *Reader[T]) scanExprForURIs(
+func (s *Reader) scanExprForURIs(
 	uris []string, withFilename bool,
 ) string {
 	quoted := make([]string, len(uris))
@@ -132,7 +132,7 @@ func filenameOpt(withFilename bool) string {
 // (tie-break within one (entity, version) group so the same row
 // wins on every re-read). Needed whenever dedup is enabled,
 // regardless of WithHistory.
-func (s *Reader[T]) needsFilename() bool {
+func (s *Reader) needsFilename() bool {
 	return s.cfg.dedupEnabled()
 }
 
@@ -161,7 +161,7 @@ func (s *Reader[T]) needsFilename() bool {
 // Dedup requires scanExpr to have been built with filename=true;
 // the caller computes that flag via needsFilename, keeping the
 // two sides in sync.
-func (s *Reader[T]) wrapScanExpr(
+func (s *Reader) wrapScanExpr(
 	scanExpr string,
 	userSQL string,
 	includeHistory bool,
@@ -229,6 +229,6 @@ func noFilesMatchedErr(pattern string) error {
 // Callers using the standard for-rows.Next loop see a clean empty
 // iteration; callers that inspect rows.Columns() see a single
 // synthetic NULL column.
-func (s *Reader[T]) emptyRows(ctx context.Context) (*sql.Rows, error) {
+func (s *Reader) emptyRows(ctx context.Context) (*sql.Rows, error) {
 	return s.db.QueryContext(ctx, "SELECT NULL WHERE 1=0")
 }

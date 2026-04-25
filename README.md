@@ -320,10 +320,9 @@ PartitionKeyOf: func(r Record) string {
 ```
 
 Partition values live only in the path, saving storage. `s3sql` still
-surfaces them as columns and you can `SELECT` or `WHERE` on them; the
-reflection-based row binder silently discards them when they have no
-matching struct field. `s3parquet` ignores Hive paths entirely — if you
-need `year`/`month` on the Go-only read path, reconstruct them from `Ts`.
+surfaces them as columns and you can `SELECT` or `WHERE` on them.
+`s3parquet` ignores Hive paths entirely — if you need `year`/`month`
+on the Go-only read path, reconstruct them from `Ts`.
 
 Pick A when the partition is a first-class attribute (customer, tenant);
 pick B when it's a derived time bucket. Mixing within one store is fine.

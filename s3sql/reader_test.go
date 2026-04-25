@@ -8,12 +8,6 @@ import (
 	"github.com/ueisele/s3store/s3parquet"
 )
 
-type testRec struct {
-	Period   string `parquet:"period"`
-	Customer string `parquet:"customer"`
-	Value    int64  `parquet:"value"`
-}
-
 func validTarget() s3parquet.S3Target {
 	return s3parquet.NewS3Target(s3parquet.S3TargetConfig{
 		Bucket:            "b",
@@ -23,8 +17,8 @@ func validTarget() s3parquet.S3Target {
 	})
 }
 
-func validConfig() ReaderConfig[testRec] {
-	return ReaderConfig[testRec]{
+func validConfig() ReaderConfig {
+	return ReaderConfig{
 		Target:     validTarget(),
 		TableAlias: "t",
 	}
@@ -39,14 +33,14 @@ func TestNewReader_Validation(t *testing.T) {
 	}
 	cases := []struct {
 		name    string
-		mutate  func(*s3parquet.S3TargetConfig, *ReaderConfig[testRec])
+		mutate  func(*s3parquet.S3TargetConfig, *ReaderConfig)
 		wantSub string
 	}{
-		{"missing Bucket", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.Bucket = "" }, "Bucket is required"},
-		{"missing Prefix", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.Prefix = "" }, "Prefix is required"},
-		{"missing TableAlias", func(_ *s3parquet.S3TargetConfig, c *ReaderConfig[testRec]) { c.TableAlias = "" }, "TableAlias is required"},
-		{"missing S3Client", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.S3Client = nil }, "S3Client is required"},
-		{"missing PartitionKeyParts", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig[testRec]) { tc.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
+		{"missing Bucket", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig) { tc.Bucket = "" }, "Bucket is required"},
+		{"missing Prefix", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig) { tc.Prefix = "" }, "Prefix is required"},
+		{"missing TableAlias", func(_ *s3parquet.S3TargetConfig, c *ReaderConfig) { c.TableAlias = "" }, "TableAlias is required"},
+		{"missing S3Client", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig) { tc.S3Client = nil }, "S3Client is required"},
+		{"missing PartitionKeyParts", func(tc *s3parquet.S3TargetConfig, _ *ReaderConfig) { tc.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,7 +84,7 @@ func TestSQLQuote(t *testing.T) {
 // TestDedupEnabled guards the dedup gate: explicit opt-in via
 // EntityKeyColumns, no default.
 func TestDedupEnabled(t *testing.T) {
-	var c ReaderConfig[testRec]
+	var c ReaderConfig
 	if c.dedupEnabled() {
 		t.Error("empty config: dedupEnabled should be false")
 	}
@@ -106,19 +100,19 @@ func TestDedupEnabled(t *testing.T) {
 func TestNewReader_DedupValidation(t *testing.T) {
 	cases := []struct {
 		name    string
-		mutate  func(*ReaderConfig[testRec])
+		mutate  func(*ReaderConfig)
 		wantSub string
 	}{
 		{
 			name: "VersionColumn without EntityKeyColumns",
-			mutate: func(c *ReaderConfig[testRec]) {
+			mutate: func(c *ReaderConfig) {
 				c.VersionColumn = "ts"
 			},
 			wantSub: "EntityKeyColumns is required",
 		},
 		{
 			name: "EntityKeyColumns without VersionColumn",
-			mutate: func(c *ReaderConfig[testRec]) {
+			mutate: func(c *ReaderConfig) {
 				c.EntityKeyColumns = []string{"customer_id"}
 			},
 			wantSub: "VersionColumn is required",
@@ -137,37 +131,6 @@ func TestNewReader_DedupValidation(t *testing.T) {
 					err.Error(), tc.wantSub)
 			}
 		})
-	}
-}
-
-// TestNewReader_FilenameColumnCollision guards the guard: a T
-// with a `parquet:"filename"` field collides with DuckDB's
-// read_parquet(filename=true), which we use for the dedup CTE's
-// tie-breaker. NewReader must reject the configuration up front
-// instead of producing wrong rows at query time.
-//
-// (After Phase 1, InsertedAtField is a real parquet column
-// decoded natively — no filename plumbing — so the historical
-// "InsertedAtField set" branch of this test no longer applies.)
-func TestNewReader_FilenameColumnCollision(t *testing.T) {
-	type recWithFilename struct {
-		Period   string `parquet:"period"`
-		Customer string `parquet:"customer"`
-		Filename string `parquet:"filename"`
-	}
-	cfg := ReaderConfig[recWithFilename]{
-		Target:           validTarget(),
-		TableAlias:       "t",
-		EntityKeyColumns: []string{"period"},
-		VersionColumn:    "customer",
-	}
-	_, err := NewReader(cfg)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "dedup tie-breaker") {
-		t.Errorf("error %q did not contain %q",
-			err.Error(), "dedup tie-breaker")
 	}
 }
 

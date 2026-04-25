@@ -42,7 +42,7 @@ type sqlOpts struct {
 type testFixture struct {
 	bucket string
 	writer *s3parquet.Writer[Rec]
-	sql    *s3sql.Reader[Rec]
+	sql    *s3sql.Reader
 }
 
 // newFixture creates a fresh bucket on the shared MinIO,
@@ -71,7 +71,7 @@ func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 		t.Fatalf("s3parquet.NewWriter: %v", err)
 	}
 
-	s, err := s3sql.NewReader(s3sql.ReaderConfig[Rec]{
+	s, err := s3sql.NewReader(s3sql.ReaderConfig{
 		Target:             target,
 		TableAlias:         "records",
 		VersionColumn:      opts.versionColumn,
@@ -234,7 +234,7 @@ func newIdempotentFixture(t *testing.T) *testFixture {
 		t.Fatalf("s3parquet.NewWriter: %v", err)
 	}
 
-	s, err := s3sql.NewReader(s3sql.ReaderConfig[Rec]{
+	s, err := s3sql.NewReader(s3sql.ReaderConfig{
 		Target:             target,
 		TableAlias:         "records",
 		VersionColumn:      "ts",

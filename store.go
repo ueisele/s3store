@@ -31,7 +31,7 @@ import (
 type Store[T any] struct {
 	writer        *s3parquet.Writer[T]
 	parquetReader *s3parquet.Reader[T]
-	sqlReader     *s3sql.Reader[T]
+	sqlReader     *s3sql.Reader
 }
 
 // New constructs a Store, building the pure-Go Writer + Reader and
@@ -71,7 +71,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if err != nil {
 		return nil, err
 	}
-	sr, err := s3sql.NewReader(s3sql.ReaderConfig[T]{
+	sr, err := s3sql.NewReader(s3sql.ReaderConfig{
 		Target:             target,
 		TableAlias:         cfg.TableAlias,
 		VersionColumn:      cfg.VersionColumn,
@@ -103,7 +103,7 @@ func (s *Store[T]) Reader() *s3parquet.Reader[T] {
 // SQL returns the underlying s3sql.Reader. Use when arbitrary
 // DuckDB SQL or QueryMany aggregations are needed beyond the
 // umbrella's Query / QueryMany delegations.
-func (s *Store[T]) SQL() *s3sql.Reader[T] {
+func (s *Store[T]) SQL() *s3sql.Reader {
 	return s.sqlReader
 }
 
