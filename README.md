@@ -171,17 +171,18 @@ type NarrowRec struct {
 
 store, _ := s3parquet.New[FullRec](ctx, cfg)
 view, _ := s3parquet.NewReaderFromStore[NarrowRec, FullRec](store,
-    s3parquet.ReaderExtras[NarrowRec]{})
+    s3parquet.ReaderConfig[NarrowRec]{})
 
 recs, _ := view.Read(ctx, "*") // []NarrowRec — ProcessLog not fetched
 ```
 
-`ReaderExtras[T']` carries the read-side knobs that aren't shared
-with the Writer (`EntityKeyOf`, `VersionOf`, `InsertedAtField`,
-`OnMissingData`). `SettleWindow` is inherited from the Writer
-(and its `S3Target`), so the view sees the same window as the
-source. Dedup closures are typed over `T'`, so you supply them
-explicitly for the narrow shape when needed.
+The narrow `ReaderConfig[T']` carries the read-side knobs
+(`EntityKeyOf`, `VersionOf`, `InsertedAtField`, `OnMissingData`,
+`ConsistencyControl`); the constructor overwrites the `Target`
+field from the source Writer/Store so `SettleWindow` and the
+S3 wiring are inherited automatically. Dedup closures are typed
+over `T'`, so you supply them explicitly for the narrow shape
+when needed.
 
 The relationship between constructors:
 
@@ -190,8 +191,8 @@ The relationship between constructors:
 | Both write and read, same `T` | `New(ctx, Config[T])` → `*Store[T]` |
 | Write only, narrow config | `NewWriter(ctx, WriterConfig[T])` → `*Writer[T]` |
 | Read only, narrow config | `NewReader(ReaderConfig[T])` → `*Reader[T]` |
-| Same-/narrower-`T'` Reader over a Writer | `NewReaderFromWriter[T', U](writer, extras)` |
-| Same-/narrower-`T'` Reader over a Store | `NewReaderFromStore[T', U](store, extras)` |
+| Same-/narrower-`T'` Reader over a Writer | `NewReaderFromWriter[T', U](writer, cfg)` |
+| Same-/narrower-`T'` Reader over a Store | `NewReaderFromStore[T', U](store, cfg)` |
 
 ## Non-trivial Go types (`decimal.Decimal`, UUID wrappers, …)
 
@@ -435,17 +436,26 @@ Typical pairing: one day's worth of multi-customer data in one file,
 read back one customer at a time.
 
 `Write` fans out per-partition work in parallel (bounded by
-`PartitionWriteConcurrency`, default 8), so a single call with many
-groups completes in roughly the time of the slowest group instead of
-their sum. Raise the cap for workloads with many small partitions per
+`MaxInflightRequests`, default 8), so a single call with many groups
+completes in roughly the time of the slowest group instead of their
+sum. Raise the cap for workloads with many small partitions per
 Write (e.g. a DB poll that fans out to dozens of Hive keys at once);
 leave at the default when per-partition parquet buffers are large
-enough that N × buffer-size dominates memory. Each partition is
+enough that N × buffer-size dominates memory. Within each partition
+the data PUT, marker PUTs, and ref PUT run serially, so net
+in-flight S3 requests per call stay bounded by `MaxInflightRequests`
+without compounding through the inner axis. Each partition is
 self-contained — on error the function cancels still-running
 partitions and returns the results that already committed in
 sorted-key order, alongside the first real error. Callers can retry
 the failed partitions via `WriteWithKey` without re-writing the ones
 that succeeded.
+
+> The cap is per call, not library-wide. If you run many concurrent
+> Write/Read goroutines, the total in-flight count compounds — raise
+> `http.Transport.MaxConnsPerHost` on your `*s3.Client` (default ~10)
+> to match, or excess requests will queue at the transport layer
+> instead of running in parallel.
 
 ### Stream — refs only
 
@@ -799,7 +809,7 @@ type AggregationRec struct {
 }
 
 narrow, _ := s3parquet.NewReaderFromStore[AggregationRec](store,
-    s3parquet.ReaderExtras[AggregationRec]{})
+    s3parquet.ReaderConfig[AggregationRec]{})
 
 for r, err := range narrow.ReadIterWhere(ctx,
     "charge_period_start=2026-03-17",
@@ -817,7 +827,7 @@ pruning fetches 4/20 of those columns, so total wire transfer
 a full read.
 
 **Dedup caveat for narrow-T reads**: if you configure
-`EntityKeyOf` in `ReaderExtras`, the narrow struct must still
+`EntityKeyOf` in `ReaderConfig`, the narrow struct must still
 carry every field the closure reads. If the full record's entity
 key is `Customer + SKU + Project` but your narrow struct drops
 `Project`, the closure compiles but sees an empty string for
@@ -1776,6 +1786,43 @@ Configuration for the sub-packages is narrower — see
 the exact fields.
 
 ## Migration from earlier versions
+
+Breaking changes in the simplification release:
+
+- **`PartitionWriteConcurrency` → `MaxInflightRequests`**, moved
+  from `WriterConfig` / `Config` onto the shared
+  `s3parquet.S3Target`. One knob now caps every fan-out (Write
+  partitions, Read/PollRecords/BackfillIndex files, *Many LISTs).
+  Default is 8. Within a partition the work runs serially so the
+  cap doesn't compound through inner axes — peak in-flight per
+  call is bounded by the configured value, not by N × inner.
+
+  ```go
+  // Before
+  cfg := s3parquet.Config[T]{ ..., PartitionWriteConcurrency: 16 }
+
+  // After
+  cfg := s3parquet.Config[T]{ ..., MaxInflightRequests: 16 }
+  ```
+
+  See the Write section for the `http.Transport.MaxConnsPerHost`
+  interaction when running many concurrent callers.
+
+- **`s3parquet.ReaderExtras[T']` removed.**
+  `NewReaderFromWriter` / `NewReaderFromStore` now take a full
+  `ReaderConfig[T']`; the constructor overrides the `Target`
+  from the source Writer/Store. Pass an empty `ReaderConfig{}` if
+  you only want field-projection without dedup.
+
+  ```go
+  // Before
+  view, _ := s3parquet.NewReaderFromStore[NarrowRec](store,
+      s3parquet.ReaderExtras[NarrowRec]{})
+
+  // After
+  view, _ := s3parquet.NewReaderFromStore[NarrowRec](store,
+      s3parquet.ReaderConfig[NarrowRec]{})
+  ```
 
 Breaking changes in the idempotent-write release:
 
