@@ -539,25 +539,24 @@ func (s *Writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 	return out, nil
 }
 
-// putMarkers issues marker PUTs serially. Net in-flight S3
-// requests stays bounded by Target.MaxInflightRequests at the
-// outer partition fan-out (one partition per slot); compounding
-// with intra-partition concurrency would multiply the cap and
-// overshoot http.Transport.MaxConnsPerHost. Returns the first
-// PUT error; partial success on failure is accepted — orphan
-// markers are tolerated at Lookup time.
+// putMarkers fans marker PUTs out through core.FanOut. The
+// per-target MaxInflightRequests semaphore inside target.put caps
+// net in-flight S3 requests, so the fan-out can't overshoot
+// http.Transport.MaxConnsPerHost — extra goroutines just queue at
+// the semaphore. Returns the first PUT error; partial success on
+// failure is accepted — orphan markers are tolerated at Lookup
+// time.
 func (s *Writer[T]) putMarkers(
 	ctx context.Context, paths []string,
 ) error {
-	for _, p := range paths {
-		if err := s.cfg.Target.put(
-			ctx, p, nil, "application/octet-stream",
-			s.cfg.ConsistencyControl,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+	return core.FanOut(ctx, paths,
+		s.cfg.Target.EffectiveMaxInflightRequests(),
+		func(ctx context.Context, _ int, p string) error {
+			return s.cfg.Target.put(
+				ctx, p, nil, "application/octet-stream",
+				s.cfg.ConsistencyControl,
+			)
+		})
 }
 
 // populateInsertedAt reflectively writes t into every record's
