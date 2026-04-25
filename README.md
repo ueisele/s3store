@@ -886,19 +886,27 @@ The `*sql.Rows` cursor can be materialized into typed records with
 `parquet:"…"` tag, NULL-safe, supports `sql.Scanner` and composite
 shapes (LIST/STRUCT/MAP).
 
-> **Tuning DuckDB parallelism.** DuckDB's internal thread pool
-> (defaults to host CPU count) controls parallel scans, joins,
-> and aggregations. Override at construction via `ExtraInitSQL`:
+> **Tuning DuckDB.** DuckDB auto-detects two knobs at open
+> time: `threads` (defaults to the host's logical CPU count) caps
+> parallel scans/joins/aggregations, and `memory_limit` (defaults
+> to ~80% of system RAM) caps in-process working set before
+> DuckDB spills to disk. Override either via `ExtraInitSQL`:
 >
 > ```go
-> ExtraInitSQL: []string{"SET threads = 8"}
+> ExtraInitSQL: []string{
+>     "SET threads = 8",
+>     "SET memory_limit = '4GB'",
+> }
 > ```
 >
-> This is independent of `MaxInflightRequests` — that knob bounds
-> the Go-side aws-sdk client (Writer PUTs, the LIST that resolves
-> URIs for `Query`, s3parquet Reader GETs); DuckDB's httpfs GETs
-> for parquet bodies run on DuckDB's own thread pool, outside our
-> semaphore.
+> Full list of settings:
+> [duckdb.org/docs/stable/configuration/overview](https://duckdb.org/docs/stable/configuration/overview).
+>
+> These are independent of `MaxInflightRequests` — that knob
+> bounds the Go-side aws-sdk client (Writer PUTs, the LIST that
+> resolves URIs for `Query`, s3parquet Reader GETs); DuckDB's
+> httpfs GETs for parquet bodies run on DuckDB's own thread pool,
+> outside our semaphore.
 
 ## Idempotent writes
 
