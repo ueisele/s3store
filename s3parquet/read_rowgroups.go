@@ -54,7 +54,7 @@ func (s *Reader[T]) ReadManyIterWhere(
 		var o core.QueryOpts
 		o.Apply(opts...)
 
-		patterns = dedupePatterns(patterns)
+		patterns = core.DedupePatterns(patterns)
 		if len(patterns) == 0 {
 			return
 		}
@@ -62,9 +62,9 @@ func (s *Reader[T]) ReadManyIterWhere(
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		plans := make([]*readPlan, len(patterns))
+		plans := make([]*core.ReadPlan, len(patterns))
 		for i, p := range patterns {
-			plan, err := buildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
 			if err != nil {
 				yield(*new(T), fmt.Errorf(
 					"s3parquet: ReadManyIterWhere pattern %d %q: %w",

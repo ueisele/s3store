@@ -16,12 +16,11 @@ import (
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// ErrAlreadyExists is the sentinel returned by putIfAbsent and
-// headThenPut when the target key is already present at the
-// destination. Signals the write path that the current attempt is
-// a retry of a previously-persisted logical write; callers scope-
-// LIST the ref stream to decide whether the ref also needs
-// re-emission.
+// ErrAlreadyExists is the sentinel returned by putIfAbsent when
+// the target key is already present at the destination. Signals
+// the write path that the current attempt is a retry of a
+// previously-persisted logical write; callers scope-LIST the ref
+// stream to decide whether the ref also needs re-emission.
 var ErrAlreadyExists = errors.New("s3parquet: object already exists")
 
 // s3CallOpt configures a single S3 target call. Used to thread

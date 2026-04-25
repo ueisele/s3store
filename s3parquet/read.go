@@ -24,23 +24,8 @@ import (
 
 // pollDownloadConcurrency caps the number of parquet files
 // downloaded + decoded in parallel by Read and PollRecords.
-//
-// 8 is a sweet spot across three constraints:
-//
-//   - Network: ~30–100 ms S3 GET latency per object, so 1 → 8
-//     in parallel is a big throughput win. 8 → 32 is diminishing
-//     returns for small/medium parquet files.
-//   - CPU: parquet decode is CPU-bound. On an 8-core host, 8
-//     concurrent decoders roughly saturate cores; more just
-//     causes contention.
-//   - AWS SDK transport: the default HTTP client's
-//     MaxConnsPerHost is around 10, so 8 avoids connection
-//     churn without needing a custom transport.
-//
-// Fixed rather than configurable in v1. If profiling shows
-// this is the bottleneck (e.g. many small files on a large-
-// core host, or a constrained environment that needs a lower
-// cap), promote to a Config knob — ~5 lines, non-breaking.
+// 8 matches the AWS SDK's default MaxConnsPerHost so the cap
+// doesn't outrun the underlying transport's connection pool.
 const pollDownloadConcurrency = 8
 
 // versionedRecord carries a decoded record together with the
@@ -108,14 +93,14 @@ func (s *Reader[T]) ReadMany(
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	patterns = dedupePatterns(patterns)
+	patterns = core.DedupePatterns(patterns)
 	if len(patterns) == 0 {
 		return nil, nil
 	}
 
-	plans := make([]*readPlan, len(patterns))
+	plans := make([]*core.ReadPlan, len(patterns))
 	for i, p := range patterns {
-		plan, err := buildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+		plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: ReadMany pattern %d %q: %w", i, p, err)
@@ -197,7 +182,7 @@ func (s *Reader[T]) ReadManyIter(
 		var o core.QueryOpts
 		o.Apply(opts...)
 
-		patterns = dedupePatterns(patterns)
+		patterns = core.DedupePatterns(patterns)
 		if len(patterns) == 0 {
 			return
 		}
@@ -205,9 +190,9 @@ func (s *Reader[T]) ReadManyIter(
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		plans := make([]*readPlan, len(patterns))
+		plans := make([]*core.ReadPlan, len(patterns))
 		for i, p := range patterns {
-			plan, err := buildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
+			plan, err := core.BuildReadPlan(p, s.dataPath, s.cfg.Target.PartitionKeyParts)
 			if err != nil {
 				yield(*new(T), fmt.Errorf(
 					"s3parquet: ReadManyIter pattern %d %q: %w",
@@ -392,7 +377,7 @@ func (s *Reader[T]) emitPartition(
 // S3 metadata rather than re-parsing the filename. S3 LIST
 // handles pagination; the predicate runs in memory per key.
 func (s *Reader[T]) listMatchingParquet(
-	ctx context.Context, plan *readPlan,
+	ctx context.Context, plan *core.ReadPlan,
 ) ([]core.KeyMeta, error) {
 	paginator := s.cfg.Target.list(plan.ListPrefix)
 	opts := withConsistencyControl(s.cfg.ConsistencyControl)
@@ -409,7 +394,7 @@ func (s *Reader[T]) listMatchingParquet(
 			if !strings.HasSuffix(objKey, ".parquet") {
 				continue
 			}
-			hiveKey, ok := hiveKeyOfDataFile(objKey, s.dataPath)
+			hiveKey, ok := core.HiveKeyOfDataFile(objKey, s.dataPath)
 			if !ok {
 				continue
 			}
@@ -431,7 +416,7 @@ func (s *Reader[T]) listMatchingParquet(
 // cover March data). Fast-path: len(plans) == 1 falls through
 // to the single-plan implementation with no goroutine overhead.
 func (s *Reader[T]) listAllMatchingParquet(
-	ctx context.Context, plans []*readPlan,
+	ctx context.Context, plans []*core.ReadPlan,
 ) ([]core.KeyMeta, error) {
 	return runPlansConcurrent(ctx, plans,
 		s.listMatchingParquet, keyMetaKey)
@@ -478,9 +463,6 @@ func runPlansConcurrent[P any, R any](
 // element is itself the dedup key. Used by the index/backfill
 // callers that haven't been migrated to []core.KeyMeta.
 func identityKey(s string) string { return s }
-
-// dedupePatterns forwards to core.DedupePatterns.
-var dedupePatterns = core.DedupePatterns
 
 // downloadAndDecodeAll fans out a bounded set of parallel
 // downloads, decodes each parquet file into []T, and returns
@@ -631,7 +613,7 @@ func (s *Reader[T]) groupKeysByPartition(
 ) map[string][]core.KeyMeta {
 	out := make(map[string][]core.KeyMeta)
 	for _, k := range keys {
-		hk, ok := hiveKeyOfDataFile(k.Key, s.dataPath)
+		hk, ok := core.HiveKeyOfDataFile(k.Key, s.dataPath)
 		if !ok {
 			// Defensively skip keys that don't parse. List paths
 			// already filtered to .parquet, so reaching here means

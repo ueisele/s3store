@@ -327,14 +327,14 @@ func (i *Index[K]) Lookup(
 func (i *Index[K]) LookupMany(
 	ctx context.Context, patterns []string,
 ) ([]K, error) {
-	patterns = dedupePatterns(patterns)
+	patterns = core.DedupePatterns(patterns)
 	if len(patterns) == 0 {
 		return nil, nil
 	}
 
-	plans := make([]*readPlan, len(patterns))
+	plans := make([]*core.ReadPlan, len(patterns))
 	for j, p := range patterns {
-		plan, err := buildReadPlan(p, i.indexPath, i.columns)
+		plan, err := core.BuildReadPlan(p, i.indexPath, i.columns)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3parquet: index %q LookupMany pattern %d %q: %w",
@@ -383,7 +383,7 @@ func (i *Index[K]) valuesToEntry(values []string) K {
 // a strong level (or on AWS S3, which is strong-LIST by default),
 // Lookup is read-after-write — no settle window needed.
 func (i *Index[K]) listMatchingMarkers(
-	ctx context.Context, plan *readPlan,
+	ctx context.Context, plan *core.ReadPlan,
 ) ([]string, error) {
 	paginator := i.target.list(plan.ListPrefix)
 	opts := withConsistencyControl(i.consistency)
@@ -419,7 +419,7 @@ func (i *Index[K]) listMatchingMarkers(
 // same marker, e.g. "sku=*" and "sku=s1" both cover the s1
 // markers).
 func (i *Index[K]) listAllMatchingMarkers(
-	ctx context.Context, plans []*readPlan,
+	ctx context.Context, plans []*core.ReadPlan,
 ) ([]string, error) {
 	return runPlansConcurrent(ctx, plans,
 		i.listMatchingMarkers, identityKey)
@@ -529,7 +529,7 @@ func BackfillIndexMany[T any, K comparable](
 ) (BackfillStats, error) {
 	var stats BackfillStats
 
-	patterns = dedupePatterns(patterns)
+	patterns = core.DedupePatterns(patterns)
 	if len(patterns) == 0 {
 		return stats, nil
 	}
@@ -551,9 +551,9 @@ func BackfillIndexMany[T any, K comparable](
 	}
 
 	dataPath := core.DataPath(target.Prefix)
-	plans := make([]*readPlan, len(patterns))
+	plans := make([]*core.ReadPlan, len(patterns))
 	for j, p := range patterns {
-		plan, err := buildReadPlan(p, dataPath, target.PartitionKeyParts)
+		plan, err := core.BuildReadPlan(p, dataPath, target.PartitionKeyParts)
 		if err != nil {
 			return stats, fmt.Errorf(
 				"s3parquet: BackfillIndexMany pattern %d %q: %w",
@@ -668,7 +668,7 @@ func BackfillIndexMany[T any, K comparable](
 func listDataFilesBelowUntil(
 	ctx context.Context,
 	target S3Target,
-	plans []*readPlan,
+	plans []*core.ReadPlan,
 	dataPath string,
 	until Offset,
 	consistency ConsistencyLevel,
@@ -687,7 +687,7 @@ func listDataFilesBelowUntil(
 	}
 
 	return runPlansConcurrent(ctx, plans,
-		func(ctx context.Context, plan *readPlan) ([]string, error) {
+		func(ctx context.Context, plan *core.ReadPlan) ([]string, error) {
 			return listDataFilesForPlan(
 				ctx, target, plan, dataPath, filter, cutoff, consistency)
 		}, identityKey)
@@ -699,7 +699,7 @@ func listDataFilesBelowUntil(
 func listDataFilesForPlan(
 	ctx context.Context,
 	target S3Target,
-	plan *readPlan,
+	plan *core.ReadPlan,
 	dataPath string,
 	filter bool,
 	cutoff time.Time,
@@ -720,7 +720,7 @@ func listDataFilesForPlan(
 			if !strings.HasSuffix(objKey, ".parquet") {
 				continue
 			}
-			hiveKey, ok := hiveKeyOfDataFile(objKey, dataPath)
+			hiveKey, ok := core.HiveKeyOfDataFile(objKey, dataPath)
 			if !ok {
 				continue
 			}

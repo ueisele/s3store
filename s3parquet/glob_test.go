@@ -1,6 +1,10 @@
 package s3parquet
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ueisele/s3store/internal/core"
+)
 
 func TestBuildReadPlan_ListPrefix(t *testing.T) {
 	partitionKeyParts := []string{"period", "customer"}
@@ -38,7 +42,7 @@ func TestBuildReadPlan_ListPrefix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan, err := buildReadPlan(tc.pattern, dataPath, partitionKeyParts)
+			plan, err := core.BuildReadPlan(tc.pattern, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -103,7 +107,7 @@ func TestBuildReadPlan_Match(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan, err := buildReadPlan(tc.pattern, dataPath, partitionKeyParts)
+			plan, err := core.BuildReadPlan(tc.pattern, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -125,8 +129,8 @@ func TestBuildReadPlan_RejectsInvalidPattern(t *testing.T) {
 	}
 	for _, p := range cases {
 		t.Run(p, func(t *testing.T) {
-			if _, err := buildReadPlan(p, "pre/data", partitionKeyParts); err == nil {
-				t.Errorf("buildReadPlan(%q): expected error", p)
+			if _, err := core.BuildReadPlan(p, "pre/data", partitionKeyParts); err == nil {
+				t.Errorf("core.BuildReadPlan(%q): expected error", p)
 			}
 		})
 	}
@@ -151,7 +155,7 @@ func TestHiveKeyOfDataFile(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := hiveKeyOfDataFile(tc.s3Key, tc.dp)
+			got, ok := core.HiveKeyOfDataFile(tc.s3Key, tc.dp)
 			if ok != tc.wantOK {
 				t.Errorf("ok = %v, want %v", ok, tc.wantOK)
 			}
