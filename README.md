@@ -881,6 +881,25 @@ configured. Pass `s3store.WithHistory()` to see all versions. Both
 methods return `*sql.Rows`; bind rows with the standard
 `database/sql` contract.
 
+The `*sql.Rows` cursor can be materialized into typed records with
+`s3sql.ScanAll[T](rows)` — maps DuckDB columns to T fields by
+`parquet:"…"` tag, NULL-safe, supports `sql.Scanner` and composite
+shapes (LIST/STRUCT/MAP).
+
+> **Tuning DuckDB parallelism.** DuckDB's internal thread pool
+> (defaults to host CPU count) controls parallel scans, joins,
+> and aggregations. Override at construction via `ExtraInitSQL`:
+>
+> ```go
+> ExtraInitSQL: []string{"SET threads = 8"}
+> ```
+>
+> This is independent of `MaxInflightRequests` — that knob bounds
+> the Go-side aws-sdk client (Writer PUTs, the LIST that resolves
+> URIs for `Query`, s3parquet Reader GETs); DuckDB's httpfs GETs
+> for parquet bodies run on DuckDB's own thread pool, outside our
+> semaphore.
+
 ## Idempotent writes
 
 s3store defaults to at-least-once on the write path: a retry after a
