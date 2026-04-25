@@ -12,10 +12,8 @@ import (
 	"reflect"
 	"slices"
 	"sort"
-	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
@@ -101,7 +99,7 @@ func (s *Reader[T]) ReadMany(
 		plans[i] = plan
 	}
 
-	keys, err := s.listAllMatchingParquet(ctx, plans)
+	keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +193,7 @@ func (s *Reader[T]) ReadManyIter(
 			plans[i] = plan
 		}
 
-		keys, err := s.listAllMatchingParquet(ctx, plans)
+		keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
 		if err != nil {
 			yield(*new(T), err)
 			return
@@ -363,59 +361,6 @@ func (s *Reader[T]) emitPartition(
 	return true
 }
 
-// listMatchingParquet lists every parquet object under the
-// plan's ListPrefix and returns the subset whose Hive key
-// matches the plan's predicate, carrying each object's
-// LastModified so the read path can stamp InsertedAtField from
-// S3 metadata rather than re-parsing the filename. S3 LIST
-// handles pagination; the predicate runs in memory per key.
-func (s *Reader[T]) listMatchingParquet(
-	ctx context.Context, plan *core.ReadPlan,
-) ([]core.KeyMeta, error) {
-	paginator := s.cfg.Target.list(plan.ListPrefix)
-
-	var out []core.KeyMeta
-	for paginator.HasMorePages() {
-		page, err := s.cfg.Target.listPage(
-			ctx, paginator, s.cfg.ConsistencyControl)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"s3parquet: list data files: %w", err)
-		}
-		for _, obj := range page.Contents {
-			objKey := aws.ToString(obj.Key)
-			if !strings.HasSuffix(objKey, ".parquet") {
-				continue
-			}
-			hiveKey, ok := core.HiveKeyOfDataFile(objKey, s.dataPath)
-			if !ok {
-				continue
-			}
-			if plan.Match(hiveKey) {
-				out = append(out, core.KeyMeta{
-					Key:        objKey,
-					InsertedAt: aws.ToTime(obj.LastModified),
-				})
-			}
-		}
-	}
-	return out, nil
-}
-
-// listAllMatchingParquet runs listMatchingParquet across every
-// plan with bounded concurrency and returns the unioned set of
-// KeyMetas, deduplicated on key (overlapping plans can list the
-// same parquet file, e.g. "period=*" and "period=2026-03" both
-// cover March data). Fast-path: len(plans) == 1 falls through
-// to the single-plan implementation with no goroutine overhead.
-func (s *Reader[T]) listAllMatchingParquet(
-	ctx context.Context, plans []*core.ReadPlan,
-) ([]core.KeyMeta, error) {
-	return core.RunPlansConcurrent(ctx, plans,
-		s.cfg.Target.EffectiveMaxInflightRequests(),
-		s.listMatchingParquet, keyMetaKey)
-}
-
 // applyIdempotentRead validates opts.IdempotentReadToken when set
 // and filters keys accordingly. The filter runs at LIST time with
 // no S3 call; cost is O(len(keys)). See core.ApplyIdempotentRead
@@ -435,9 +380,6 @@ func (s *Reader[T]) applyIdempotentRead(
 	return core.ApplyIdempotentRead(
 		keys, s.dataPath, opts.IdempotentReadToken), nil
 }
-
-// keyMetaKey is the keyOf function for KeyMeta fan-outs.
-func keyMetaKey(k core.KeyMeta) string { return k.Key }
 
 // identityKey is the keyOf function for []string fan-outs — the
 // element is itself the dedup key. Used by the index/backfill

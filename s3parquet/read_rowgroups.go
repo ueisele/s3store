@@ -73,7 +73,7 @@ func (s *Reader[T]) ReadManyIterWhere(
 			plans[i] = plan
 		}
 
-		keys, err := s.listAllMatchingParquet(ctx, plans)
+		keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
 		if err != nil {
 			yield(*new(T), err)
 			return

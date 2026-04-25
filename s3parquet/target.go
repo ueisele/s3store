@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -569,6 +570,69 @@ func (t S3Target) listPage(
 		return err
 	})
 	return out, err
+}
+
+// ListDataFiles returns every parquet object under the plan's
+// ListPrefix whose Hive key matches the plan's predicate, each
+// carrying S3 LastModified so downstream filters
+// (WithIdempotentRead, sort fallbacks) can reason about write
+// time without a second round-trip.
+//
+// Single source of truth for partition LIST across s3parquet
+// (Read / ReadIter / PollRecords) and s3sql (Query / QueryMany).
+// Each page-fetch acquires the target's MaxInflightRequests
+// semaphore (via listPage) so all callers compete for the same
+// budget. The Hive-key range is computed from Prefix() — the
+// data-file prefix — so files outside the partition tree are
+// silently skipped.
+func (t S3Target) ListDataFiles(
+	ctx context.Context, plan *core.ReadPlan,
+	consistency ConsistencyLevel,
+) ([]core.KeyMeta, error) {
+	dataPath := core.DataPath(t.cfg.Prefix)
+	paginator := t.list(plan.ListPrefix)
+
+	var out []core.KeyMeta
+	for paginator.HasMorePages() {
+		page, err := t.listPage(ctx, paginator, consistency)
+		if err != nil {
+			return nil, fmt.Errorf("list data files: %w", err)
+		}
+		for _, obj := range page.Contents {
+			objKey := aws.ToString(obj.Key)
+			if !strings.HasSuffix(objKey, ".parquet") {
+				continue
+			}
+			hiveKey, ok := core.HiveKeyOfDataFile(objKey, dataPath)
+			if !ok {
+				continue
+			}
+			if plan.Match(hiveKey) {
+				out = append(out, core.KeyMeta{
+					Key:        objKey,
+					InsertedAt: aws.ToTime(obj.LastModified),
+				})
+			}
+		}
+	}
+	return out, nil
+}
+
+// ListDataFilesMany runs ListDataFiles across every plan with
+// bounded concurrency (capped at MaxInflightRequests) and returns
+// the deduplicated union of KeyMetas. Overlapping plans (e.g.
+// "period=*" and "period=2026-03-*") are deduped on key so
+// downstream GET / scan work is not duplicated.
+func (t S3Target) ListDataFilesMany(
+	ctx context.Context, plans []*core.ReadPlan,
+	consistency ConsistencyLevel,
+) ([]core.KeyMeta, error) {
+	return core.RunPlansConcurrent(ctx, plans,
+		t.EffectiveMaxInflightRequests(),
+		func(ctx context.Context, plan *core.ReadPlan) ([]core.KeyMeta, error) {
+			return t.ListDataFiles(ctx, plan, consistency)
+		},
+		func(k core.KeyMeta) string { return k.Key })
 }
 
 // httpStatusOf extracts the HTTP status code from a smithy-wrapped
