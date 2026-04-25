@@ -48,23 +48,15 @@ func (s *Reader[T]) Read(
 // For a Cartesian "all N × M" shape, use a single pattern with
 // whole-segment "*".
 //
-// Execution model:
-//
-//   - Single-pattern fast path (len(patterns) == 1 after
-//     literal dedup, WithIdempotentRead unset): hands the glob
-//     URI directly to DuckDB so plan-time partition pruning and
-//     glob expansion happen server-side. No Go-side S3 LIST.
-//     "No files found" from DuckDB is translated to an empty
-//     result.
-//   - Multi-pattern path (or any pattern count with
-//     WithIdempotentRead set): per-pattern S3 LIST in Go with a
-//     bounded concurrency cap, deduplicated union of exact file
-//     URIs → one read_parquet([uri1, ..., uriN]) call. DuckDB
-//     plans once over the full set, enabling cross-pattern
-//     aggregations / GROUP BY / joins the single-pattern path
-//     can't give you. The barrier filter (if set) applies to the
-//     KeyMeta list before URI emission so DuckDB never sees
-//     excluded files.
+// Execution model: the file set is resolved by a Go-side S3 LIST
+// (per pattern, bounded-concurrent fan-out, deduplicated union),
+// and the resulting URI list is handed to read_parquet([…]). The
+// LIST carries ConsistencyControl, giving read-after-write on
+// strong-consistent backends — including StorageGRID, which
+// DuckDB's httpfs cannot honour on its own (it has no
+// per-request HTTP header hook for s3:// URLs). The barrier
+// filter (WithIdempotentRead) applies to the KeyMeta list before
+// URI emission.
 //
 // Empty slice → (nil, nil). Zero file matches → (nil, nil).
 // First malformed pattern fails with its index.
@@ -80,25 +72,6 @@ func (s *Reader[T]) ReadMany(
 
 	var o core.QueryOpts
 	o.Apply(opts...)
-
-	// Single-pattern fast path: hand the glob URI to DuckDB so
-	// plan-time partition pruning stays in effect. Skipped when
-	// WithIdempotentRead is set — the per-partition filter needs
-	// each file's LastModified, so the Go-side LIST path is forced
-	// to keep the read-modify-write semantics consistent with the
-	// multi-pattern path.
-	if len(patterns) == 1 && o.IdempotentReadToken == "" {
-		rows, err := s.Query(ctx, patterns[0],
-			"SELECT * FROM "+s.cfg.TableAlias, opts...)
-		if err != nil {
-			if isNoFilesMatchedError(err) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		defer rows.Close()
-		return s.scanAll(rows)
-	}
 
 	uris, err := s.listAllMatchingURIs(ctx, patterns, &o, "ReadMany")
 	if err != nil {
@@ -187,13 +160,10 @@ func (s *Reader[T]) ReadManyIter(
 }
 
 // openIterRows is the row-source factory shared by ReadIter and
-// ReadManyIter. Mirrors ReadMany's branching: single-pattern
-// hands the glob URI to DuckDB so plan-time partition pruning
-// stays in effect; multi-pattern (or any count with
-// WithIdempotentRead set) lists in Go and feeds an explicit URI
-// list to read_parquet so the barrier filter can apply. Returns
-// nil rows on a "no files matched" outcome so the caller treats
-// it as an empty iterator instead of an error.
+// ReadManyIter. Resolves the file set via a Go-side S3 LIST
+// (matching ReadMany), then opens a *sql.Rows over the explicit
+// URI list. Returns nil rows on a "no files matched" outcome so
+// the caller treats it as an empty iterator instead of an error.
 func (s *Reader[T]) openIterRows(
 	ctx context.Context,
 	patterns []string,
@@ -201,19 +171,6 @@ func (s *Reader[T]) openIterRows(
 ) (*sql.Rows, error) {
 	var o core.QueryOpts
 	o.Apply(opts...)
-
-	// Same barrier-forces-LIST rule as ReadMany (see there).
-	if len(patterns) == 1 && o.IdempotentReadToken == "" {
-		r, err := s.Query(ctx, patterns[0],
-			"SELECT * FROM "+s.cfg.TableAlias, opts...)
-		if err != nil {
-			if isNoFilesMatchedError(err) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		return r, nil
-	}
 
 	uris, err := s.listAllMatchingURIs(ctx, patterns, &o, "ReadManyIter")
 	if err != nil {

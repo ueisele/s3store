@@ -77,12 +77,21 @@ type ReaderConfig[T any] struct {
 	InsertedAtField string
 
 	// ConsistencyControl sets the Consistency-Control HTTP header
-	// on the S3 operations this Reader controls — today that's
-	// LIST of the ref stream. Data-file reads go through DuckDB's
-	// opaque HTTP client and are unaffected: on weakly-consistent
-	// backends (StorageGRID read-after-new-write), use the
-	// s3parquet.Reader paths (Read / ReadIter / ReadIterWhere) if
-	// strong-consistent GETs of parquet data are required. See
+	// on the S3 operations this Reader controls — every Go-side
+	// LIST (data-file LIST for Read / Query, ref-stream LIST for
+	// PollRecords). Together with the writer's matching setting,
+	// this gives read-after-write file discovery on
+	// strong-consistent backends like StorageGRID.
+	//
+	// The DuckDB-issued GET that fetches each parquet body cannot
+	// carry the header — DuckDB's httpfs has no per-request hook
+	// for s3:// URLs. In practice this is fine: data files are
+	// write-once and StorageGRID's read-after-new-write covers the
+	// first read of any new key, so an immutable file is always
+	// returned at its committed bytes. Use the s3parquet.Reader
+	// paths only if you need explicit consistency control on the
+	// GET as well (e.g. a custom backend whose default isn't even
+	// read-after-new-write). See
 	// s3parquet.WriterConfig.ConsistencyControl for the full
 	// contract.
 	ConsistencyControl s3parquet.ConsistencyLevel
@@ -241,90 +250,4 @@ func (s *Reader[T]) s3URI(key string) string {
 // string is embedded into SQL.
 func sqlQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-}
-
-// buildParquetURI compiles a user-supplied key pattern into an
-// S3 glob URI passed directly to DuckDB's httpfs / read_parquet.
-// The pattern is validated against the shared grammar; DuckDB
-// handles expansion of the allowed wildcards natively.
-//
-// Range segments (FROM..TO) become a common-prefix glob here;
-// the exact bounds are enforced by a WHERE clause built in
-// buildRangeWhere, applied over the hive partition column.
-func (s *Reader[T]) buildParquetURI(
-	keyPattern string,
-) (string, error) {
-	segs, err := core.ParseKeyPattern(
-		keyPattern, s.cfg.Target.PartitionKeyParts)
-	if err != nil {
-		return "", err
-	}
-	if segs == nil {
-		return s.s3URI(s.dataPath + "/**/*.parquet"), nil
-	}
-
-	globSegs := make([]string, len(segs))
-	for i, seg := range segs {
-		switch seg.Kind {
-		case core.SegWildAll:
-			globSegs[i] = seg.KeyPart + "=*"
-		case core.SegExact:
-			globSegs[i] = seg.KeyPart + "=" + seg.Value
-		case core.SegPrefix:
-			globSegs[i] = seg.KeyPart + "=" + seg.Value + "*"
-		case core.SegRange:
-			cp := core.CommonPrefix(seg.Value, seg.ToValue)
-			if cp == "" {
-				globSegs[i] = seg.KeyPart + "=*"
-			} else {
-				globSegs[i] = seg.KeyPart + "=" + cp + "*"
-			}
-		}
-	}
-	return s.s3URI(
-		s.dataPath + "/" + strings.Join(globSegs, "/") +
-			"/*.parquet"), nil
-}
-
-// buildRangeWhere emits a WHERE-clause body (without the leading
-// "WHERE") enforcing the bounds of every range segment in the
-// pattern against its hive partition column. Returns "" when the
-// pattern has no range segments — the scan is then unfiltered.
-//
-// DuckDB's hive_partitioning=true exposes each PartitionKeyParts
-// entry as a column, and pushes string comparisons on those
-// columns down to file-selection time, so this is effectively
-// partition pruning at the SQL layer.
-func (s *Reader[T]) buildRangeWhere(
-	keyPattern string,
-) (string, error) {
-	segs, err := core.ParseKeyPattern(
-		keyPattern, s.cfg.Target.PartitionKeyParts)
-	if err != nil {
-		return "", err
-	}
-	var preds []string
-	for _, seg := range segs {
-		if seg.Kind != core.SegRange {
-			continue
-		}
-		col := sqlIdentifier(seg.KeyPart)
-		if seg.Value != "" {
-			preds = append(preds,
-				col+" >= "+sqlQuote(seg.Value))
-		}
-		if seg.ToValue != "" {
-			preds = append(preds,
-				col+" < "+sqlQuote(seg.ToValue))
-		}
-	}
-	return strings.Join(preds, " AND "), nil
-}
-
-// sqlIdentifier returns a DuckDB double-quoted identifier with
-// embedded double-quotes doubled. Partition-key names are only
-// validated for '=' and '/', so double-quoting defends against
-// arbitrary characters (including SQL keywords) in the name.
-func sqlIdentifier(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }

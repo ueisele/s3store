@@ -4,39 +4,23 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 )
 
-// noFilesErrFragment is the DuckDB error text for a glob pattern
-// that matches zero files:
+// noFilesErrFragment matches the wording DuckDB uses for a glob
+// that resolves to zero files:
 //
 //	IO Error: No files found that match the pattern "..."
 //
-// Used by the Read / ReadMany / QueryMany / QueryRowMany
-// convenience wrappers to normalize "zero matches" to an empty
-// result instead of an error. The raw Query / QueryRow pair
-// propagates the DuckDB error unchanged for callers that opt
-// into database/sql semantics directly.
+// Query / QueryRow synthesize errors carrying this fragment when
+// the Go-side LIST returns zero matches, so callers that branch
+// on the message fragment keep working regardless of whether the
+// LIST was performed by DuckDB (legacy fast path) or by us
+// (current behaviour).
 const noFilesErrFragment = "No files found that match the pattern"
 
-// isNoFilesMatchedError reports whether err is DuckDB's error
-// for a glob pattern that matched zero files. Matched by text
-// fragment (duckdb-go wraps the native error without a stable
-// sentinel); the fragment is specific enough that a false
-// positive on another error is effectively impossible.
-func isNoFilesMatchedError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), noFilesErrFragment)
-}
-
-// noFilesMatchedErr synthesizes an error whose text embeds
-// noFilesErrFragment so isNoFilesMatchedError keeps matching on
-// paths that bypass DuckDB's glob (e.g. Query with
-// WithIdempotentRead — the barrier filter ran in Go and
-// excluded every match). Same fragment, so existing callers that
-// branch on isNoFilesMatchedError keep working.
+// noFilesMatchedErr synthesizes an error carrying noFilesErrFragment
+// for the zero-match path, so callers that already pattern-match
+// the DuckDB-style "No files found" string keep working.
 func noFilesMatchedErr(pattern string) error {
 	return fmt.Errorf(
 		"IO Error: %s %q", noFilesErrFragment, pattern)

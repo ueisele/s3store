@@ -1596,13 +1596,18 @@ delay:
 | `s3parquet.Reader.Read` / `ReadIter` / `ReadIterWhere` (+ `*Many` variants) | `s3parquet` |
 | `s3parquet.Index.Lookup` / `LookupMany` | `s3parquet` |
 | `s3parquet.BackfillIndex` / `BackfillIndexMany` | `s3parquet` |
-| `s3sql.Reader.Read` / `ReadMany` | `s3sql` ¹ |
-| `s3sql.Reader.Query` / `QueryRow` / `QueryMany` / `QueryRowMany` | `s3sql` ¹ |
-| Umbrella `Store.Read` / `Query` / `QueryRow` | forwards to `s3sql` ¹ |
+| `s3sql.Reader.Read` / `ReadMany` (+ `Iter` variants) | `s3sql` |
+| `s3sql.Reader.Query` / `QueryRow` / `QueryMany` / `QueryRowMany` | `s3sql` |
+| Umbrella `Store.Read` / `Query` / `QueryRow` | forwards to `s3sql` |
 
-¹ On the `s3sql` / umbrella side the **LIST** is read-after-write,
-but the **GET** of the parquet body goes through DuckDB's `httpfs`
-extension — see the [DuckDB caveat](#duckdb-httpfs-has-no-per-request-header-hook) below.
+On the `s3sql` / umbrella read paths, the file discovery LIST is
+done in Go (carries the header); the parquet-body GET runs through
+DuckDB's `httpfs` and **does not** carry the header. That's fine
+because data files are write-once-immutable, and StorageGRID's
+default `read-after-new-write` covers first-read-of-new-key —
+DuckDB's GET sees the committed bytes regardless. See the
+[DuckDB note](#duckdb-httpfs-has-no-per-request-header-hook) for
+the full reasoning.
 
 `Poll` / `PollRecords` / `PollRecordsAll` are the intentional
 exceptions: they apply the `SettleWindow` cutoff so near-tip refs
@@ -1630,32 +1635,37 @@ subsequent poll issued after one `SettleWindow` has elapsed.
 
 #### DuckDB httpfs has no per-request header hook
 
-One caveat on the `s3sql` / umbrella read path: DuckDB reads
-parquet files through its `httpfs` extension, which supports
-`s3_endpoint` / `s3_region` / `s3_use_ssl` / `s3_url_style`
-settings but exposes **no mechanism to attach an arbitrary HTTP
-header per request**. The Go-side LIST that discovers files
-carries `Consistency-Control`, so StorageGRID returns the correct
-set of file URIs — but the subsequent DuckDB-issued GETs do not.
+DuckDB reads parquet files through its `httpfs` extension, which
+supports `s3_endpoint` / `s3_region` / `s3_use_ssl` /
+`s3_url_style` settings but exposes **no mechanism to attach an
+arbitrary HTTP header per request** for `s3://` URLs (`CREATE
+SECRET TYPE HTTP`'s `EXTRA_HTTP_HEADERS` works for `https://`
+URLs only). Verified against DuckDB 1.5.2, the current latest.
 
-On AWS S3 / MinIO this is a non-issue (their GET is strong
-regardless of the header). On StorageGRID with the bucket default
-at `read-after-new-write`, an `s3sql.Reader.Read` issued inside a
-few hundred milliseconds of a `Write` may fetch a stale body for
-a file whose key **is** visible in the LIST.
+This means we can't ask DuckDB to send `Consistency-Control` on
+the parquet-body GET. Two reasons it doesn't matter:
 
-Workarounds on StorageGRID:
+- **The LIST does carry it.** Every `s3sql` read path resolves
+  the file URI list via a Go-side S3 LIST first, then hands the
+  explicit list to `read_parquet([…])`. DuckDB never expands
+  globs through `httpfs` on the read paths, so its lack of header
+  control over LIST is moot. (Earlier versions had a single-pattern
+  fast path that did expose this gap; it was removed.)
+- **The GET is safe on write-once data.** Data files have
+  deterministic immutable paths under `WithIdempotencyToken` and
+  unique `{tsMicros}-{shortID}` paths otherwise — they never get
+  overwritten. StorageGRID's default `read-after-new-write` is
+  exactly the guarantee that the first GET of a new key returns
+  the committed bytes, so any DuckDB GET of a key our LIST
+  surfaced sees the right contents without needing a stronger
+  consistency level on the GET itself.
 
-- **Raise the bucket's default consistency** to `strong-global`
-  / `strong-site` globally on the StorageGRID side. DuckDB's GETs
-  then inherit the strong level.
-- **Route strong-read paths through `s3parquet` directly.**
-  `s3parquet.Reader.Read` + `Index.Lookup` + `BackfillIndex` all
-  carry the header on both LIST and GET, so they stay
-  read-after-write regardless of the bucket default.
-- **Accept the lag on `s3sql`.** If stale reads within a few
-  hundred ms of write are tolerable (analytics dashboards,
-  backfilled warehousing), nothing else is required.
+The corollary: on a backend whose default is *weaker* than
+`read-after-new-write` (very rare in practice — neither AWS nor
+MinIO nor StorageGRID falls into this category), the `s3sql`
+GETs would be exposed. The mitigation is to raise the bucket's
+default consistency on the storage side. The library can't help
+from above DuckDB.
 
 ### Write
 
@@ -2012,12 +2022,14 @@ rush it.
   `s3sql`'s DuckDB path, which treats its input URI list as
   authoritative — a dangling ref fails the whole call. Use
   `s3parquet` directly if you need the tolerant read path.
-- **`s3sql` GET on StorageGRID can't be forced to strong**
-  (DuckDB `httpfs` has no per-request HTTP header setting, so
-  `ConsistencyControl` can't be attached to the parquet-body GET).
-  Raise the bucket-default consistency on the StorageGRID side or
-  route strong-read paths through `s3parquet` directly. AWS S3 /
-  MinIO are unaffected. See [Read-after-write](#read-after-write).
+- **`s3sql` parquet-body GET can't carry `ConsistencyControl`**
+  (DuckDB `httpfs` has no per-request HTTP header setting on
+  `s3://` URLs). Not a problem on AWS / MinIO / StorageGRID:
+  data files are write-once and the GET is the first read of a
+  new key, which `read-after-new-write` already covers. Only
+  matters on a backend whose default is weaker than
+  read-after-new-write — raise the bucket default in that case.
+  See [Read-after-write](#read-after-write).
 - **Schema evolution is limited to tolerant reads.** Both packages handle
   "column added to T that isn't in an old file" by returning the Go zero
   value. Renames, splits, type changes, and row-level computed

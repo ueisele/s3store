@@ -8,53 +8,16 @@ import (
 	"strings"
 )
 
-// scanExprForPattern returns the base read_parquet scan for a
-// Hive-glob pattern. Shared by Query, QueryRow, Read.
-//
-// Range segments (FROM..TO) in the pattern become a common-prefix
-// S3 glob plus a WHERE clause on the corresponding hive partition
-// column, so DuckDB can prune at file-selection time.
-//
-// The URI is SQL-quoted via sqlQuote so partition values that
-// contain an apostrophe don't break the query at plan time.
+// scanExprForURIs builds the read_parquet scan over a pre-resolved,
+// deduplicated list of exact file URIs (from listAllMatchingURIs).
+// All read paths funnel through here — the Go-side LIST owns
+// pattern expansion and range-bound enforcement, so DuckDB sees
+// only an explicit URI list without partition-pruning hints.
 //
 // withFilename adds filename=true to read_parquet so the source
 // object key is exposed as a `filename` column — used by the
 // dedup CTE as a tie-breaker on equal VersionColumn values.
 // Callers typically compute the flag via needsFilename().
-func (s *Reader[T]) scanExprForPattern(
-	key string, withFilename bool,
-) (string, error) {
-	parquetURI, err := s.buildParquetURI(key)
-	if err != nil {
-		return "", err
-	}
-	where, err := s.buildRangeWhere(key)
-	if err != nil {
-		return "", err
-	}
-	scan := fmt.Sprintf(
-		"SELECT * FROM read_parquet(%s, "+
-			"hive_partitioning=true, hive_types_autocast=false, "+
-			"union_by_name=true%s)",
-		sqlQuote(parquetURI), filenameOpt(withFilename))
-	if where != "" {
-		scan += " WHERE " + where
-	}
-	return scan, nil
-}
-
-// scanExprForURIs is the multi-pattern sibling of
-// scanExprForPattern: given a pre-computed, deduplicated list of
-// exact file URIs (from listAllMatchingURIs), it emits the same
-// read_parquet(...) shape but with the URI list in place of a
-// glob and no range-WHERE clause (row-level filtering already
-// happened in Go via plan.Match).
-//
-// Used by the multi-pattern path of ReadMany / QueryMany /
-// QueryRowMany. The single-pattern path still goes through
-// scanExprForPattern so DuckDB keeps its plan-time partition
-// pruning and the glob-expansion round-trip.
 func (s *Reader[T]) scanExprForURIs(
 	uris []string, withFilename bool,
 ) string {
@@ -72,8 +35,8 @@ func (s *Reader[T]) scanExprForURIs(
 
 // filenameOpt returns the trailing ", filename=true" fragment if
 // withFilename is set; empty string otherwise. Pulled out so the
-// two read_parquet builders (scanExprForPattern, PollRecords)
-// share the exact option spelling.
+// two read_parquet builders (scanExprForURIs, PollRecords) share
+// the exact option spelling.
 func filenameOpt(withFilename bool) string {
 	if withFilename {
 		return ", filename=true"
