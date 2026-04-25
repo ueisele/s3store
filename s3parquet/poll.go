@@ -14,20 +14,6 @@ import (
 // s3ListMaxKeys is the per-request page-size cap enforced by S3.
 const s3ListMaxKeys int32 = 1000
 
-// pollIterBatch returns the inner batch size used by
-// PollRecordsIter: 2 * EffectiveMaxInflightRequests, capped at
-// the S3 LIST page size. The 2× headroom lets the pipeline
-// producer stage the next batch while the consumer drains the
-// previous one without ballooning the in-memory record count;
-// the cap on s3ListMaxKeys stays inside the LIST page-size limit.
-//
-// At MaxInflightRequests=32 (default) this is 64 — far below the
-// previous static 1000, which materialized up to 1000 decoded
-// files at once.
-func pollIterBatch(t S3Target) int32 {
-	return min(int32(2*t.EffectiveMaxInflightRequests()), s3ListMaxKeys)
-}
-
 // Poll returns up to maxEntries stream entries (refs only) after
 // the given offset, up to now - SettleWindow. Issues one or more
 // S3 LIST calls (page size capped at 1000) and no GETs.
@@ -160,31 +146,39 @@ func (s *Reader[T]) PollRecords(
 }
 
 // PollRecordsIter streams every record in [since, until) as an
-// iter.Seq2[T, error]. A background producer goroutine drives
-// PollRecords with batch size = 2 × MaxInflightRequests (capped
-// at the LIST page size) and pushes results onto a buffered
-// channel; the consumer pulls one batch at a time and iterates
-// records out. Steady state pipelines: producer fetches batch
-// N+1 while consumer drains batch N, hiding the LIST + download
-// latency.
+// iter.Seq2[T, error] via the same streamEager pipeline that
+// backs ReadIter. The ref stream is walked upfront (LIST only,
+// no body fetches) into a flat []KeyMeta, then handed to
+// streamEager which downloads + decodes + yields with byte-budget
+// streaming, cross-file pipelining, and per-partition dedup.
 //
-// Memory peak: 2 batches' worth of decoded records (one staged
-// in the channel, one being iterated). With the default
-// MaxInflightRequests=32 that's ~128 files' worth of records,
-// orders of magnitude below the older 1000-files-per-batch
-// shape that risked OOM on wide windows.
+// Memory: streamEager bounds in-flight body memory via
+// WithReadAheadBytes (now meaningful here, was a no-op on the
+// older slice-batch shape). KeyMeta slice is small (~100 bytes
+// per ref), so even windows of 100k+ refs stay well under MB
+// of metadata before streaming begins.
 //
-// A consumer that breaks out of the range loop cancels the
-// producer's context via defer; the in-flight LIST/download
-// bails on ctx, the producer exits, the channel closes.
+// Latency note: walking refs upfront means LIST completes before
+// the first record yields. For typical windows (last hour, last
+// day) this is sub-100ms. For huge backfill windows it can be
+// seconds — chunk via since/until to stream incrementally.
+//
+// Consumer break cancels ctx via defer in streamEager, stopping
+// in-flight downloads cleanly.
 //
 // Pass Offset("") for since to start at the stream head;
 // pass Offset("") for until to read to the settle-window
 // cutoff (= live tip). Combine with OffsetAt for time windows.
 //
-// Dedup semantics match PollRecords: per-batch. If you need
-// window-global latest-per-entity, pass WithHistory and dedup
-// client-side.
+// Dedup semantics match ReadIter: per-partition (refs are
+// grouped into partitions by Hive key inside streamEager). If
+// you need window-global latest-per-entity, pass WithHistory and
+// dedup client-side.
+//
+// Resumption: PollRecordsIter does NOT expose the per-batch
+// offset, so consumer aborts (ctx cancel, range break) cannot be
+// safely resumed. Use PollRecords (Kafka-style batched API) when
+// you need to checkpoint offsets between batches.
 //
 // Errors are yielded as (zero-value, err); the loop must check
 // err before using the record. The iter terminates after an
@@ -198,51 +192,49 @@ func (s *Reader[T]) PollRecordsIter(
 	// caller snuck in via opts — the `until` parameter is the
 	// method's contract.
 	opts = append(opts, WithUntilOffset(until))
-	batch := pollIterBatch(s.cfg.Target)
 
 	return func(yield func(T, error) bool) {
-		// Cancel propagates to producer when consumer breaks.
-		pollCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
+		var o core.QueryOpts
+		o.Apply(opts...)
 
-		type batchResult struct {
-			recs []T
-			next Offset
-			err  error
-		}
-		// Buffer=1: producer can stage one batch ahead. Larger
-		// would multiply memory; 0 would serialize (no pipeline).
-		ch := make(chan batchResult, 1)
-
-		go func() {
-			defer close(ch)
-			cur := since
-			for {
-				recs, next, err := s.PollRecords(
-					pollCtx, cur, batch, opts...)
-				select {
-				case ch <- batchResult{recs: recs, next: next, err: err}:
-				case <-pollCtx.Done():
-					return
-				}
-				if err != nil || len(recs) == 0 {
-					return
-				}
-				cur = next
-			}
-		}()
-
-		for b := range ch {
-			if b.err != nil {
-				yield(*new(T), b.err)
+		// Walk the ref stream into a flat KeyMeta slice. LIST-only
+		// (no parquet bodies fetched), so this phase is cheap. Use
+		// the LIST page max as the per-Poll cap to minimize round
+		// trips — the slice growth here is bounded metadata, not
+		// decoded record memory.
+		var keys []core.KeyMeta
+		cur := since
+		for {
+			entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, opts...)
+			if err != nil {
+				yield(*new(T), err)
 				return
 			}
-			for _, r := range b.recs {
-				if !yield(r, nil) {
-					return
-				}
+			if len(entries) == 0 {
+				break
 			}
+			for _, e := range entries {
+				keys = append(keys, core.KeyMeta{
+					Key:        e.DataPath,
+					InsertedAt: e.InsertedAt,
+				})
+			}
+			cur = next
 		}
+		if len(keys) == 0 {
+			return
+		}
+
+		keys, err := core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
+		if err != nil {
+			yield(*new(T), fmt.Errorf("s3parquet: %w", err))
+			return
+		}
+		if len(keys) == 0 {
+			return
+		}
+
+		s.streamEager(ctx, keys, &o, yield)
 	}
 }
 

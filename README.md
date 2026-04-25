@@ -548,9 +548,10 @@ activity"), use `OffsetAt` to turn a wall-clock time into a stream offset.
 The range is half-open `[since, until)`, matching Kafka offset semantics.
 
 `PollRecordsIter` is the entry point for bounded windows. It returns
-an `iter.Seq2[T, error]` that lazily fetches the next batch only when
-the consumer drains the previous one — memory scales with one batch
-(~1000 refs' worth of records), not the full window:
+an `iter.Seq2[T, error]` backed by the same `streamEager` pipeline
+that powers `ReadIter` — byte-budget streaming
+(`WithReadAheadBytes`), cross-file pipelining, per-partition dedup.
+Memory is bounded by the byte budget, not by window size:
 
 ```go
 // All records written on 2026-04-17 (UTC).
@@ -562,9 +563,13 @@ for r, err := range store.PollRecordsIter(ctx, start, end) {
 }
 ```
 
-Breaking out of the range loop cleanly stops further polling (no extra
-LIST). If you genuinely want a slice of everything in the window,
-`slices.Collect2` it; the iter form is the primitive.
+Breaking out of the range loop cleanly cancels in-flight downloads
+inside `streamEager`. The ref LIST walk runs upfront before the first
+record yields — sub-100ms for typical windows, but for huge backfill
+windows chunk via `since`/`until` to stream incrementally instead of
+walking everything first. If you need to checkpoint offsets between
+batches (resume on cancel), use `PollRecords` (Kafka-style batched
+API) — `PollRecordsIter` does not surface per-batch offsets.
 
 Half-open boundary semantics:
 

@@ -1832,13 +1832,14 @@ func TestPollRecordsIter(t *testing.T) {
 	}
 }
 
-// TestPollRecordsIter_LazyAndBreak proves the lazy-paging
+// TestPollRecordsIter_EarlyBreak proves the streamEager break
 // contract: breaking out of the range loop after the first
-// record stops further polling. Verified by counting that the
-// number of records yielded is strictly less than what was
-// written when we break early — a non-lazy implementation would
-// have already buffered everything.
-func TestPollRecordsIter_LazyAndBreak(t *testing.T) {
+// record stops further yielding (and cancels in-flight downloads
+// inside streamEager via its defer cancel). Note: the LIST walk
+// runs upfront before any record yields, so this test does not
+// claim "no further LIST" — it claims "no further records
+// yielded after break".
+func TestPollRecordsIter_EarlyBreak(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 

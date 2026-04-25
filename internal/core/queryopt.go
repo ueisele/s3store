@@ -102,9 +102,10 @@ func WithReadAheadPartitions(n int) QueryOption {
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
-// bytes that may sit decoded in the ReadIter / ReadManyIter
-// pipeline ahead of the current yield position. Zero (default)
-// disables the cap; only WithReadAheadPartitions binds.
+// bytes that may sit decoded in the ReadIter / ReadManyIter /
+// PollRecordsIter pipeline ahead of the current yield position.
+// Zero (default) disables the cap; only WithReadAheadPartitions
+// binds.
 //
 // Composes with WithReadAheadPartitions — both are evaluated and
 // whichever cap binds first holds the producer back. Useful when
