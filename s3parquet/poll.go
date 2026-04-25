@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
-	"github.com/ueisele/s3store/internal/refstream"
 )
 
 // Poll returns up to maxEntries stream entries (refs only) after
@@ -23,10 +22,6 @@ import (
 // StorageGRID strong-global / strong-site the LIST linearizes with
 // the writer's ref PUT (no silent miss when a newly-written ref
 // propagates slower than SettleWindow).
-//
-// The paginator + cutoff logic lives in internal/refstream — it's
-// byte-identical with s3sql.Poll and shares this one
-// implementation.
 func (s *Reader[T]) Poll(
 	ctx context.Context,
 	since Offset,
@@ -40,8 +35,8 @@ func (s *Reader[T]) Poll(
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	entries, offset, err := refstream.Poll(ctx, s.cfg.Target.S3Client(),
-		refstream.PollOpts{
+	entries, offset, err := pollRefs(ctx, s.cfg.Target.S3Client(),
+		refPollOpts{
 			Bucket:             s.cfg.Target.Bucket(),
 			RefPath:            s.refPath,
 			DataPath:           s.dataPath,
@@ -135,7 +130,7 @@ func (s *Reader[T]) PollRecordsAll(
 	// caller snuck in via opts — the `until` parameter is the
 	// method's contract.
 	opts = append(opts, WithUntilOffset(until))
-	return refstream.PollAll(ctx, since,
+	return pollRefsAll(ctx, since,
 		func(ctx context.Context, since Offset, max int32,
 		) ([]T, Offset, error) {
 			return s.PollRecords(ctx, since, max, opts...)
@@ -153,5 +148,5 @@ func (s *Reader[T]) PollRecordsAll(
 //	end   := store.OffsetAt(time.Date(y, m, d+1, 0,0,0,0, loc))
 //	records, _ := store.PollRecordsAll(ctx, start, end)
 func (s *Reader[T]) OffsetAt(t time.Time) Offset {
-	return refstream.OffsetAt(s.refPath, t)
+	return offsetAt(s.refPath, t)
 }

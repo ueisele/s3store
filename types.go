@@ -31,10 +31,10 @@ const (
 // s3store/s3parquet or s3store/s3sql directly.
 //
 // T must be a struct whose exported fields carry parquet struct
-// tags (e.g. `parquet:"customer"`). s3store uses those tags to
-// drive both the parquet writer (via s3parquet) and the SQL
-// reader's reflection-based row binder (via s3sql) — one schema
-// declaration covers both sides.
+// tags (e.g. `parquet:"customer"`). The parquet writer + reader
+// use those tags directly; the SQL reader uses the column names
+// referenced by VersionColumn / EntityKeyColumns to drive the
+// dedup CTE.
 type Config[T any] struct {
 	// S3 bucket name.
 	Bucket string
@@ -54,6 +54,20 @@ type Config[T any] struct {
 	// record. Required for Write(); used to group records.
 	PartitionKeyOf func(T) string
 
+	// EntityKeyOf identifies the unique entity for a record on
+	// the parquet read path (Read / PollRecords / ReadIter):
+	// records with the same EntityKeyOf value collapse to the
+	// latest version per VersionOf within a partition. Leave nil
+	// to disable dedup. Mirrors s3parquet's EntityKeyOf.
+	EntityKeyOf func(T) string
+
+	// VersionOf returns the comparable version stamp for a record
+	// on the parquet read path. When EntityKeyOf is set but
+	// VersionOf is nil, NewReader applies DefaultVersionOf
+	// (insertedAt.UnixMicro), which gives wrote-last-wins. Ignored
+	// when EntityKeyOf is nil.
+	VersionOf func(T, time.Time) int64
+
 	// VersionColumn is the column name that orders versions of
 	// the same entity on the SQL read path: the record with the
 	// greatest VersionColumn value per entity wins. Required
@@ -62,8 +76,9 @@ type Config[T any] struct {
 
 	// EntityKeyColumns are the SQL-side columns that identify a
 	// unique entity for latest-per-entity dedup. Leave empty
-	// to disable dedup entirely. Mirrors s3parquet's
-	// EntityKeyOf — explicit opt-in, no default.
+	// to disable dedup entirely. Mirrors EntityKeyOf on the
+	// parquet read path; both must be set together for callers
+	// who exercise both read paths.
 	EntityKeyColumns []string
 
 	// TableAlias is the name used in SQL queries for the
@@ -81,27 +96,23 @@ type Config[T any] struct {
 
 	// Compression selects the parquet compression codec used on
 	// Write. Zero value defaults to snappy — the ecosystem
-	// default. Forwarded to the s3parquet sub-store. See
-	// s3parquet.CompressionCodec for the accepted values.
+	// default. See s3parquet.CompressionCodec for the accepted
+	// values.
 	Compression s3parquet.CompressionCodec
 
 	// InsertedAtField names a time.Time field on T that the
 	// writer populates with its wall-clock time.Now() at write
 	// time; Read and PollRecords surface the same value back.
 	// The field must carry a non-empty, non-"-" parquet tag (e.g.
-	// `parquet:"inserted_at"`) — the value is a real parquet
-	// column, not library-managed metadata. Forwarded to both
-	// sub-stores so the umbrella's read paths return the
-	// identical value across s3parquet and s3sql.
+	// `parquet:"inserted_at"`).
 	InsertedAtField string
 
 	// DisableRefStream opts the dataset out of writing stream ref
 	// files under <Prefix>/_stream/refs/. Saves one S3 PUT per
 	// distinct partition key touched by a Write. Read / Query /
-	// QueryRow / ReadMany / QueryMany / QueryRowMany are
-	// unaffected; Poll / PollRecords / PollRecordsAll return
-	// ErrRefStreamDisabled. OffsetAt still works (pure timestamp
-	// encoding). Forwarded to both sub-stores.
+	// ReadMany / QueryMany are unaffected; Poll / PollRecords /
+	// PollRecordsAll return ErrRefStreamDisabled. OffsetAt still
+	// works (pure timestamp encoding).
 	DisableRefStream bool
 
 	// MaxInflightRequests caps S3 requests in flight per library
@@ -120,15 +131,15 @@ type Config[T any] struct {
 	// on correctness-critical S3 operations. Empty value sends no
 	// header (AWS S3 / MinIO default). On NetApp StorageGRID, set
 	// to one of the stronger levels for Phase 3's idempotency
-	// guarantees. Forwarded to both s3parquet.WriterConfig and
-	// s3parquet.ReaderConfig so the two halves cannot drift.
+	// guarantees. Forwarded to all three sub-handles so they
+	// cannot drift.
 	ConsistencyControl s3parquet.ConsistencyLevel
 }
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /
 // PollRecordsAll when Config.DisableRefStream is set. Aliased
 // to the shared sentinel so errors.Is matches regardless of
-// which sub-store produced the error.
+// which sub-handle produced the error.
 var ErrRefStreamDisabled = s3parquet.ErrRefStreamDisabled
 
 // Re-export core types so callers of the umbrella never need
@@ -165,7 +176,8 @@ func WithIdempotencyToken(
 type QueryOption = core.QueryOption
 
 // WithHistory disables latest-per-key deduplication on any
-// read path. When VersionColumn is empty, dedup is a no-op
+// read path. When neither EntityKeyOf (parquet path) nor
+// EntityKeyColumns (SQL path) is configured, dedup is a no-op
 // regardless of this option.
 func WithHistory() QueryOption {
 	return core.WithHistory()
@@ -179,11 +191,8 @@ func WithUntilOffset(until Offset) QueryOption {
 }
 
 // WithReadAheadPartitions tells partition-streaming readers
-// (currently s3parquet.Reader.ReadIter / ReadManyIter) to
-// prefetch n partitions ahead of the yield position. Default
-// is 0 (strict-serial). Accepted on the umbrella for API
-// symmetry; the umbrella's ReadIter forwards to s3sql which
-// ignores the option.
+// (ReadIter / ReadManyIter) to prefetch n partitions ahead of
+// the yield position. Default is 0 (strict-serial).
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }

@@ -1,37 +1,34 @@
-// Package s3sql provides SQL-based read access to an s3store
+// Package s3sql provides SQL query access to an s3store dataset
 // using embedded DuckDB as the query engine. Requires cgo.
 //
-// The package is read-only. Writes go through
-// github.com/ueisele/s3store/s3parquet.Writer; s3sql.Reader
-// queries the parquet files the Writer produced. Construct via
-// NewReader, passing the same s3parquet.S3Target value the
-// Writer was built with so the two halves can't drift on
-// Bucket / Prefix / SettleWindow / DisableRefStream.
+// The package is read-only and intentionally narrow: it exposes
+// just Query and QueryMany, both returning *sql.Rows. Typed-row
+// iteration, change-stream tailing, and pure-Go reads live on
+// github.com/ueisele/s3store/s3parquet so this package stays a
+// thin SQL surface over the parquet files the Writer produced.
 //
-// The target record type T drives both the SQL result shape and
-// the per-row binding: s3sql reflects over T's parquet struct
-// tags at NewReader() time and builds a NULL-safe row binder
-// that populates T directly from the result set. Columns absent
-// from the parquet file land as the field's Go zero value; user
-// types implementing sql.Scanner are supported (e.g.
-// shopspring/decimal.Decimal).
+// Construct via NewReader, passing the same s3parquet.S3Target
+// the Writer was built with so the two halves can't drift on
+// Bucket / Prefix / SettleWindow / DisableRefStream. The dedup
+// CTE references VersionColumn + EntityKeyColumns by name; the
+// generic parameter T is only inspected to guard against a
+// `parquet:"filename"` field that would collide with DuckDB's
+// read_parquet(filename=true) helper.
 //
 // Capability sketch:
 //
-//   - Read: typed records matching a key pattern, deduplicated
-//     to latest-per-entity by VersionColumn.
-//   - Query, QueryRow: arbitrary SQL over the parquet files
-//     scoped by a key pattern. Use for aggregations, complex
-//     filtering, or joins across multiple stores.
-//   - Poll, PollRecords: stream refs or typed records after an
-//     offset; PollRecords goes through DuckDB so dedup is
-//     consistent with Read.
+//   - Query: arbitrary SQL over the parquet files scoped by a
+//     key pattern. Use for aggregations, complex filtering, or
+//     joins across multiple stores.
+//   - QueryMany: single SQL query over the deduplicated union
+//     of files matching every pattern. Aggregations and ORDER
+//     BY apply across the full set.
 //
-// For cgo-free access to the same store (no SQL, limited glob,
-// in-memory dedup), use github.com/ueisele/s3store/s3parquet.
+// For typed reads, change-stream polling, and a cgo-free option,
+// use github.com/ueisele/s3store/s3parquet.
 //
 // S3 endpoint, region, and URL style are auto-derived from the
 // S3Client.Options() — DuckDB's httpfs extension is configured
-// once at New() time. Override via ExtraInitSQL if needed
+// once at NewReader() time. Override via ExtraInitSQL if needed
 // (e.g. CREATE SECRET for credential rotation).
 package s3sql

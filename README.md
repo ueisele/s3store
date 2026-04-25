@@ -22,9 +22,9 @@ needs:
 
 | Package | cgo | Import path | Capabilities |
 |---|---|---|---|
-| `s3parquet` | **no** | `github.com/ueisele/s3store/s3parquet` | Write, WriteWithKey, Read, Poll, PollRecords. Pure Go / parquet-go; in-memory dedup. |
-| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | **Read-only.** Read, Query, QueryRow, Poll, PollRecords via embedded DuckDB. Construct with `NewReader(ReaderConfig)`; share the same `s3parquet.S3Target` with the Writer so the two halves can't drift. |
-| `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Composes `s3parquet.Writer` + `s3sql.Reader`; both halves share one `S3Target` so they can't drift on S3 wiring. |
+| `s3parquet` | **no** | `github.com/ueisele/s3store/s3parquet` | Writer + Reader: Write, WriteWithKey, Read, ReadIter, Poll, PollRecords, OffsetAt, secondary indexes. Pure Go / parquet-go; in-memory per-partition dedup. |
+| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | **SQL-only, read-only.** Query and QueryMany return `*sql.Rows`; the caller binds rows themselves. Construct with `NewReader(ReaderConfig)`; share the same `s3parquet.S3Target` with the Writer so the two halves can't drift. |
+| `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Composes `s3parquet.Writer` + `s3parquet.Reader` + `s3sql.Reader`; all three share one `S3Target` so they can't drift on S3 wiring. |
 
 Binary size: DuckDB bundles a ~50 MB C++ library. `CGO_ENABLED=0 go build
 ./s3parquet/...` produces a small static binary with none of it. The
@@ -115,11 +115,12 @@ store, err := s3parquet.New[CostRecord](ctx, s3parquet.Config[CostRecord]{
 latest, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
 ```
 
-Both packages drive typed results off the parquet struct tags on `T` —
-`s3parquet` via parquet-go's `GenericReader[T]`, `s3sql` via a NULL-safe
-reflection binder built at `New()`. No `ScanFunc` or manual column-order
-bookkeeping on either side. A field whose column is missing from a given
-file lands as Go's zero value.
+`s3parquet` drives typed results off the parquet struct tags on `T`
+via parquet-go's `GenericReader[T]` — no `ScanFunc` or manual
+column-order bookkeeping. A field whose column is missing from a given
+file lands as Go's zero value. `s3sql.Query` returns `*sql.Rows`
+unchanged; the caller binds rows with the standard `database/sql`
+contract.
 
 ## Writer / Reader / View (`s3parquet`)
 
@@ -486,14 +487,16 @@ records, newOffset, err = store.PollRecords(ctx, lastOffset, 100,
     s3store.WithHistory())
 ```
 
-Whether dedup actually runs depends on which package you use:
+Whether dedup actually runs depends on which read path you use:
 
-- **Umbrella / `s3sql.PollRecords`** — dedup when `VersionColumn` is set
-  (DuckDB `QUALIFY ROW_NUMBER()`). When `VersionColumn` is empty, every
-  record passes through.
-- **`s3parquet.PollRecords`** — dedup when `EntityKeyOf` is set. If
-  `VersionOf` is nil, it defaults to `DefaultVersionOf` (the file's
-  write time). When `EntityKeyOf` is nil, every record passes through.
+- **`s3parquet.PollRecords` / `Read` / `ReadIter` (and the umbrella
+  delegations)** — dedup when `EntityKeyOf` is set. If `VersionOf` is
+  nil, it defaults to `DefaultVersionOf` (the file's write time). When
+  `EntityKeyOf` is nil, every record passes through.
+- **`s3sql.Query` / `QueryMany` (and the umbrella delegations)** —
+  dedup when `EntityKeyColumns` + `VersionColumn` are both set (DuckDB
+  `QUALIFY ROW_NUMBER()` CTE). When either is empty, every record
+  passes through.
 
 `WithHistory()` forces the no-dedup path in every case.
 
@@ -542,10 +545,11 @@ recs, _ := store.Read(ctx, "*")
 // recs[i].InsertedAt is the writer's wall-clock at write-start.
 ```
 
-Works on `s3parquet.Read` / `PollRecords` and, for the umbrella,
-`s3sql.Read` / `PollRecords` — DuckDB decodes the column natively
-via `SELECT *`; no filename-based routing is involved. Zero
-reflection cost when unset.
+Works on every typed read path (`s3parquet.Read`, `ReadIter`,
+`PollRecords`) and on the SQL side too — DuckDB decodes the
+column natively via `SELECT *` (s3sql exposes it as a regular
+column on the `*sql.Rows` cursor). Zero reflection cost when
+unset.
 
 ### Stream — time window
 
@@ -623,8 +627,8 @@ Effect on each method:
 
 - **`Write` / `WriteWithKey`** — one fewer S3 PUT per call;
   `WriteResult.Offset` and `WriteResult.RefPath` are empty.
-- **`Read` / `Query` / `QueryRow` / `ReadMany` / `QueryMany` /
-  `QueryRowMany` / `Lookup` / `BackfillIndex`** — unaffected. They
+- **`Read` / `ReadMany` / `ReadIter` / `ReadManyIter` / `Query` /
+  `QueryMany` / `Lookup` / `BackfillIndex`** — unaffected. They
   LIST `data/` (or `_index/<name>/`) directly and never consult refs.
 - **`Poll` / `PollRecords` / `PollRecordsAll`** — return
   `s3store.ErrRefStreamDisabled` (shared sentinel, matches
@@ -637,10 +641,10 @@ Per-write irreversible: data written with `DisableRefStream: true`
 has no refs, so flipping the flag back does not retroactively make
 `Poll` see the historical writes.
 
-Both sides of the deployment (writer and `s3sql` reader) must agree
-on the flag — set it on the umbrella `Config`, or on the
-`s3parquet.S3Target` shared by `s3parquet.Writer` and
-`s3sql.Reader`. The two failure modes if they drift:
+Both sides of the deployment (writer and reader) must agree on the
+flag — set it on the umbrella `Config`, or on the
+`s3parquet.S3Target` shared by `s3parquet.Writer` and the readers.
+The two failure modes if they drift:
 
 - **Writer disabled + reader enabled** — `Poll` walks an empty
   `_stream/refs/` prefix and silently returns zero entries with no
@@ -660,10 +664,10 @@ read the same value.
 records, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
 ```
 
-Returns every record matching the glob, decoded directly into `[]T` via
-the parquet tags (parquet-go for `s3parquet`, the reflection binder for
-`s3sql`). When dedup is configured (see Stream above), the result is the
-latest version per key; otherwise every version comes through.
+Returns every record matching the glob, decoded directly into `[]T`
+via parquet-go and the parquet tags on `T`. When dedup is configured
+(see Stream above), the result is the latest version per key;
+otherwise every version comes through.
 
 For retry-safe read-modify-write, pair the `Read` with
 `WithIdempotentRead(token)` and write with `WithIdempotencyToken(token,
@@ -684,27 +688,21 @@ for r, err := range store.ReadIter(ctx, "charge_period=2026-03-*/*") {
 // breaking out of the loop cancels in-flight downloads — no Close
 ```
 
-Three callable surfaces, matching `Read` / `ReadMany` exactly:
-`s3parquet.Reader.ReadIter`, `s3sql.Reader.ReadIter`, and the umbrella
-`s3store.Store.ReadIter` (forwards to s3sql). Same for `*ManyIter`.
+Two callable surfaces: `s3parquet.Reader.ReadIter` and the umbrella
+`s3store.Store.ReadIter` (forwards to `s3parquet.Reader`). Same for
+`ReadManyIter`.
 
-**Memory profile** depends on which backend and which dedup mode:
-
-| Path | Default (dedup on) | `WithHistory()` |
-|---|---|---|
-| `s3parquet.Reader.ReadIter` | O(one partition's records) | O(one partition's records) |
-| `s3sql.Reader.ReadIter` | O(DuckDB query plan) | same |
-
-The pure-Go path processes one partition at a time: files inside the
-partition download 8-wide in parallel, the decoded batch is deduped
-(or passed through on `WithHistory()`), records are yielded in
-lex/insertion order, then the batch is dropped before the next
-partition starts. Month-scale reads go from O(month) to O(partition)
-peak memory, which is usually small enough for hourly/daily
-partitioning. If a single partition is large enough that even one
-pre-dedup batch is a problem, file an issue — we can follow up with a
-streaming fold that trades the code simplicity for peak memory
-proportional to unique entities rather than total records.
+**Memory profile**: `O(one partition's records)`. The pure-Go path
+processes one partition at a time: files inside the partition
+download in parallel, the decoded batch is deduped (or passed through
+on `WithHistory()`), records are yielded in lex/insertion order, then
+the batch is dropped before the next partition starts. Month-scale
+reads go from O(month) to O(partition) peak memory, which is usually
+small enough for hourly/daily partitioning. If a single partition is
+large enough that even one pre-dedup batch is a problem, file an
+issue — we can follow up with a streaming fold that trades the code
+simplicity for peak memory proportional to unique entities rather
+than total records.
 
 **Prefetch with `WithReadAheadPartitions(n)`**: by default, the next
 partition's download only starts after the current partition's yield
@@ -725,8 +723,7 @@ records (one being yielded, `n` buffered, one in the producer's hand
 while waiting to send). Speed-up is bounded by how much of your
 per-partition yield time would otherwise sit idle waiting for
 downloads. Default `0` preserves strict-serial semantics — existing
-callers see no change. No-op on the s3sql / umbrella read paths since
-DuckDB already streams rows across the full file union.
+callers see no change.
 
 ### Snapshot — row-group pruning (`ReadIterWhere`)
 
@@ -783,8 +780,7 @@ even via `ReadIterWhere`; use `ReadIter` for those.
 
 **Caveats**: same per-partition dedup contract as `ReadIter`
 applies. The filtered path is **not available on s3sql** — use
-`Query` or `ReadMany` with a SQL `WHERE` and let DuckDB plan the
-prune instead.
+`Query` with a SQL `WHERE` and let DuckDB plan the prune instead.
 
 ### Snapshot — row-group pruning + narrow reads composed
 
@@ -864,9 +860,8 @@ regardless of how rows are streamed back.
 and downloads files within a partition in lex order; the user-visible
 emission order inside each partition is then decided by the reader's
 sort cascade — `(entity, version)` when `EntityKeyOf` is set, else
-`(insertedAt, fileName)`. `s3sql.Reader.ReadIter` returns rows in
-DuckDB's query order — add `ORDER BY` in a custom `Query` call if you
-need stability.
+`(insertedAt, fileName)`. SQL queries return rows in DuckDB's query
+order — add `ORDER BY` in your `Query` call if you need stability.
 
 ### SQL query (umbrella or `s3sql`)
 
@@ -875,15 +870,17 @@ rows, err := store.Query(ctx, "charge_period=2026-03-*/*",
     "SELECT customer, sku, SUM(net_cost) AS total "+
         "FROM costs GROUP BY customer, sku")
 
-var total float64
-err = store.QueryRow(ctx, "charge_period=2026-03-17/*",
-    "SELECT SUM(net_cost) FROM costs").Scan(&total)
+// QueryMany aggregates across an arbitrary set of partition tuples.
+rows2, err := store.QueryMany(ctx, []string{
+    "charge_period=2026-03-17/customer=abc",
+    "charge_period=2026-03-18/customer=def",
+}, "SELECT SUM(net_cost) AS total FROM costs")
 ```
 
-Deduplicated by default. Pass `s3store.WithHistory()` to see all versions.
-`QueryRow` is the `database/sql` convention for queries that return at
-most one row — construction-time errors surface through the returned
-`*sql.Row` at `Scan` time.
+Deduplicated by default when `EntityKeyColumns` + `VersionColumn` are
+configured. Pass `s3store.WithHistory()` to see all versions. Both
+methods return `*sql.Rows`; bind rows with the standard
+`database/sql` contract.
 
 ## Idempotent writes
 
@@ -917,8 +914,10 @@ Tokens reduce *storage* duplication. They do **not** on their own
 guarantee exactly-once at the consumer. For that, pair tokens with
 reader-side dedup:
 
-- `EntityKeyOf` + `VersionOf` on `s3parquet.Reader`
-- `EntityKeyColumns` + `VersionColumn` on `s3sql.Reader` / umbrella
+- `EntityKeyOf` + `VersionOf` on `s3parquet.Reader` (and the
+  umbrella, for `Read` / `ReadIter` / `PollRecords`)
+- `EntityKeyColumns` + `VersionColumn` on `s3sql.Reader` (and the
+  umbrella, for `Query` / `QueryMany`)
 
 | Config | Storage layer | Consumer layer |
 |---|---|---|
@@ -1177,28 +1176,20 @@ not diverging ones).
 - `s3parquet.Reader`: `Read`, `ReadIter`, `ReadMany`,
   `ReadManyIter`, `ReadIterWhere`, `ReadManyIterWhere`,
   `PollRecords`, `PollRecordsAll`.
-- `s3sql.Reader`: `Read`, `ReadIter`, `ReadMany`, `ReadManyIter`,
-  `Query`, `QueryRow`, `QueryMany`, `QueryRowMany`, `PollRecords`,
-  `PollRecordsAll`.
+- `s3sql.Reader`: `Query`, `QueryMany`.
 - Umbrella `Store`: all of the above forward through.
 
 **Performance impact** — `s3parquet` and poll-based paths apply
 the filter purely in memory on a LIST (or ref-stream) that runs
-anyway, so there's no extra S3 work. On `s3sql`, when the barrier
-is set the single-pattern DuckDB-glob fast path is skipped in
-favour of a Go-side S3 LIST — DuckDB's glob doesn't expose
-LastModified, so the filter needs the explicit LIST to see each
-file's write time. That's one extra LIST pagination on otherwise-
-glob-only calls (`Read`, `ReadIter`, `Query`, `QueryRow`, and
-single-pattern `ReadMany` / `QueryMany`). Multi-pattern and
-`*RowMany` variants already LIST, so no additional cost there.
+anyway, so there's no extra S3 work. `s3sql.Query` / `QueryMany`
+already drive a Go-side LIST to assemble the URI list for
+`read_parquet([...])`, so the barrier filter folds in for free.
 
-**Zero matches under a barrier**: `Query` / `QueryRow` preserve
-their raw-error contract by surfacing an
-`isNoFilesMatchedError`-compatible error when the barrier filters
-every match away, so callers branching on that helper keep
-working. `QueryMany` / `QueryRowMany` / `Read*` normalize to empty
-results as they already do.
+**Zero matches under a barrier**: `Query` preserves its raw-error
+contract by surfacing an `isNoFilesMatchedError`-compatible error
+when the barrier filters every match away, so callers branching
+on that helper keep working. `QueryMany` and `Read*` normalize to
+empty results as they already do.
 
 The token passes `ValidateIdempotencyToken` — same grammar as
 `WithIdempotencyToken` (non-empty, no `/`, no `..`, printable
@@ -1215,10 +1206,10 @@ configuration.
 - **`s3parquet`** — parquet-go matches columns to struct fields by the
   `parquet:` tag, so column order in the file doesn't matter and unknown
   columns are ignored.
-- **`s3sql`** — the reflection binder does the same for DuckDB results:
-  unused columns are discarded, missing columns leave the field at its
-  Go zero, and user types implementing `sql.Scanner` (e.g.
-  `shopspring/decimal.Decimal`) are supported natively.
+- **`s3sql`** — `Query` returns `*sql.Rows` directly; bind columns
+  with the standard `database/sql` contract. DuckDB's `union_by_name`
+  read mode tolerates schema drift across the file union, so
+  reading old + new files in one query just works.
 
 Renames, splits, and row-level computed derivations still require a
 migration tool — rewrite the affected files with the new shape.
@@ -1308,8 +1299,8 @@ read paths and the index layer:
 
 | Entry point | Where |
 |---|---|
-| `Reader.ReadMany` | `s3parquet.Reader`, `s3sql.Reader`, umbrella |
-| `Reader.QueryMany` / `QueryRowMany` | `s3sql.Reader`, umbrella |
+| `Reader.ReadMany` / `ReadManyIter` | `s3parquet.Reader`, umbrella |
+| `Reader.QueryMany` | `s3sql.Reader`, umbrella |
 | `Index.LookupMany` | `s3parquet`, umbrella |
 | `BackfillIndexMany` | `s3parquet`, umbrella |
 
@@ -1346,20 +1337,17 @@ runs over the unioned set, and dedup (if configured) applies
 globally — an entity appearing under two patterns is kept as
 the latest version across the union, not per-pattern.
 
-**Execution model (s3sql path):** single-pattern fast-paths stay
-on DuckDB's glob + plan-time partition pruning. Multi-pattern
-pre-LISTs in Go with the same 8-wide cap to produce the exact
-file URI list, then runs **one** `read_parquet([...])` so
-DuckDB plans once over the whole set — the analytical win
-(`SUM` / `GROUP BY` / joins across non-Cartesian tuples) that N
-separate `Query` calls would force the caller to do in Go.
+**Execution model (s3sql path):** every `Query` / `QueryMany`
+pre-LISTs in Go (per pattern, with the same bounded cap) to
+produce the exact file URI list, then runs **one**
+`read_parquet([...])` so DuckDB plans once over the whole set —
+the analytical win (`SUM` / `GROUP BY` / joins across
+non-Cartesian tuples) that N separate `Query` calls would force
+the caller to do in Go.
 
-Single-pattern `Read` / `Query` / `QueryRow` / `Lookup` /
-`BackfillIndex` are one-line sugar over their `-Many`
-counterparts and stay unchanged. Passing a one-element slice to
-a `-Many` method takes the same fast path as calling the
-single-pattern form directly — no Go-side LIST, no extra
-machinery.
+Single-pattern `Read` / `Query` / `Lookup` / `BackfillIndex` are
+one-line sugar over their `-Many` counterparts and stay
+unchanged.
 
 ### What's in scope for v1
 
@@ -1568,16 +1556,16 @@ delay:
 | `s3parquet.Reader.Read` / `ReadIter` / `ReadIterWhere` (+ `*Many` variants) | `s3parquet` |
 | `s3parquet.Index.Lookup` / `LookupMany` | `s3parquet` |
 | `s3parquet.BackfillIndex` / `BackfillIndexMany` | `s3parquet` |
-| `s3sql.Reader.Read` / `ReadMany` (+ `Iter` variants) | `s3sql` |
-| `s3sql.Reader.Query` / `QueryRow` / `QueryMany` / `QueryRowMany` | `s3sql` |
-| Umbrella `Store.Read` / `Query` / `QueryRow` | forwards to `s3sql` |
+| `s3sql.Reader.Query` / `QueryMany` | `s3sql` |
+| Umbrella `Store.Read` / `ReadIter` (+ `*Many` variants) | forwards to `s3parquet` |
+| Umbrella `Store.Query` / `QueryMany` | forwards to `s3sql` |
 
-On the `s3sql` / umbrella read paths, the file discovery LIST is
-done in Go (carries the header); the parquet-body GET runs through
-DuckDB's `httpfs` and **does not** carry the header. That's fine
-because data files are write-once-immutable, and StorageGRID's
-default `read-after-new-write` covers first-read-of-new-key —
-DuckDB's GET sees the committed bytes regardless. See the
+On the `s3sql` read path, the file discovery LIST is done in Go
+(carries the header); the parquet-body GET runs through DuckDB's
+`httpfs` and **does not** carry the header. That's fine because
+data files are write-once-immutable, and StorageGRID's default
+`read-after-new-write` covers first-read-of-new-key — DuckDB's
+GET sees the committed bytes regardless. See the
 [DuckDB note](#duckdb-httpfs-has-no-per-request-header-hook) for
 the full reasoning.
 

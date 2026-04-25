@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/ueisele/s3store/internal/core"
@@ -13,25 +12,14 @@ import (
 )
 
 // ReaderConfig defines how an s3sql Reader is set up. T is the
-// record type returned by Read and PollRecords; arbitrary SQL
-// queries via Query / QueryRow return *sql.Rows / *sql.Row
-// directly.
-//
-// T must be a struct whose exported fields carry parquet struct
-// tags (e.g. `parquet:"customer"`). s3sql builds a reflection-
-// based row binder once at NewReader() from those tags; the
-// binder drives both the SELECT column list and the per-row Scan
-// into typed records. Columns absent from the parquet file land
-// as the field's Go zero value; user types implementing
-// sql.Scanner are supported.
+// record type whose parquet tags name the columns the dedup CTE
+// references; arbitrary SQL queries via Query / QueryMany return
+// *sql.Rows directly and the caller binds rows themselves.
 //
 // The S3-wiring bundle (Bucket, Prefix, S3Client,
-// PartitionKeyParts, SettleWindow, DisableRefStream) is carried
-// through a shared s3parquet.S3Target so a Writer and a Reader
-// built against the same dataset cannot drift on those fields.
-// A service that writes and reads in the same process can build
-// the Target once and pass the same value to both
-// s3parquet.WriterConfig.Target and ReaderConfig.Target.
+// PartitionKeyParts) is carried through a shared
+// s3parquet.S3Target so a Writer and a Reader built against the
+// same dataset cannot drift on those fields.
 type ReaderConfig[T any] struct {
 	// Target carries the dataset's S3 wiring and partitioning
 	// metadata. Required; same S3Target the writing
@@ -64,22 +52,9 @@ type ReaderConfig[T any] struct {
 	// credential overrides, or other extension loads.
 	ExtraInitSQL []string
 
-	// InsertedAtField names a time.Time field on T populated by
-	// the writer (s3parquet.WriterConfig.InsertedAtField) as a real
-	// parquet column. The field must carry a non-empty, non-"-"
-	// parquet tag (e.g. `parquet:"inserted_at"`) — DuckDB decodes
-	// the column natively via SELECT *, so no filename-routing
-	// plumbing is involved on this read path.
-	//
-	// Empty disables the feature. Paired with the writer's
-	// InsertedAtField: the value round-trips through the parquet
-	// file, identical at every read path.
-	InsertedAtField string
-
 	// ConsistencyControl sets the Consistency-Control HTTP header
-	// on the S3 operations this Reader controls — every Go-side
-	// LIST (data-file LIST for Read / Query, ref-stream LIST for
-	// PollRecords). Together with the writer's matching setting,
+	// on the Go-side LIST that resolves the file set for Query /
+	// QueryMany. Together with the writer's matching setting,
 	// this gives read-after-write file discovery on
 	// strong-consistent backends like StorageGRID.
 	//
@@ -87,37 +62,24 @@ type ReaderConfig[T any] struct {
 	// carry the header — DuckDB's httpfs has no per-request hook
 	// for s3:// URLs. In practice this is fine: data files are
 	// write-once and StorageGRID's read-after-new-write covers the
-	// first read of any new key, so an immutable file is always
-	// returned at its committed bytes. Use the s3parquet.Reader
-	// paths only if you need explicit consistency control on the
-	// GET as well (e.g. a custom backend whose default isn't even
-	// read-after-new-write). See
-	// s3parquet.WriterConfig.ConsistencyControl for the full
-	// contract.
+	// first read of any new key.
 	ConsistencyControl s3parquet.ConsistencyLevel
 }
 
 // dedupEnabled reports whether the reader should emit a dedup
-// CTE for reads. Gated on EntityKeyColumns being non-empty;
-// NewReader guarantees VersionColumn is also set when this is true.
+// CTE. Gated on EntityKeyColumns being non-empty; NewReader
+// guarantees VersionColumn is also set when this is true.
 func (c ReaderConfig[T]) dedupEnabled() bool {
 	return len(c.EntityKeyColumns) > 0
 }
 
-// Reader is the cgo / DuckDB entry point to an s3store dataset.
-// Read-only: the write path lives in s3parquet.Writer.
+// Reader is the cgo / DuckDB SQL entry point to an s3store
+// dataset. Read-only and SQL-only: typed iteration / streaming
+// lives on s3parquet.Reader.
 type Reader[T any] struct {
 	cfg      ReaderConfig[T]
 	db       *sql.DB
 	dataPath string
-	refPath  string
-	binder   *binder
-
-	// insertedAtFieldIndex is the reflect struct-field path for
-	// Config.InsertedAtField, resolved once at NewReader(). nil
-	// when unset — scanAll short-circuits the filename-column
-	// lookup in that case, so there's no hot-path cost.
-	insertedAtFieldIndex []int
 }
 
 // NewReader constructs a Reader, opens a DuckDB connection,
@@ -147,31 +109,16 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 				"VersionColumn is set")
 	}
 
-	b, err := buildBinder(reflect.TypeFor[T]())
-	if err != nil {
-		return nil, fmt.Errorf("s3sql: %w", err)
-	}
-
-	insertedAtIdx, err := validateInsertedAtField[T](cfg.InsertedAtField)
-	if err != nil {
-		return nil, err
-	}
-
 	// The dedup CTE's filename DESC tie-breaker relies on DuckDB's
 	// read_parquet(filename=true) helper, which injects a column
 	// literally named "filename". A T that already maps a parquet
 	// column of that name would either lose its binding (the CTE
 	// would EXCLUDE it) or produce a duplicate-schema error inside
-	// read_parquet. Catch the Go-side case at NewReader — the
-	// on-disk-parquet-has-"filename" case is still DuckDB's to
-	// reject at query time since we can't see the file schemas
-	// here.
-	if _, ok := b.byName["filename"]; ok && cfg.dedupEnabled() {
-		return nil, fmt.Errorf(
-			"s3sql: T has a `parquet:\"filename\"` field, " +
-				"which collides with DuckDB's " +
-				"read_parquet(filename=true) used for " +
-				"the dedup tie-breaker; rename the field")
+	// read_parquet. Catch the Go-side case at NewReader.
+	if cfg.dedupEnabled() {
+		if err := checkFilenameCollision(reflect.TypeFor[T]()); err != nil {
+			return nil, err
+		}
 	}
 
 	db, err := openDuckDB(cfg.Target.S3Client(), cfg.ExtraInitSQL)
@@ -181,56 +128,42 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	}
 
 	return &Reader[T]{
-		cfg:                  cfg,
-		db:                   db,
-		dataPath:             core.DataPath(cfg.Target.Prefix()),
-		refPath:              core.RefPath(cfg.Target.Prefix()),
-		binder:               b,
-		insertedAtFieldIndex: insertedAtIdx,
+		cfg:      cfg,
+		db:       db,
+		dataPath: core.DataPath(cfg.Target.Prefix()),
 	}, nil
 }
 
-// validateInsertedAtField resolves Config.InsertedAtField to a
-// struct-field index on T. Mirrors s3parquet.validateInsertedAtField:
-// the field must exist, be time.Time, and carry a non-empty,
-// non-"-" parquet tag so DuckDB's SELECT * sees a real column
-// (the writer populates it as part of the parquet schema).
-func validateInsertedAtField[T any](name string) ([]int, error) {
-	if name == "" {
-		return nil, nil
+// checkFilenameCollision rejects T types whose parquet tags claim
+// the literal column name "filename" — that name is reserved for
+// DuckDB's read_parquet(filename=true) helper used by the dedup
+// CTE.
+func checkFilenameCollision(rt reflect.Type) error {
+	for rt.Kind() == reflect.Ptr {
+		rt = rt.Elem()
 	}
-	rt := reflect.TypeFor[T]()
 	if rt.Kind() != reflect.Struct {
-		return nil, fmt.Errorf(
-			"s3sql: InsertedAtField requires T to be a struct, got %s",
-			rt)
+		return nil
 	}
-	f, ok := rt.FieldByName(name)
-	if !ok {
-		return nil, fmt.Errorf(
-			"s3sql: InsertedAtField %q: no such field on %s",
-			name, rt)
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		tag, ok := f.Tag.Lookup("parquet")
+		if !ok {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "filename" {
+			return fmt.Errorf(
+				"s3sql: T has a `parquet:\"filename\"` field, " +
+					"which collides with DuckDB's " +
+					"read_parquet(filename=true) used for " +
+					"the dedup tie-breaker; rename the field")
+		}
 	}
-	if f.Type != reflect.TypeFor[time.Time]() {
-		return nil, fmt.Errorf(
-			"s3sql: InsertedAtField %q: must be time.Time, got %s",
-			name, f.Type)
-	}
-	tag := f.Tag.Get("parquet")
-	name0, _, _ := strings.Cut(tag, ",")
-	if name0 == "" || name0 == "-" {
-		return nil, fmt.Errorf(
-			"s3sql: InsertedAtField %q: must carry a non-empty, "+
-				"non-\"-\" parquet tag so DuckDB can decode the "+
-				"writer-populated column (got %q)", name, tag)
-	}
-	return f.Index, nil
+	return nil
 }
 
-// Target returns the S3Target this Reader is bound to. Useful
-// for tooling that constructs other read-only handles (indexes,
-// backfill) against the same dataset without reaching back into
-// the Config.
+// Target returns the S3Target this Reader is bound to.
 func (s *Reader[T]) Target() s3parquet.S3Target {
 	return s.cfg.Target
 }

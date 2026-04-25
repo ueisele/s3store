@@ -1,10 +1,7 @@
 package s3sql
 
 import (
-	"context"
-	"database/sql"
 	"fmt"
-	"reflect"
 	"strings"
 )
 
@@ -34,9 +31,7 @@ func (s *Reader[T]) scanExprForURIs(
 }
 
 // filenameOpt returns the trailing ", filename=true" fragment if
-// withFilename is set; empty string otherwise. Pulled out so the
-// two read_parquet builders (scanExprForURIs, PollRecords) share
-// the exact option spelling.
+// withFilename is set; empty string otherwise.
 func filenameOpt(withFilename bool) string {
 	if withFilename {
 		return ", filename=true"
@@ -50,28 +45,13 @@ func filenameOpt(withFilename bool) string {
 // on equal VersionColumn) and the history-with-replica-dedup path
 // (tie-break within one (entity, version) group so the same row
 // wins on every re-read). Needed whenever dedup is enabled,
-// regardless of WithHistory. The scan-expr builders and
-// wrapScanExpr both consult this so the scan and the CTE agree on
-// whether filename is present.
+// regardless of WithHistory.
 func (s *Reader[T]) needsFilename() bool {
 	return s.cfg.dedupEnabled()
 }
 
-// errorRow returns a *sql.Row that will fail on Scan with the
-// given error. The delivery mechanism is a DuckDB `error()`
-// call that raises at execution time, so the error surfaces
-// through the standard database/sql Row API without requiring
-// a signature change on QueryRow.
-func (s *Reader[T]) errorRow(
-	ctx context.Context, err error,
-) *sql.Row {
-	return s.db.QueryRowContext(ctx,
-		"SELECT error("+sqlQuote(err.Error())+")")
-}
-
 // wrapScanExpr wraps a base scan expression with an optional
-// dedup CTE and the user's SQL query. Shared by Query, QueryRow,
-// Read, PollRecords.
+// dedup CTE and the user's SQL query. Shared by Query, QueryMany.
 //
 // Three branches, driven by (dedupEnabled, includeHistory):
 //
@@ -136,82 +116,4 @@ func (s *Reader[T]) wrapScanExpr(
 	}
 	sb.WriteString(userSQL)
 	return sb.String()
-}
-
-// rowBinder captures the per-result-set state (column ordering,
-// per-column binders) so scanAll and the iter readers share the
-// per-row decode loop without recomputing rows.Columns() and the
-// binder lookup on every row.
-type rowBinder[T any] struct {
-	cols []string
-	fbs  []*fieldBinder
-}
-
-// newRowBinder resolves rows.Columns() once and returns the
-// per-result-set binder. Mirrors scanAll's old setup block;
-// kept here so the iter path doesn't duplicate it.
-func (s *Reader[T]) newRowBinder(rows *sql.Rows) (*rowBinder[T], error) {
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("s3sql: get columns: %w", err)
-	}
-	fbs := make([]*fieldBinder, len(cols))
-	for i, c := range cols {
-		fbs[i] = s.binder.byName[c]
-	}
-	return &rowBinder[T]{
-		cols: cols,
-		fbs:  fbs,
-	}, nil
-}
-
-// bindNext consumes one row from rows (caller must have already
-// confirmed rows.Next() returned true) and writes the decoded
-// record into *out. Reuses the pre-resolved binders; allocates
-// only the per-row dests slice.
-func (b *rowBinder[T]) bindNext(rows *sql.Rows, out *T) error {
-	dests := make([]any, len(b.cols))
-	for i, fb := range b.fbs {
-		if fb == nil {
-			dests[i] = new(any)
-			continue
-		}
-		dests[i] = fb.makeDest()
-	}
-	if err := rows.Scan(dests...); err != nil {
-		return fmt.Errorf("s3sql: scan row: %w", err)
-	}
-	rv := reflect.ValueOf(out).Elem()
-	for i, fb := range b.fbs {
-		if fb == nil {
-			continue
-		}
-		fb.assign(rv.FieldByIndex(fb.fieldIndex), dests[i])
-	}
-	return nil
-}
-
-// scanAll reads every row from a DuckDB result set into a []T
-// using the pre-built binder. Column order is taken from the
-// result set (rows.Columns()) so struct field order in T is
-// independent of the parquet file's column order. Any unmapped
-// column (including read_parquet's `filename` helper when it
-// leaks through a non-dedup path) still gets a discard dest.
-func (s *Reader[T]) scanAll(rows *sql.Rows) ([]T, error) {
-	rb, err := s.newRowBinder(rows)
-	if err != nil {
-		return nil, err
-	}
-	var records []T
-	for rows.Next() {
-		var rec T
-		if err := rb.bindNext(rows, &rec); err != nil {
-			return nil, err
-		}
-		records = append(records, rec)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("s3sql: iterate rows: %w", err)
-	}
-	return records, nil
 }

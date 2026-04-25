@@ -1,10 +1,10 @@
 package s3parquet
 
 import (
+	"errors"
 	"time"
 
 	"github.com/ueisele/s3store/internal/core"
-	"github.com/ueisele/s3store/internal/refstream"
 )
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /
@@ -12,9 +12,11 @@ import (
 // dataset was written without ref files, so there is no stream
 // to tail. OffsetAt stays usable (pure timestamp encoding).
 //
-// Aliased to the shared sentinel in internal/refstream so
-// errors.Is matches across s3parquet, s3sql, and the umbrella.
-var ErrRefStreamDisabled = refstream.ErrDisabled
+// The umbrella s3store package re-exports this so errors.Is
+// matches whether the caller imported s3store or s3parquet.
+var ErrRefStreamDisabled = errors.New(
+	"ref stream disabled on this Store; " +
+		"Poll/PollRecords/PollRecordsAll unavailable")
 
 // Offset represents a position in the stream.
 type Offset = core.Offset

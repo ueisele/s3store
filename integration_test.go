@@ -40,10 +40,20 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 		opts.settleWindow = 300 * time.Millisecond
 	}
 	// VersionColumn is paired with EntityKeyColumns: both or
-	// neither, matching New()'s validation.
+	// neither, matching New()'s validation. EntityKeyOf /
+	// VersionOf give the parquet reader the typed equivalents so
+	// Read / PollRecords dedup matches the SQL side.
 	versionColumn := ""
+	var entityKeyOf func(IntRecord) string
+	var versionOf func(IntRecord, time.Time) int64
 	if len(opts.entityKeyColumns) > 0 {
 		versionColumn = "ts"
+		entityKeyOf = func(r IntRecord) string {
+			return fmt.Sprintf("%s|%s|%s", r.Period, r.Customer, r.SKU)
+		}
+		versionOf = func(r IntRecord, _ time.Time) int64 {
+			return r.Ts.UnixMicro()
+		}
 	}
 	store, err := New[IntRecord](Config[IntRecord]{
 		Bucket:            f.Bucket,
@@ -51,6 +61,8 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
 		TableAlias:        "records",
+		EntityKeyOf:       entityKeyOf,
+		VersionOf:         versionOf,
 		VersionColumn:     versionColumn,
 		EntityKeyColumns:  opts.entityKeyColumns,
 		SettleWindow:      opts.settleWindow,
@@ -74,9 +86,9 @@ func newStore(t *testing.T, opts storeOpts) *Store[IntRecord] {
 }
 
 // TestUmbrella_WriteRead covers the most basic end-to-end path:
-// Write via the umbrella writes through s3parquet; Read via the
-// umbrella reads through s3sql. If the sub-store composition
-// ever mis-wires either side, this is the test that fails first.
+// Write through s3parquet.Writer; Read through s3parquet.Reader.
+// If the composition ever mis-wires either side, this is the
+// test that fails first.
 func TestUmbrella_WriteRead(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
@@ -144,8 +156,8 @@ func TestUmbrella_WritePoll(t *testing.T) {
 }
 
 // TestUmbrella_WritePollRecords verifies umbrella.PollRecords
-// forwards to s3sql.PollRecords (DuckDB-powered dedup), and that
-// WithHistory opts out of dedup.
+// forwards to s3parquet.PollRecords (in-memory dedup via
+// EntityKeyOf), and that WithHistory opts out of dedup.
 func TestUmbrella_WritePollRecords(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
@@ -262,19 +274,16 @@ func TestUmbrella_PartitionRange(t *testing.T) {
 	}
 }
 
-// TestUmbrella_QueryRowInvalidPattern guards that an invalid
-// key pattern surfaces via *sql.Row at Scan time
-// (database/sql convention), not via a panic or silent zero
-// result. Proves the errorRow path survives the umbrella
-// forward.
-func TestUmbrella_QueryRowInvalidPattern(t *testing.T) {
+// TestUmbrella_QueryInvalidPattern guards that an invalid key
+// pattern surfaces as an error from Query rather than a panic
+// or silent zero result.
+func TestUmbrella_QueryInvalidPattern(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	var ignore int64
-	err := store.QueryRow(ctx,
+	_, err := store.Query(ctx,
 		"period=X/customer=Y/extra=Z",
-		"SELECT 1").Scan(&ignore)
+		"SELECT 1")
 	if err == nil {
 		t.Error("expected error for invalid pattern, got nil")
 	}
@@ -350,10 +359,9 @@ func TestUmbrella_Close(t *testing.T) {
 }
 
 // TestUmbrella_ReadIter exercises the umbrella's iter forwarder
-// end-to-end. The umbrella routes ReadIter through s3sql.Reader
-// (DuckDB row streaming), so this test mostly proves the
-// forwarder is wired correctly — the s3sql-side iter contract is
-// covered in s3sql/integration_test.go.
+// end-to-end. The umbrella routes ReadIter through
+// s3parquet.Reader (per-partition streaming with in-memory
+// dedup), so this test proves the forwarder is wired correctly.
 func TestUmbrella_ReadIter(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{

@@ -3,6 +3,7 @@ package s3store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"iter"
 	"time"
 
@@ -10,36 +11,32 @@ import (
 	"github.com/ueisele/s3store/s3sql"
 )
 
-// Store is the umbrella entry point: a thin composer over
-// *s3parquet.Writer[T] (pure Go write path, in-memory parquet
-// encoding + S3 PUT) and *s3sql.Reader[T] (cgo, DuckDB-powered
-// reads) that preserves the single-Store ergonomics callers
-// are used to. Reads route through DuckDB so they stay
-// consistent with Query / PollRecords on schema evolution and
-// dedup semantics.
+// Store is the umbrella entry point: a thin composer over the
+// s3parquet writer (in-memory parquet encoding + S3 PUT), the
+// s3parquet reader (pure-Go decoding, change-stream tailing, per-
+// partition dedup), and the s3sql reader (cgo, DuckDB-powered SQL
+// over the same files).
 //
 // Method forwarding:
 //
-//   - Write, WriteWithKey        → s3parquet.Writer
-//   - Poll, OffsetAt, PollRecords,
-//     PollRecordsAll             → s3sql.Reader (S3 LIST-based
-//     stream routes through the shared internal/refstream
-//     implementation so parity with s3parquet.Reader is free)
-//   - Read, ReadMany, Query,
-//     QueryRow, QueryMany,
-//     QueryRowMany               → s3sql.Reader
+//   - Write, WriteWithKey, WriteRowGroupsBy,
+//     WriteWithKeyRowGroupsBy, PartitionKey       → s3parquet.Writer
+//   - Read, ReadMany, ReadIter, ReadManyIter,
+//     Poll, OffsetAt, PollRecords, PollRecordsAll → s3parquet.Reader
+//   - Query, QueryMany                            → s3sql.Reader
 //
-// Importing this package transitively pulls in DuckDB (cgo).
-// If you want a cgo-free build, import s3store/s3parquet
-// directly for write-plus-simple-read workloads.
+// Importing this package transitively pulls in DuckDB (cgo). For
+// a cgo-free build, import s3store/s3parquet directly — every
+// non-SQL surface lives there.
 type Store[T any] struct {
-	writer *s3parquet.Writer[T]
-	reader *s3sql.Reader[T]
+	writer        *s3parquet.Writer[T]
+	parquetReader *s3parquet.Reader[T]
+	sqlReader     *s3sql.Reader[T]
 }
 
-// New constructs a Store, building the pure-Go Writer and the
-// DuckDB-backed Reader from a single umbrella Config. Both
-// halves share one S3Target so they can't drift on Bucket /
+// New constructs a Store, building the pure-Go Writer + Reader and
+// the DuckDB-backed SQL Reader from a single umbrella Config. All
+// three halves share one S3Target so they can't drift on Bucket /
 // Prefix / PartitionKeyParts / SettleWindow / DisableRefStream.
 //
 // Performs no S3 I/O at construction time.
@@ -64,19 +61,28 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := s3sql.NewReader(s3sql.ReaderConfig[T]{
+	pr, err := s3parquet.NewReader(s3parquet.ReaderConfig[T]{
 		Target:             target,
-		TableAlias:         cfg.TableAlias,
-		VersionColumn:      cfg.VersionColumn,
-		EntityKeyColumns:   cfg.EntityKeyColumns,
-		ExtraInitSQL:       cfg.ExtraInitSQL,
+		EntityKeyOf:        cfg.EntityKeyOf,
+		VersionOf:          cfg.VersionOf,
 		InsertedAtField:    cfg.InsertedAtField,
 		ConsistencyControl: cfg.ConsistencyControl,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Store[T]{writer: w, reader: r}, nil
+	sr, err := s3sql.NewReader(s3sql.ReaderConfig[T]{
+		Target:             target,
+		TableAlias:         cfg.TableAlias,
+		VersionColumn:      cfg.VersionColumn,
+		EntityKeyColumns:   cfg.EntityKeyColumns,
+		ExtraInitSQL:       cfg.ExtraInitSQL,
+		ConsistencyControl: cfg.ConsistencyControl,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Store[T]{writer: w, parquetReader: pr, sqlReader: sr}, nil
 }
 
 // Writer returns the underlying s3parquet.Writer. Use when a
@@ -87,25 +93,32 @@ func (s *Store[T]) Writer() *s3parquet.Writer[T] {
 	return s.writer
 }
 
-// Reader returns the underlying s3sql.Reader. Symmetric with
+// Reader returns the underlying s3parquet.Reader. Symmetric with
 // Writer(); useful for passing the Reader into helpers that
 // accept it directly.
-func (s *Store[T]) Reader() *s3sql.Reader[T] {
-	return s.reader
+func (s *Store[T]) Reader() *s3parquet.Reader[T] {
+	return s.parquetReader
 }
 
-// Target returns the S3Target the umbrella was built with. Both
+// SQL returns the underlying s3sql.Reader. Use when arbitrary
+// DuckDB SQL or QueryMany aggregations are needed beyond the
+// umbrella's Query / QueryMany delegations.
+func (s *Store[T]) SQL() *s3sql.Reader[T] {
+	return s.sqlReader
+}
+
+// Target returns the S3Target the umbrella was built with. All
 // halves share this value, so it's the canonical handle for
 // tooling that operates on the same dataset without carrying T.
 func (s *Store[T]) Target() s3parquet.S3Target {
 	return s.writer.Target()
 }
 
-// Close releases resources. Only the Reader (DuckDB) owns
-// anything that needs explicit release; the Writer is purely
-// stateless on top of the shared S3 client.
+// Close releases resources. Only the SQL Reader (DuckDB) owns
+// anything that needs explicit release; the Writer and parquet
+// Reader are stateless on top of the shared S3 client.
 func (s *Store[T]) Close() error {
-	return s.reader.Close()
+	return errors.Join(s.sqlReader.Close())
 }
 
 // Write delegates to the Writer. Accepts WriteOption for
@@ -155,69 +168,65 @@ func (s *Store[T]) PartitionKey(rec T) string {
 	return s.writer.PartitionKey(rec)
 }
 
-// Poll delegates to the Reader (pure S3 LIST; no DuckDB
-// involvement despite living on the cgo-backed half).
+// Poll delegates to the parquet Reader (pure S3 LIST; no DuckDB).
 func (s *Store[T]) Poll(
 	ctx context.Context, since Offset, maxEntries int32,
 	opts ...QueryOption,
 ) ([]StreamEntry, Offset, error) {
-	return s.reader.Poll(ctx, since, maxEntries, opts...)
+	return s.parquetReader.Poll(ctx, since, maxEntries, opts...)
 }
 
 // OffsetAt returns the stream offset corresponding to wall-
 // clock time t. Pair with WithUntilOffset on Poll/PollRecords
 // to read records within a time window.
 func (s *Store[T]) OffsetAt(t time.Time) Offset {
-	return s.reader.OffsetAt(t)
+	return s.parquetReader.OffsetAt(t)
 }
 
-// Read delegates to the Reader so dedup semantics and the
-// reflection-based row binder match Query / PollRecords.
+// Read delegates to the parquet Reader. Per-partition
+// latest-per-entity dedup applies when EntityKeyOf + VersionOf
+// are configured; pass WithHistory() to opt out.
 func (s *Store[T]) Read(
 	ctx context.Context, keyPattern string, opts ...QueryOption,
 ) ([]T, error) {
-	return s.reader.Read(ctx, keyPattern, opts...)
+	return s.parquetReader.Read(ctx, keyPattern, opts...)
 }
 
-// ReadMany delegates to the Reader. Runs a single DuckDB
-// query over the deduplicated union of files matching every
-// pattern; see s3sql.Reader.ReadMany for the full contract.
+// ReadMany delegates to the parquet Reader. See
+// s3parquet.Reader.ReadMany for the full contract.
 func (s *Store[T]) ReadMany(
 	ctx context.Context, patterns []string, opts ...QueryOption,
 ) ([]T, error) {
-	return s.reader.ReadMany(ctx, patterns, opts...)
+	return s.parquetReader.ReadMany(ctx, patterns, opts...)
 }
 
-// ReadIter delegates to the Reader. Streams records via DuckDB's
-// native row iteration so callers don't materialise the full
-// []T. See s3sql.Reader.ReadIter for the contract — note that
-// the umbrella's iter goes through DuckDB, not the
-// per-partition-dedup pure-Go path on s3parquet.Reader.ReadIter.
+// ReadIter delegates to the parquet Reader. Streams records
+// per-partition without materialising the full []T.
 func (s *Store[T]) ReadIter(
 	ctx context.Context, pattern string, opts ...QueryOption,
 ) iter.Seq2[T, error] {
-	return s.reader.ReadIter(ctx, pattern, opts...)
+	return s.parquetReader.ReadIter(ctx, pattern, opts...)
 }
 
-// ReadManyIter delegates to the Reader. Multi-pattern streaming
-// counterpart to ReadIter; see s3sql.Reader.ReadManyIter.
+// ReadManyIter delegates to the parquet Reader. Multi-pattern
+// streaming counterpart to ReadIter.
 func (s *Store[T]) ReadManyIter(
 	ctx context.Context, patterns []string, opts ...QueryOption,
 ) iter.Seq2[T, error] {
-	return s.reader.ReadManyIter(ctx, patterns, opts...)
+	return s.parquetReader.ReadManyIter(ctx, patterns, opts...)
 }
 
-// Query delegates to the Reader.
+// Query delegates to the SQL Reader.
 func (s *Store[T]) Query(
 	ctx context.Context,
 	keyPattern string,
 	sqlQuery string,
 	opts ...QueryOption,
 ) (*sql.Rows, error) {
-	return s.reader.Query(ctx, keyPattern, sqlQuery, opts...)
+	return s.sqlReader.Query(ctx, keyPattern, sqlQuery, opts...)
 }
 
-// QueryMany delegates to the Reader. Use when a SQL-level
+// QueryMany delegates to the SQL Reader. Use when a SQL-level
 // aggregation or join needs to span a non-Cartesian tuple set;
 // see s3sql.Reader.QueryMany for the full contract.
 func (s *Store[T]) QueryMany(
@@ -226,39 +235,17 @@ func (s *Store[T]) QueryMany(
 	sqlQuery string,
 	opts ...QueryOption,
 ) (*sql.Rows, error) {
-	return s.reader.QueryMany(ctx, patterns, sqlQuery, opts...)
+	return s.sqlReader.QueryMany(ctx, patterns, sqlQuery, opts...)
 }
 
-// QueryRow delegates to the Reader.
-func (s *Store[T]) QueryRow(
-	ctx context.Context,
-	keyPattern string,
-	sqlQuery string,
-	opts ...QueryOption,
-) *sql.Row {
-	return s.reader.QueryRow(ctx, keyPattern, sqlQuery, opts...)
-}
-
-// QueryRowMany delegates to the Reader. See
-// s3sql.Reader.QueryRowMany for the full contract.
-func (s *Store[T]) QueryRowMany(
-	ctx context.Context,
-	patterns []string,
-	sqlQuery string,
-	opts ...QueryOption,
-) *sql.Row {
-	return s.reader.QueryRowMany(ctx, patterns, sqlQuery, opts...)
-}
-
-// PollRecords delegates to the Reader so dedup and schema-
-// evolution transforms are consistent with Read.
+// PollRecords delegates to the parquet Reader.
 func (s *Store[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
 	opts ...QueryOption,
 ) ([]T, Offset, error) {
-	return s.reader.PollRecords(ctx, since, maxEntries, opts...)
+	return s.parquetReader.PollRecords(ctx, since, maxEntries, opts...)
 }
 
 // PollRecordsAll reads every record in [since, until) via
@@ -269,5 +256,5 @@ func (s *Store[T]) PollRecordsAll(
 	since, until Offset,
 	opts ...QueryOption,
 ) ([]T, error) {
-	return s.reader.PollRecordsAll(ctx, since, until, opts...)
+	return s.parquetReader.PollRecordsAll(ctx, since, until, opts...)
 }
