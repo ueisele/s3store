@@ -1,36 +1,27 @@
 // Package s3store provides append-only, versioned data storage
-// on S3 with Parquet data files, a change stream, and embedded
-// DuckDB queries.
+// on S3 with Parquet data files and a change stream. Pure Go,
+// cgo-free. No server, no broker, no coordinator — S3 is the
+// only dependency.
 //
-// No server, no broker, no coordinator. S3 is the only
-// dependency.
+// Capability sketch:
 //
-// This root package is a thin umbrella that composes two
-// sub-packages:
+//   - Write, WriteWithKey: encode []T as Parquet, PUT to S3,
+//     write an empty stream-ref file.
+//   - Read, ReadIter, ReadRangeIter: list Parquet files matching
+//     a key pattern, decode into []T, optionally dedup latest-
+//     per-entity in memory.
+//   - Poll, PollRecords: stream ref entries or records from
+//     the ref stream, starting after a caller-supplied offset.
 //
-//   - s3store/s3parquet — pure Go, cgo-free. Writer (Write,
-//     WriteWithKey, ...) plus Reader (Read, ReadIter, Poll,
-//     PollRecords, OffsetAt). In-memory per-partition dedup.
-//   - s3store/s3sql — requires cgo (embedded DuckDB). SQL-only
-//     surface: Query returns *sql.Rows; the caller binds rows
-//     themselves.
+// Every snapshot read defaults to latest-per-key deduplication
+// (configured via EntityKeyOf + VersionOf) and accepts
+// WithHistory() to opt out.
 //
-// Importing this umbrella pulls in DuckDB (cgo). If you only
-// need the cgo-free subset (writes, typed reads, change-stream
-// tailing), import s3store/s3parquet directly. Both sub-packages
-// share the S3 layout and ref-stream wire format, so the same
-// data is accessible through either.
+// Glob patterns are restricted to a deliberately narrow grammar:
+// whole-segment "*", a single trailing "*" inside a value (e.g.
+// "period=2026-03-*"), and half-open "FROM..TO" ranges. See
+// validateKeyPattern for the full spec.
 //
-// Access patterns:
-//
-//   - Write / WriteWithKey: append Parquet + stream ref
-//   - Poll: stream of refs (which keys changed)
-//   - PollRecords: typed records for the refs Poll would
-//     return.
-//   - Read / ReadIter: typed, deduplicated snapshot with glob
-//     support.
-//   - Query: DuckDB SQL with auto-dedup CTE.
-//
-// Every read API defaults to latest-per-key deduplication and
-// accepts WithHistory() to opt out.
+// Deduplication is in-memory per partition; large key
+// cardinalities can exceed available RAM.
 package s3store

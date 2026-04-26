@@ -3,9 +3,9 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/ueisele/s3store.svg)](https://pkg.go.dev/github.com/ueisele/s3store)
 [![Release](https://img.shields.io/github/v/tag/ueisele/s3store?sort=semver&label=release)](https://github.com/ueisele/s3store/releases)
 
-Append-only, versioned data storage on S3 with a change stream and optional
-embedded DuckDB queries. No server. No broker. No coordinator. Just a Go
-library and an S3 bucket.
+Append-only, versioned data storage on S3 with a change stream. Pure Go,
+cgo-free. No server. No broker. No coordinator. Just a Go library and an
+S3 bucket.
 
 ## What it does
 
@@ -13,25 +13,8 @@ library and an S3 bucket.
 - **Stream** changes via lightweight "ref" files — one empty S3 object per
   write, all metadata in the object key.
 - **Read** point-in-time deduplicated snapshots with glob support.
-- **Query** the whole store with DuckDB SQL in a single embedded process.
-
-## Packages
-
-s3store ships as three packages. Pick the smallest one that covers your
-needs:
-
-| Package | cgo | Import path | Capabilities |
-|---|---|---|---|
-| `s3parquet` | **no** | `github.com/ueisele/s3store/s3parquet` | Writer + Reader: Write, WriteWithKey, Read, ReadIter, Poll, PollRecords, OffsetAt, secondary indexes. Pure Go / parquet-go; in-memory per-partition dedup. |
-| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | **SQL-only, read-only.** Query returns `*sql.Rows`; the caller binds rows themselves. Construct with `NewReader(ReaderConfig)`; share the same `s3parquet.S3Target` with the Writer so the two halves can't drift. |
-| `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Composes `s3parquet.Writer` + `s3parquet.Reader` + `s3sql.Reader`; all three share one `S3Target` so they can't drift on S3 wiring. |
-
-Binary size: DuckDB bundles a ~50 MB C++ library. `CGO_ENABLED=0 go build
-./s3parquet/...` produces a small static binary with none of it. The
-umbrella and `s3sql` both require cgo.
-
-Both sub-packages share the S3 layout and ref-stream wire format, so the
-same data is accessible through either.
+- **Iterate** large reads with bounded-memory streaming.
+- **Index** secondary lookups with empty marker files (LIST-only Lookup).
 
 ## Install
 
@@ -42,10 +25,9 @@ go get github.com/ueisele/s3store@latest
 s3store is pre-v1 — **minor version bumps (`v0.x.0`) may carry breaking
 API changes**. Pin an exact version in your `go.mod` (or commit your
 `go.sum`) to control when you pick them up. Requires Go 1.26.2+ (declared
-in [go.mod](go.mod)). DuckDB's httpfs extension is auto-installed on first
-use or pre-installed in air-gapped environments.
+in [go.mod](go.mod)).
 
-## Quick start — full umbrella
+## Quick start
 
 ```go
 type CostRecord struct {
@@ -57,43 +39,10 @@ type CostRecord struct {
     CalculatedAt time.Time `parquet:"calculated_at,timestamp(millisecond)"`
 }
 
-store, err := s3store.New[CostRecord](ctx, s3store.Config[CostRecord]{
-    Bucket:        "warehouse",
-    Prefix:        "billing",
-    S3Client:      s3Client,
-    PartitionKeyParts:      []string{"charge_period", "customer"},
-    VersionColumn: "calculated_at",
-    TableAlias:    "costs",
-    PartitionKeyOf: func(r CostRecord) string {
-        return fmt.Sprintf("charge_period=%s/customer=%s",
-            r.ChargePeriod, r.CustomerID)
-    },
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer store.Close()
-
-// Write — groups records by PartitionKeyOf, one Parquet file per group
-_, err = store.Write(ctx, records)
-
-// Snapshot read — deduplicated by VersionColumn via DuckDB
-latest, err := store.Read(ctx, []string{"charge_period=2026-03-17/customer=abc"})
-
-// SQL query — DuckDB handles the aggregation
-rows, err := store.Query(ctx, []string{"charge_period=2026-03-*/*"},
-    "SELECT customer, SUM(net_cost) FROM costs GROUP BY customer")
-```
-
-## Quick start — cgo-free (`s3parquet` only)
-
-For write-heavy services or consumers that don't need SQL:
-
-```go
-store, err := s3parquet.New[CostRecord](ctx, s3parquet.Config[CostRecord]{
-    Bucket:   "warehouse",
-    Prefix:   "billing",
-    S3Client: s3Client,
+store, err := s3store.New[CostRecord](s3store.Config[CostRecord]{
+    Bucket:            "warehouse",
+    Prefix:            "billing",
+    S3Client:          s3Client,
     PartitionKeyParts: []string{"charge_period", "customer"},
     PartitionKeyOf: func(r CostRecord) string {
         return fmt.Sprintf("charge_period=%s/customer=%s",
@@ -101,51 +50,65 @@ store, err := s3parquet.New[CostRecord](ctx, s3parquet.Config[CostRecord]{
     },
     // Optional: enable latest-per-entity dedup on Read / PollRecords.
     // EntityKeyOf and VersionOf are required together — both or
-    // neither. NewReader rejects partial config.
+    // neither. New rejects partial config.
     EntityKeyOf: func(r CostRecord) string {
         return r.CustomerID + "|" + r.SKU
     },
     VersionOf: func(r CostRecord) int64 {
-        return r.CalculatedAt.UnixNano()
+        return r.CalculatedAt.UnixMicro()
     },
 })
+if err != nil {
+    log.Fatal(err)
+}
 
-// parquet-go decodes directly into []CostRecord via the parquet tags
+// Write — groups records by PartitionKeyOf, one Parquet file per group
+_, err = store.Write(ctx, records)
+
+// Snapshot read — deduplicated by VersionOf when EntityKeyOf is set
 latest, err := store.Read(ctx, []string{"charge_period=2026-03-17/customer=abc"})
+
+// Iterate over a range without buffering everything in memory
+for r, err := range store.ReadIter(ctx, []string{"charge_period=2026-03-*/*"}) {
+    if err != nil { return err }
+    process(r)
+}
+
+// Stream changes since an offset (one S3 LIST, no GETs)
+entries, next, err := store.Poll(ctx, since, 100)
 ```
 
-`s3parquet` drives typed results off the parquet struct tags on `T`
-via parquet-go's `GenericReader[T]` — no `ScanFunc` or manual
+`s3store` decodes directly into `[]CostRecord` via the parquet struct
+tags on `T` (parquet-go's `GenericReader[T]`) — no `ScanFunc` or manual
 column-order bookkeeping. A field whose column is missing from a given
-file lands as Go's zero value. `s3sql.Query` returns `*sql.Rows`
-unchanged; the caller binds rows with the standard `database/sql`
-contract.
+file lands as Go's zero value.
 
-## Writer / Reader / View (`s3parquet`)
+## Writer / Reader / View
 
-`s3parquet.Store[T]` is a composition of two public halves: a `Writer[T]`
+`s3store.Store[T]` is a composition of two public halves: a `Writer[T]`
 for the write path and a `Reader[T]` for the read path. Most users keep
 using `New(Config)` and get both through `Store`. Services that only
 write or only read can construct a single half with a narrower config:
 
 ```go
 // Build the shared S3 wiring once — Target is the untyped handle
-// Writer, Reader, Index, and BackfillIndex all speak.
-target := s3parquet.NewS3Target(
-    "warehouse", "billing", s3Client,
-    []string{"charge_period", "customer"},
-)
+// Writer, Reader, IndexReader, and BackfillIndex all speak.
+target := s3store.NewS3Target(s3store.S3TargetConfig{
+    Bucket:            "warehouse",
+    Prefix:            "billing",
+    S3Client:          s3Client,
+    PartitionKeyParts: []string{"charge_period", "customer"},
+})
 
 // Write-only service: no read-side knobs in config.
-w, err := s3parquet.NewWriter[CostRecord](s3parquet.WriterConfig[CostRecord]{
+w, err := s3store.NewWriter[CostRecord](s3store.WriterConfig[CostRecord]{
     Target:         target,
     PartitionKeyOf: func(r CostRecord) string { /* ... */ },
 })
 
 // Read-only service: no PartitionKeyOf / Compression.
-r, err := s3parquet.NewReader[CostRecord](s3parquet.ReaderConfig[CostRecord]{
-    Target:          target,
-    InsertedAtField: "InsertedAt",
+r, err := s3store.NewReader[CostRecord](s3store.ReaderConfig[CostRecord]{
+    Target: target,
 })
 ```
 
@@ -169,11 +132,11 @@ type NarrowRec struct {
     // ProcessLog deliberately absent.
 }
 
-store, _ := s3parquet.New[FullRec](ctx, cfg)
-view, _ := s3parquet.NewReaderFromStore[NarrowRec, FullRec](store,
-    s3parquet.ReaderConfig[NarrowRec]{})
+store, _ := s3store.New[FullRec](cfg)
+view, _ := s3store.NewReaderFromStore[NarrowRec, FullRec](store,
+    s3store.ReaderConfig[NarrowRec]{})
 
-recs, _ := view.Read(ctx, "*") // []NarrowRec — ProcessLog not fetched
+recs, _ := view.Read(ctx, []string{"*"}) // []NarrowRec — ProcessLog not fetched
 ```
 
 The narrow `ReaderConfig[T']` carries the read-side knobs
@@ -188,8 +151,8 @@ The relationship between constructors:
 
 | Want | Call |
 |---|---|
-| Both write and read, same `T` | `New(ctx, Config[T])` → `*Store[T]` |
-| Write only, narrow config | `NewWriter(ctx, WriterConfig[T])` → `*Writer[T]` |
+| Both write and read, same `T` | `New(Config[T])` → `*Store[T]` |
+| Write only, narrow config | `NewWriter(WriterConfig[T])` → `*Writer[T]` |
 | Read only, narrow config | `NewReader(ReaderConfig[T])` → `*Reader[T]` |
 | Same-/narrower-`T'` Reader over a Writer | `NewReaderFromWriter[T', U](writer, cfg)` |
 | Same-/narrower-`T'` Reader over a Store | `NewReaderFromStore[T', U](store, cfg)` |
@@ -248,7 +211,7 @@ func fromFile(f UsageFile) (Usage, error) {
 }
 
 // Hand the library UsageFile, not Usage.
-store, _ := s3parquet.New[UsageFile](ctx, s3parquet.Config[UsageFile]{ /* ... */ })
+store, _ := s3store.New[UsageFile](s3store.Config[UsageFile]{ /* ... */ })
 
 // Writes:
 files := make([]UsageFile, len(usages))
@@ -268,8 +231,9 @@ for i, f := range files {
 ```
 
 Parquet's `DECIMAL(p, s)` logical type is the preferred encoding for
-monetary values — DuckDB reads it as a real decimal so `SUM(amount)` just
-works. Use `int64` backing for precision ≤ 18, `[N]byte` for more.
+monetary values — most parquet readers (Spark, Trino, DuckDB) decode
+it as a real decimal so `SUM(amount)` just works. Use `int64`
+backing for precision ≤ 18, `[N]byte` for more.
 
 ## S3 layout
 
@@ -298,13 +262,12 @@ separate — both patterns are supported.
 
 **Pattern A — partition name == Parquet column name** (all the examples above).
 The partition key is a real record attribute, and `PartitionKeyOf` reads it
-directly from the struct. On the `s3sql` read path, DuckDB exposes the Hive
-partition column *alongside* the Parquet column of the same name; the
-Hive-derived value wins when they collide. Because `Write` derives the path
-from the same record the Parquet file holds, they always agree, so the
-"hive wins" rule is invisible in normal code. The one way to hit it is to
-call `WriteWithKey` with a key inconsistent with the record's fields —
-don't do that.
+directly from the struct. Because `Write` derives the path from the same
+record the Parquet file holds, the Hive value and the column value always
+agree, and external SQL engines pointed at the layout (DuckDB, Trino,
+Athena, …) see one consistent value either way. The one way to surface a
+mismatch is to call `WriteWithKey` with a key inconsistent with the
+record's fields — don't do that.
 
 **Pattern B — partition name separate from every Parquet column** (classical
 Hive). The partition key is *derived*, not stored as a field:
@@ -318,17 +281,20 @@ PartitionKeyOf: func(r Record) string {
 },
 ```
 
-Partition values live only in the path, saving storage. `s3sql` still
-surfaces them as columns and you can `SELECT` or `WHERE` on them.
-`s3parquet` ignores Hive paths entirely — if you need `year`/`month`
-on the Go-only read path, reconstruct them from `Ts`.
+Partition values live only in the path, saving storage. `s3store`
+ignores Hive paths on the typed read path — if you need
+`year`/`month` on records, reconstruct them from `Ts`. External
+SQL engines (DuckDB, Trino, Athena, …) still surface the Hive
+columns when pointed at the data path, so you can `SELECT` /
+`WHERE` on them from outside the library.
 
 Pick A when the partition is a first-class attribute (customer, tenant);
 pick B when it's a derived time bucket. Mixing within one store is fine.
 
 ## Glob grammar
 
-Both `s3parquet` and `s3sql` share one grammar, validated identically:
+The same grammar is used by every snapshot read entry point and
+validated once:
 
 | Pattern | Accepted? |
 |---|---|
@@ -354,19 +320,13 @@ segments (part name in the wrong position) are also rejected.
 unbounded end. Both sides are plain literals — no `*`, no `..`. `..` alone
 is rejected; use `*` to match everything.
 
-Ranges enable partition pruning: both read paths extract the common prefix
-of `FROM` and `TO` as an S3 `LIST` prefix so only potentially-matching keys
-are enumerated. The SQL path additionally pushes the bounds down as a
-`WHERE` predicate on the hive partition column, so DuckDB skips non-matching
-files at plan time.
+Ranges enable partition pruning: the read path extracts the common
+prefix of `FROM` and `TO` as an S3 `LIST` prefix so only
+potentially-matching keys are enumerated.
 
-**Bounds are compared lexicographically** — byte-wise on both read paths
-(`s3parquet` uses Go string compare; `s3sql` runs the `WHERE` against the
-Hive partition column as `VARCHAR`, since we pass `hive_types_autocast=false`
-so DuckDB never reinterprets the value as DATE / INT). That makes the two
-paths agree exactly, but it also means the range matches *characters*, not
-numbers or dates. **Partition values must be chosen so lex order matches
-intent:**
+**Bounds are compared lexicographically** — byte-wise Go string
+compare. The range matches *characters*, not numbers or dates.
+**Partition values must be chosen so lex order matches intent:**
 
 - ISO-8601 timestamps (`2026-03-01T00`, `2026-03-01`) — correct by design.
 - Zero-padded fixed-width numbers (`00042`, not `42`) — correct.
@@ -456,31 +416,19 @@ records, newOffset, err = store.PollRecords(ctx, lastOffset, 100,
     s3store.WithHistory())
 ```
 
-Whether dedup actually runs depends on which read path you use:
-
-- **`s3parquet.PollRecords` / `Read` / `ReadIter` (and the umbrella
-  delegations)** — dedup when `EntityKeyOf` AND `VersionOf` are both
-  set (NewReader rejects partial config). When neither is set, every
-  record passes through in decode order.
-- **`s3sql.Query` (and the umbrella delegation)** — dedup when
-  `EntityKeyColumns` + `VersionColumn` are both set (DuckDB
-  `QUALIFY ROW_NUMBER()` CTE). When either is empty, every record
-  passes through.
-
-`WithHistory()` forces the no-dedup path in every case.
+Dedup runs on every read path when `EntityKeyOf` AND `VersionOf`
+are both set on the Reader (`New` / `NewReader` reject partial
+config). When neither is set, every record passes through in
+decode order. `WithHistory()` forces the no-dedup path explicitly.
 
 **Tie-break on equal max version (default dedup, no
 `WithHistory`).** When two writes share the same version for the
 same entity key — common on an at-least-once retry that replays a
-batch with the same domain timestamp — both backends resolve the
-tie the same way: **lex-later filename wins**.
-
-- **`s3parquet`**: input is sorted by `(entityKey, versionOf)`
-  stable on ties; preparePartitions feeds files in lex order, so
-  within a tied group the lex-later file's record is the last one
-  and dedupLatestSeq's `pending` advances onto it.
-- **`s3sql`**: secondary `ORDER BY filename DESC` in the dedup CTE
-  picks the lex-later filename explicitly.
+batch with the same domain timestamp — the **lex-later filename
+wins**. Input is sorted by `(entityKey, versionOf)` stable on
+ties; files feed in lex order, so within a tied group the lex-
+later file's record is the last one and dedupLatestSeq's
+`pending` advances onto it.
 
 For the auto-generated `{tsMicros}-{shortID}` id, lex-later =
 wrote-later, so this is "wrote-later wins" in practice. With
@@ -489,8 +437,7 @@ tie-break follows the token's lex order rather than wall-clock
 order. Use a time-sortable token format
 (e.g. `{ISO-timestamp}-{suffix}`) if you rely on chronological
 tie-breaking. Stable across repeated reads either way. To make
-ties impossible, ensure `VersionColumn` / `VersionOf` strictly
-increases per write.
+ties impossible, ensure `VersionOf` strictly increases per write.
 
 **Replicas under `WithHistory`.** Records that share
 `(entity, version)` describe the same logical write — a retry,
@@ -527,12 +474,9 @@ recs, _ := store.Read(ctx, []string{"*"})
 // recs[i].InsertedAt is the writer's wall-clock at write-start.
 ```
 
-Works on every typed read path (`s3parquet.Read`, `ReadIter`,
-`PollRecords`) and on the SQL side too — DuckDB decodes the
-column natively via `SELECT *` (s3sql exposes it as a regular
-column on the `*sql.Rows` cursor). The reader has no special
-handling: the column round-trips like any other parquet field.
-Zero reflection cost when unset.
+Works on every read path (`Read`, `ReadIter`, `PollRecords`) —
+the column round-trips like any other parquet field. The reader
+has no special handling. Zero reflection cost when unset.
 
 To use the writer-stamped time as the dedup version, reference
 the field from `VersionOf`:
@@ -628,9 +572,7 @@ already provides retry-safety).
 
 `OffsetAt` is pure computation — no S3 call — and bridges
 `time.Time` to the offset cursor used by `Poll` / `PollRecords` /
-`WithUntilOffset`. All four APIs — `OffsetAt`, `WithUntilOffset`,
-`ReadRangeIter`, `PollRecords` — are available on the umbrella,
-`s3parquet`, and `s3sql`.
+`WithUntilOffset`.
 
 ### Stream — opting out (`DisableRefStream`)
 
@@ -639,8 +581,8 @@ Every `Write` / `WriteWithKey` call issues one extra S3 PUT to
 records by key and calls `WriteWithKey` once per group, so a batch
 spanning N partitions produces N ref PUTs. For pure batch / analytics
 workloads that never tail the stream, that's pure overhead. Set
-`DisableRefStream: true` on the umbrella `Config`, `s3parquet.Config`,
-or `s3parquet.S3Target` to skip the ref PUT:
+`DisableRefStream: true` on `Config` or on the `S3Target` to skip
+the ref PUT:
 
 ```go
 s3store.Config[CostRecord]{
@@ -653,12 +595,11 @@ Effect on each method:
 
 - **`Write` / `WriteWithKey`** — one fewer S3 PUT per call;
   `WriteResult.Offset` and `WriteResult.RefPath` are empty.
-- **`Read` / `ReadIter` / `Query` / `Lookup` / `BackfillIndex`**
-  — unaffected. They LIST `data/` (or `_index/<name>/`) directly
+- **`Read` / `ReadIter` / `Lookup` / `BackfillIndex`** —
+  unaffected. They LIST `data/` (or `_index/<name>/`) directly
   and never consult refs.
 - **`Poll` / `PollRecords` / `ReadRangeIter`** — return
-  `s3store.ErrRefStreamDisabled` (shared sentinel, matches
-  `errors.Is` across packages). `ReadRangeIter` surfaces the
+  `s3store.ErrRefStreamDisabled`. `ReadRangeIter` surfaces the
   error via the first yielded `(zero, err)` tuple.
 - **`OffsetAt`** — still works. It's pure timestamp encoding with no
   S3 dependency, so it keeps returning well-formed offsets even
@@ -669,9 +610,9 @@ has no refs, so flipping the flag back does not retroactively make
 `Poll` see the historical writes.
 
 Both sides of the deployment (writer and reader) must agree on the
-flag — set it on the umbrella `Config`, or on the
-`s3parquet.S3Target` shared by `s3parquet.Writer` and the readers.
-The two failure modes if they drift:
+flag — set it on `Config` or on the shared `S3Target` so the
+Writer and Reader read the same value. The two failure modes if
+they drift:
 
 - **Writer disabled + reader enabled** — `Poll` walks an empty
   `_stream/refs/` prefix and silently returns zero entries with no
@@ -681,9 +622,9 @@ The two failure modes if they drift:
   Unset `DisableRefStream` on the reader to recover; no data is
   lost.
 
-`s3parquet` users constructing a `Store` via `New(Config)` can't
-drift — the flag lives on the shared `S3Target` and both halves
-read the same value.
+Callers building a `Store` via `New(Config)` can't drift — the
+flag lives on the constructed `S3Target` and both halves read
+from the same value.
 
 ### Snapshot
 
@@ -715,10 +656,9 @@ for r, err := range store.ReadIter(ctx, []string{"charge_period=2026-03-*/*"}) {
 // breaking out of the loop cancels in-flight downloads — no Close
 ```
 
-Two callable surfaces: `s3parquet.Reader.ReadIter` and the umbrella
-`s3store.Store.ReadIter` (forwards to `s3parquet.Reader`).
+Available on both `Store[T]` and the underlying `Reader[T]`.
 
-**Memory profile**: `O(one partition's records)`. The pure-Go path
+**Memory profile**: `O(one partition's records)`. The pipeline
 processes one partition at a time: files inside the partition
 download in parallel, the decoded batch is deduped (or passed through
 on `WithHistory()`), records are yielded in lex/insertion order, then
@@ -753,19 +693,19 @@ holds the producer back:
 ```go
 // Many small partitions: prefetch generously by count.
 for r, err := range store.ReadIter(ctx, []string{"*"},
-    s3parquet.WithReadAheadPartitions(8)) { ... }
+    s3store.WithReadAheadPartitions(8)) { ... }
 
 // Skewed partition sizes (mostly tiny + a few large): cap by bytes
 // so prefetch self-throttles on the large ones. Decoded Go memory
 // typically runs 1–2× the uncompressed size depending on data
 // shape (string headers, slice/map pointer overhead).
 for r, err := range store.ReadIter(ctx, []string{"*"},
-    s3parquet.WithReadAheadBytes(2<<30)) { ... } // ≤ 2 GiB
+    s3store.WithReadAheadBytes(2<<30)) { ... } // ≤ 2 GiB
 
 // Combine — useful when both axes matter.
 for r, err := range store.ReadIter(ctx, []string{"*"},
-    s3parquet.WithReadAheadPartitions(8),
-    s3parquet.WithReadAheadBytes(2<<30)) { ... }
+    s3store.WithReadAheadPartitions(8),
+    s3store.WithReadAheadBytes(2<<30)) { ... }
 ```
 
 **Trade-off**: peak memory ≈ `WithReadAheadBytes` (decoded
@@ -786,7 +726,7 @@ flows (the cap can't bind below partition granularity without
 row-group-level streaming). The cap only prevents *additional*
 partitions from joining the buffer.
 
-**Per-partition dedup contract on `s3parquet.Reader.ReadIter`**: differs
+**Per-partition dedup contract on `s3store.Reader.ReadIter`**: differs
 from `Read`'s global dedup. The iter path buffers one partition at a
 time, dedups within that partition, yields, then drops it. **Correct
 only when the partition key strictly determines every component of
@@ -800,64 +740,12 @@ For typical time-series shapes (`charge_period_start` leads both
 `ReadIter` produces the same records as `Read`, just with bounded peak
 memory.
 
-**`s3sql` side has no such caveat** — DuckDB plans across the union of
-files and runs `QUALIFY` over the full result, so dedup is global
-regardless of how rows are streamed back.
-
-**Order**: `s3parquet.Reader.ReadIter` visits partitions in lex order
-and downloads files within a partition in lex order. Within a
-partition the user-visible emission order is `(entity, version)`
-ascending when `EntityKeyOf` is set; when no dedup is configured the
-sort is skipped entirely and records emit in decode order (file lex
-order, then parquet row order). SQL queries return rows in DuckDB's
-query order — add `ORDER BY` in your `Query` call if you need
-stability.
-
-### SQL query (umbrella or `s3sql`)
-
-```go
-rows, err := store.Query(ctx, []string{"charge_period=2026-03-*/*"},
-    "SELECT customer, sku, SUM(net_cost) AS total "+
-        "FROM costs GROUP BY customer, sku")
-
-// Query aggregates across an arbitrary set of partition tuples.
-rows2, err := store.Query(ctx, []string{
-    "charge_period=2026-03-17/customer=abc",
-    "charge_period=2026-03-18/customer=def",
-}, "SELECT SUM(net_cost) AS total FROM costs")
-```
-
-Deduplicated by default when `EntityKeyColumns` + `VersionColumn` are
-configured. Pass `s3store.WithHistory()` to see all versions. `Query`
-returns `*sql.Rows`; bind rows with the standard `database/sql`
-contract.
-
-The `*sql.Rows` cursor can be materialized into typed records with
-`s3sql.ScanAll[T](rows)` — maps DuckDB columns to T fields by
-`parquet:"…"` tag, NULL-safe, supports `sql.Scanner` and composite
-shapes (LIST/STRUCT/MAP).
-
-> **Tuning DuckDB.** DuckDB auto-detects two knobs at open
-> time: `threads` (defaults to the host's logical CPU count) caps
-> parallel scans/joins/aggregations, and `memory_limit` (defaults
-> to ~80% of system RAM) caps in-process working set before
-> DuckDB spills to disk. Override either via `ExtraInitSQL`:
->
-> ```go
-> ExtraInitSQL: []string{
->     "SET threads = 8",
->     "SET memory_limit = '4GB'",
-> }
-> ```
->
-> Full list of settings:
-> [duckdb.org/docs/stable/configuration/overview](https://duckdb.org/docs/stable/configuration/overview).
->
-> These are independent of `MaxInflightRequests` — that knob
-> bounds the Go-side aws-sdk client (Writer PUTs, the LIST that
-> resolves URIs for `Query`, s3parquet Reader GETs); DuckDB's
-> httpfs GETs for parquet bodies run on DuckDB's own thread pool,
-> outside the semaphore.
+**Order**: `ReadIter` visits partitions in lex order and downloads
+files within a partition in lex order. Within a partition the user-
+visible emission order is `(entity, version)` ascending when
+`EntityKeyOf` is set; when no dedup is configured the sort is skipped
+entirely and records emit in decode order (file lex order, then
+parquet row order).
 
 ## Idempotent writes
 
@@ -889,12 +777,8 @@ On retry with the same token:
 
 Tokens reduce *storage* duplication. They do **not** on their own
 guarantee exactly-once at the consumer. For that, pair tokens with
-reader-side dedup:
-
-- `EntityKeyOf` + `VersionOf` on `s3parquet.Reader` (and the
-  umbrella, for `Read` / `ReadIter` / `PollRecords`)
-- `EntityKeyColumns` + `VersionColumn` on `s3sql.Reader` (and the
-  umbrella, for `Query`)
+reader-side dedup: configure `EntityKeyOf` + `VersionOf` so
+`Read` / `ReadIter` / `PollRecords` collapse latest-per-entity.
 
 | Config | Storage layer | Consumer layer |
 |---|---|---|
@@ -959,11 +843,11 @@ treats the resulting 403 + HEAD as `ErrAlreadyExists`). That
 deny plus a per-target `ConsistencyControl` strong enough to
 make the scoped retry-LIST list-after-write across nodes are
 the two backend-side settings the library can't apply for you.
-Both are documented in
-[StorageGRID consistency](#storagegrid-consistency), along with
-what each consistency level means for every correctness-critical
-call s3store makes, why `strong-*` is required on both halves of
-the library, and where we deliberately leave the bucket default.
+Both are documented in [STORAGEGRID.md](STORAGEGRID.md), along
+with what each consistency level means for every correctness-
+critical call s3store makes, why `strong-*` is required on both
+halves of the library, and where we deliberately leave the
+bucket default.
 
 ### Zombie writers and orchestrators
 
@@ -984,7 +868,7 @@ that's a caller invariant. Two cases:
   paths) and two distinct refs; reader dedup via
   `(entity, version)` collapses them at read time.
 
-[cdpg]: #s3putoverwriteobject-deny-is-a-post-completion-gate-not-a-mutex
+[cdpg]: STORAGEGRID.md#s3putoverwriteobject-deny-is-a-post-completion-gate-not-a-mutex
 
 For orchestrator-driven jobs: **reuse the same token across
 failovers** (persist it in your job state). A fresh token per
@@ -1084,21 +968,15 @@ orchestrator's partition-ownership lease or by reusing the same
 token across failovers so zombies produce byte-identical writes,
 not diverging ones).
 
-**Scope** — accepted by every read path:
+**Scope** — accepted by `Read`, `ReadIter`, `ReadRangeIter`, and
+`PollRecords`.
 
-- `s3parquet.Reader`: `Read`, `ReadIter`, `ReadRangeIter`,
-  `PollRecords`.
-- `s3sql.Reader`: `Query`.
-- Umbrella `Store`: all of the above forward through.
+**Performance impact** — the filter applies purely in memory on
+a LIST (or ref-stream) that runs anyway, so there's no extra S3
+work.
 
-**Performance impact** — `s3parquet` and poll-based paths apply
-the filter purely in memory on a LIST (or ref-stream) that runs
-anyway, so there's no extra S3 work. `s3sql.Query` already drive 
-a Go-side LIST to assemble the URI list for `read_parquet([...])`, 
-so the barrier filter folds in for free.
-
-**Zero matches under a barrier**: `Query` and `Read*` normalize to
-empty results as they do.
+**Zero matches under a barrier**: `Read*` normalizes to an empty
+result.
 
 The token passes `ValidateIdempotencyToken` — same grammar as
 `WithIdempotencyToken` (non-empty, no `/`, no `..`, printable
@@ -1107,18 +985,12 @@ clear error; no S3 call is issued.
 
 ## Schema evolution
 
-Both read paths tolerate missing columns out of the box: a field whose
-column isn't in a given parquet file lands as Go's zero value, never an
-error. That covers the common "added a column" case without any extra
-configuration.
-
-- **`s3parquet`** — parquet-go matches columns to struct fields by the
-  `parquet:` tag, so column order in the file doesn't matter and unknown
-  columns are ignored.
-- **`s3sql`** — `Query` returns `*sql.Rows` directly; bind columns
-  with the standard `database/sql` contract. DuckDB's `union_by_name`
-  read mode tolerates schema drift across the file union, so
-  reading old + new files in one query just works.
+Reads tolerate missing columns out of the box: a field whose column
+isn't in a given parquet file lands as Go's zero value, never an
+error. That covers the common "added a column" case without any
+extra configuration. parquet-go matches columns to struct fields by
+the `parquet:` tag, so column order in the file doesn't matter and
+unknown columns are ignored.
 
 Renames, splits, and row-level computed derivations still require a
 migration tool — rewrite the affected files with the new shape.
@@ -1128,10 +1000,9 @@ migration tool — rewrite the affected files with the new shape.
 When a query filters on a column that isn't a partition key
 (e.g. "list every customer that had usage of SKU X in period
 P"), scanning every data file is prohibitive at scale. A
-secondary index solves this by writing
-one empty S3 *marker* per distinct tuple of the columns you want
-to query. The query is a single LIST under the marker prefix —
-zero parquet reads, no cgo, no DuckDB.
+secondary index solves this by writing one empty S3 *marker* per
+distinct tuple of the columns you want to query. The query is a
+single LIST under the marker prefix — zero parquet reads.
 
 ### Shape
 
@@ -1144,7 +1015,7 @@ An index has two halves that are wired separately:
   reflects T's `parquet` tags + `Columns` once at `NewWriter` and
   emits markers without any caller code.
 - **Read side (`IndexLookupDef[K]`)** is consumed by
-  `s3parquet.NewIndexReader(target, lookupDef)` to build a typed
+  `s3store.NewIndexReader(target, lookupDef)` to build a typed
   `IndexReader[K]` query handle. `From` projects each marker back into
   K. Same convention: nil means reflect K's parquet tags against
   `Columns`; a non-nil custom `From` overrides.
@@ -1181,8 +1052,8 @@ type SkuPeriodEntry struct {
     ChargePeriodEnd   time.Time `parquet:"charge_period_end"`
 }
 
-skuIdx, _ := s3parquet.NewIndexReader(store.Target(),
-    s3parquet.IndexLookupDef[SkuPeriodEntry]{
+skuIdx, _ := s3store.NewIndexReader(store.Target(),
+    s3store.IndexLookupDef[SkuPeriodEntry]{
         Name: "sku_period_idx",
         Columns: []string{
             "sku_id", "charge_period_start",
@@ -1277,26 +1148,15 @@ customer=def)` but *not* the off-diagonal combinations), pass them
 as additional elements of the same `[]string` patterns slice.
 Every read entry point already takes `[]string`:
 
-| Entry point | Where |
-|---|---|
-| `Reader.Read` / `ReadIter` | `s3parquet.Reader`, umbrella |
-| `Reader.Query` | `s3sql.Reader`, umbrella |
-| `Index.Lookup` | `s3parquet`, umbrella |
-| `BackfillIndex` | `s3parquet`, umbrella |
+Every read entry point — `Read`, `ReadIter`, `IndexReader.Lookup`,
+`BackfillIndex` — accepts the same `[]string` shape:
 
 ```go
-// Pure-Go read across non-Cartesian tuples.
+// Read across non-Cartesian tuples.
 recs, _ := store.Read(ctx, []string{
     "period=2026-03-17/customer=abc",
     "period=2026-03-18/customer=def",
 })
-
-// DuckDB aggregation across the union — one query, global
-// GROUP BY / SUM / join across the tuple set.
-rows, _ := store.Query(ctx, []string{
-    "period=2026-03-17/customer=abc",
-    "period=2026-03-18/customer=def",
-}, "SELECT customer, SUM(amount) FROM records GROUP BY customer")
 
 // Index lookup over an arbitrary set of (col, col) tuples.
 entries, _ := idx.Lookup(ctx, []string{
@@ -1310,23 +1170,16 @@ stats, _ := s3store.BackfillIndex(ctx, target, def,
     until, nil)
 ```
 
-**Execution model (s3parquet path):** LIST calls fan out across
-patterns with the Target's `MaxInflightRequests` cap, overlapping
-patterns are deduplicated at the key level, the GET+decode pool
-runs over the unioned set, and dedup (if configured) applies
-globally — an entity appearing under two patterns is kept as
-the latest version across the union, not per-pattern.
+**Execution model:** LIST calls fan out across patterns with the
+Target's `MaxInflightRequests` cap, overlapping patterns are
+deduplicated at the key level, the GET+decode pool runs over the
+unioned set, and dedup (if configured) applies globally — an
+entity appearing under two patterns is kept as the latest version
+across the union, not per-pattern.
 
-**Execution model (s3sql path):** every `Query` pre-LISTs in Go
-(per pattern, with the same bounded cap) to produce the exact file
-URI list, then runs **one** `read_parquet([...])` so DuckDB plans
-once over the whole set — the analytical win (`SUM` / `GROUP BY` /
-joins across non-Cartesian tuples) that N separate `Query` calls
-would force the caller to do in Go.
-
-A single-element slice is the common case for queries over one
-pattern; the multi-pattern API simply lets the caller add more
-when they need a non-Cartesian set.
+A single-element slice is the common case; the multi-pattern API
+simply lets the caller add more when they need a non-Cartesian
+set.
 
 ### What's in scope for v1
 
@@ -1338,7 +1191,7 @@ when they need a non-Cartesian set.
   marker without a settle delay. On AWS S3 / MinIO that's
   native; on StorageGRID, set the level once on the target and
   it flows to marker PUT + LIST automatically (see
-  [StorageGRID consistency](#storagegrid-consistency)).
+  [STORAGEGRID.md](STORAGEGRID.md)).
 - **Backfill** as a standalone package function (below).
 
 ### Backfill
@@ -1358,7 +1211,7 @@ data — the typical shape is:
 
 ```go
 stats, err := s3store.BackfillIndex(ctx,
-    store.Target(),     // or construct via s3parquet.NewS3Target
+    store.Target(),     // or construct via s3store.NewS3Target
     def,                // the same IndexDef the live app registered
     []string{"*"},      // patterns (PartitionKeyParts grammar)
     until,              // exclusive upper bound on LastModified (time.Time)
@@ -1453,9 +1306,9 @@ Accepted values:
 Zero value (empty string) resolves to snappy, so leaving the field unset
 is safe. `New()` rejects any other string.
 
-Readers (s3parquet and DuckDB's httpfs/parquet) auto-detect the codec on
-read, so switching compression per Write doesn't require any read-side
-config.
+parquet-go auto-detects the codec on read, so switching compression
+per Write doesn't require any read-side config. External engines
+(DuckDB, Spark, Trino) do the same.
 
 ## Settle window
 
@@ -1525,641 +1378,25 @@ PUT specifically there's no strong-vs-weak distinction. Real PUT
 latencies (tens of ms) fit comfortably inside the halved budget
 for any reasonable `SettleWindow`.
 
-## StorageGRID consistency
-
-s3store's correctness on AWS S3 and MinIO is automatic — both
-backends are strongly consistent on LIST and GET out of the box,
-and `ConsistencyControl` can stay at its zero value. **On NetApp
-StorageGRID it is not automatic.** This section is everything
-the library needs from StorageGRID's consistency model: what to
-configure, what each level means for every call we make, why
-`strong-*` is load-bearing on both halves, and where we have to
-make assumptions because the docs don't address a case directly.
-
-[sgcc]: https://docs.netapp.com/us-en/storagegrid-119/s3/consistency-controls.html
-[sgcwl]: https://docs.netapp.com/us-en/storagegrid-119/s3/conflicting-client-requests.html
-
-> **Scope: metadata visibility, not durability.** Every guarantee
-> here is about **when a freshly-PUT object becomes findable** by
-> a subsequent GET / HEAD / LIST. **None of it is about data
-> durability.** Replica count, erasure coding, geographic
-> placement, and write durability are all governed by **ILM
-> rules** and are orthogonal to the `Consistency-Control` header.
-> A `strong-global` PUT is not "more durable" than a
-> `read-after-new-write` PUT — it just propagates the metadata
-> more widely before returning success. The 11.9 docs cover [the
-> consistency-vs-ILM interaction explicitly][sgcc].
-
-### Setup
-
-Two configurations are required on StorageGRID:
-
-**1. Bucket policy denying `s3:PutOverwriteObject` on
-`{prefix}/data/*`.** This is the conditional-PUT surface for
-idempotent writes — a retry against an already-written data
-key gets `403 → ErrAlreadyExists` and the writer pivots to ref
-dedup. Scope the deny narrowly:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "DenyDataOverwrite",
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": ["s3:PutOverwriteObject"],
-      "Resource": [
-        "arn:aws:s3:::YOUR-BUCKET/YOUR-PREFIX/data/*"
-      ]
-    }
-  ]
-}
-```
-
-Apply with:
-
-```python
-s3.put_bucket_policy(Bucket="YOUR-BUCKET", Policy=json.dumps(policy))
-```
-
-> **Why narrow scope matters.** s3store's layout has three
-> subtrees under `{prefix}`:
->
-> - `data/` — parquet files. Deterministic paths under
->   `WithIdempotencyToken`; the deny fires here on retry so the
->   body isn't re-uploaded. **This is what needs the deny.**
-> - `_index/` — secondary-index markers. **Byte-identical
->   idempotent overwrites by design** — the same
->   `{col}={value}/m.idx` marker is written every time that
->   `(col, value)` tuple recurs in a batch. A bucket-wide deny
->   rejects the second write with `403 AccessDenied` and breaks
->   index writes entirely.
-> - `_stream/refs/` — ref files. Unique per-PUT keys
->   (refTsMicros prefix), so they never overwrite either way.
->
-> **Symptom of an over-scoped deny**: data writes succeed, then
-> markers fail with `403 AccessDenied` as soon as any
-> `(col, value)` tuple recurs. The library attempts a cleanup
-> DELETE on the orphan data, which often fails with the same
-> 403, leaving orphan parquet under `data/` with no markers and
-> no ref.
-
-**2. `ConsistencyControl` on the S3 target** to one of the
-stronger levels:
-
-```go
-target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
-    // ...
-    ConsistencyControl: s3parquet.ConsistencyStrongGlobal, // multi-site
-    // or:               s3parquet.ConsistencyStrongSite,  // single-site
-})
-```
-
-The umbrella `s3store.Config.ConsistencyControl` and
-`s3parquet.Config.ConsistencyControl` forward onto the target
-they build, so single-Config callers set the level once at the
-top. Setting it on the *target* (not on `WriterConfig` /
-`ReaderConfig` / `IndexDef`, where it used to live) means every
-S3 call routed through that target uses one and the same value
-— NetApp's "[same consistency for paired operations][sgcc]"
-rule is enforced by construction. On AWS / MinIO the header is
-unknown to the backend and ignored, so the zero value is correct
-there.
-
-### The five consistency levels
-
-Per the StorageGRID 11.9 [docs][sgcc]:
-
-- **`all`** — every storage node receives the metadata
-  immediately, or the request fails. Strongest, slowest;
-  intolerant of node outages.
-- **`strong-global`** — read-after-write *and* list-after-write
-  for every client request, across all sites.
-- **`strong-site`** — same guarantee, scoped to a single site.
-  Cross-site visibility lags.
-- **`read-after-new-write`** *(StorageGRID's default)* — for
-  **new** objects only: HEAD / GET see the freshly-PUT key (the
-  server retries the lookup at increasing consistency, up to
-  `strong-global`, on miss). **Overwrites, metadata updates,
-  and deletes are eventually consistent** (overwrite propagation
-  can take up to 15 days per the docs).
-- **`available`** — eventual consistency for everything; HEAD /
-  GET don't ladder up. Intended for log buckets or HEAD/GET on
-  keys known to be missing.
-
-### Operation × level matrix
-
-The matrix lists S3 operation types — pure storage-layer
-semantics, not s3store-specific use cases. **Authorization is
-a separate axis from consistency**: the
-`s3:PutOverwriteObject` deny is part of the auth layer, applies
-independently of the level, and is discussed in
-[its own subsection](#s3putoverwriteobject-deny-is-a-post-completion-gate-not-a-mutex).
-
-Cells describe the **within-level guarantee** the docs commit
-to (paired PUT + GET at the same level). Specific write scope
-(`W`) and read scope (`R`) per level are *not* docs-stated —
-see [What's documented about each level](#whats-documented-about-each-level-and-what-isnt)
-for what we do and don't know about the mechanism.
-
-| Operation | `available` | `read-after-new-write` (default) | `strong-site` | `strong-global` (11.9 / upgraded) | `all` |
-|---|---|---|---|---|---|
-| **PUT (new key)** — first write to a key that doesn't yet exist | weak; reads at any level may not see for a while | within-level paired HEAD/GET reads find the PUT (via the ladder, which always reaches strong-global on miss); LIST has no ladder, so LIST visibility is **eventually consistent** | within-level paired reads find the PUT — read-after-write within a site, no cross-site claim | every site must be available for the PUT to succeed; paired reads find it across all sites | strongest |
-| **PUT (overwrite)** — write replacing an existing key. Two parallel writes to the same key both succeed regardless of level — StorageGRID arbitrates with [latest-wins][sgcwl] | eventual | the docs explicitly call out overwrites: *"Overwrites of existing objects, metadata updates, and deletes are eventually consistent. Overwrites generally take seconds or minutes to propagate, but can take up to 15 days."* ([sgcc][sgcc]) | within-site overwrite consistency | every site has the new bytes after success | strongest |
-| **GET** — fetch object body | may 404 a freshly-written object | safe for new keys via the ladder; the ladder is documented to *always* reach strong-global on miss before returning 404 ([sgcc][sgcc]), so **strong-global READ is the system's authoritative read**. For overwrites, eventual per the quote above | within-site read-after-write | finds any prior PUT (every site has the data after a strong-global PUT) | strongest |
-| **HEAD** — existence / metadata check | same as GET | same as GET (ladder fires *on miss*) | same as GET | same as GET | same as GET |
-| **LIST** — enumerate keys under a prefix | misses recent PUTs from other nodes | **eventually consistent** — load-bearing weak spot (see [Why we need `strong-*`](#why-we-need-strong-global-or-strong-site)); the HEAD/GET ladder doesn't apply to LIST, and `read-after-new-write`'s definition is given in GET terms only | within-site list-after-write | within-site list-after-write (every site has the data after a strong-global PUT, so any site's read scope finds it) | strongest |
-
-[cput]: s3parquet/write.go#L235-L240
-[cref]: s3parquet/write.go#L333-L335
-[cmark]: s3parquet/write.go#L552-L554
-[cget]: s3parquet/read.go#L183
-[chead]: s3parquet/target.go#L431
-[clist]: s3parquet/target.go#L533-L552
-
-These S3 operations correspond to s3store call sites as
-follows:
-
-- **PUT (new)** — data PUT on first attempt ([code][cput]); ref
-  PUT ([code][cref]) always (the refTsMicros prefix is unique
-  per call); index marker PUT ([code][cmark]) on first
-  occurrence of a `(col, value)` tuple.
-- **PUT (overwrite)** — data PUT on retry under
-  `WithIdempotencyToken` (deterministic paths produce the same
-  key); marker PUT on a recurring `(col, value)`. *Same call
-  sites as PUT (new)* — whether a given attempt is "new" or
-  "overwrite" depends on whether the target key already
-  exists.
-- **GET** — parquet body fetch ([code][cget]).
-- **HEAD** — `putIfAbsent` 403→404 disambiguation
-  ([code][chead]).
-- **LIST** — partition LIST, marker LIST (`Index.Lookup`),
-  ref-stream LIST (`Poll` / `PollRecords` / `ReadRangeIter`),
-  scoped retry-LIST (`findExistingRef`); all funnel through
-  `listEach` ([code][clist]).
-
-### What's documented about each level (and what isn't)
-
-The 11.9 docs describe the *outcomes* each level guarantees but
-do not document the underlying *mechanism* — and the gaps
-matter because operationally the mechanism determines fault
-tolerance, latency, and which configurations are safe. We pin
-down what the docs commit to, then explicitly mark the rest as
-gap.
-
-[sg-meta]: https://docs.netapp.com/us-en/storagegrid/admin/managing-object-metadata-storage.html
-[sg-12]: https://docs.netapp.com/us-en/storagegrid/release-notes/whats-new.html
-[sg-quorum-kb]: https://kb.netapp.com/hybrid/StorageGRID/Object_Mgmt/Configuring_StorageGRID_quorum_semantics_for_strong-global_consistency
-
-#### Docs-stated
-
-- **HEAD/GET ladder for `read-after-new-write`** ([sgcc][sgcc]):
-  on a miss, the lookup retries at increasing levels and
-  *"if the object does not exist, the object lookup will always
-  reach a consistency equivalent to the behavior for
-  strong-global"*. The ladder terminates at strong-global,
-  treating it as definitive — implicitly asserting
-  **strong-global READ is the system's authoritative read**.
-- **11.9 strong-global PUT requires every site to be available**
-  ([sg-quorum-kb][sg-quorum-kb]): *"Strong-global consistency in
-  StorageGRID 11.9 and earlier ensures read-after-write
-  consistency across all sites, but requires ALL sites to be
-  available for client writes and deletes to be successful."*
-  No site failure tolerance.
-- **12.0 introduces "Quorum Strong-Global"** ([sg-12][sg-12]),
-  with site failure tolerance for 3+ site grids. New installs
-  default to it; upgraded grids retain the legacy
-  every-site-required behavior unless an operator opts in via
-  [the KB article's procedure][sg-quorum-kb].
-- **Latest-wins** for concurrent writes ([sgcwl][sgcwl]).
-- **Pairing rule** for `PutObject` / `GetObject`
-  ([sgcc][sgcc]) — same level on both halves.
-- **Metadata is Cassandra-backed**, 3 replicas per site
-  ([sg-meta][sg-meta]).
-
-#### Not docs-stated — multiple models fit
-
-- Exact write quorum (`W`) and read scope (`R`) for
-  `available`, `read-after-new-write`, and `strong-site`.
-- The mechanism by which strong-global READ achieves its
-  definitive-read guarantee.
-- Why the pairing rule exists — whether it's a quorum-overlap
-  necessity, an internal optimization, or vendor caution.
-
-We've cycled through several plausible models in this README's
-history; none is confirmed:
-
-- *`read-after-new-write` writes to local-quorum,
-  `strong-site` writes to all local replicas* — making
-  strong-site analogous to `all`-within-a-site.
-- *`read-after-new-write` writes to one replica with the read
-  ladder closing the gap*; this requires the ladder's top rung
-  to query enough replicas to find any single-replica write,
-  which (under naive Cassandra-style quorum) doesn't quite work
-  unless the read scope is `ALL`.
-- *Hash-based deterministic placement* (e.g., the primary
-  replica derives from `hash(prefix) % N`); reads at any level
-  know which primary to query, escalating to a quorum only on
-  primary unavailability.
-- *Some StorageGRID-specific mechanism* that doesn't map
-  cleanly to standard Cassandra semantics.
-
-The docs don't distinguish between these. **Empirical
-benchmarks against a real 11.9 grid** can confirm two things:
-
-- PUT: `read-after-new-write` ≈ `strong-site` ≈ 500 ms (both
-  stay local); `strong-global` ≈ 700 ms (~one inter-site RTT
-  added). The cross-site delta is consistent with EACH_QUORUM
-  on `strong-global` writes.
-- LIST: `read-after-new-write` ≈ 45 ms; `strong-site` ≈
-  `strong-global` ≈ 55 ms — strong levels indistinguishable on
-  the LIST side.
-
-The benchmark distinguishes *strong-global* from the others
-clearly, but cannot distinguish *`read-after-new-write`* from
-*`strong-site`* on the write path — the two have
-indistinguishable medians, consistent with several of the
-candidate models.
-
-#### Bottom line
-
-The actionable conclusion is reduced to what the docs *do*
-commit to: **`strong-global` (11.9) delivers list-after-write
-across all sites at the cost of every-site availability.**
-That's the trade. Everything below `strong-global` (whether
-the writes go to a local-quorum, a single primary, or
-something else entirely) we cannot reason about precisely
-from the docs alone. See
-[Choosing `strong-site` vs `strong-global`](#choosing-strong-site-vs-strong-global-deployment-topology)
-for how to make the deployment-topology decision under that
-constraint.
-
-### Why we need `strong-global` (or `strong-site`)
-
-**LIST is the load-bearing operation.** The 11.9 [docs][sgcc]
-describe the `read-after-new-write` lookup ladder explicitly in
-HEAD/GET terms only:
-
-> "When a HEAD or GET operation uses the 'Read-after-new-write'
-> consistency, StorageGRID performs the lookup in multiple
-> steps... It first looks up the object using a low consistency.
-> If that lookup fails, it repeats the lookup at the next
-> consistency value until it reaches a consistency equivalent
-> to the behavior for strong-global."
-
-The ladder is the **mechanism** by which `read-after-new-write`
-delivers its promise — and its existence is evidence that the
-underlying metadata propagation is itself **eventual**. If a
-freshly-PUT object were always visible at the low consistency
-the ladder starts at, no retry-up would be needed. HEAD/GET get
-to mask that eventual state; LIST does not. The docs describe
-no equivalent ladder for LIST, and the `read-after-new-write`
-definition itself uses GET language ("Any GET following a
-successfully completed PUT will be able to read the newly
-written data"). The conclusion is forced by the documented
-mechanism: **LIST under `read-after-new-write` is eventually
-consistent.** A LIST routed to a node that hasn't received the
-new metadata yet will omit the freshly-PUT key, with no
-automatic retry-up. `strong-site` and `strong-global` close
-that gap by guaranteeing read-after-write "for all client
-requests" — phrasing broad enough to include LIST.
-
-s3store relies on LIST seeing recent PUTs in four places:
-
-1. **Idempotent retry dedup** — `findExistingRef` LISTs the ref
-   stream to find the prior attempt's ref. A LIST that misses
-   it produces a duplicate ref. (The conditional data PUT's
-   overwrite-deny *may* fire under default; the docs don't
-   address that case. But even if it doesn't, the byte-identical
-   re-upload is a bandwidth concern, not a correctness one — the
-   correctness break is on this LIST.)
-2. **`s3parquet.Reader.Read` / `s3sql.Reader.Query`** — partition
-   LIST surfaces freshly-written data files for the
-   read-after-write contract.
-3. **`Index.Lookup`** — LIST under `_index/{col}={value}/`
-   surfaces the marker emitted by the latest write.
-4. **`Poll` / `PollRecords` / `ReadRangeIter`** — ref-stream LIST
-   advances the consumer's cutoff. Without `strong-*`,
-   `SettleWindow` would have to be sized as pure LIST-propagation
-   slack; with it, `SettleWindow` only has to cover the writer's
-   in-flight ref-PUT budget (see [Settle window](#settle-window)).
-
-HEAD and GET are *not* the bottleneck — they would be safe on
-their own under default thanks to the documented ladder. We send
-`strong-*` on them only because StorageGRID requires "[the same
-consistency for both the PutObject and GetObject
-operations][sgcc]", and the PUT side has to be `strong-*` to
-keep its paired LIST consistent.
-
-`all` would also satisfy the invariants but adds a strict-
-quorum precondition the library doesn't need: the load-bearing
-guarantee is list-after-write, not all-node ack at PUT time.
-`read-after-new-write` (default) and `available` are too weak
-— both leave LIST visibility unbounded. The choice between
-`strong-site` and `strong-global` is a *deployment-topology*
-decision — see below.
-
-### Asymmetric levels don't work (and one accidental exception)
-
-A natural optimization question: can we save cost by mixing
-levels — say, LIST at `strong-global` but PUTs at
-`read-after-new-write`, or PUTs at `strong-site` but LISTs at
-`strong-global`? Walking each setup through the per-site
-mechanics:
-
-| Setup (11.9) | What the PUT writes | Where the LIST reads | Verdict |
-|---|---|---|---|
-| `read-after-new-write` PUT + `strong-global` LIST | minimal local replicas; replication async | local-site quorum | **broken** — even within the writer's site, the PUT might be on too few local replicas to overlap with local quorum |
-| `strong-site` PUT + `strong-global` LIST | local-site quorum (writer's site only) | local-site quorum (in any site) | **broken cross-site** — LIST in a non-writer site sees nothing until async replication catches up |
-| `strong-global` PUT + `read-after-new-write` LIST | every site has local quorum | 1 replica, no ladder for LIST | **broken** — LIST can land on the 1-of-3 local replica that doesn't have the data |
-| `strong-global` PUT + `strong-site` LIST | every site has local quorum | local-site quorum | *safe in 11.9* (every site has the data; local-quorum LIST in any site finds it). NetApp's pairing rule is `PutObject`/`GetObject` only — PUT/LIST asymmetry is technically out-of-scope. **Breaks under 12.0 Quorum** (strong-global PUT no longer guarantees every site has the data); benchmarks show no measurable LIST savings vs. strong-global LIST anyway. Don't ship it. |
-| `strong-global` + `strong-global` | every site has local quorum | local-site quorum (works in any site) | safe |
-| `strong-site` + `strong-site` (same site) | local-site quorum | local-site quorum | safe within a site only |
-
-The "accidental exception" — `strong-global` PUT +
-`strong-site` LIST — is a quirk of the 11.9 EACH_QUORUM
-mechanism: because every site is *required* to ack a
-strong-global PUT, every site has the data after success, so
-any site's local-quorum LIST finds it.
-
-NetApp's [pairing rule][sgcc] is silent on this combination.
-The rule's exact wording is *"you must use the same
-consistency for both the PutObject and GetObject
-operations"* — `GetObject` specifically, not `ListObjects`.
-PUT/LIST asymmetry isn't in scope of the rule. So the docs
-neither bless nor forbid this configuration; we're operating
-on the mechanism alone.
-
-**Don't ship it anyway.** Three concrete reasons:
-
-1. **It breaks on 12.0 with Quorum semantics.** A site that's
-   temporarily unavailable will be skipped by the strong-global
-   PUT (Quorum = majority of sites, not every site). A
-   strong-site LIST in that recovered site won't see the write
-   until async replication catches up. The "optimization"
-   silently regresses across an upgrade — and the upgrade path
-   is a one-way switch from EACH_QUORUM to Quorum that the
-   operator may opt into without realizing s3store depended on
-   the legacy semantics.
-2. **Benchmarks show no measurable savings.** `strong-site`
-   LIST and `strong-global` LIST come back at ~55 ms median
-   in our 3-site grid — indistinguishable. The cost we're
-   trying to chase is on the PUT side, and we're keeping
-   strong-global there.
-3. **The library couldn't ship it cleanly.**
-   `ConsistencyControl` lives on the shared `S3Target` and
-   applies uniformly to every routed call. Splitting per-op
-   (a hypothetical `ListConsistencyControl` field) would add
-   public API surface for a fragile, near-zero-benefit
-   optimization.
-
-More generally, asymmetric setups can't help s3store: both
-halves of the library issue LISTs that need list-after-write.
-The *write* side does `findExistingRef` (idempotency dedup);
-the *read* side does partition LIST, marker LIST, and `Poll`
-LIST. Whichever side you weaken to a non-strong level loses
-list-after-write on its own LISTs — independently of any
-PUT/GET pairing concern.
-
-### Choosing `strong-site` vs `strong-global` (deployment topology)
-
-`strong-site` only delivers read-after-write **when the reader
-is in the same site as the writer**. `strong-global` (legacy
-11.9 / upgraded 12.0) only succeeds **when every site is
-available**. The choice is a deployment-topology decision —
-two axes, not a tuning knob:
-
-| Topology | Recommended | Correctness rationale | Availability rationale |
-|---|---|---|---|
-| **Single-site grid** | `strong-site` | One site, so `strong-site` ≡ `strong-global`. | Same fault tolerance — only that one site has to be up either way. |
-| **Multi-site grid, every reader/writer pair co-located per site** (Site A's app talks only to Site A's bucket; Site B is DR) | `strong-site` *with caveat* | Safe in steady state. Breaks on **cross-site failover** — if a writer fails over to Site B mid-batch, `findExistingRef` in Site B may not yet see the ref Site A wrote, and idempotent retry detection silently degrades until propagation catches up. | **`strong-site` is more available than 11.9 `strong-global`** here. A failure of any non-local site doesn't block local writes; under `strong-global` (11.9) it would. |
-| **Multi-site grid with cross-cutting traffic** (any reader/writer pair can land on different sites — global load balancer, readers in different regions than writers) | `strong-global` | Required for correctness. | **In 11.9, the cost is severe: any single site outage causes all writes to fail.** Plan for this — operators of 11.9 multi-site grids should understand strong-global as a *consistency-availability trade*, not a free upgrade over strong-site. |
-
-**The 11.9 availability cliff.** Under legacy strong-global,
-your write availability degrades to the *minimum* of all sites
-— if any site is in maintenance or partitioned, writes fail
-everywhere. Operationally this means:
-
-- A site rolling-restart blocks *all* writers globally for the
-  duration. Coordinate accordingly, or temporarily downgrade to
-  `strong-site` (with the corresponding correctness regression
-  for cross-site reads).
-- Network partitions between sites cause global write
-  unavailability, even for traffic local to a healthy site.
-- 12.0 with Quorum semantics fixes this for new installs (3+
-  site grids tolerate 1 site failure), but **upgraded grids
-  retain 11.9 behavior** until you opt in via [the KB
-  article's procedure][sg-quorum-kb].
-
-If your operational reality includes scheduled maintenance
-windows or cross-site network risk, factor that into the
-choice. There's a real argument for running `strong-site` even
-in a multi-site grid if the alternative is "all writes fail
-during any site's maintenance" — but you have to accept that
-cross-site reads may miss recent writes within the propagation
-window. The library can't make this trade-off for you.
-
-**Empirical latency profile** (3-site benchmark, 1000-object
-LIST and 1 MiB PUTs):
-
-- LIST: `read-after-new-write` ≈ 45 ms median, `strong-site` ≈
-  `strong-global` ≈ 55 ms median. Both strong-* levels read
-  local-site quorum, so latency profiles match.
-- PUT (1 MiB, single-stream): `read-after-new-write` ≈
-  `strong-site` ≈ 500 ms median (both stay local),
-  `strong-global` ≈ 700 ms median. The ~200 ms gap is the
-  slowest-site RTT — the price of "every site must respond".
-
-The PUT penalty for `strong-global` is the actionable cost —
-combined with the availability constraint above, it's why the
-library defaults the field to empty (zero value) rather than
-auto-selecting `strong-global`. Operators need to make the
-topology + availability decision deliberately.
-
-### `s3:PutOverwriteObject` deny is a post-completion gate, not a mutex
-
-The `s3:PutOverwriteObject` deny is part of StorageGRID's
-**authorization** layer. Authorization and consistency are
-independent axes:
-
-- **Consistency** governs how widely metadata propagates after
-  PUT and what subsequent reads see. The matrix above describes
-  this.
-- **Authorization** decides whether a given PUT is *allowed* to
-  proceed at all. The `s3:PutOverwriteObject` deny matches when
-  the auth-layer's existence check sees an object at the target
-  key, regardless of the consistency level configured on the
-  PUT request.
-
-The deny's *reliability* depends on whether the auth layer's
-existence check sees a recent PUT — which is itself a metadata
-read. **The docs don't tell us what consistency that internal
-check uses.** Empirically (and based on the latest-wins
-mechanism documented below) the deny fires reliably for
-sequential retries when the original PUT was at `strong-*`;
-under weaker levels we have no documented guarantee.
-
-#### Concurrent writers always race
-
-StorageGRID resolves overlapping writes to the same key on a
-"latest-wins" basis ([sgcwl][sgcwl]):
-
-> "Conflicting client requests, such as two clients writing to
-> the same key, are resolved on a 'latest-wins' basis. The
-> timing for the 'latest-wins' evaluation is based on when the
-> StorageGRID system completes a given request, and not on when
-> S3 clients begin an operation."
-
-That means **two parallel writes to the same key both succeed,
-on every consistency level**. At the moment each PUT is
-authorized, neither has *completed* yet — so neither's existence
-check sees an object, and the deny doesn't fire. Latest-wins
-arbitrates the bytes after the fact. The deny is a
-post-completion gate, not a synchronization primitive.
-
-#### Sequential retries
-
-For a retry that arrives *after* the prior PUT has completed,
-the auth layer's existence check has a chance to see the prior
-object. Whether it does depends on metadata visibility:
-
-- Under `strong-global` (11.9 EACH_QUORUM): every site has the
-  metadata after the original PUT succeeds, so the auth layer's
-  check sees the existing object regardless of which node the
-  retry lands on. Deny fires reliably.
-- Under `strong-site`: the retry's auth check sees the existing
-  object only if it lands on the same site as the original
-  writer. Cross-site retries may miss until propagation.
-- Under `read-after-new-write` and `available`: we don't know
-  what consistency the auth layer uses for its existence check;
-  the docs are silent. Could be reliable, could not be.
-
-#### Why s3store's correctness doesn't depend on the deny firing
-
-For s3store's idempotency model under `WithIdempotencyToken`:
-
-- Parquet encoding is deterministic, so the data PUT's bytes on
-  retry are byte-identical to the first attempt. Latest-wins on
-  identical bytes is a no-op.
-- Marker overwrites are byte-identical empty markers — same.
-- The load-bearing dedup primitive is the **`findExistingRef`
-  LIST**, not the deny. Even if the deny silently misses a
-  retry, `findExistingRef` finds the prior ref and the writer
-  returns the existing offset without emitting a duplicate.
-
-The deny is best understood as a *bandwidth* optimization — when
-it fires on a sequential retry, the writer skips re-uploading
-the body. It's not a correctness lever. Correctness lives on the
-LIST side. See
-[Zombie writers and orchestrators](#zombie-writers-and-orchestrators)
-for the full concurrent-writer discussion.
-
-### Where we deliberately leave the bucket default
-
-A few call sites do **not** carry the configured
-`ConsistencyControl`. Each is correctness-safe under
-StorageGRID's `read-after-new-write` default:
-
-- **DuckDB `s3sql` parquet-body GET.** DuckDB's `httpfs`
-  extension exposes no per-request header hook for `s3://`
-  URLs (verified against DuckDB 1.5.2 — see the
-  [DuckDB note](#duckdb-httpfs-has-no-per-request-header-hook)).
-  Safe because data files are write-once-immutable under
-  unique paths; the file-discovery LIST runs in Go and *does*
-  carry the strong header, so DuckDB only GETs keys our LIST
-  has already surfaced. Default `read-after-new-write` is
-  exactly the guarantee that the first GET of a new key
-  returns the committed bytes — the entire access pattern.
-- **Best-effort cleanup `DELETE`.** [`S3Target.del`](s3parquet/target.go#L436-L448)
-  takes no consistency parameter. Cleanup deletes only fire on
-  rare orphan-data paths (marker / ref PUT failure) and bucket
-  lifecycle GC sweeps anything missed. Eventual deletion
-  visibility costs storage tidiness, not correctness.
-- **No per-call overrides.** Every S3 call routed through an
-  `S3Target` uses that target's level — there is no per-method
-  knob. If a future caller needs a one-off operation at a
-  different level (e.g. an `available`-level maintenance scan),
-  they can construct a separate `S3Target` for that path.
-
-### What the docs say, what we infer, and what we'd be wrong about
-
-#### Docs-stated facts
-
-- **HEAD/GET ladder for `read-after-new-write`** ([sgcc][sgcc]):
-  retries at increasing consistency on miss, and *"if the
-  object does not exist, the object lookup will always reach a
-  consistency equivalent to the behavior for strong-global"* —
-  implicitly making strong-global READ the system's
-  authoritative read.
-- **PUT/GET pairing rule**: *"You must use the same consistency
-  for both the PutObject and GetObject operations."*
-  ([sgcc][sgcc])
-- **Latest-wins for conflicting writes** ([sgcwl][sgcwl]):
-  *"based on when the StorageGRID system completes a given
-  request, and not on when S3 clients begin an operation."*
-- **`strong-global` in 11.9 (and upgraded 12.0) requires every
-  site to be available** for client writes and deletes
-  ([sg-quorum-kb][sg-quorum-kb]).
-- **12.0 introduces Quorum Strong-Global** with site-failure
-  tolerance for 3+ site grids; new installs default to it,
-  upgraded grids retain legacy behavior unless an operator opts
-  in. ([sg-12][sg-12], [sg-quorum-kb][sg-quorum-kb])
-- **LIST accepts the consistency header** ([sg-ops][sg-ops]).
-- **Metadata is Cassandra-backed**, 3 replicas per site
-  ([sg-meta][sg-meta]).
-
-[sg-ops]: https://docs.netapp.com/us-en/storagegrid-119/s3/operations-on-buckets.html
-
-#### Inferences specific to s3store's correctness reasoning
-
-Most of the level-mechanics gaps live in
-[What's documented about each level](#whats-documented-about-each-level-and-what-isnt).
-Two inferences specific to *how s3store's call paths interact
-with those levels* remain:
-
-1. **LIST under `read-after-new-write` is eventually
-   consistent.** *Evidence:* the HEAD/GET ladder is documented
-   HEAD/GET-only; the `read-after-new-write` definition uses
-   GET language ("Any GET following a successfully completed
-   PUT…") with no LIST extension. The ladder's existence is
-   evidence the underlying state is eventual; LIST has no
-   equivalent, so it sees that state directly.
-
-2. **The conditional-PUT existence check fires reliably on a
-   sequential retry under `strong-*`.** *Evidence:* the
-   latest-wins doc says conflict resolution is based on
-   "completed" requests; under `strong-*` a completed PUT is
-   grid-visible, so the next PUT's check sees the prior object.
-   Truly concurrent writers fall under
-   [latest-wins → post-completion gate](#s3putoverwriteobject-deny-is-a-post-completion-gate-not-a-mutex)
-   and produce byte-identical re-uploads under
-   `WithIdempotencyToken`.
-
-#### What we'd be wrong about, and how it'd fail
-
-- *(1) wrong* → LIST under `read-after-new-write` is actually
-  list-after-write. We'd be over-paying by sending `strong-*`
-  for our LIST calls. **Failure mode: latency cost only.**
-- *(2) wrong* → conditional-PUT existence check is unreliable
-  under `strong-*` even for sequential retries. **Failure
-  mode: bandwidth (byte-identical re-upload), not correctness
-  — the load-bearing dedup happens via the `findExistingRef`
-  LIST.**
-
-The level-mechanics gap (W and R values, which model
-StorageGRID actually uses for sub-strong levels) is a *bigger*
-unknown but a *smaller* risk for s3store specifically, because
-we always set `strong-*` on the target — every load-bearing
-call lands inside a docs-stated guarantee regardless of the
-underlying mechanism.
-
-The asymmetric mistake — assuming a weaker or mismatched setup
-works when it doesn't — would fail *silently*: a LIST that
-misses a recent PUT, a Lookup that returns no marker for a
-record just written, a `findExistingRef` retry that emits a
-duplicate ref. We default to symmetric `strong-*` to keep every
-load-bearing call inside an explicit doc guarantee.
+## StorageGRID
+
+s3store works on AWS S3, MinIO, and NetApp StorageGRID. AWS and
+MinIO need no configuration — both are strongly consistent on
+LIST and GET by default and ignore the `Consistency-Control`
+header. **StorageGRID needs explicit setup:**
+
+1. A bucket policy denying `s3:PutOverwriteObject` on the
+   `data/` subtree of the s3store prefix.
+2. `ConsistencyControl: ConsistencyStrongGlobal` (multi-site
+   grid with cross-cutting traffic) or `ConsistencyStrongSite`
+   (single-site grid, or co-located reader/writer pairs) on
+   the `S3Target`.
+
+See [STORAGEGRID.md](STORAGEGRID.md) for the full setup,
+including a ready-to-run boto3 example for the bucket policy,
+the topology decision matrix, operational notes on the 11.9
+availability cliff, and the consistency-model reasoning that
+motivates these requirements.
 
 ## Durability guarantees
 
@@ -2176,23 +1413,9 @@ following operations issued from any process against the same
 bucket sees the new records immediately — no sleep, no settle
 delay:
 
-| Operation | Sub-package |
-|---|---|
-| `s3parquet.Reader.Read` / `ReadIter` | `s3parquet` |
-| `s3parquet.Index.Lookup` | `s3parquet` |
-| `s3parquet.BackfillIndex` | `s3parquet` |
-| `s3sql.Reader.Query` | `s3sql` |
-| Umbrella `Store.Read` / `ReadIter` | forwards to `s3parquet` |
-| Umbrella `Store.Query` | forwards to `s3sql` |
-
-On the `s3sql` read path, the file discovery LIST is done in Go
-(carries the header); the parquet-body GET runs through DuckDB's
-`httpfs` and **does not** carry the header. That's fine because
-data files are write-once-immutable, and StorageGRID's default
-`read-after-new-write` covers first-read-of-new-key — DuckDB's
-GET sees the committed bytes regardless. See the
-[DuckDB note](#duckdb-httpfs-has-no-per-request-header-hook) for
-the full reasoning.
+- `Reader.Read` / `ReadIter`
+- `IndexReader.Lookup`
+- `BackfillIndex`
 
 `Poll` / `PollRecords` / `ReadRangeIter` are the intentional
 exceptions: they apply the `SettleWindow` cutoff so near-tip refs
@@ -2209,43 +1432,9 @@ subsequent poll issued after one `SettleWindow` has elapsed.
   ConsistencyStrongGlobal` (multi-site) or
   `ConsistencyStrongSite` (single-site) on the target — and
   apply the bucket policy. Both are documented in
-  [StorageGRID consistency](#storagegrid-consistency), which
-  also explains why a weaker level (or asymmetric writer/reader
-  levels) breaks the read-after-write contract.
-
-#### DuckDB httpfs has no per-request header hook
-
-DuckDB reads parquet files through its `httpfs` extension, which
-supports `s3_endpoint` / `s3_region` / `s3_use_ssl` /
-`s3_url_style` settings but exposes **no mechanism to attach an
-arbitrary HTTP header per request** for `s3://` URLs (`CREATE
-SECRET TYPE HTTP`'s `EXTRA_HTTP_HEADERS` works for `https://`
-URLs only). Verified against DuckDB 1.5.2, the current latest.
-
-This means we can't ask DuckDB to send `Consistency-Control` on
-the parquet-body GET. Two reasons it doesn't matter:
-
-- **The LIST does carry it.** Every `s3sql` read path resolves
-  the file URI list via a Go-side S3 LIST first, then hands the
-  explicit list to `read_parquet([…])`. DuckDB never expands
-  globs through `httpfs` on the read paths, so its lack of header
-  control over LIST is moot. (Earlier versions had a single-pattern
-  fast path that did expose this gap; it was removed.)
-- **The GET is safe on write-once data.** Data files have
-  deterministic immutable paths under `WithIdempotencyToken` and
-  unique `{tsMicros}-{shortID}` paths otherwise — they never get
-  overwritten. StorageGRID's default `read-after-new-write` is
-  exactly the guarantee that the first GET of a new key returns
-  the committed bytes, so any DuckDB GET of a key our LIST
-  surfaced sees the right contents without needing a stronger
-  consistency level on the GET itself.
-
-The corollary: on a backend whose default is *weaker* than
-`read-after-new-write` (very rare in practice — neither AWS nor
-MinIO nor StorageGRID falls into this category), the `s3sql`
-GETs would be exposed. The mitigation is to raise the bucket's
-default consistency on the storage side. The library can't help
-from above DuckDB.
+  [STORAGEGRID.md](STORAGEGRID.md), which also explains why a
+  weaker level (or asymmetric writer/reader levels) breaks the
+  read-after-write contract.
 
 ### Write
 
@@ -2260,11 +1449,10 @@ the object is there).
 If `Write` returns an **error**, state is indeterminate — the
 records may or may not be durable. The caller must retry. A
 retry after partial success writes some records twice; dedupe
-those on read via `EntityKeyColumns` + `VersionColumn` (umbrella
-/ `s3sql`) or `EntityKeyOf` + `VersionOf` (`s3parquet`).
-Multi-group `Write` returns `([]WriteResult, error)` — consult
-the slice for records that *did* commit before the error so a
-retry can skip them if needed.
+those on read via `EntityKeyOf` + `VersionOf`. Multi-group
+`Write` returns `([]WriteResult, error)` — consult the slice for
+records that *did* commit before the error so a retry can skip
+them if needed.
 
 To make retries produce deterministic data paths at the storage
 layer (no duplicate bytes, no duplicate refs within a bounded
@@ -2294,7 +1482,7 @@ anomaly into permanent breakage. Every *other* GET error
 dropping records on transient failure is worse than propagating.
 
 ```go
-s3parquet.Config[T]{
+s3store.Config[T]{
     // ...
     OnMissingData: func(dataPath string) {
         slog.Warn("s3store: data file missing, skipping",
@@ -2306,38 +1494,27 @@ s3parquet.Config[T]{
 The hook is called from the download worker pool and must be
 safe for concurrent invocation. `nil` means "skip silently."
 
-> **Limitation.** `OnMissingData` is honored by `s3parquet` only.
-> The umbrella's `Query` goes through `s3sql` (DuckDB's
-> `read_parquet`), where a missing file fails the whole call. See
-> [Limitations](#limitations).
-
-## Configuration — umbrella
+## Configuration
 
 ```go
 type Config[T any] struct {
     // Required
-    Bucket     string                     // S3 bucket name
-    Prefix     string                     // prefix under which data lives
-    PartitionKeyParts   []string                   // ordered Hive partition key names
-    TableAlias string                     // name used in Query SQL
-    S3Client   *s3.Client                 // AWS SDK v2 S3 client
+    Bucket            string     // S3 bucket name
+    Prefix            string     // prefix under which data lives
+    PartitionKeyParts []string   // ordered Hive partition key names
+    S3Client          *s3.Client // AWS SDK v2 S3 client
 
     // Required for Write
-    PartitionKeyOf func(T) string         // derive key from record (Write)
+    PartitionKeyOf func(T) string  // derive key from record (Write)
 
-    // Parquet-side dedup (used by Read / ReadIter / PollRecords).
-    // Both or neither — explicit opt-in, no default. NewReader
-    // rejects partial config.
-    EntityKeyOf func(T) string            // identifies a unique entity
-    VersionOf   func(T) int64             // monotonic version per entity
-
-    // SQL-side dedup (used by Query via DuckDB CTE).
-    // Both or neither.
-    EntityKeyColumns []string             // columns that identify an entity
-    VersionColumn    string               // column to ORDER BY for latest
+    // Read-side dedup (used by Read / ReadIter / PollRecords).
+    // Both or neither — explicit opt-in, no default. New rejects
+    // partial config.
+    EntityKeyOf func(T) string  // identifies a unique entity
+    VersionOf   func(T) int64   // monotonic version per entity
 
     // Stream
-    SettleWindow time.Duration            // default: 5s
+    SettleWindow time.Duration  // default: 5s
 
     // Optional write-time column: if set, the writer populates
     // this field on T (must be `time.Time` with a non-empty,
@@ -2361,388 +1538,80 @@ type Config[T any] struct {
     // Empty on AWS / MinIO; set to ConsistencyStrongGlobal /
     // ConsistencyStrongSite on StorageGRID. See "Consistency
     // levels × S3 operations" for the full contract.
-    ConsistencyControl s3parquet.ConsistencyLevel
+    ConsistencyControl ConsistencyLevel
 
-    // DuckDB extras
-    ExtraInitSQL []string                 // SET / CREATE SECRET / LOAD
-                                          // statements run after the
-                                          // auto-derived S3 settings
+    // Optional ref-stream opt-out and tuning knobs.
+    DisableRefStream    bool
+    MaxInflightRequests int
+    OnMissingData       func(dataPath string)
+    Indexes             []IndexDef[T]
 }
 ```
 
-`S3Endpoint` is no longer in the config — endpoint, region, URL style,
-and use_ssl are auto-derived from `S3Client.Options()` at `New()` time.
-Credentials are not auto-derived (they can rotate); pass them via
-`ExtraInitSQL` with `SET s3_access_key_id=...` or, on real AWS with IAM
-roles, use `CREATE SECRET ... PROVIDER credential_chain` so DuckDB
-resolves them itself and stays fresh.
-
-Configuration for the sub-packages is narrower — see
-`s3parquet.Config[T]`, `s3parquet.WriterConfig[T]`,
-`s3parquet.ReaderConfig[T]`, and `s3sql.ReaderConfig[T]` for
-the exact fields.
+`Config` is the all-in-one form for `New(Config[T])`. Services that
+only write or only read can use the narrower `WriterConfig[T]` /
+`ReaderConfig[T]` directly with `NewWriter` / `NewReader` — see the
+[Writer / Reader / View](#writer--reader--view) section.
 
 ## Migration from earlier versions
 
-Breaking changes in the indexes-in-config release:
+Breaking changes in the single-package collapse:
 
-- **`IndexDef[T, K]` → `IndexDef[T]`.** The K type parameter is
-  gone from the write-side def.
-- **`Of func(T) []K` → `Of func(T) ([]string, error)`.** `Of`
-  now returns the per-record column values as a slice positional
-  to `Columns`. Returning `(nil, nil)` skips the record. **`Of`
-  is also optional** — nil triggers auto-projection: the library
-  reflects T's parquet tags + `Columns` once at `NewWriter` and
-  emits markers without any caller code. String columns project
-  directly; `time.Time` columns are formatted with `Layout.Time`
-  (a new field on `IndexDef`, e.g. `Layout: Layout{Time: time.RFC3339}`).
-  Provide a custom `Of` only when transformation is needed
-  beyond what `Layout` covers (per-column time formats, derived
-  values, computed strings).
-- **Indexes now live in `Config.Indexes` /
-  `WriterConfig.Indexes`.** Wired at construction time; the old
-  `RegisterIndex`, `NewIndexWithRegister`, and
-  `NewIndexFromStoreWithRegister` are gone. The "registered
-  after first Write" footgun and the registration-vs-Write race
-  are no longer reachable. `BackfillIndex` still covers the
-  retroactive case.
-- **`From func(map[string]string) (K, error)` → `From func([]string) (K, error)`.**
-  Read-side mirror of `Of`'s shape change. `values` is positional
-  to `Columns`; nil `From` reflects K's parquet tags as before.
-  K may carry `time.Time` fields when `IndexLookupDef.Layout.Time`
-  is set — the auto-default parses each marker's segment via
-  `time.Parse(Layout.Time, ...)`. Layouts on the read and write
-  sides must agree; define one constant and reuse it. The
-  intermediate per-result map allocation in `Lookup` is gone.
-- **`Index[K]` → `IndexReader[K]`; `NewIndex` → `NewIndexReader`.**
-  The read handle now matches the `Reader[T]` / `Writer[T]`
-  naming used by the rest of the package. Mechanical rename.
-- **`s3parquet.NewIndexReader` is the only constructor for `IndexReader[K]`.**
-  It takes the target + `IndexLookupDef[K]`. The umbrella's
-  `s3store.NewIndex(store, def)` forwarder has been removed —
-  call `s3parquet.NewIndexReader(store.Target(), def)` directly.
-  `store.Target()` also works on a `*s3parquet.Writer`, so the
-  same constructor covers writer-only and full-store paths.
-  `IndexReader[K]` is T-free, so a forwarder would only
-  re-introduce a stray T type parameter on the call site.
-- **`BackfillIndex` lost its K type parameter** — it now takes
-  `IndexDef[T]` only.
-- **`BackfillIndex.until` is now `time.Time`, not `Offset`.**
-  `until` was always semantically a time bound on `LastModified`;
-  the previous `Offset` shape was indirection that callers
-  immediately unwrapped. Pass the time directly; `time.Time{}`
-  (the zero value) is the new "no bound" sentinel (replaces
-  `Offset("")` / `OffsetUnbounded` for this call). The dual-shape
-  acceptance (RefCutoff prefix vs full ref key) is gone — there's
-  no Offset to parse.
-- **`s3store.IndexValues` and `s3store.IndexBind` removed.** The
-  helpers were map-shape glue; with `Of`/`From` operating on
-  `[]string` and the auto-default doing the reflection itself,
-  there's nothing for them to do.
-- **K's fields must be Go `string` regardless of `From`.** With
-  the default reflection binder, the rule is enforced at
-  `NewIndexReader`. With a custom `From`, the caller is
-  responsible for producing a valid K.
+- **`s3sql` package and DuckDB removed.** The SQL-on-Parquet half
+  (DuckDB-backed `Query` returning `*sql.Rows`) is gone. If your
+  workload needs SQL aggregation, use DuckDB directly (point its
+  `httpfs` extension at the same bucket and `read_parquet()` over
+  the data path) or pin an older release.
+- **`s3parquet` package collapsed into the root `s3store` package.**
+  The single-package layout is the new home for everything:
 
   ```go
   // Before
-  idx, _ := s3store.NewIndex[Usage, SkuKey](store,
-      s3store.IndexDef[Usage, SkuKey]{
-          IndexLookupDef: s3store.IndexLookupDef[SkuKey]{
-              Name:    "sku_idx",
-              Columns: []string{"sku", "customer"},
-          },
-          Of: func(u Usage) []SkuKey {
-              return []SkuKey{{SKU: u.SKU, Customer: u.Customer}}
-          },
-      })
-
-  // After — when Usage has parquet:"sku" and parquet:"customer"
-  // string fields, Of can be left nil and the library projects
-  // them automatically.
-  cfg.Indexes = []s3store.IndexDef[Usage]{{
-      Name:    "sku_idx",
-      Columns: []string{"sku", "customer"},
-  }}
-  store, _ := s3store.New[Usage](cfg)
-  idx, _ := s3parquet.NewIndexReader(store.Target(),
-      s3parquet.IndexLookupDef[SkuKey]{
-          Name:    "sku_idx",
-          Columns: []string{"sku", "customer"},
-      })
-
-  // After — when Of needs to compute / format values, supply it
-  // explicitly. Order MUST match Columns:
-  cfg.Indexes = []s3store.IndexDef[Usage]{{
-      Name:    "sku_period_idx",
-      Columns: []string{"sku", "period"},
-      Of: func(u Usage) ([]string, error) {
-          return []string{u.SKU, u.At.Format(time.RFC3339)}, nil
-      },
-  }}
-  ```
-
-Breaking changes in the consistency-on-target release:
-
-- **`ConsistencyControl` moved to `s3parquet.S3TargetConfig`.**
-  Previously the field lived on `s3parquet.WriterConfig`,
-  `s3parquet.ReaderConfig`, `s3parquet.IndexLookupDef`, and
-  `s3sql.ReaderConfig`, with a runtime warning if writer/reader
-  drifted. The level is now a property of the S3 target — every
-  S3 call routed through one target uses the same value, which
-  is what NetApp's "same consistency for paired operations" rule
-  requires. Callers using the umbrella `s3store.Config` see no
-  change (the umbrella's `ConsistencyControl` is forwarded onto
-  the target it builds). Callers building configs directly
-  should move the field:
-
-  ```go
-  // Before
-  target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
-      Bucket: "b", Prefix: "store", S3Client: cli,
-      PartitionKeyParts: []string{"period"},
-  })
-  w, _ := s3parquet.NewWriter(s3parquet.WriterConfig[T]{
-      Target:             target,
-      PartitionKeyOf:     keyOf,
-      ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
-  })
-  r, _ := s3parquet.NewReader(s3parquet.ReaderConfig[T]{
-      Target:             target,
-      ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
-  })
+  import "github.com/ueisele/s3store/s3parquet"
+  store, _ := s3store.New[T](s3store.Config[T]{ ... })
 
   // After
-  target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
-      Bucket: "b", Prefix: "store", S3Client: cli,
-      PartitionKeyParts:  []string{"period"},
-      ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
-  })
-  w, _ := s3parquet.NewWriter(s3parquet.WriterConfig[T]{
-      Target: target, PartitionKeyOf: keyOf,
-  })
-  r, _ := s3parquet.NewReader(s3parquet.ReaderConfig[T]{
-      Target: target,
-  })
+  import "github.com/ueisele/s3store"
+  store, _ := s3store.New[T](s3store.Config[T]{ ... })
   ```
 
-  `IndexLookupDef.ConsistencyControl` is also gone — marker
-  PUTs and LISTs go through the writer's / index's target, which
-  already carries the level.
+  Mechanical rename — every public symbol moved with the same
+  name (`Writer[T]`, `Reader[T]`, `Config[T]`, `S3Target`,
+  `IndexDef[T]`, `IndexReader[K]`, `BackfillIndex`, etc.).
+- **DuckDB-only umbrella fields removed from `Config`.**
+  `TableAlias`, `VersionColumn`, `EntityKeyColumns`,
+  `ExtraInitSQL`, `Store.Query`, `Store.Close`, and `Store.SQL`
+  are gone. Reader dedup uses `EntityKeyOf` + `VersionOf` (the
+  parquet-side equivalent that already existed) — drop the SQL
+  fields from your config and add the typed closures. `Store`
+  no longer needs `Close` (no DuckDB connection to release).
+- **`internal/testutil` package removed.** The MinIO test fixture
+  is now in `fixture_test.go` in root. Only the integration build
+  tag and your own integration tests are affected.
 
-Breaking changes in the simplification release:
-
-- **`s3parquet.S3Target` is now a constructed live handle, not a
-  struct literal.** The user-facing config moved to a new
-  `s3parquet.S3TargetConfig` value type; `S3Target` itself holds
-  the config plus an unexported per-target semaphore (sized at
-  `MaxInflightRequests`). All public fields are gone — read via
-  accessor methods (`target.Bucket()`, `target.Prefix()`, …) or
-  the `target.Config()` getter.
-
-  ```go
-  // Before
-  target := s3parquet.S3Target{
-      Bucket:            "b",
-      Prefix:            "store",
-      S3Client:          cli,
-      PartitionKeyParts: []string{"period", "customer"},
-  }
-
-  // After
-  target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
-      Bucket:            "b",
-      Prefix:            "store",
-      S3Client:          cli,
-      PartitionKeyParts: []string{"period", "customer"},
-  })
-  ```
-
-  Pass the same `S3Target` value to `WriterConfig.Target` and
-  `ReaderConfig.Target` so the Writer and Reader share one
-  semaphore (Targets are passed by value but the chan inside is
-  a reference). `s3parquet.New(cfg)` and `s3store.New(cfg)`
-  construct the target internally — single-Config callers see no
-  change beyond the field name swap below.
-
-- **`PartitionWriteConcurrency` → `MaxInflightRequests`**, moved
-  from `WriterConfig` / `Config` onto the shared
-  `s3parquet.S3TargetConfig`. One knob caps every fan-out
-  (partition, file, pattern, marker) via the per-target
-  semaphore — peak in-flight per Target is bounded by the
-  configured value regardless of axis.
-
-  ```go
-  // Before
-  cfg := s3parquet.Config[T]{ ..., PartitionWriteConcurrency: 16 }
-
-  // After
-  cfg := s3parquet.Config[T]{ ..., MaxInflightRequests: 16 }
-  ```
-
-  See the Write section for the `http.Transport.MaxConnsPerHost`
-  interaction when running many Targets concurrently.
-
-- **`s3parquet.ReaderExtras[T']` removed.**
-  `NewReaderFromWriter` / `NewReaderFromStore` now take a full
-  `ReaderConfig[T']`; the constructor overrides the `Target`
-  from the source Writer/Store. Pass an empty `ReaderConfig{}` if
-  you only want field-projection without dedup.
-
-  ```go
-  // Before
-  view, _ := s3parquet.NewReaderFromStore[NarrowRec](store,
-      s3parquet.ReaderExtras[NarrowRec]{})
-
-  // After
-  view, _ := s3parquet.NewReaderFromStore[NarrowRec](store,
-      s3parquet.ReaderConfig[NarrowRec]{})
-  ```
-
-Breaking changes in the idempotent-write release:
-
-- **`DuplicateWriteDetection` config field + factory functions
-  (`DuplicateWriteDetectionByOverwritePrevention`,
-  `DuplicateWriteDetectionByHEAD`,
-  `DuplicateWriteDetectionByProbe`) removed.** Idempotent writes
-  always use `If-None-Match: *` now (with the StorageGRID
-  403+HEAD fallback inside `putIfAbsent`) — the constructor
-  no longer probes the backend. On backends that don't enforce
-  any overwrite prevention, retries silently re-PUT byte-identical
-  data; reader dedup absorbs the harmless extra ref. Drop the
-  field from your config; nothing else changes.
-
-- **`s3store.New`, `s3parquet.New`, `s3parquet.NewWriter` no
-  longer take `context.Context`** — the constructor performs no
-  S3 I/O, so the parameter is gone. `NewReader` /
-  `s3sql.NewReader` were already context-free.
-
-  ```go
-  // Before
-  store, err := s3store.New[T](ctx, cfg)
-
-  // After
-  store, err := s3store.New[T](cfg)
-  ```
-
-- **`s3sql.WithReadAheadPartitions` removed.** Was a documented
-  no-op on the s3sql read path. The umbrella + s3parquet exports
-  remain. Drop the call site if you had one.
-
-- **`Write`, `WriteWithKey` accept a variadic `...WriteOption`
-  tail** for `WithIdempotencyToken`. Existing callers that don't
-  pass options compile unchanged — the tail is variadic.
-
-Breaking changes in the bloom-filter removal:
-
-- **`BloomFilterColumns` removed** from `s3parquet.Config`,
-  `s3parquet.WriterConfig`, and umbrella `s3store.Config`. The
-  feature didn't pay off for typical workloads (a single row
-  group per file leaves nothing to prune; partition columns are
-  already pruned at file-selection time). Files written with
-  the old config remain readable on both paths; files written
-  by the new code emit no bloom filters. If your queries
-  actually relied on bloom-filter pruning (multi-row-group
-  files plus equality filters on a non-partition column), pin
-  an older version or open an issue.
-
-Breaking changes in the `s3sql`-as-Reader refactor:
-
-- **`s3sql.Store[T]` → `s3sql.Reader[T]`.** The type only ever
-  read; the rename makes that contract explicit.
-- **`s3sql.Config[T]` → `s3sql.ReaderConfig[T]`.** The S3-wiring
-  fields (`Bucket`, `Prefix`, `S3Client`, `PartitionKeyParts`,
-  `SettleWindow`, `DisableRefStream`) moved under a single
-  `Target s3parquet.S3Target` field. Build the target once and
-  share it between `s3parquet.WriterConfig` and
-  `s3sql.ReaderConfig` so the two halves can't drift.
-- **`s3sql.New` → `s3sql.NewReader`.**
-- **Umbrella `s3store.Store[T]` internals recomposed** around
-  `s3parquet.Writer[T]` + `s3sql.Reader[T]` (was `s3parquet.Store[T]`
-  + `s3sql.Store[T]`). `s3store.Config[T]` is unchanged; the
-  umbrella now exposes `.Writer()` and `.Reader()` accessors if
-  a caller needs the underlying halves.
-- **`s3parquet.S3Target.settleWindow()` → `EffectiveSettleWindow()`
-  and `validate()/validateLookup()` → `Validate()/ValidateLookup()`.**
-  Internal-only methods promoted so `s3sql.NewReader` can reuse
-  them without duplicating validation logic.
-
-
-
-Breaking changes in the Index refactor (superseded by the
-indexes-in-config release above; included here for callers
-upgrading across both):
-
-- **`Index[T, K]` → `IndexReader[K]`.** Lookup never touches T, so the
-  query handle is now T-free.
-- **`Index.Backfill` removed; use the package-level
-  `s3parquet.BackfillIndex` / `s3store.BackfillIndex`.** Takes an
-  `S3Target` + `IndexDef[T]` + `[]string` patterns + `until
-  time.Time` + `onMissingData` hook, with no writer/reader
-  argument. See the [Backfill](#backfill) section.
-- **`s3parquet.Store.Close()` removed.** The method was a documented
-  no-op (pure-Go Store held no resources). Delete the call sites.
-  `s3sql.Reader.Close()` and `s3store.Store.Close()` still exist — only
-  the parquet side lost it.
-- **`WriterConfig` / `ReaderConfig` restructured.** The five
-  S3-wiring fields (`Bucket`, `Prefix`, `S3Client`,
-  `PartitionKeyParts`, `SettleWindow`) moved under a single
-  `Target s3parquet.S3Target` field. Move those fields into a
-  `Target: s3parquet.S3Target{...}` literal, or build the target
-  once via `s3parquet.NewS3Target(...)` and reuse it between
-  `WriterConfig` and `ReaderConfig`. The unified umbrella
-  `s3store.Config[T]` is unchanged — its flat layout still
-  projects onto the narrower configs internally.
-
-Breaking changes in the package-split refactor:
-
-- **`Config.KeyFunc` → `Config.PartitionKeyOf`** — new name better reflects
-  the field's role.
-- **`Config.KeyParts` → `Config.PartitionKeyParts`** — follows the same
-  `PartitionKey*` naming family.
-- **`Config.S3Endpoint` removed** — auto-derived from
-  `S3Client.Options().BaseEndpoint`. For local S3-compatible setups
-  (MinIO fork, SeaweedFS, etc.), just pass the full URL
-  (`http://localhost:9000`) on your `s3.Options`.
-- **Glob grammar narrowed** — `?`, `[abc]`, `{a,b}` alternation, and
-  leading/middle `*` in values are rejected. Only whole-segment `*` and a
-  single trailing `*` per value are accepted. If you relied on the richer
-  DuckDB glob dialect, file an issue — we can relax the parser if there's
-  real usage.
-- **`Config.ScanFunc` removed** — `s3sql` now reflects over `T`'s parquet
-  tags to build a NULL-safe row binder at `New()`. Drop your `ScanFunc`
-  closure; the library decodes into `[]T` directly. Custom types need to
-  implement `sql.Scanner` (e.g. `shopspring/decimal.Decimal` already
-  does).
-- **`Config.ColumnAliases` / `Config.ColumnDefaults` removed** — the
-  "missing column → Go zero" contract is now built in to both read paths.
-  For non-zero defaults, apply them in your app code or use `Query` with
-  `COALESCE`. For column renames, rewrite the affected files.
-- **`Config.DeduplicateBy` → `Config.EntityKeyColumns`, no default** —
-  mirrors `s3parquet.Config.EntityKeyOf`: explicit opt-in to latest-per-
-  entity dedup, no silent partition-key default. `VersionColumn` and
-  `EntityKeyColumns` must now be set together (both or neither); `New()`
-  rejects one without the other. If you relied on the old default, set
-  `EntityKeyColumns = PartitionKeyParts` explicitly.
+For anyone upgrading across multiple releases, the older
+breaking-change history (indexes-in-config, consistency-on-target,
+S3Target-as-handle, idempotent-write, bloom-filter removal,
+s3sql-as-Reader, the Index refactor, the package split) is
+preserved in git history — `git log -- README.md`.
 
 ## Testing
 
 ```
-# Unit tests, cgo required (s3sql + umbrella embed DuckDB).
+# Unit tests — pure Go, no C compiler needed.
 go test -count=1 ./...
 
-# Unit tests on the cgo-free subset — no C compiler needed.
-CGO_ENABLED=0 go test -count=1 ./s3parquet/... ./internal/...
-
 # Integration tests — full round-trip against a MinIO container.
-# Uses testcontainers; one container is shared across every
-# package in the invocation.
+# Uses testcontainers; one container is shared across the
+# invocation.
 go test -tags=integration -timeout=10m -count=1 ./...
+
+# Lint (gofmt + govet + project linters in one shot).
+golangci-lint run ./...
 ```
 
 Integration tests require Docker and pull a pinned `pgsty/minio`
-release on first run (see
-[`internal/testutil/minio.go`](internal/testutil/minio.go)).
+release on first run (see [`fixture_test.go`](fixture_test.go)).
 After upstream `minio/minio` was archived in Feb 2026, the
 community-maintained `pgsty/minio` fork continues the same
 code under AGPLv3; it's a drop-in for the testcontainers MinIO
@@ -2790,34 +1659,21 @@ rush it.
 
 ## Limitations
 
-- **Single-process reads** (umbrella / `s3sql`). DuckDB runs embedded in
-  your Go process. `s3parquet` has no embedded engine — reads are just
-  parquet-go + S3 calls.
+- **No SQL engine.** Reads are typed Go (`Read` / `ReadIter` /
+  `PollRecords`) — no aggregation, no joins. For SQL workloads,
+  point DuckDB at the same bucket via its `httpfs` extension and
+  `read_parquet()` over the data path.
 - **S3 key limit: 1024 bytes.** Long partition values reduce the budget.
 - **Stream latency = poll interval + settle window.** Not real-time.
 - **Upsert-only compacted mode.** There is no tombstone / key-delete
   mechanism — keys can only be updated, not removed.
-- **`s3parquet` dedup is in-memory.** Large key cardinality can OOM;
-  route those workloads to `s3sql` which streams through DuckDB.
-- **Missing-data tolerance only in `s3parquet`.** `OnMissingData`
-  (skip a parquet file whose GET returns `NoSuchKey`) is honored
-  by `s3parquet.Read` / `PollRecords` / `BackfillIndex`. The
-  umbrella's `Query` goes through `s3sql`'s DuckDB path, which
-  treats its input URI list as authoritative — a dangling ref
-  fails the whole call. Use `s3parquet` directly (or the umbrella's
-  `Read` / `ReadIter` / `PollRecords`, which delegate to
-  `s3parquet`) if you need the tolerant read path.
-- **`s3sql` parquet-body GET can't carry `ConsistencyControl`**
-  (DuckDB `httpfs` has no per-request HTTP header setting on
-  `s3://` URLs). Not a problem on AWS / MinIO / StorageGRID:
-  data files are write-once and the GET is the first read of a
-  new key, which `read-after-new-write` already covers. Only
-  matters on a backend whose default is weaker than
-  read-after-new-write — raise the bucket default in that case.
-  See [Read-after-write](#read-after-write).
-- **Schema evolution is limited to tolerant reads.** Both packages handle
-  "column added to T that isn't in an old file" by returning the Go zero
-  value. Renames, splits, type changes, and row-level computed
+- **Dedup is in-memory.** Large key cardinality can OOM; partition
+  the dataset finely enough that any single partition's distinct
+  entities fit comfortably in RAM, or read history with
+  `WithHistory()` and dedup yourself.
+- **Schema evolution is limited to tolerant reads.** "Column added
+  to T that isn't in an old file" returns the Go zero value.
+  Renames, splits, type changes, and row-level computed
   derivations require rewriting the affected files.
 
 ## License
