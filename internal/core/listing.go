@@ -22,10 +22,9 @@ import "time"
 // Size is the compressed object size from the LIST response
 // (S3's Contents.Size). Zero when the call site doesn't have
 // access to a LIST result (e.g. PollRecords assembles KeyMetas
-// from ref filenames). Used by ReadIter / ReadManyIter as the
-// download-stage memory estimate; the uncompressed size used by
-// the byte-budget gate is read from each parquet file's footer
-// after download.
+// from ref filenames). Used by ReadIter as the download-stage
+// memory estimate; the uncompressed size used by the byte-budget
+// gate is read from each parquet file's footer after download.
 type KeyMeta struct {
 	Key        string
 	InsertedAt time.Time
@@ -62,12 +61,12 @@ func UnionKeys[R any](perPlan [][]R, keyOf func(R) string) []R {
 
 // DedupePatterns removes literal-duplicate entries from a
 // patterns slice, preserving first-seen order. Cheap pre-step
-// for the *Many functions so accidental duplicates (e.g. from a
-// generated list with possible repeats) don't cause duplicate
-// LIST round-trips. Doesn't catch semantic overlap — patterns
-// like "*" and "2026-*" both list overlapping files but aren't
-// string-equal; that case is still handled by UnionKeys at the
-// key level, just at the cost of one extra LIST.
+// for the multi-pattern read paths so accidental duplicates
+// (e.g. from a generated list with possible repeats) don't cause
+// duplicate LIST round-trips. Doesn't catch semantic overlap —
+// patterns like "*" and "2026-*" both list overlapping files but
+// aren't string-equal; that case is still handled by UnionKeys
+// at the key level, just at the cost of one extra LIST.
 func DedupePatterns(patterns []string) []string {
 	if len(patterns) <= 1 {
 		return patterns

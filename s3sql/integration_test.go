@@ -15,7 +15,7 @@ import (
 )
 
 // Rec is the on-disk shape used by these tests. Parquet tags
-// drive the s3parquet write; s3sql Query / QueryMany only need
+// drive the s3parquet write; s3sql Query only needs
 // the column names — no row binding happens on the SQL side.
 type Rec struct {
 	Period   string    `parquet:"period"`
@@ -112,7 +112,7 @@ func TestQuery(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	rows, err := f.sql.Query(ctx, "*",
+	rows, err := f.sql.Query(ctx, []string{"*"},
 		"SELECT customer, SUM(amount) AS total FROM records "+
 			"GROUP BY customer ORDER BY customer")
 	if err != nil {
@@ -150,10 +150,10 @@ func TestQuery(t *testing.T) {
 	}
 }
 
-// TestQueryMany_AggregationAcrossPatterns proves QueryMany runs
-// ONE DuckDB query over the deduplicated union of patterns, so
+// TestQuery_AggregationAcrossPatterns proves Query runs ONE
+// DuckDB query over the deduplicated union of patterns, so
 // aggregations and joins span the full set rather than per-pattern.
-func TestQueryMany_AggregationAcrossPatterns(t *testing.T) {
+func TestQuery_AggregationAcrossPatterns(t *testing.T) {
 	f := newFixture(t, sqlOpts{})
 
 	f.writeSome(t, []Rec{
@@ -169,17 +169,17 @@ func TestQueryMany_AggregationAcrossPatterns(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	rows, err := f.sql.QueryMany(ctx, []string{
+	rows, err := f.sql.Query(ctx, []string{
 		"period=2026-03-17/customer=abc",
 		"period=2026-03-18/customer=def",
 	},
 		"SELECT SUM(amount) AS total FROM records")
 	if err != nil {
-		t.Fatalf("QueryMany: %v", err)
+		t.Fatalf("Query: %v", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		t.Fatal("QueryMany: no rows")
+		t.Fatal("Query: no rows")
 	}
 	var total float64
 	if err := rows.Scan(&total); err != nil {
@@ -192,18 +192,18 @@ func TestQueryMany_AggregationAcrossPatterns(t *testing.T) {
 	}
 }
 
-// TestQueryMany_NoMatch covers the empty-cursor synthesis path:
+// TestQuery_NoMatch covers the empty-cursor synthesis path:
 // when no patterns match any files, the caller still gets a
 // well-formed *sql.Rows that yields zero rows on Next().
-func TestQueryMany_NoMatch(t *testing.T) {
+func TestQuery_NoMatch(t *testing.T) {
 	f := newFixture(t, sqlOpts{})
 
 	ctx := context.Background()
-	rows, err := f.sql.QueryMany(ctx,
+	rows, err := f.sql.Query(ctx,
 		[]string{"period=2099-01-01/customer=nobody"},
 		"SELECT 1 FROM records")
 	if err != nil {
-		t.Fatalf("QueryMany: %v", err)
+		t.Fatalf("Query: %v", err)
 	}
 	defer rows.Close()
 	if rows.Next() {
@@ -279,7 +279,7 @@ func TestIdempotentRead_Query(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 
 	// Query with the barrier: only the baseline survives.
-	rows, err := f.sql.Query(ctx, key,
+	rows, err := f.sql.Query(ctx, []string{key},
 		"SELECT COUNT(*) FROM records",
 		s3sql.WithIdempotentRead(token))
 	if err != nil {
@@ -304,7 +304,7 @@ func TestIdempotentRead_Query(t *testing.T) {
 func TestIdempotentRead_QueryRejectsBadToken(t *testing.T) {
 	ctx := context.Background()
 	f := newIdempotentFixture(t)
-	if _, err := f.sql.Query(ctx, "period=2026-04-22/customer=*",
+	if _, err := f.sql.Query(ctx, []string{"period=2026-04-22/customer=*"},
 		"SELECT 1 FROM records",
 		s3sql.WithIdempotentRead("has/slash")); err == nil {
 		t.Fatal("want error for barrier token with '/', got nil")
@@ -333,7 +333,7 @@ func TestIdempotentRead_QueryZeroMatches(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	_, err := f.sql.Query(ctx, key,
+	_, err := f.sql.Query(ctx, []string{key},
 		"SELECT COUNT(*) FROM records",
 		s3sql.WithIdempotentRead(token))
 	if err == nil {

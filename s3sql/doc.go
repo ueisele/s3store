@@ -2,8 +2,8 @@
 // using embedded DuckDB as the query engine. Requires cgo.
 //
 // The package is read-only and intentionally narrow: it exposes
-// just Query and QueryMany, both returning *sql.Rows. Typed-row
-// iteration, change-stream tailing, and pure-Go reads live on
+// just Query, returning *sql.Rows. Typed-row iteration, change-
+// stream tailing, and pure-Go reads live on
 // github.com/ueisele/s3store/s3parquet so this package stays a
 // thin SQL surface over the parquet files the Writer produced.
 //
@@ -17,12 +17,9 @@
 //
 // Capability sketch:
 //
-//   - Query: arbitrary SQL over the parquet files scoped by a
-//     key pattern. Use for aggregations, complex filtering, or
-//     joins across multiple stores.
-//   - QueryMany: single SQL query over the deduplicated union
-//     of files matching every pattern. Aggregations and ORDER
-//     BY apply across the full set.
+//   - Query: single SQL query over the deduplicated union of
+//     files matching every pattern in keyPatterns. Aggregations
+//     and ORDER BY apply across the full set.
 //   - ScanAll[T]: optional helper that materializes a *sql.Rows
 //     into []T by parquet tag, NULL-safe, with composite
 //     (LIST/STRUCT/MAP) decode via mapstructure. Use when typed

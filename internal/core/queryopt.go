@@ -17,13 +17,13 @@ type QueryOpts struct {
 	// [since, Until) range. Matches Kafka's offset semantics.
 	Until Offset
 	// ReadAheadPartitions controls how many partitions ahead of
-	// the current yield position a streaming read (ReadIter /
-	// ReadManyIter) may download. Zero keeps the current strict-
-	// serial behavior (download one, yield all, advance, repeat);
-	// higher values overlap the next partition's download with the
-	// current partition's yield loop, at O(N+1 partitions) memory.
-	// Ignored by read paths that don't partition work this way
-	// (s3sql, which streams through DuckDB).
+	// the current yield position a streaming read (ReadIter) may
+	// download. Zero keeps the current strict-serial behavior
+	// (download one, yield all, advance, repeat); higher values
+	// overlap the next partition's download with the current
+	// partition's yield loop, at O(N+1 partitions) memory. Ignored
+	// by read paths that don't partition work this way (s3sql,
+	// which streams through DuckDB).
 	ReadAheadPartitions int
 	// ReadAheadBytes caps the cumulative uncompressed parquet
 	// bytes that may sit decoded in the streaming read pipeline
@@ -80,9 +80,9 @@ func WithUntilOffset(until Offset) QueryOption {
 	}
 }
 
-// WithReadAheadPartitions tells ReadIter / ReadManyIter /
-// PollRecordsIter to prefetch n partitions ahead of the current
-// yield position. Default is 1 — minimum useful lookahead so
+// WithReadAheadPartitions tells ReadIter / PollRecordsIter to
+// prefetch n partitions ahead of the current yield position.
+// Default is 1 — minimum useful lookahead so
 // decode of partition N+1 overlaps yield of partition N. Pass a
 // larger value for more aggressive prefetch on consumers that do
 // non-trivial per-record work; combine with WithReadAheadBytes
@@ -104,8 +104,8 @@ func WithReadAheadPartitions(n int) QueryOption {
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
-// bytes that may sit decoded in the ReadIter / ReadManyIter /
-// PollRecordsIter pipeline ahead of the current yield position.
+// bytes that may sit decoded in the ReadIter / PollRecordsIter
+// pipeline ahead of the current yield position.
 // Zero (default) disables the cap; only WithReadAheadPartitions
 // binds.
 //
@@ -143,9 +143,9 @@ func WithReadAheadBytes(n int64) QueryOption {
 // saw, computes the same diff, and writes the same bytes. One
 // token, both sides.
 //
-// Applies to snapshot-style reads: Read / ReadIter / ReadMany /
-// ReadManyIter / PollRecordsIter / Query / QueryMany. NOT applied
-// on PollRecords (cursor-based, CDC-style) — the offset cursor
+// Applies to snapshot-style reads: Read / ReadIter /
+// PollRecordsIter / Query. NOT applied on PollRecords
+// (cursor-based, CDC-style) — the offset cursor
 // already provides retry-safety on that path, and the by-
 // LastModified barrier doesn't compose cleanly with offset-window
 // semantics.

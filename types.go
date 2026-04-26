@@ -114,10 +114,10 @@ type Config[T any] struct {
 
 	// DisableRefStream opts the dataset out of writing stream ref
 	// files under <Prefix>/_stream/refs/. Saves one S3 PUT per
-	// distinct partition key touched by a Write. Read / Query /
-	// ReadMany / QueryMany are unaffected; Poll / PollRecords /
-	// PollRecordsIter return ErrRefStreamDisabled. OffsetAt still
-	// works (pure timestamp encoding).
+	// distinct partition key touched by a Write. Read / ReadIter /
+	// Query are unaffected; Poll / PollRecords / PollRecordsIter
+	// return ErrRefStreamDisabled. OffsetAt still works (pure
+	// timestamp encoding).
 	DisableRefStream bool
 
 	// MaxInflightRequests caps S3 requests in flight per library
@@ -201,21 +201,19 @@ func WithUntilOffset(until Offset) QueryOption {
 }
 
 // WithReadAheadPartitions tells partition-streaming readers
-// (ReadIter / ReadManyIter / PollRecordsIter) to prefetch n
-// partitions ahead of the yield position. Default is 1 (one
-// partition lookahead so decode of N+1 overlaps yield of N).
-// Values < 1 are floored to 1.
+// (ReadIter / PollRecordsIter) to prefetch n partitions ahead of
+// the yield position. Default is 1 (one partition lookahead so
+// decode of N+1 overlaps yield of N). Values < 1 are floored to 1.
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
 // bytes that may sit decoded ahead of the yield position on
-// ReadIter / ReadManyIter / PollRecordsIter. Composes with
-// WithReadAheadPartitions
-// — whichever cap binds first holds the producer back. Useful
-// for skewed partition sizes. See core.WithReadAheadBytes for
-// the full contract.
+// ReadIter / PollRecordsIter. Composes with
+// WithReadAheadPartitions — whichever cap binds first holds the
+// producer back. Useful for skewed partition sizes. See
+// core.WithReadAheadBytes for the full contract.
 func WithReadAheadBytes(n int64) QueryOption {
 	return core.WithReadAheadBytes(n)
 }
@@ -225,11 +223,10 @@ func WithReadAheadBytes(n int64) QueryOption {
 // token — the caller's own prior attempts are excluded, and every
 // other file with LastModified at or after the barrier is excluded
 // too (per partition). Applies to snapshot-style reads (Read /
-// ReadIter / ReadMany / ReadManyIter / PollRecordsIter / Query /
-// QueryMany). Ignored on PollRecords — the offset cursor already
-// provides retry-safety on that path. Pair with
-// WithIdempotencyToken on the write side; one token drives both
-// halves of a retry-safe read-modify-write. See
+// ReadIter / PollRecordsIter / Query). Ignored on PollRecords —
+// the offset cursor already provides retry-safety on that path.
+// Pair with WithIdempotencyToken on the write side; one token
+// drives both halves of a retry-safe read-modify-write. See
 // core.WithIdempotentRead for the full contract.
 func WithIdempotentRead(token string) QueryOption {
 	return core.WithIdempotentRead(token)

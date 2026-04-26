@@ -65,33 +65,32 @@ func WithUntilOffset(until Offset) QueryOption {
 	return core.WithUntilOffset(until)
 }
 
-// WithReadAheadPartitions tells ReadIter / ReadManyIter /
-// PollRecordsIter to prefetch n partitions ahead of the yield
-// position. Default is 1 (one partition lookahead so decode of
-// N+1 overlaps yield of N). Values < 1 are floored to 1. See
-// core.WithReadAheadPartitions for the full contract.
+// WithReadAheadPartitions tells ReadIter / PollRecordsIter to
+// prefetch n partitions ahead of the yield position. Default is 1
+// (one partition lookahead so decode of N+1 overlaps yield of N).
+// Values < 1 are floored to 1. See core.WithReadAheadPartitions
+// for the full contract.
 func WithReadAheadPartitions(n int) QueryOption {
 	return core.WithReadAheadPartitions(n)
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
-// bytes that may sit decoded in the ReadIter / ReadManyIter /
-// PollRecordsIter pipeline ahead of the current yield position.
-// Composes with WithReadAheadPartitions — whichever cap binds
-// first holds the producer back. See core.WithReadAheadBytes
-// for the full contract.
+// bytes that may sit decoded in the ReadIter / PollRecordsIter
+// pipeline ahead of the current yield position. Composes with
+// WithReadAheadPartitions — whichever cap binds first holds the
+// producer back. See core.WithReadAheadBytes for the full
+// contract.
 func WithReadAheadBytes(n int64) QueryOption {
 	return core.WithReadAheadBytes(n)
 }
 
 // WithIdempotentRead makes snapshot reads retry-safe: the result
 // reflects state as of the first write of the given idempotency
-// token. Applies to Read / ReadIter / ReadMany / ReadManyIter /
-// PollRecordsIter. Ignored on PollRecords — the offset cursor
-// already provides retry-safety on that path. Pair with
-// WithIdempotencyToken on the write side so one token drives
-// both sides of the retry. See core.WithIdempotentRead for the
-// full contract.
+// token. Applies to Read / ReadIter / PollRecordsIter. Ignored
+// on PollRecords — the offset cursor already provides retry-safety
+// on that path. Pair with WithIdempotencyToken on the write side
+// so one token drives both sides of the retry. See
+// core.WithIdempotentRead for the full contract.
 func WithIdempotentRead(token string) QueryOption {
 	return core.WithIdempotentRead(token)
 }

@@ -168,8 +168,8 @@ func TestDecodeParquet_MissingColumnsZeroFill(t *testing.T) {
 }
 
 // TestDedupePatterns guards the literal-duplicate dedup applied
-// before plan construction in the *Many functions. Tests the
-// fast paths (nil, single) and order preservation on duplicates.
+// before plan construction in the multi-pattern read paths. Tests
+// the fast paths (nil, single) and order preservation on duplicates.
 func TestDedupePatterns(t *testing.T) {
 	cases := []struct {
 		name string

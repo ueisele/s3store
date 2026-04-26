@@ -23,7 +23,7 @@ needs:
 | Package | cgo | Import path | Capabilities |
 |---|---|---|---|
 | `s3parquet` | **no** | `github.com/ueisele/s3store/s3parquet` | Writer + Reader: Write, WriteWithKey, Read, ReadIter, Poll, PollRecords, OffsetAt, secondary indexes. Pure Go / parquet-go; in-memory per-partition dedup. |
-| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | **SQL-only, read-only.** Query and QueryMany return `*sql.Rows`; the caller binds rows themselves. Construct with `NewReader(ReaderConfig)`; share the same `s3parquet.S3Target` with the Writer so the two halves can't drift. |
+| `s3sql` | yes | `github.com/ueisele/s3store/s3sql` | **SQL-only, read-only.** Query returns `*sql.Rows`; the caller binds rows themselves. Construct with `NewReader(ReaderConfig)`; share the same `s3parquet.S3Target` with the Writer so the two halves can't drift. |
 | `s3store` (umbrella) | yes | `github.com/ueisele/s3store` | Everything above behind one `Store[T]`. Composes `s3parquet.Writer` + `s3parquet.Reader` + `s3sql.Reader`; all three share one `S3Target` so they can't drift on S3 wiring. |
 
 Binary size: DuckDB bundles a ~50 MB C++ library. `CGO_ENABLED=0 go build
@@ -78,10 +78,10 @@ defer store.Close()
 _, err = store.Write(ctx, records)
 
 // Snapshot read — deduplicated by VersionColumn via DuckDB
-latest, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
+latest, err := store.Read(ctx, []string{"charge_period=2026-03-17/customer=abc"})
 
 // SQL query — DuckDB handles the aggregation
-rows, err := store.Query(ctx, "charge_period=2026-03-*/*",
+rows, err := store.Query(ctx, []string{"charge_period=2026-03-*/*"},
     "SELECT customer, SUM(net_cost) FROM costs GROUP BY customer")
 ```
 
@@ -111,7 +111,7 @@ store, err := s3parquet.New[CostRecord](ctx, s3parquet.Config[CostRecord]{
 })
 
 // parquet-go decodes directly into []CostRecord via the parquet tags
-latest, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
+latest, err := store.Read(ctx, []string{"charge_period=2026-03-17/customer=abc"})
 ```
 
 `s3parquet` drives typed results off the parquet struct tags on `T`
@@ -259,7 +259,7 @@ for i, u := range usages {
 _, err := store.Write(ctx, files)
 
 // Reads:
-files, err := store.Read(ctx, "...")
+files, err := store.Read(ctx, []string{"..."})
 usages := make([]Usage, len(files))
 for i, f := range files {
     u, err := fromFile(f); if err != nil { return err }
@@ -462,8 +462,8 @@ Whether dedup actually runs depends on which read path you use:
   delegations)** — dedup when `EntityKeyOf` AND `VersionOf` are both
   set (NewReader rejects partial config). When neither is set, every
   record passes through in decode order.
-- **`s3sql.Query` / `QueryMany` (and the umbrella delegations)** —
-  dedup when `EntityKeyColumns` + `VersionColumn` are both set (DuckDB
+- **`s3sql.Query` (and the umbrella delegation)** — dedup when
+  `EntityKeyColumns` + `VersionColumn` are both set (DuckDB
   `QUALIFY ROW_NUMBER()` CTE). When either is empty, every record
   passes through.
 
@@ -523,7 +523,7 @@ s3store.Config[Event]{
     InsertedAtField: "InsertedAt",
 }
 
-recs, _ := store.Read(ctx, "*")
+recs, _ := store.Read(ctx, []string{"*"})
 // recs[i].InsertedAt is the writer's wall-clock at write-start.
 ```
 
@@ -655,9 +655,9 @@ Effect on each method:
 
 - **`Write` / `WriteWithKey`** — one fewer S3 PUT per call;
   `WriteResult.Offset` and `WriteResult.RefPath` are empty.
-- **`Read` / `ReadMany` / `ReadIter` / `ReadManyIter` / `Query` /
-  `QueryMany` / `Lookup` / `BackfillIndex`** — unaffected. They
-  LIST `data/` (or `_index/<name>/`) directly and never consult refs.
+- **`Read` / `ReadIter` / `Query` / `Lookup` / `BackfillIndex`**
+  — unaffected. They LIST `data/` (or `_index/<name>/`) directly
+  and never consult refs.
 - **`Poll` / `PollRecords` / `PollRecordsIter`** — return
   `s3store.ErrRefStreamDisabled` (shared sentinel, matches
   `errors.Is` across packages). `PollRecordsIter` surfaces the
@@ -690,7 +690,7 @@ read the same value.
 ### Snapshot
 
 ```go
-records, err := store.Read(ctx, "charge_period=2026-03-17/customer=abc")
+records, err := store.Read(ctx, []string{"charge_period=2026-03-17/customer=abc"})
 ```
 
 Returns every record matching the glob, decoded directly into `[]T`
@@ -704,13 +704,13 @@ For retry-safe read-modify-write, pair the `Read` with
 
 ### Snapshot — streaming (`ReadIter`)
 
-`Read` and `ReadMany` buffer the full result set before returning. For
-month-scale or otherwise unbounded ranges that's a memory problem; use
-`ReadIter` / `ReadManyIter` instead — they yield records one at a time
-via Go 1.23's `iter.Seq2[T, error]`:
+`Read` buffers the full result set before returning. For month-scale or
+otherwise unbounded ranges that's a memory problem; use `ReadIter`
+instead — it yields records one at a time via Go 1.23's
+`iter.Seq2[T, error]`:
 
 ```go
-for r, err := range store.ReadIter(ctx, "charge_period=2026-03-*/*") {
+for r, err := range store.ReadIter(ctx, []string{"charge_period=2026-03-*/*"}) {
     if err != nil { return err }
     aggregate(r)            // fold into an aggregation map and forget r
 }
@@ -718,8 +718,7 @@ for r, err := range store.ReadIter(ctx, "charge_period=2026-03-*/*") {
 ```
 
 Two callable surfaces: `s3parquet.Reader.ReadIter` and the umbrella
-`s3store.Store.ReadIter` (forwards to `s3parquet.Reader`). Same for
-`ReadManyIter`.
+`s3store.Store.ReadIter` (forwards to `s3parquet.Reader`).
 
 **Memory profile**: `O(one partition's records)`. The pure-Go path
 processes one partition at a time: files inside the partition
@@ -755,18 +754,18 @@ holds the producer back:
 
 ```go
 // Many small partitions: prefetch generously by count.
-for r, err := range store.ReadIter(ctx, "*",
+for r, err := range store.ReadIter(ctx, []string{"*"},
     s3parquet.WithReadAheadPartitions(8)) { ... }
 
 // Skewed partition sizes (mostly tiny + a few large): cap by bytes
 // so prefetch self-throttles on the large ones. Decoded Go memory
 // typically runs 1–2× the uncompressed size depending on data
 // shape (string headers, slice/map pointer overhead).
-for r, err := range store.ReadIter(ctx, "*",
+for r, err := range store.ReadIter(ctx, []string{"*"},
     s3parquet.WithReadAheadBytes(2<<30)) { ... } // ≤ 2 GiB
 
 // Combine — useful when both axes matter.
-for r, err := range store.ReadIter(ctx, "*",
+for r, err := range store.ReadIter(ctx, []string{"*"},
     s3parquet.WithReadAheadPartitions(8),
     s3parquet.WithReadAheadBytes(2<<30)) { ... }
 ```
@@ -819,21 +818,21 @@ stability.
 ### SQL query (umbrella or `s3sql`)
 
 ```go
-rows, err := store.Query(ctx, "charge_period=2026-03-*/*",
+rows, err := store.Query(ctx, []string{"charge_period=2026-03-*/*"},
     "SELECT customer, sku, SUM(net_cost) AS total "+
         "FROM costs GROUP BY customer, sku")
 
-// QueryMany aggregates across an arbitrary set of partition tuples.
-rows2, err := store.QueryMany(ctx, []string{
+// Query aggregates across an arbitrary set of partition tuples.
+rows2, err := store.Query(ctx, []string{
     "charge_period=2026-03-17/customer=abc",
     "charge_period=2026-03-18/customer=def",
 }, "SELECT SUM(net_cost) AS total FROM costs")
 ```
 
 Deduplicated by default when `EntityKeyColumns` + `VersionColumn` are
-configured. Pass `s3store.WithHistory()` to see all versions. Both
-methods return `*sql.Rows`; bind rows with the standard
-`database/sql` contract.
+configured. Pass `s3store.WithHistory()` to see all versions. `Query`
+returns `*sql.Rows`; bind rows with the standard `database/sql`
+contract.
 
 The `*sql.Rows` cursor can be materialized into typed records with
 `s3sql.ScanAll[T](rows)` — maps DuckDB columns to T fields by
@@ -860,7 +859,7 @@ shapes (LIST/STRUCT/MAP).
 > bounds the Go-side aws-sdk client (Writer PUTs, the LIST that
 > resolves URIs for `Query`, s3parquet Reader GETs); DuckDB's
 > httpfs GETs for parquet bodies run on DuckDB's own thread pool,
-> outside our semaphore.
+> outside the semaphore.
 
 ## Idempotent writes
 
@@ -897,7 +896,7 @@ reader-side dedup:
 - `EntityKeyOf` + `VersionOf` on `s3parquet.Reader` (and the
   umbrella, for `Read` / `ReadIter` / `PollRecords`)
 - `EntityKeyColumns` + `VersionColumn` on `s3sql.Reader` (and the
-  umbrella, for `Query` / `QueryMany`)
+  umbrella, for `Query`)
 
 | Config | Storage layer | Consumer layer |
 |---|---|---|
@@ -1153,22 +1152,19 @@ not diverging ones).
 
 **Scope** — accepted by every read path:
 
-- `s3parquet.Reader`: `Read`, `ReadIter`, `ReadMany`,
-  `ReadManyIter`, `PollRecords`, `PollRecordsIter`.
-- `s3sql.Reader`: `Query`, `QueryMany`.
+- `s3parquet.Reader`: `Read`, `ReadIter`, `PollRecords`,
+  `PollRecordsIter`.
+- `s3sql.Reader`: `Query`.
 - Umbrella `Store`: all of the above forward through.
 
 **Performance impact** — `s3parquet` and poll-based paths apply
 the filter purely in memory on a LIST (or ref-stream) that runs
-anyway, so there's no extra S3 work. `s3sql.Query` / `QueryMany`
-already drive a Go-side LIST to assemble the URI list for
-`read_parquet([...])`, so the barrier filter folds in for free.
+anyway, so there's no extra S3 work. `s3sql.Query` already drive 
+a Go-side LIST to assemble the URI list for `read_parquet([...])`, 
+so the barrier filter folds in for free.
 
-**Zero matches under a barrier**: `Query` preserves its raw-error
-contract by surfacing an `isNoFilesMatchedError`-compatible error
-when the barrier filters every match away, so callers branching
-on that helper keep working. `QueryMany` and `Read*` normalize to
-empty results as they already do.
+**Zero matches under a barrier**: `Query` and `Read*` normalize to
+empty results as they do.
 
 The token passes `ValidateIdempotencyToken` — same grammar as
 `WithIdempotencyToken` (non-empty, no `/`, no `..`, printable
@@ -1255,9 +1251,10 @@ are idempotent (same S3 key, same empty body).
 ### Lookup
 
 ```go
-hits, err := skuIdx.Lookup(ctx,
+hits, err := skuIdx.Lookup(ctx, []string{
     "sku_id=SKU-123/charge_period_start=2026-03-01..2026-04-01/"+
-    "causing_customer=*/charge_period_end=*")
+    "causing_customer=*/charge_period_end=*",
+})
 // hits []SkuPeriodEntry
 ```
 
@@ -1272,61 +1269,60 @@ The single-pattern grammar is Cartesian per segment — `period=*`
 combined with `customer=abc` matches the cross product of all
 periods × abc. When the caller has an arbitrary **set of tuples**
 (e.g. `(period=2026-03, customer=abc), (period=2026-04,
-customer=def)` but *not* the off-diagonal combinations), pass
-them as a slice instead. The full family is available on both
-read paths and the index layer:
+customer=def)` but *not* the off-diagonal combinations), pass them
+as additional elements of the same `[]string` patterns slice.
+Every read entry point already takes `[]string`:
 
 | Entry point | Where |
 |---|---|
-| `Reader.ReadMany` / `ReadManyIter` | `s3parquet.Reader`, umbrella |
-| `Reader.QueryMany` | `s3sql.Reader`, umbrella |
-| `Index.LookupMany` | `s3parquet`, umbrella |
-| `BackfillIndexMany` | `s3parquet`, umbrella |
+| `Reader.Read` / `ReadIter` | `s3parquet.Reader`, umbrella |
+| `Reader.Query` | `s3sql.Reader`, umbrella |
+| `Index.Lookup` | `s3parquet`, umbrella |
+| `BackfillIndex` | `s3parquet`, umbrella |
 
 ```go
 // Pure-Go read across non-Cartesian tuples.
-recs, _ := store.ReadMany(ctx, []string{
+recs, _ := store.Read(ctx, []string{
     "period=2026-03-17/customer=abc",
     "period=2026-03-18/customer=def",
 })
 
 // DuckDB aggregation across the union — one query, global
 // GROUP BY / SUM / join across the tuple set.
-rows, _ := store.QueryMany(ctx, []string{
+rows, _ := store.Query(ctx, []string{
     "period=2026-03-17/customer=abc",
     "period=2026-03-18/customer=def",
 }, "SELECT customer, SUM(amount) FROM records GROUP BY customer")
 
 // Index lookup over an arbitrary set of (col, col) tuples.
-entries, _ := idx.LookupMany(ctx, []string{
+entries, _ := idx.Lookup(ctx, []string{
     "sku=s1/customer=abc",
     "sku=s4/customer=def",
 })
 
 // One-off migration across several partitions.
-stats, _ := s3store.BackfillIndexMany(ctx, target, def,
+stats, _ := s3store.BackfillIndex(ctx, target, def,
     []string{"period=2026-03-*/customer=*", "period=2026-04-01/customer=*"},
     until, nil)
 ```
 
 **Execution model (s3parquet path):** LIST calls fan out across
-patterns with a bounded 8-wide concurrency cap, overlapping
+patterns with the Target's `MaxInflightRequests` cap, overlapping
 patterns are deduplicated at the key level, the GET+decode pool
 runs over the unioned set, and dedup (if configured) applies
 globally — an entity appearing under two patterns is kept as
 the latest version across the union, not per-pattern.
 
-**Execution model (s3sql path):** every `Query` / `QueryMany`
-pre-LISTs in Go (per pattern, with the same bounded cap) to
-produce the exact file URI list, then runs **one**
-`read_parquet([...])` so DuckDB plans once over the whole set —
-the analytical win (`SUM` / `GROUP BY` / joins across
-non-Cartesian tuples) that N separate `Query` calls would force
-the caller to do in Go.
+**Execution model (s3sql path):** every `Query` pre-LISTs in Go
+(per pattern, with the same bounded cap) to produce the exact file
+URI list, then runs **one** `read_parquet([...])` so DuckDB plans
+once over the whole set — the analytical win (`SUM` / `GROUP BY` /
+joins across non-Cartesian tuples) that N separate `Query` calls
+would force the caller to do in Go.
 
-Single-pattern `Read` / `Query` / `Lookup` / `BackfillIndex` are
-one-line sugar over their `-Many` counterparts and stay
-unchanged.
+A single-element slice is the common case for queries over one
+pattern; the multi-pattern API simply lets the caller add more
+when they need a non-Cartesian set.
 
 ### What's in scope for v1
 
@@ -1356,10 +1352,10 @@ shape is:
 
 ```go
 stats, err := s3store.BackfillIndex(ctx,
-    store.Target(), // or construct via s3parquet.NewS3Target
-    def,            // the same IndexDef the live app registered
-    "*",            // pattern (PartitionKeyParts grammar)
-    until,          // exclusive upper bound on LastModified
+    store.Target(),     // or construct via s3parquet.NewS3Target
+    def,                // the same IndexDef the live app registered
+    []string{"*"},      // patterns (PartitionKeyParts grammar)
+    until,              // exclusive upper bound on LastModified
     func(path string) { slog.Warn("missing data", "path", path) },
 )
 // stats.DataObjects / Records / Markers
@@ -1532,12 +1528,12 @@ delay:
 
 | Operation | Sub-package |
 |---|---|
-| `s3parquet.Reader.Read` / `ReadIter` (+ `*Many` variants) | `s3parquet` |
-| `s3parquet.Index.Lookup` / `LookupMany` | `s3parquet` |
-| `s3parquet.BackfillIndex` / `BackfillIndexMany` | `s3parquet` |
-| `s3sql.Reader.Query` / `QueryMany` | `s3sql` |
-| Umbrella `Store.Read` / `ReadIter` (+ `*Many` variants) | forwards to `s3parquet` |
-| Umbrella `Store.Query` / `QueryMany` | forwards to `s3sql` |
+| `s3parquet.Reader.Read` / `ReadIter` | `s3parquet` |
+| `s3parquet.Index.Lookup` | `s3parquet` |
+| `s3parquet.BackfillIndex` | `s3parquet` |
+| `s3sql.Reader.Query` | `s3sql` |
+| Umbrella `Store.Read` / `ReadIter` | forwards to `s3parquet` |
+| Umbrella `Store.Query` | forwards to `s3sql` |
 
 On the `s3sql` read path, the file discovery LIST is done in Go
 (carries the header); the parquet-body GET runs through DuckDB's
@@ -1666,9 +1662,9 @@ The hook is called from the download worker pool and must be
 safe for concurrent invocation. `nil` means "skip silently."
 
 > **Limitation.** `OnMissingData` is honored by `s3parquet` only.
-> The umbrella's `Read` / `Query` / `PollRecords` go through
-> `s3sql` (DuckDB's `read_parquet`), where a missing file fails
-> the whole call. See [Limitations](#limitations).
+> The umbrella's `Query` goes through `s3sql` (DuckDB's
+> `read_parquet`), where a missing file fails the whole call. See
+> [Limitations](#limitations).
 
 ## Configuration — umbrella
 
@@ -1690,7 +1686,7 @@ type Config[T any] struct {
     EntityKeyOf func(T) string            // identifies a unique entity
     VersionOf   func(T) int64             // monotonic version per entity
 
-    // SQL-side dedup (used by Query / QueryMany via DuckDB CTE).
+    // SQL-side dedup (used by Query via DuckDB CTE).
     // Both or neither.
     EntityKeyColumns []string             // columns that identify an entity
     VersionColumn    string               // column to ORDER BY for latest
@@ -1905,10 +1901,10 @@ Breaking changes in the Index refactor (s3parquet only; umbrella
   `s3parquet.NewIndexFromStoreWithRegister(store, def)`.
 - **`Index.Backfill` removed; use the package-level
   `s3parquet.BackfillIndex` / `s3store.BackfillIndex`.** The new
-  function takes an `S3Target` + `IndexDef` + `pattern` + `until
-  Offset` + `onMissingData` hook, with no writer/reader argument.
-  The common shape is a standalone migration job; see the
-  [Backfill](#backfill) section for the expected flow.
+  function takes an `S3Target` + `IndexDef` + `[]string` patterns
+  + `until Offset` + `onMissingData` hook, with no writer/reader
+  argument. The common shape is a standalone migration job; see
+  the [Backfill](#backfill) section for the expected flow.
 - **`s3parquet.Store.Close()` removed.** The method was a documented
   no-op (pure-Go Store held no resources). Delete the call sites.
   `s3sql.Reader.Close()` and `s3store.Store.Close()` still exist — only
@@ -2031,10 +2027,11 @@ rush it.
 - **Missing-data tolerance only in `s3parquet`.** `OnMissingData`
   (skip a parquet file whose GET returns `NoSuchKey`) is honored
   by `s3parquet.Read` / `PollRecords` / `BackfillIndex`. The
-  umbrella's `Read` / `Query` / `PollRecords` go through
-  `s3sql`'s DuckDB path, which treats its input URI list as
-  authoritative — a dangling ref fails the whole call. Use
-  `s3parquet` directly if you need the tolerant read path.
+  umbrella's `Query` goes through `s3sql`'s DuckDB path, which
+  treats its input URI list as authoritative — a dangling ref
+  fails the whole call. Use `s3parquet` directly (or the umbrella's
+  `Read` / `ReadIter` / `PollRecords`, which delegate to
+  `s3parquet`) if you need the tolerant read path.
 - **`s3sql` parquet-body GET can't carry `ConsistencyControl`**
   (DuckDB `httpfs` has no per-request HTTP header setting on
   `s3://` URLs). Not a problem on AWS / MinIO / StorageGRID:

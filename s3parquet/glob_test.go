@@ -42,13 +42,14 @@ func TestBuildReadPlan_ListPrefix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan, err := core.BuildReadPlan(tc.pattern, dataPath, partitionKeyParts)
+			plans, err := core.BuildReadPlans(
+				[]string{tc.pattern}, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if plan.ListPrefix != tc.want {
+			if plans[0].ListPrefix != tc.want {
 				t.Errorf("ListPrefix = %q, want %q",
-					plan.ListPrefix, tc.want)
+					plans[0].ListPrefix, tc.want)
 			}
 		})
 	}
@@ -107,11 +108,12 @@ func TestBuildReadPlan_Match(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan, err := core.BuildReadPlan(tc.pattern, dataPath, partitionKeyParts)
+			plans, err := core.BuildReadPlans(
+				[]string{tc.pattern}, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got := plan.Match(tc.hiveKey); got != tc.want {
+			if got := plans[0].Match(tc.hiveKey); got != tc.want {
 				t.Errorf("Match(%q) under pattern %q = %v, want %v",
 					tc.hiveKey, tc.pattern, got, tc.want)
 			}
@@ -119,7 +121,7 @@ func TestBuildReadPlan_Match(t *testing.T) {
 	}
 }
 
-func TestBuildReadPlan_RejectsInvalidPattern(t *testing.T) {
+func TestBuildReadPlans_RejectsInvalidPattern(t *testing.T) {
 	partitionKeyParts := []string{"period", "customer"}
 	cases := []string{
 		"period=*-17/customer=abc",      // leading star
@@ -129,8 +131,9 @@ func TestBuildReadPlan_RejectsInvalidPattern(t *testing.T) {
 	}
 	for _, p := range cases {
 		t.Run(p, func(t *testing.T) {
-			if _, err := core.BuildReadPlan(p, "pre/data", partitionKeyParts); err == nil {
-				t.Errorf("core.BuildReadPlan(%q): expected error", p)
+			if _, err := core.BuildReadPlans(
+				[]string{p}, "pre/data", partitionKeyParts); err == nil {
+				t.Errorf("core.BuildReadPlans(%q): expected error", p)
 			}
 		})
 	}

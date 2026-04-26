@@ -51,35 +51,16 @@ func NewIndex[T any, K comparable](
 	return s3parquet.NewIndexWithRegister(store.writer, def)
 }
 
-// BackfillIndex scans existing parquet data under pattern (with
-// LastModified < until) and writes index markers for every record
-// already present. See s3parquet.BackfillIndex for the full
-// contract.
+// BackfillIndex delegates to s3parquet.BackfillIndex.
+// See s3parquet.BackfillIndex for the full contract.
 func BackfillIndex[T any, K comparable](
 	ctx context.Context,
 	target S3Target,
 	def IndexDef[T, K],
-	pattern string,
+	keyPatterns []string,
 	until Offset,
 	onMissingData func(dataPath string),
 ) (BackfillStats, error) {
 	return s3parquet.BackfillIndex(
-		ctx, target, def, pattern, until, onMissingData)
-}
-
-// BackfillIndexMany runs BackfillIndex across every pattern in
-// patterns. Use when a migration job needs to cover an arbitrary
-// set of partition tuples that can't be expressed as a single
-// Cartesian pattern. See s3parquet.BackfillIndexMany for the
-// full contract.
-func BackfillIndexMany[T any, K comparable](
-	ctx context.Context,
-	target S3Target,
-	def IndexDef[T, K],
-	patterns []string,
-	until Offset,
-	onMissingData func(dataPath string),
-) (BackfillStats, error) {
-	return s3parquet.BackfillIndexMany(
-		ctx, target, def, patterns, until, onMissingData)
+		ctx, target, def, keyPatterns, until, onMissingData)
 }

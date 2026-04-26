@@ -31,11 +31,11 @@ import (
 // Nested structs use the same `parquet` tag for their fields.
 //
 // Closes rows automatically before returning. Use when arbitrary
-// SQL via Query / QueryMany should be materialized into typed
-// records; use the returned *sql.Rows directly when you want to
-// stream / aggregate without buffering.
+// SQL via Query should be materialized into typed records; use
+// the returned *sql.Rows directly when you want to stream /
+// aggregate without buffering.
 //
-//	rows, err := r.Query(ctx, "*", "SELECT * FROM records WHERE ...")
+//	rows, err := r.Query(ctx, []string{"*"}, "SELECT * FROM records WHERE ...")
 //	if err != nil { return nil, err }
 //	out, err := s3sql.ScanAll[MyRec](rows)
 func ScanAll[T any](rows *sql.Rows) ([]T, error) {

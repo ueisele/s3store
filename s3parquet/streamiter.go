@@ -14,8 +14,7 @@ import (
 )
 
 // streamEager is the byte-budget-aware streaming pipeline backing
-// ReadIter / ReadManyIter. Three concurrent stages plus the
-// caller's yield loop:
+// ReadIter. Three concurrent stages plus the caller's yield loop:
 //
 //  1. Producer goroutine: walks partitions in lex order and
 //     pushes (partIdx, fileIdx) jobs into a download queue.

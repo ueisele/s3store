@@ -100,3 +100,40 @@ func FanOut[I any](
 	}
 	return parentCtx.Err()
 }
+
+// FanOutMapReduce runs mapFn across items in parallel via FanOut,
+// then folds the per-item slices through reduceFn. The map step
+// reuses every guarantee of FanOut (worker pool, first-error wins,
+// cancellation propagation); the reduce step runs once on the main
+// goroutine after all workers finish, so reduceFn does not need to
+// be safe for concurrent use.
+//
+// Per-item results are stored in a preallocated [][]O slot so
+// workers never share state. On any map error the reduce step is
+// skipped and the zero value of R is returned alongside the error.
+//
+// Empty input returns reduceFn(nil) — reducers that need a different
+// empty-case answer should check for it themselves.
+func FanOutMapReduce[I, O, R any](
+	ctx context.Context,
+	items []I,
+	concurrency int,
+	mapFn func(ctx context.Context, item I) ([]O, error),
+	reduceFn func([][]O) R,
+) (R, error) {
+	results := make([][]O, len(items))
+	err := FanOut(ctx, items, concurrency,
+		func(ctx context.Context, i int, item I) error {
+			r, err := mapFn(ctx, item)
+			if err != nil {
+				return err
+			}
+			results[i] = r
+			return nil
+		})
+	if err != nil {
+		var zero R
+		return zero, err
+	}
+	return reduceFn(results), nil
+}

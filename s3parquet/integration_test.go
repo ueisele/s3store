@@ -110,8 +110,8 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 	}
 
 	// Exact lookup: one SKU, one period, any customer.
-	got, err := idx.Lookup(ctx,
-		"sku=s1/period=2026-03-17/customer=*")
+	got, err := idx.Lookup(ctx, []string{
+		"sku=s1/period=2026-03-17/customer=*"})
 	if err != nil {
 		t.Fatalf("Lookup exact: %v", err)
 	}
@@ -128,8 +128,8 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 	}
 
 	// Range on the period column — covers 03-17 and 03-18, not 04-01.
-	got, err = idx.Lookup(ctx,
-		"sku=s1/period=2026-03-01..2026-04-01/customer=*")
+	got, err = idx.Lookup(ctx, []string{
+		"sku=s1/period=2026-03-01..2026-04-01/customer=*"})
 	if err != nil {
 		t.Fatalf("Lookup range: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 	}
 
 	// Miss — an SKU we never wrote.
-	got, err = idx.Lookup(ctx, "sku=s999/period=*/customer=*")
+	got, err = idx.Lookup(ctx, []string{"sku=s999/period=*/customer=*"})
 	if err != nil {
 		t.Fatalf("Lookup miss: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestIndex_LookupReadAfterWrite(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := idx.Lookup(ctx, "sku=s1/customer=*")
+	got, err := idx.Lookup(ctx, []string{"sku=s1/customer=*"})
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestBackfillIndex(t *testing.T) {
 
 	// Before BackfillIndex: only the post-registration record is
 	// visible.
-	got, err := idx.Lookup(ctx, "sku=*/customer=*")
+	got, err := idx.Lookup(ctx, []string{"sku=*/customer=*"})
 	if err != nil {
 		t.Fatalf("pre-backfill Lookup: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestBackfillIndex(t *testing.T) {
 
 	// BackfillIndex with empty until covers everything.
 	stats, err := s3parquet.BackfillIndex(
-		ctx, target, def, "*", s3parquet.Offset(""), nil)
+		ctx, target, def, []string{"*"}, s3parquet.Offset(""), nil)
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestBackfillIndex(t *testing.T) {
 
 	// After BackfillIndex: every distinct (sku, customer) is
 	// visible.
-	got, err = idx.Lookup(ctx, "sku=*/customer=*")
+	got, err = idx.Lookup(ctx, []string{"sku=*/customer=*"})
 	if err != nil {
 		t.Fatalf("post-backfill Lookup: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestBackfillIndex(t *testing.T) {
 	// are no-ops at the semantic level. We only check it doesn't
 	// error and reports the same scan volume.
 	stats2, err := s3parquet.BackfillIndex(
-		ctx, target, def, "*", s3parquet.Offset(""), nil)
+		ctx, target, def, []string{"*"}, s3parquet.Offset(""), nil)
 	if err != nil {
 		t.Fatalf("second BackfillIndex: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestBackfillIndex(t *testing.T) {
 	// covers 2 of the 5 objects.
 	scoped, err := s3parquet.BackfillIndex(
 		ctx, target, def,
-		"period=2026-03-17/customer=*",
+		[]string{"period=2026-03-17/customer=*"},
 		s3parquet.Offset(""), nil)
 	if err != nil {
 		t.Fatalf("scoped BackfillIndex: %v", err)
@@ -411,7 +411,7 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 	until := store.OffsetAt(midpoint)
 
 	stats, err := s3parquet.BackfillIndex(
-		ctx, target, def, "*", until, nil)
+		ctx, target, def, []string{"*"}, until, nil)
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 	// A bogus until rejects — callers must pass an Offset from
 	// OffsetAt or Offset("") for unbounded.
 	_, err = s3parquet.BackfillIndex(
-		ctx, target, def, "*", s3parquet.Offset("not-an-offset"), nil)
+		ctx, target, def, []string{"*"}, s3parquet.Offset("not-an-offset"), nil)
 	if err == nil {
 		t.Error("expected error for malformed until, got nil")
 	}
@@ -491,7 +491,7 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 		missed   []string
 	)
 	stats, err := s3parquet.BackfillIndex(
-		ctx, store.Target(), def, "*", s3parquet.Offset(""),
+		ctx, store.Target(), def, []string{"*"}, s3parquet.Offset(""),
 		func(p string) {
 			missedMu.Lock()
 			defer missedMu.Unlock()
@@ -580,7 +580,7 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 	// Read is LIST-based; its LIST already reflects the
 	// deletion, so it never GETs the missing file and the hook
 	// does not fire. The remaining record still comes back.
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -654,7 +654,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 	after := time.Now()
 	time.Sleep(400 * time.Millisecond)
 
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -813,7 +813,7 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 		t.Fatalf("NewReaderFromStore: %v", err)
 	}
 
-	got, err := view.Read(ctx, "*")
+	got, err := view.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("view.Read: %v", err)
 	}
@@ -831,13 +831,13 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 	}
 }
 
-// TestReadMany_NonCartesian proves ReadMany covers an arbitrary
+// TestRead_NonCartesian proves Read covers an arbitrary
 // tuple set, not just a Cartesian product. Writing to four
 // (period, customer) tuples and asking for only two of them via
 // a 2-element patterns slice must return just those records —
 // something a single `|`-style pattern couldn't express without
 // over-reading the cross product.
-func TestReadMany_NonCartesian(t *testing.T) {
+func TestRead_NonCartesian(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -855,12 +855,12 @@ func TestReadMany_NonCartesian(t *testing.T) {
 	// A Cartesian pattern would also return the off-diagonal
 	// entries (10 and 40 only wanted; Cartesian would include
 	// 20 and 30).
-	got, err := store.ReadMany(ctx, []string{
+	got, err := store.Read(ctx, []string{
 		"period=2026-03-17/customer=abc",
 		"period=2026-03-18/customer=def",
 	})
 	if err != nil {
-		t.Fatalf("ReadMany: %v", err)
+		t.Fatalf("Read: %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("got %d records, want 2", len(got))
@@ -877,11 +877,11 @@ func TestReadMany_NonCartesian(t *testing.T) {
 	}
 }
 
-// TestReadMany_OverlapsDeduped proves overlapping patterns don't
+// TestRead_OverlapsDeduped proves overlapping patterns don't
 // cause a parquet file to be fetched + decoded twice. A bare "*"
 // plus a narrower pattern that it subsumes must still yield the
 // single expected record set.
-func TestReadMany_OverlapsDeduped(t *testing.T) {
+func TestRead_OverlapsDeduped(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -892,12 +892,12 @@ func TestReadMany_OverlapsDeduped(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.ReadMany(ctx, []string{
+	got, err := store.Read(ctx, []string{
 		"*",
 		"period=2026-03-17/customer=abc",
 	})
 	if err != nil {
-		t.Fatalf("ReadMany: %v", err)
+		t.Fatalf("Read: %v", err)
 	}
 	// 2 records, not 3 — overlap dedup collapses the redundant
 	// listing of abc's parquet file.
@@ -906,22 +906,22 @@ func TestReadMany_OverlapsDeduped(t *testing.T) {
 	}
 }
 
-// TestReadMany_EmptyAndBadPattern covers the two edge cases:
+// TestRead_EmptyAndBadPattern covers the two edge cases:
 // an empty slice returns (nil, nil) without S3 traffic, and a
 // malformed pattern fails with the offending index in the error.
-func TestReadMany_EmptyAndBadPattern(t *testing.T) {
+func TestRead_EmptyAndBadPattern(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	got, err := store.ReadMany(ctx, nil)
+	got, err := store.Read(ctx, nil)
 	if err != nil {
-		t.Errorf("ReadMany(nil): %v", err)
+		t.Errorf("Read(nil): %v", err)
 	}
 	if got != nil {
-		t.Errorf("ReadMany(nil): got %v, want nil", got)
+		t.Errorf("Read(nil): got %v, want nil", got)
 	}
 
-	_, err = store.ReadMany(ctx, []string{
+	_, err = store.Read(ctx, []string{
 		"period=2026-03-17/customer=abc",
 		"not-a-valid-pattern", // segment count wrong
 	})
@@ -933,12 +933,11 @@ func TestReadMany_EmptyAndBadPattern(t *testing.T) {
 	}
 }
 
-// TestReadMany_WithHistory guards that opts pass through to the
-// dedup path: with dedup configured, ReadMany + WithHistory()
+// TestRead_WithHistory guards that opts pass through to the
+// dedup path: with dedup configured, Read + WithHistory()
 // returns every record, and without WithHistory() returns one
-// per entity. The single-pattern Read already covers this; this
-// test ensures the ReadMany wrapper doesn't swallow opts.
-func TestReadMany_WithHistory(t *testing.T) {
+// per entity.
+func TestRead_WithHistory(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
 		entityKeyOf: func(r Rec) string { return r.SKU },
@@ -954,31 +953,31 @@ func TestReadMany_WithHistory(t *testing.T) {
 		}
 	}
 
-	// ReadMany without opts: dedup kicks in → 1 record.
-	deduped, err := store.ReadMany(ctx, []string{key})
+	// Read without opts: dedup kicks in → 1 record.
+	deduped, err := store.Read(ctx, []string{key})
 	if err != nil {
-		t.Fatalf("ReadMany (deduped): %v", err)
+		t.Fatalf("Read (deduped): %v", err)
 	}
 	if len(deduped) != 1 {
 		t.Errorf("deduped: got %d records, want 1", len(deduped))
 	}
 
-	// ReadMany with WithHistory: all 3 records returned.
-	full, err := store.ReadMany(ctx,
+	// Read with WithHistory: all 3 records returned.
+	full, err := store.Read(ctx,
 		[]string{key}, s3parquet.WithHistory())
 	if err != nil {
-		t.Fatalf("ReadMany (history): %v", err)
+		t.Fatalf("Read (history): %v", err)
 	}
 	if len(full) != 3 {
 		t.Errorf("history: got %d, want 3", len(full))
 	}
 }
 
-// TestLookupMany_EmptyAndBadPattern mirrors
-// TestReadMany_EmptyAndBadPattern at the Index layer: empty
+// TestLookup_EmptyAndBadPattern mirrors
+// TestRead_EmptyAndBadPattern at the Index layer: empty
 // slice is a no-op, malformed pattern surfaces the offending
 // index.
-func TestLookupMany_EmptyAndBadPattern(t *testing.T) {
+func TestLookup_EmptyAndBadPattern(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1000,15 +999,15 @@ func TestLookupMany_EmptyAndBadPattern(t *testing.T) {
 		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
 	}
 
-	got, err := idx.LookupMany(ctx, nil)
+	got, err := idx.Lookup(ctx, nil)
 	if err != nil {
-		t.Errorf("LookupMany(nil): %v", err)
+		t.Errorf("Lookup(nil): %v", err)
 	}
 	if got != nil {
-		t.Errorf("LookupMany(nil): got %v, want nil", got)
+		t.Errorf("Lookup(nil): got %v, want nil", got)
 	}
 
-	_, err = idx.LookupMany(ctx, []string{
+	_, err = idx.Lookup(ctx, []string{
 		"sku=s1/customer=abc",
 		"not-a-valid-pattern",
 	})
@@ -1020,9 +1019,9 @@ func TestLookupMany_EmptyAndBadPattern(t *testing.T) {
 	}
 }
 
-// TestBackfillIndexMany_EmptyAndBadPattern covers the matching
+// TestBackfillIndex_EmptyAndBadPattern covers the matching
 // edge cases for the migration entry point.
-func TestBackfillIndexMany_EmptyAndBadPattern(t *testing.T) {
+func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1041,17 +1040,17 @@ func TestBackfillIndexMany_EmptyAndBadPattern(t *testing.T) {
 	}
 	target := store.Target()
 
-	stats, err := s3parquet.BackfillIndexMany(
+	stats, err := s3parquet.BackfillIndex(
 		ctx, target, def, nil, s3parquet.Offset(""), nil)
 	if err != nil {
-		t.Errorf("BackfillIndexMany(nil): %v", err)
+		t.Errorf("BackfillIndex(nil): %v", err)
 	}
 	if stats != (s3parquet.BackfillStats{}) {
-		t.Errorf("BackfillIndexMany(nil): got %+v, want zero stats",
+		t.Errorf("BackfillIndex(nil): got %+v, want zero stats",
 			stats)
 	}
 
-	_, err = s3parquet.BackfillIndexMany(ctx, target, def, []string{
+	_, err = s3parquet.BackfillIndex(ctx, target, def, []string{
 		"period=2026-03-17/customer=abc",
 		"not-a-valid-pattern",
 	}, s3parquet.Offset(""), nil)
@@ -1063,10 +1062,10 @@ func TestBackfillIndexMany_EmptyAndBadPattern(t *testing.T) {
 	}
 }
 
-// TestLookupMany_NonCartesian mirrors TestReadMany_NonCartesian
+// TestLookup_NonCartesian mirrors TestRead_NonCartesian
 // at the index layer: pick a non-Cartesian tuple set of
 // (sku, customer) pairs and verify only those markers come back.
-func TestLookupMany_NonCartesian(t *testing.T) {
+func TestLookup_NonCartesian(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1098,12 +1097,12 @@ func TestLookupMany_NonCartesian(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	got, err := idx.LookupMany(ctx, []string{
+	got, err := idx.Lookup(ctx, []string{
 		"sku=s1/customer=abc",
 		"sku=s4/customer=def",
 	})
 	if err != nil {
-		t.Fatalf("LookupMany: %v", err)
+		t.Fatalf("Lookup: %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("got %d entries, want 2", len(got))
@@ -1132,12 +1131,12 @@ func TestLookupMany_NonCartesian(t *testing.T) {
 	}
 }
 
-// TestBackfillIndexMany exercises the multi-pattern migration
-// shape: write records across several partitions, then backfill
-// only the partitions of interest via a patterns slice. The
-// run covers exactly the selected partitions, and the union is
-// deduplicated when patterns overlap.
-func TestBackfillIndexMany(t *testing.T) {
+// TestBackfillIndex_NonCartesian exercises the multi-pattern
+// migration shape: write records across several partitions, then
+// backfill only the partitions of interest via a patterns slice.
+// The run covers exactly the selected partitions, and the union
+// is deduplicated when patterns overlap.
+func TestBackfillIndex_NonCartesian(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1171,14 +1170,14 @@ func TestBackfillIndexMany(t *testing.T) {
 
 	// Backfill just the two March partitions via explicit patterns.
 	// The April partition should NOT be covered.
-	stats, err := s3parquet.BackfillIndexMany(ctx, store.Target(), def,
+	stats, err := s3parquet.BackfillIndex(ctx, store.Target(), def,
 		[]string{
 			"period=2026-03-17/customer=*",
 			"period=2026-03-18/customer=*",
 		},
 		s3parquet.Offset(""), nil)
 	if err != nil {
-		t.Fatalf("BackfillIndexMany: %v", err)
+		t.Fatalf("BackfillIndex: %v", err)
 	}
 	if stats.DataObjects != 3 {
 		t.Errorf("DataObjects: got %d, want 3 (two March-17 + one "+
@@ -1188,7 +1187,7 @@ func TestBackfillIndexMany(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 
 	// Sanity: Lookup sees the March markers, NOT April.
-	got, err := idx.Lookup(ctx, "sku=*/customer=*")
+	got, err := idx.Lookup(ctx, []string{"sku=*/customer=*"})
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -1221,7 +1220,7 @@ func TestWriteAndRead(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -1267,7 +1266,7 @@ func TestWriteWithKey(t *testing.T) {
 		t.Errorf("incomplete result: %+v", result)
 	}
 
-	got, err := store.Read(ctx, key)
+	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -1309,7 +1308,7 @@ func TestReadGlob(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := store.Read(ctx, tc.pattern)
+			got, err := store.Read(ctx, []string{tc.pattern})
 			if err != nil {
 				t.Fatalf("Read: %v", err)
 			}
@@ -1346,7 +1345,7 @@ func TestDedupExplicit(t *testing.T) {
 		t.Fatalf("second Write: %v", err)
 	}
 
-	got, err := store.Read(ctx, key)
+	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -1386,7 +1385,7 @@ func TestReplicaDedup_CollapsesSameEntityVersion(t *testing.T) {
 		}
 	}
 
-	deduped, err := store.Read(ctx, key)
+	deduped, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read (default): %v", err)
 	}
@@ -1394,7 +1393,7 @@ func TestReplicaDedup_CollapsesSameEntityVersion(t *testing.T) {
 		t.Errorf("default dedup: got %d records, want 1", len(deduped))
 	}
 
-	full, err := store.Read(ctx, key, s3parquet.WithHistory())
+	full, err := store.Read(ctx, []string{key}, s3parquet.WithHistory())
 	if err != nil {
 		t.Fatalf("Read (history): %v", err)
 	}
@@ -1431,7 +1430,7 @@ func TestReplicaDedup_PreservesDistinctVersionsWithHistory(t *testing.T) {
 		}
 	}
 
-	full, err := store.Read(ctx, key, s3parquet.WithHistory())
+	full, err := store.Read(ctx, []string{key}, s3parquet.WithHistory())
 	if err != nil {
 		t.Fatalf("Read (history): %v", err)
 	}
@@ -1443,7 +1442,7 @@ func TestReplicaDedup_PreservesDistinctVersionsWithHistory(t *testing.T) {
 
 // TestReadIter_ReplicaDedupWithHistory covers the ReadIter path
 // through emitPartition: same (entity, version) replicas collapse
-// even with WithHistory. ReadMany's dedup path is covered by
+// even with WithHistory. Read's dedup path is covered by
 // TestReplicaDedup_CollapsesSameEntityVersion — this test pins
 // the iter path so the emitPartition refactor doesn't regress.
 func TestReadIter_ReplicaDedupWithHistory(t *testing.T) {
@@ -1469,7 +1468,7 @@ func TestReadIter_ReplicaDedupWithHistory(t *testing.T) {
 	}
 
 	var got []Rec
-	for r, err := range store.ReadIter(ctx, key, s3parquet.WithHistory()) {
+	for r, err := range store.ReadIter(ctx, []string{key}, s3parquet.WithHistory()) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -1500,7 +1499,7 @@ func TestReadWithHistory(t *testing.T) {
 		}
 	}
 
-	deduped, err := store.Read(ctx, key)
+	deduped, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read (deduped): %v", err)
 	}
@@ -1508,7 +1507,7 @@ func TestReadWithHistory(t *testing.T) {
 		t.Errorf("deduped: got %d, want 1", len(deduped))
 	}
 
-	full, err := store.Read(ctx, key, s3parquet.WithHistory())
+	full, err := store.Read(ctx, []string{key}, s3parquet.WithHistory())
 	if err != nil {
 		t.Fatalf("Read (history): %v", err)
 	}
@@ -1627,7 +1626,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 		t.Fatalf("s3parquet.New(Rec): %v", err)
 	}
 
-	got, err := rWide.Read(ctx, "period=2026-03-17/customer=abc")
+	got, err := rWide.Read(ctx, []string{"period=2026-03-17/customer=abc"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -2035,7 +2034,7 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.Read(ctx, "period=2026-03-17/customer=abc")
+	got, err := store.Read(ctx, []string{"period=2026-03-17/customer=abc"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -2114,7 +2113,7 @@ func TestDisableRefStream(t *testing.T) {
 	}
 
 	// Data was actually written — Read returns everything.
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -2251,7 +2250,7 @@ func TestDisableRefStream_IndexLookup(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	got, err := idx.Lookup(ctx, "sku=s1/period=2026-03-17/customer=*")
+	got, err := idx.Lookup(ctx, []string{"sku=s1/period=2026-03-17/customer=*"})
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -2354,7 +2353,7 @@ func TestReadIter_PerPartitionDedup(t *testing.T) {
 	}
 
 	var got []Rec
-	for r, err := range store.ReadIter(ctx, key) {
+	for r, err := range store.ReadIter(ctx, []string{key}) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2396,7 +2395,7 @@ func TestReadIter_WithHistory_Order(t *testing.T) {
 	}
 
 	var values []int64
-	for r, err := range store.ReadIter(ctx, key, s3parquet.WithHistory()) {
+	for r, err := range store.ReadIter(ctx, []string{key}, s3parquet.WithHistory()) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2432,7 +2431,7 @@ func TestReadIter_EarlyBreak(t *testing.T) {
 	}
 
 	count := 0
-	for r, err := range store.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, []string{"*"}) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2448,7 +2447,7 @@ func TestReadIter_EarlyBreak(t *testing.T) {
 	// Second iteration must complete — proves the early-break
 	// didn't leak goroutines or wedge S3 client state.
 	count = 0
-	for r, err := range store.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, []string{"*"}) {
 		if err != nil {
 			t.Fatalf("ReadIter (second pass): %v", err)
 		}
@@ -2469,7 +2468,7 @@ func TestReadIter_Empty(t *testing.T) {
 
 	yields := 0
 	for _, err := range store.ReadIter(ctx,
-		"period=9999-01-01/customer=missing") {
+		[]string{"period=9999-01-01/customer=missing"}) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2507,13 +2506,13 @@ func TestReadIter_ReadAheadPartitions(t *testing.T) {
 
 	// Prefetching matches strict-serial on values and order.
 	var serial, prefetched []int64
-	for r, err := range store.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, []string{"*"}) {
 		if err != nil {
 			t.Fatalf("serial ReadIter: %v", err)
 		}
 		serial = append(serial, r.Value)
 	}
-	for r, err := range store.ReadIter(ctx, "*",
+	for r, err := range store.ReadIter(ctx, []string{"*"},
 		s3parquet.WithReadAheadPartitions(3)) {
 		if err != nil {
 			t.Fatalf("prefetched ReadIter: %v", err)
@@ -2529,7 +2528,7 @@ func TestReadIter_ReadAheadPartitions(t *testing.T) {
 	// exit via ctx.Done. A subsequent full-read must still succeed
 	// (no leaked goroutines, no wedged S3 client).
 	count := 0
-	for _, err := range store.ReadIter(ctx, "*",
+	for _, err := range store.ReadIter(ctx, []string{"*"},
 		s3parquet.WithReadAheadPartitions(3)) {
 		if err != nil {
 			t.Fatalf("ReadIter (break): %v", err)
@@ -2540,7 +2539,7 @@ func TestReadIter_ReadAheadPartitions(t *testing.T) {
 		}
 	}
 	count = 0
-	for _, err := range store.ReadIter(ctx, "*",
+	for _, err := range store.ReadIter(ctx, []string{"*"},
 		s3parquet.WithReadAheadPartitions(3)) {
 		if err != nil {
 			t.Fatalf("ReadIter (recovery): %v", err)
@@ -2576,7 +2575,7 @@ func TestReadIter_MultiPartition(t *testing.T) {
 	}
 
 	var periods []string
-	for r, err := range store.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, []string{"*"}) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2631,7 +2630,7 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 	after := time.Now()
 	time.Sleep(400 * time.Millisecond)
 
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -2703,7 +2702,7 @@ func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	readTime := time.Now()
 
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -2757,7 +2756,7 @@ func TestSort_ByEntityKeyAndVersion(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 
 	// WithHistory so sort can be observed without dedup folding.
-	got, err := store.Read(ctx, "*", s3parquet.WithHistory())
+	got, err := store.Read(ctx, []string{"*"}, s3parquet.WithHistory())
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -2804,7 +2803,7 @@ func TestSort_LastModifiedFallback(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -2845,13 +2844,13 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	readGot, err := store.Read(ctx, "*", s3parquet.WithHistory())
+	readGot, err := store.Read(ctx, []string{"*"}, s3parquet.WithHistory())
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
 
 	var iterGot []Rec
-	for rec, err := range store.ReadIter(ctx, "*", s3parquet.WithHistory()) {
+	for rec, err := range store.ReadIter(ctx, []string{"*"}, s3parquet.WithHistory()) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}
@@ -2976,7 +2975,7 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	// didn't land a duplicate. Wait past SettleWindow first so
 	// Read can observe the ref in full.
 	time.Sleep(400 * time.Millisecond)
-	got, err := store.Read(ctx, key)
+	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -3025,7 +3024,7 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 	}
 
 	time.Sleep(400 * time.Millisecond)
-	got, err := store.Read(ctx, key)
+	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -3113,7 +3112,7 @@ func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 
 	// 2. Attempt-1 reads with the barrier: no token matches yet, so
 	// the full current state (baseline only) is returned.
-	attempt1, err := store.Read(ctx, key,
+	attempt1, err := store.Read(ctx, []string{key},
 		s3parquet.WithIdempotentRead(token))
 	if err != nil {
 		t.Fatalf("attempt-1 Read: %v", err)
@@ -3146,7 +3145,7 @@ func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 	// barrier excludes both the attempt-1 file (self-exclusion) and
 	// the zombie file (LastModified >= barrier). Only the baseline
 	// survives.
-	attempt2, err := store.Read(ctx, key,
+	attempt2, err := store.Read(ctx, []string{key},
 		s3parquet.WithIdempotentRead(token))
 	if err != nil {
 		t.Fatalf("attempt-2 Read: %v", err)
@@ -3160,7 +3159,7 @@ func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 	// The newIdempotentStore fixture has EntityKeyOf on
 	// (customer, sku) with VersionOf = Value, so the three SKUs
 	// are distinct entities and nothing dedups away.
-	full, err := store.Read(ctx, key)
+	full, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("full Read: %v", err)
 	}
@@ -3219,7 +3218,7 @@ func TestIdempotentRead_PerPartitionIsolation(t *testing.T) {
 	// Read across both partitions with the barrier. A is filtered
 	// (only baseline survives); B has no token file so its barrier
 	// is absent — both B records pass through.
-	got, err := store.Read(ctx, "period=2026-04-22/customer=*",
+	got, err := store.Read(ctx, []string{"period=2026-04-22/customer=*"},
 		s3parquet.WithIdempotentRead(token))
 	if err != nil {
 		t.Fatalf("barrier Read: %v", err)
@@ -3253,7 +3252,7 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 	ctx := context.Background()
 	store := newIdempotentStore(t)
 
-	if _, err := store.Read(ctx, "period=2026-04-22/customer=*",
+	if _, err := store.Read(ctx, []string{"period=2026-04-22/customer=*"},
 		s3parquet.WithIdempotentRead("has/slash")); err == nil {
 		t.Fatal("want error for barrier token with '/', got nil")
 	}

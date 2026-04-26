@@ -104,7 +104,7 @@ func TestUmbrella_WriteRead(t *testing.T) {
 
 	// newStore was called without entityKeyColumns, so no dedup:
 	// every written record comes back.
-	got, err := store.Read(ctx, "*")
+	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestUmbrella_Query(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	rows, err := store.Query(ctx, "*",
+	rows, err := store.Query(ctx, []string{"*"},
 		"SELECT customer, SUM(amount) AS total FROM records "+
 			"GROUP BY customer ORDER BY customer")
 	if err != nil {
@@ -265,7 +265,7 @@ func TestUmbrella_PartitionRange(t *testing.T) {
 	}
 
 	got, err := store.Read(ctx,
-		"period=2026-03-01..2026-04-01/customer=abc")
+		[]string{"period=2026-03-01..2026-04-01/customer=abc"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestUmbrella_QueryInvalidPattern(t *testing.T) {
 	store := newStore(t, storeOpts{})
 
 	_, err := store.Query(ctx,
-		"period=X/customer=Y/extra=Z",
+		[]string{"period=X/customer=Y/extra=Z"},
 		"SELECT 1")
 	if err == nil {
 		t.Error("expected error for invalid pattern, got nil")
@@ -379,7 +379,7 @@ func TestUmbrella_ReadIter(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 
 	count := 0
-	for r, err := range store.ReadIter(ctx, "*") {
+	for r, err := range store.ReadIter(ctx, []string{"*"}) {
 		if err != nil {
 			t.Fatalf("ReadIter: %v", err)
 		}

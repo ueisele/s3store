@@ -286,44 +286,22 @@ func (i *Index[K]) markerPath(entry K) (string, error) {
 	return p, nil
 }
 
-// Lookup returns every K whose marker matches the key pattern.
-// pattern uses the same grammar as Reader.Read (see
-// core.ValidateKeyPattern), evaluated against Columns.
+// Lookup returns every K whose marker matches any of the given
+// key patterns. Patterns use the grammar from
+// core.ValidateKeyPattern, evaluated against Columns. Pass
+// multiple patterns when the target set isn't a Cartesian product
+// (e.g. (sku=A, customer=X) and (sku=B, customer=Y) but not the
+// off-diagonal pairs); overlapping patterns are deduplicated, so
+// the result has no duplicate K entries.
 //
-// Results are unbounded: narrow the pattern if an index has
-// millions of matching markers. No deduplication is needed —
-// S3 PUT is idempotent, so distinct markers imply distinct K.
+// Read-after-write: honors the Index's ConsistencyControl on the
+// LIST, so every marker the writer has already published is
+// visible. Unlike Poll there is no SettleWindow filter.
 //
-// Read-after-write: Lookup carries the Index's ConsistencyControl
-// on the LIST, so it sees every marker the writer has already
-// published under the matching level — strong on AWS S3, strong
-// on MinIO, strong-global / strong-site on StorageGRID when the
-// header is honoured. Unlike Poll there is no SettleWindow filter
-// here; marker visibility is delegated to the storage layer.
-//
-// Single-pattern sugar over LookupMany — use LookupMany when
-// the caller has an arbitrary set of column tuples (e.g. a
-// non-Cartesian "(sku=A, customer=X), (sku=B, customer=Y)"
-// selection).
+// Results are unbounded — narrow the patterns if an index has
+// millions of matching markers. Empty patterns slice returns
+// (nil, nil); a malformed pattern fails with the offending index.
 func (i *Index[K]) Lookup(
-	ctx context.Context, pattern string,
-) ([]K, error) {
-	return i.LookupMany(ctx, []string{pattern})
-}
-
-// LookupMany runs Lookup across every pattern and returns the
-// unioned set of K values. Overlapping patterns are safe: a
-// marker listed by two plans is counted once, so the returned
-// slice has no duplicate K entries.
-//
-// Each pattern uses the grammar described on Lookup. Pass more
-// than one when the target set isn't a Cartesian product of
-// per-column values. LISTs fan out with the same concurrency
-// cap as Reader's GETs (pollDownloadConcurrency), literal-
-// duplicate patterns are dropped up front. Empty slice → (nil,
-// nil). First malformed pattern fails the whole call with its
-// index.
-func (i *Index[K]) LookupMany(
 	ctx context.Context, patterns []string,
 ) ([]K, error) {
 	patterns = core.DedupePatterns(patterns)
@@ -334,7 +312,7 @@ func (i *Index[K]) LookupMany(
 	plans, err := core.BuildReadPlans(patterns, i.indexPath, i.columns)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"s3parquet: index %q LookupMany %w", i.name, err)
+			"s3parquet: index %q Lookup %w", i.name, err)
 	}
 
 	keys, err := i.listAllMatchingMarkers(ctx, plans)
@@ -411,9 +389,10 @@ func (i *Index[K]) listMatchingMarkers(
 func (i *Index[K]) listAllMatchingMarkers(
 	ctx context.Context, plans []*core.ReadPlan,
 ) ([]string, error) {
-	return core.RunPlansConcurrent(ctx, plans,
+	return core.FanOutMapReduce(ctx, plans,
 		i.target.EffectiveMaxInflightRequests(),
-		i.listMatchingMarkers, identityKey)
+		i.listMatchingMarkers,
+		func(per [][]string) []string { return core.UnionKeys(per, identityKey) })
 }
 
 // hiveKeyOfMarker returns the "col=val/col=val/..." body of a
@@ -446,82 +425,45 @@ type BackfillStats struct {
 	Markers     int
 }
 
-// BackfillIndex scans existing parquet data under pattern and
-// writes index markers for every record already present. The
-// normal path is to wire RegisterIndex onto the live writer
-// before the first Write; BackfillIndex is the relief valve for
-// records written before that registration.
+// BackfillIndex scans existing parquet data and writes index
+// markers for every record already present. The normal path is
+// to register an index before the first Write; BackfillIndex is
+// the relief valve for records written before that registration.
 //
-// Standalone by design: no Writer / Reader argument, no in-
-// writer registration. The migration job constructs an S3Target
-// pointing at the same dataset the live writer uses; BackfillIndex
-// issues both GETs (parquet data) and PUTs (markers) through
-// target.S3Client().
-//
-// pattern uses the same grammar as Reader.Read and is evaluated
-// against target.PartitionKeyParts() (NOT the index's Columns) —
-// backfill LISTs parquet data files, which are keyed by
-// partition. "*" covers everything; shard across partitions to
-// parallelize a migration.
+// keyPatterns use the grammar from core.ValidateKeyPattern,
+// evaluated against target.PartitionKeyParts() (NOT the index's
+// Columns) — backfill walks parquet data files, which are keyed
+// by partition. "*" covers everything; shard across partitions
+// to parallelize a migration. Overlapping patterns are
+// deduplicated, so each parquet file is scanned at most once.
 //
 // until is an exclusive upper bound on data-file LastModified.
 // Typical use: until = OffsetAt(deployTime_of_live_writer), so
-// backfill covers historical gaps (< deploy) while the live
-// writer covers everything from deploy onward. Passing
-// OffsetUnbounded disables the bound — backfill covers every
-// file currently present, at the cost of redundant PUTs for data
-// the live writer has already marked (harmless because PUT is
-// idempotent).
+// backfill covers historical gaps while the live writer covers
+// everything from deploy onward. Pass OffsetUnbounded to cover
+// every file currently present (redundant with the live writer
+// but harmless — PUT is idempotent).
 //
 // onMissingData is invoked when a data-file GET returns S3
 // NoSuchKey (dangling ref or LIST-to-GET race); the file is
-// skipped rather than failing the whole backfill. Pass nil to
-// disable the hook — skip-on-NoSuchKey is applied either way.
+// skipped either way. Pass nil to disable the hook.
 //
-// Safe to run concurrently with a live writer that also emits
-// markers on Write (S3 PUT is idempotent; duplicates are
-// harmless). Safe to retry after a crash or cancel.
-//
-// Concurrency model matches Reader.Read: pollDownloadConcurrency
-// across objects, serial PUTs within each object so net in-flight
-// S3 requests stay at ≈ concurrency rather than concurrency².
-// Peak memory is bounded by (concurrency × largest-object size).
-//
-// Single-pattern sugar over BackfillIndexMany — use that when a
-// migration needs to cover an arbitrary set of partition tuples
-// that can't be expressed as one Cartesian pattern.
+// Safe to run concurrently with a live writer (S3 PUT is
+// idempotent) and safe to retry after a crash. Empty patterns
+// slice is a no-op: (BackfillStats{}, nil). First malformed
+// pattern fails with its index.
 func BackfillIndex[T any, K comparable](
 	ctx context.Context,
 	target S3Target,
 	def IndexDef[T, K],
-	pattern string,
-	until Offset,
-	onMissingData func(dataPath string),
-) (BackfillStats, error) {
-	return BackfillIndexMany(
-		ctx, target, def, []string{pattern}, until, onMissingData)
-}
-
-// BackfillIndexMany runs BackfillIndex across every pattern in
-// patterns, LISTing with bounded concurrency and feeding the
-// deduplicated union of data-file keys through a single
-// backfill pipeline. Stats aggregate across patterns: each
-// parquet file is scanned once even if two patterns match it.
-//
-// Empty slice is a no-op: (BackfillStats{}, nil). First
-// malformed pattern fails with its index.
-func BackfillIndexMany[T any, K comparable](
-	ctx context.Context,
-	target S3Target,
-	def IndexDef[T, K],
-	patterns []string,
+	keyPatterns []string,
 	until Offset,
 	onMissingData func(dataPath string),
 ) (BackfillStats, error) {
 	var stats BackfillStats
 
-	patterns = core.DedupePatterns(patterns)
-	if len(patterns) == 0 {
+	keyPatterns = core.DedupePatterns(keyPatterns)
+	if len(keyPatterns) == 0 {
 		return stats, nil
 	}
 
@@ -533,7 +475,7 @@ func BackfillIndexMany[T any, K comparable](
 	}
 	if def.Of == nil {
 		return stats, fmt.Errorf(
-			"s3parquet: BackfillIndexMany %q: Of is required", def.Name)
+			"s3parquet: BackfillIndex %q: Of is required", def.Name)
 	}
 
 	idx, err := buildIndex(target, def.IndexLookupDef)
@@ -542,10 +484,10 @@ func BackfillIndexMany[T any, K comparable](
 	}
 
 	dataPath := core.DataPath(target.Prefix())
-	plans, err := core.BuildReadPlans(patterns, dataPath, target.PartitionKeyParts())
+	plans, err := core.BuildReadPlans(keyPatterns, dataPath, target.PartitionKeyParts())
 	if err != nil {
 		return stats, fmt.Errorf(
-			"s3parquet: BackfillIndexMany %w", err)
+			"s3parquet: BackfillIndex %w", err)
 	}
 
 	keys, err := listDataFilesBelowUntil(
@@ -629,12 +571,13 @@ func listDataFilesBelowUntil(
 		filter = true
 	}
 
-	return core.RunPlansConcurrent(ctx, plans,
+	return core.FanOutMapReduce(ctx, plans,
 		target.EffectiveMaxInflightRequests(),
 		func(ctx context.Context, plan *core.ReadPlan) ([]string, error) {
 			return listDataFilesForPlan(
 				ctx, target, plan, dataPath, filter, cutoff, consistency)
-		}, identityKey)
+		},
+		func(per [][]string) []string { return core.UnionKeys(per, identityKey) })
 }
 
 // listDataFilesForPlan is the per-plan body extracted so the

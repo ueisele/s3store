@@ -1,7 +1,6 @@
 package core
 
 import (
-	"context"
 	"fmt"
 	"strings"
 )
@@ -22,58 +21,46 @@ type ReadPlan struct {
 }
 
 // BuildReadPlans validates each pattern against the shared
-// grammar and returns one ReadPlan per input. On the first
-// validation failure returns the index, the offending pattern,
-// and the wrapped error: `pattern N "p": <err>`. Callers wrap the
-// result with their own package + method prefix so the surfaced
-// chain reads naturally (e.g. `s3parquet: ReadMany pattern N "p":
-// ...`).
+// grammar and returns one ReadPlan per input. The dataPath is
+// the prefix under which data files live (as returned by
+// DataPath); each plan's ListPrefix is rooted at dataPath and
+// extends as far as the longest literal the pattern allows,
+// including the common prefix of a leading range/prefix segment.
+//
+// On the first validation failure returns the index, the
+// offending pattern, and the wrapped error: `pattern N "p":
+// <err>`. Callers wrap the result with their own package +
+// method prefix so the surfaced chain reads naturally (e.g.
+// `s3parquet: Read pattern N "p": ...`).
 //
 // Pure Go — no S3 calls; suitable for unit-testing.
 func BuildReadPlans(
-	patterns []string, dataPath string, partitionKeyParts []string,
+	keyPatterns []string, dataPath string, partitionKeyParts []string,
 ) ([]*ReadPlan, error) {
-	plans := make([]*ReadPlan, len(patterns))
-	for i, p := range patterns {
-		plan, err := BuildReadPlan(p, dataPath, partitionKeyParts)
+	plans := make([]*ReadPlan, len(keyPatterns))
+	for i, p := range keyPatterns {
+		segs, err := ParseKeyPattern(p, partitionKeyParts)
 		if err != nil {
 			return nil, fmt.Errorf("pattern %d %q: %w", i, p, err)
 		}
-		plans[i] = plan
+
+		// Match-all shortcut.
+		if segs == nil {
+			plans[i] = &ReadPlan{
+				ListPrefix: dataPath + "/",
+				Match:      func(string) bool { return true },
+			}
+			continue
+		}
+
+		plans[i] = &ReadPlan{
+			ListPrefix: listPrefixForSegments(dataPath, segs),
+			Match: func(hiveKey string) bool {
+				return matchHiveKey(hiveKey, segs)
+			},
+		}
 	}
 	return plans, nil
-}
-
-// BuildReadPlan validates a key pattern against the shared
-// grammar and returns an execution plan. The dataPath is the
-// prefix under which data files live (as returned by DataPath);
-// the plan's ListPrefix is rooted at dataPath and extends as
-// far as the longest literal the pattern allows, including the
-// common prefix of a leading range/prefix segment.
-//
-// Pure Go — no S3 calls; suitable for unit-testing.
-func BuildReadPlan(
-	pattern string, dataPath string, partitionKeyParts []string,
-) (*ReadPlan, error) {
-	segs, err := ParseKeyPattern(pattern, partitionKeyParts)
-	if err != nil {
-		return nil, err
-	}
-
-	// Match-all shortcut.
-	if segs == nil {
-		return &ReadPlan{
-			ListPrefix: dataPath + "/",
-			Match:      func(string) bool { return true },
-		}, nil
-	}
-
-	return &ReadPlan{
-		ListPrefix: listPrefixForSegments(dataPath, segs),
-		Match: func(hiveKey string) bool {
-			return matchHiveKey(hiveKey, segs)
-		},
-	}, nil
 }
 
 // listPrefixForSegments extends dataPath with every leading
@@ -171,34 +158,3 @@ func HiveKeyOfDataFile(s3Key, dataPath string) (string, bool) {
 	return rest[:slash], true
 }
 
-// RunPlansConcurrent runs listOne across every plan via FanOut
-// and returns the deduplicated union of results in first-seen
-// order. keyOf extracts the dedup key so callers can use richer
-// result types (e.g. KeyMeta) while still deduping on the
-// underlying S3 key.
-//
-// Single source of truth for the multi-pattern LIST fan-out used
-// by s3parquet (ReadMany, LookupMany, BackfillIndexMany) and
-// s3sql (ReadMany, QueryMany).
-func RunPlansConcurrent[P any, R any](
-	ctx context.Context,
-	plans []P,
-	concurrency int,
-	listOne func(ctx context.Context, p P) ([]R, error),
-	keyOf func(R) string,
-) ([]R, error) {
-	results := make([][]R, len(plans))
-	err := FanOut(ctx, plans, concurrency,
-		func(ctx context.Context, i int, plan P) error {
-			r, err := listOne(ctx, plan)
-			if err != nil {
-				return err
-			}
-			results[i] = r
-			return nil
-		})
-	if err != nil {
-		return nil, err
-	}
-	return UnionKeys(results, keyOf), nil
-}

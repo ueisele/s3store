@@ -7,86 +7,44 @@ import (
 	"strings"
 
 	"github.com/ueisele/s3store/internal/core"
+	"github.com/ueisele/s3store/s3parquet"
 )
 
-// Query executes a SQL query scoped to files matching the given
-// key pattern. Glob grammar follows core.ValidateKeyPattern.
-// Deduplicated by VersionColumn + EntityKeyColumns when both
-// are configured; pass WithHistory() to opt out.
+// Query runs a single SQL query over the deduplicated union of
+// files matching every pattern in keyPatterns. One DuckDB query,
+// so aggregations, joins, and ORDER BY apply across the full set.
+// Patterns use the grammar from core.ValidateKeyPattern.
 //
-// Does not normalize "zero files match" to an empty result —
-// returns an isNoFilesMatchedError-compatible error so callers
-// can branch on it. Use QueryMany if you want empty treated as
-// a successful zero-row iteration.
+// Deduplicated by EntityKeyColumns + VersionColumn when both are
+// configured (pass WithHistory to opt out). Pass WithIdempotentRead
+// for retry-safe read-modify-write (see core.WithIdempotentRead).
 //
-// Execution model: a Go-side S3 LIST resolves the matching file
-// set, the (optional) WithIdempotentRead barrier filters it, and
-// the deduplicated URI list is handed to read_parquet([…]). The
-// LIST carries ConsistencyControl, so reads are read-after-write
-// on strong-consistent backends. See QueryMany for the full
-// rationale on why DuckDB's glob-expansion fast path is not used
-// (httpfs cannot carry per-request consistency headers).
+// Empty patterns slice or zero file matches returns a *sql.Rows
+// that yields zero rows on Next() — the standard for-rows.Next
+// loop sees a clean empty iteration.
 func (s *Reader) Query(
 	ctx context.Context,
-	keyPattern string,
+	keyPatterns []string,
 	sqlQuery string,
 	opts ...QueryOption,
 ) (*sql.Rows, error) {
+	keyPatterns = core.DedupePatterns(keyPatterns)
+	if len(keyPatterns) == 0 {
+		return s.emptyRows(ctx)
+	}
+
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	uris, err := s.listAllMatchingURIs(
-		ctx, []string{keyPattern}, &o, "Query")
+	uris, err := s.listAllMatchingURIs(ctx, keyPatterns, &o)
 	if err != nil {
 		return nil, err
 	}
 	if len(uris) == 0 {
-		return nil, noFilesMatchedErr(keyPattern)
+		return s.emptyRows(ctx)
 	}
+
 	scanExpr := s.scanExprForURIs(uris, s.needsFilename())
-	return s.db.QueryContext(ctx,
-		s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
-}
-
-// QueryMany runs a single SQL query over the deduplicated union
-// of files matching every pattern. Unlike calling Query N
-// times, this runs ONE DuckDB query so aggregations, joins, and
-// ORDER BY apply across the full set.
-//
-// Execution model: per-pattern Go-side S3 LIST with bounded
-// concurrency, deduplicated union of exact file URIs, then one
-// read_parquet([…]) scan in DuckDB. The Go-side LIST carries
-// ConsistencyControl on every page so the file set linearizes
-// with concurrent writes on strong-consistent backends.
-//
-// Empty patterns slice → empty *sql.Rows. Zero file matches →
-// empty *sql.Rows. The synthetic empty cursor carries a single
-// NULL column; callers iterating via the standard
-// for-rows.Next-rows.Scan loop see a clean empty iteration.
-func (s *Reader) QueryMany(
-	ctx context.Context,
-	patterns []string,
-	sqlQuery string,
-	opts ...QueryOption,
-) (*sql.Rows, error) {
-	patterns = core.DedupePatterns(patterns)
-	if len(patterns) == 0 {
-		return s.emptyRows(ctx)
-	}
-
-	var o core.QueryOpts
-	o.Apply(opts...)
-
-	uris, err := s.listAllMatchingURIs(ctx, patterns, &o, "QueryMany")
-	if err != nil {
-		return nil, err
-	}
-	if len(uris) == 0 {
-		return s.emptyRows(ctx)
-	}
-
-	scanExpr := s.scanExprForURIs(
-		uris, s.needsFilename())
 	return s.db.QueryContext(ctx,
 		s.wrapScanExpr(scanExpr, sqlQuery, o.IncludeHistory))
 }
@@ -137,7 +95,7 @@ func (s *Reader) needsFilename() bool {
 }
 
 // wrapScanExpr wraps a base scan expression with an optional
-// dedup CTE and the user's SQL query. Shared by Query, QueryMany.
+// dedup CTE and the user's SQL query.
 //
 // Three branches, driven by (dedupEnabled, includeHistory):
 //
@@ -204,28 +162,8 @@ func (s *Reader) wrapScanExpr(
 	return sb.String()
 }
 
-// noFilesErrFragment matches the wording DuckDB uses for a glob
-// that resolves to zero files:
-//
-//	IO Error: No files found that match the pattern "..."
-//
-// Query synthesizes errors carrying this fragment when the
-// Go-side LIST returns zero matches, so callers that branch on
-// the message fragment keep working regardless of whether the
-// LIST was performed by DuckDB (legacy fast path) or by us
-// (current behaviour).
-const noFilesErrFragment = "No files found that match the pattern"
-
-// noFilesMatchedErr synthesizes an error carrying noFilesErrFragment
-// for the zero-match path, so callers that already pattern-match
-// the DuckDB-style "No files found" string keep working.
-func noFilesMatchedErr(pattern string) error {
-	return fmt.Errorf(
-		"IO Error: %s %q", noFilesErrFragment, pattern)
-}
-
 // emptyRows returns a *sql.Rows that yields zero rows. Used by
-// QueryMany when Go-side LIST proves no files match any pattern.
+// Query when Go-side LIST proves no files match any pattern.
 // Callers using the standard for-rows.Next loop see a clean empty
 // iteration; callers that inspect rows.Columns() see a single
 // synthetic NULL column.
@@ -233,33 +171,17 @@ func (s *Reader) emptyRows(ctx context.Context) (*sql.Rows, error) {
 	return s.db.QueryContext(ctx, "SELECT NULL WHERE 1=0")
 }
 
-// listAllMatchingURIs resolves every pattern to its file set via
-// the shared S3Target.ListDataFilesMany helper, applies the
-// idempotent-read filter when opts.IdempotentReadToken is set,
-// and returns the deduplicated union of file URIs (s3://bucket/key
-// form, ready to pass into DuckDB's read_parquet).
-//
-// method identifies the caller (e.g. "Query", "QueryMany") so
-// pattern-validation errors surface with the right entry point in
-// the message. Callers should already have dropped literal-
-// duplicate patterns via core.DedupePatterns — this function
-// doesn't repeat that work.
+// listAllMatchingURIs resolves every pattern to the deduplicated
+// union of file URIs (s3://bucket/key form, ready to pass into
+// DuckDB's read_parquet) via S3Target.ResolvePatterns. Callers
+// should already have dropped literal-duplicate patterns via
+// core.DedupePatterns — this function doesn't repeat that work.
 func (s *Reader) listAllMatchingURIs(
 	ctx context.Context, patterns []string,
-	opts *core.QueryOpts, method string,
+	opts *core.QueryOpts,
 ) ([]string, error) {
-	plans, err := core.BuildReadPlans(
-		patterns, s.dataPath, s.cfg.Target.PartitionKeyParts())
-	if err != nil {
-		return nil, fmt.Errorf("s3sql: %s %w", method, err)
-	}
-
-	keys, err := s.cfg.Target.ListDataFilesMany(
-		ctx, plans, s.cfg.ConsistencyControl)
-	if err != nil {
-		return nil, fmt.Errorf("s3sql: %w", err)
-	}
-	keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, opts)
+	keys, err := s3parquet.ResolvePatterns(
+		ctx, s.cfg.Target, patterns, opts, s.cfg.ConsistencyControl)
 	if err != nil {
 		return nil, fmt.Errorf("s3sql: %w", err)
 	}

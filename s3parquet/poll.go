@@ -15,19 +15,13 @@ import (
 const s3ListMaxKeys int32 = 1000
 
 // Poll returns up to maxEntries stream entries (refs only) after
-// the given offset, up to now - SettleWindow. Issues one or more
-// S3 LIST calls (page size capped at 1000) and no GETs.
+// the given offset, capped at now - SettleWindow to avoid races
+// with in-flight writes. One or more S3 LIST calls, no GETs.
+// Returns (entries, nextOffset, error); checkpoint nextOffset and
+// pass it as `since` on the next call.
 //
-// Accepts WithUntilOffset to bound the walk from above: entries
-// with offset >= until are skipped and the paginator breaks
-// early so long streams don't have to be scanned past the window
-// of interest.
-//
-// ConsistencyControl on the Reader's config is forwarded as the
-// Consistency-Control HTTP header on every paginator LIST, so on
-// StorageGRID strong-global / strong-site the LIST linearizes with
-// the writer's ref PUT (no silent miss when a newly-written ref
-// propagates slower than SettleWindow).
+// Pass WithUntilOffset to bound the walk from above so long
+// streams aren't scanned past the window of interest.
 func (s *Reader[T]) Poll(
 	ctx context.Context,
 	since Offset,
@@ -90,27 +84,22 @@ func (s *Reader[T]) Poll(
 	return nil, since, nil
 }
 
-// PollRecords returns a flat slice of typed records from the
-// files referenced by up to maxEntries refs after the offset.
-// Cursor-based, CDC-style: caller checkpoints the returned
-// offset between calls and the next call resumes from there.
+// PollRecords returns typed records from the files referenced by
+// up to maxEntries refs after the offset, plus the next offset
+// for checkpointing. Cursor-based, CDC-style: caller resumes from
+// the returned offset on the next call.
 //
-// Dedup: replica-dedup only — records sharing (entity, version)
-// collapse to one (literal duplicates from a retried ref are
-// rare but possible). Distinct versions of the same entity all
-// flow. WithHistory is accepted but is effectively the default
-// here; latest-per-entity dedup is NOT offered, because per-batch
-// "latest" is meaningless on a cursor (the next batch may carry
-// a newer version of the same entity).
+// Replica-dedup only: records sharing (entity, version) collapse
+// to one (rare retries / zombies); distinct versions of the same
+// entity all flow through. Latest-per-entity dedup is NOT offered
+// — meaningless on a cursor since the next batch may carry a newer
+// version of the same entity. For latest-per-entity, use Read or
+// PollRecordsIter (snapshot-style).
 //
-// WithIdempotentRead is accepted but ignored on this path: the
-// offset cursor already provides retry-safety, and the token-
-// barrier filter's "by-LastModified" semantics don't compose
-// cleanly with offset-window semantics. Use WithIdempotentRead
-// on Read / ReadIter / PollRecordsIter (snapshot-style reads)
-// instead.
+// WithIdempotentRead is accepted but ignored: the offset cursor
+// already provides retry-safety on this path.
 //
-// Records follow ref order (= timestamp order) and parquet-file
+// Records follow ref order (= timestamp order), then parquet-file
 // row order within each ref.
 func (s *Reader[T]) PollRecords(
 	ctx context.Context,
@@ -148,51 +137,31 @@ func (s *Reader[T]) PollRecords(
 }
 
 // PollRecordsIter streams every record in [since, until) as an
-// iter.Seq2[T, error] via the same streamEager pipeline that
-// backs ReadIter. The ref stream is walked upfront (LIST only,
-// no body fetches) into a flat []KeyMeta, then handed to
-// streamEager which downloads + decodes + yields with byte-budget
-// streaming, cross-file pipelining, and per-partition dedup.
+// iter.Seq2[T, error]. Same streaming pipeline as ReadIter:
+// per-partition dedup, byte-budget streaming, cross-file
+// pipelining.
 //
-// Memory: streamEager bounds in-flight body memory via
-// WithReadAheadPartitions (partition-count cap, default 1 = one
-// partition lookahead) and WithReadAheadBytes (uncompressed-byte
-// cap, default 0 = uncapped). Both apply here just as on
-// ReadIter. KeyMeta slice is small (~100 bytes per ref), so even
-// windows of 100k+ refs stay well under MB of metadata before
-// streaming begins.
+// Pass OffsetUnbounded for `since` to start at the stream head, or
+// for `until` to walk to the live tip (settle-window cutoff
+// snapshotted at call entry — the walk terminates under sustained
+// writes; writes landing after the call started are NOT picked up).
+// Pair with OffsetAt for time-windowed reads.
 //
-// Latency note: walking refs upfront means LIST completes before
-// the first record yields. For typical windows (last hour, last
-// day) this is sub-100ms. For huge backfill windows it can be
-// seconds — chunk via since/until to stream incrementally.
+// Memory bounded by WithReadAheadPartitions (default 1) and
+// WithReadAheadBytes (default uncapped). The ref-LIST runs upfront
+// before the first record yields — typically sub-100ms, but huge
+// backfill windows can take seconds; chunk via since/until then.
 //
-// Consumer break cancels ctx via defer in streamEager, stopping
-// in-flight downloads cleanly.
+// Dedup matches ReadIter (per-partition, not window-global). Pass
+// WithHistory and dedup client-side if you need window-global
+// latest-per-entity.
 //
-// Pass OffsetUnbounded for since to start at the stream head;
-// pass OffsetUnbounded for until to walk to the settle-window
-// cutoff (= live tip as of the call). The cutoff is snapshotted
-// at call entry, so the walk has a stable upper bound and
-// terminates even under sustained writes — writes landing
-// after the call started are NOT picked up. To keep up with new
-// writes, call again from the last seen offset (use PollRecords
-// for offset checkpointing). Combine with OffsetAt for time
-// windows.
+// Breaking out of the loop cancels in-flight downloads. Errors
+// are yielded as (zero, err) and terminate the iter.
 //
-// Dedup semantics match ReadIter: per-partition (refs are
-// grouped into partitions by Hive key inside streamEager). If
-// you need window-global latest-per-entity, pass WithHistory and
-// dedup client-side.
-//
-// Resumption: PollRecordsIter does NOT expose the per-batch
-// offset, so consumer aborts (ctx cancel, range break) cannot be
-// safely resumed. Use PollRecords (Kafka-style batched API) when
-// you need to checkpoint offsets between batches.
-//
-// Errors are yielded as (zero-value, err); the loop must check
-// err before using the record. The iter terminates after an
-// error.
+// Does NOT expose per-batch offsets — consumer aborts cannot
+// safely resume. Use PollRecords (Kafka-style batched) when you
+// need to checkpoint between batches.
 func (s *Reader[T]) PollRecordsIter(
 	ctx context.Context,
 	since, until Offset,

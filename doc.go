@@ -12,8 +12,8 @@
 //     WriteWithKey, ...) plus Reader (Read, ReadIter, Poll,
 //     PollRecords, OffsetAt). In-memory per-partition dedup.
 //   - s3store/s3sql — requires cgo (embedded DuckDB). SQL-only
-//     surface: Query and QueryMany return *sql.Rows; the caller
-//     binds rows themselves.
+//     surface: Query returns *sql.Rows; the caller binds rows
+//     themselves.
 //
 // Importing this umbrella pulls in DuckDB (cgo). If you only
 // need the cgo-free subset (writes, typed reads, change-stream
@@ -29,7 +29,7 @@
 //     return.
 //   - Read / ReadIter: typed, deduplicated snapshot with glob
 //     support.
-//   - Query / QueryMany: DuckDB SQL with auto-dedup CTE.
+//   - Query: DuckDB SQL with auto-dedup CTE.
 //
 // Every read API defaults to latest-per-key deduplication and
 // accepts WithHistory() to opt out.

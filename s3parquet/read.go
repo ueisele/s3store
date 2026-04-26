@@ -15,73 +15,31 @@ import (
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// Read returns all records whose data files match the given
-// key pattern, optionally deduplicated to latest-per-entity
-// when EntityKeyOf is configured.
+// Read returns all records whose data files match any of the
+// given key patterns. Patterns use the grammar described in
+// core.ValidateKeyPattern; pass multiple when the target set isn't
+// a Cartesian product (e.g. (period=A, customer=X) and
+// (period=B, customer=Y) but not the off-diagonal pairs).
 //
-// Accepts the same glob grammar as s3sql.Read: whole-segment
-// "*" and a single trailing "*" inside a value.
+// When EntityKeyOf and VersionOf are configured, the result is
+// deduplicated globally to the latest version per entity across
+// the union (pass WithHistory to opt out). Overlapping patterns
+// are safe — each parquet file is fetched and decoded at most once.
 //
-// Memory: all matching records are buffered before dedup/return.
-// For unbounded reads, use PollRecords to stream incrementally.
-//
-// Single-pattern sugar over ReadMany — use ReadMany directly
-// when the caller has an arbitrary set of partition tuples
-// (e.g. a non-Cartesian "(period=A, customer=X), (period=B,
-// customer=Y)" selection) that can't be expressed as one
-// pattern.
+// All records are buffered before return — for unbounded reads,
+// use ReadIter instead. Empty patterns slice returns (nil, nil);
+// a malformed pattern fails with the offending index.
 func (s *Reader[T]) Read(
-	ctx context.Context, keyPattern string, opts ...QueryOption,
-) ([]T, error) {
-	return s.ReadMany(ctx, []string{keyPattern}, opts...)
-}
-
-// ReadMany runs Read across every pattern in patterns and
-// returns the concatenated result, with dedup applied globally
-// when EntityKeyOf is configured (an entity that appears under
-// two patterns is kept as the latest version across the union,
-// not per-pattern).
-//
-// Each pattern uses the grammar described on Read. Pass more
-// than one when the target set is NOT a Cartesian product of
-// per-segment values — e.g. the tuples (period=A, customer=X)
-// and (period=B, customer=Y) but not the off-diagonal pairs.
-// For a Cartesian "all N × M" shape, pre-expand the list in
-// caller code or use a single pattern with whole-segment "*".
-//
-// LIST calls fan out with the same concurrency cap as GETs
-// (pollDownloadConcurrency), literal-duplicate patterns are
-// dropped up front, and duplicate keys that arise when
-// patterns semantically overlap are collapsed before the GET
-// phase so every parquet file is fetched and decoded at most
-// once. Passing an empty slice is a no-op: (nil, nil).
-//
-// Errors: the first malformed pattern fails the whole call,
-// surfaced with the offending index so the caller can locate
-// it. Any sub-LIST error fails fast and cancels the rest.
-func (s *Reader[T]) ReadMany(
-	ctx context.Context, patterns []string, opts ...QueryOption,
+	ctx context.Context, keyPatterns []string, opts ...QueryOption,
 ) ([]T, error) {
 	var o core.QueryOpts
 	o.Apply(opts...)
 
-	patterns = core.DedupePatterns(patterns)
-	if len(patterns) == 0 {
-		return nil, nil
-	}
-
-	plans, err := core.BuildReadPlans(patterns, s.dataPath, s.cfg.Target.PartitionKeyParts())
+	keys, err := ResolvePatterns(
+		ctx, s.cfg.Target, core.DedupePatterns(keyPatterns),
+		&o, s.cfg.ConsistencyControl)
 	if err != nil {
-		return nil, fmt.Errorf("s3parquet: ReadMany %w", err)
-	}
-
-	keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
-	if err != nil {
-		return nil, err
-	}
-	keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
-	if err != nil {
-		return nil, fmt.Errorf("s3parquet: %w", err)
+		return nil, fmt.Errorf("s3parquet: Read %w", err)
 	}
 	if len(keys) == 0 {
 		return nil, nil
@@ -95,81 +53,38 @@ func (s *Reader[T]) ReadMany(
 }
 
 // ReadIter returns an iter.Seq2[T, error] yielding records one
-// at a time instead of buffering them like Read does. Use when
-// the result set is large enough that Read's O(records) memory
-// becomes a problem.
+// at a time, streaming partition-by-partition. Use when Read's
+// O(records) memory is a problem.
 //
-// Dedup behaviour:
-//   - Default (EntityKeyOf set, no WithHistory): per-partition
-//     dedup. Files within each partition download in parallel
-//     (up to pollDownloadConcurrency) into one buffered batch,
-//     dedupLatest picks one record per entity, the batch is
-//     yielded in lex/insertion order (first-seen wins on ties),
-//     then dropped. Memory: O(one partition's pre-dedup
-//     records). Differs from Read's global dedup — correct
-//     only when the partition key strictly determines every
-//     component of EntityKeyOf (no entity spans partitions).
-//     For layouts that don't satisfy this invariant, use Read
-//     instead.
-//   - EntityKeyOf nil OR WithHistory(): no dedup. Files
-//     downloaded one partition at a time; records yielded in
-//     lex/insertion order. Memory: O(one partition's records).
-//     Order guarantee lets WithHistory callers observe per-
-//     entity version order within a partition.
+// Dedup is per-partition (not global like Read): correct only
+// when the partition key strictly determines every component of
+// EntityKeyOf so no entity ever spans partitions. For layouts
+// that don't satisfy this invariant, use Read or pass WithHistory
+// and dedup yourself. Partitions emit in lex order; within a
+// partition, records emit in lex/insertion order.
 //
-// Cleanup: breaking out of the for-range loop or panicking
-// inside the consumer cancels in-flight downloads via the
-// iterator's deferred cancel — no manual Close required.
+// Memory: O(one partition's records) by default. Tune with
+// WithReadAheadPartitions (default 1; overlap decode of N+1 with
+// yield of N) and/or WithReadAheadBytes (uncompressed-size cap).
 //
-// Partition order: lex across partitions, lex/insertion order
-// within each partition on both paths.
-//
-// Prefetch: WithReadAheadPartitions(n) runs a background
-// decoder that holds up to n partitions ahead of the yield
-// position. Default 1 — minimum useful lookahead so decode of
-// N+1 overlaps yield of N. Larger values help when the consumer
-// does non-trivial per-record work, at O((n+1) partitions) peak
-// memory.
+// Breaking out of the for-range loop cancels in-flight downloads —
+// no manual Close. Empty patterns slice yields nothing; a
+// malformed pattern surfaces as the iter's first error.
 func (s *Reader[T]) ReadIter(
-	ctx context.Context, keyPattern string, opts ...QueryOption,
-) iter.Seq2[T, error] {
-	return s.ReadManyIter(ctx, []string{keyPattern}, opts...)
-}
-
-// ReadManyIter is the multi-pattern sibling of ReadIter. Same
-// per-partition dedup contract; passing a non-Cartesian set of
-// tuples (period=A, customer=X) and (period=B, customer=Y)
-// works the same way it does on ReadMany. Empty pattern slice
-// yields nothing.
-func (s *Reader[T]) ReadManyIter(
-	ctx context.Context, patterns []string, opts ...QueryOption,
+	ctx context.Context, keyPatterns []string, opts ...QueryOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		var o core.QueryOpts
 		o.Apply(opts...)
 
-		patterns = core.DedupePatterns(patterns)
-		if len(patterns) == 0 {
-			return
-		}
-
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		plans, err := core.BuildReadPlans(patterns, s.dataPath, s.cfg.Target.PartitionKeyParts())
+		keys, err := ResolvePatterns(
+			ctx, s.cfg.Target, core.DedupePatterns(keyPatterns),
+			&o, s.cfg.ConsistencyControl)
 		if err != nil {
-			yield(*new(T), fmt.Errorf("s3parquet: ReadManyIter %w", err))
-			return
-		}
-
-		keys, err := s.cfg.Target.ListDataFilesMany(ctx, plans, s.cfg.ConsistencyControl)
-		if err != nil {
-			yield(*new(T), err)
-			return
-		}
-		keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
-		if err != nil {
-			yield(*new(T), fmt.Errorf("s3parquet: %w", err))
+			yield(*new(T), fmt.Errorf("s3parquet: ReadIter %w", err))
 			return
 		}
 		if len(keys) == 0 {
@@ -208,7 +123,7 @@ func sortKeyMetasByKey(files []core.KeyMeta) {
 //     lex-later filename, matching s3sql's
 //     `ORDER BY filename DESC`.
 //
-// Used by ReadMany / PollRecords (sync, collect into a pre-sized
+// Used by Read / PollRecords (sync, collect into a pre-sized
 // []T) and emitPartition (streaming, yield directly). Returning
 // iter.Seq[T] lets the streaming caller skip the per-partition
 // []T materialization that the old slice-returning helper
@@ -255,7 +170,7 @@ func (s *Reader[T]) emitPartition(
 // collected into a slice pre-sized to len(records) (an upper
 // bound; the actual size after dedup is ≤ len(records)).
 //
-// Used by ReadMany and PollRecords. Streaming callers
+// Used by Read and PollRecords. Streaming callers
 // (emitPartition) still iterate sortAndIterate directly.
 func (s *Reader[T]) sortAndCollect(
 	records []T, includeHistory bool,
