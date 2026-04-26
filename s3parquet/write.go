@@ -516,14 +516,15 @@ func (s *Writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 	seen := make(map[string]struct{})
 	for _, idx := range s.indexes {
 		for _, rec := range records {
-			paths, err := idx.pathsOf(rec)
+			p, err := idx.pathOf(rec)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"s3parquet: index %q: %w", idx.name, err)
 			}
-			for _, p := range paths {
-				seen[p] = struct{}{}
+			if p == "" {
+				continue
 			}
+			seen[p] = struct{}{}
 		}
 	}
 	if len(seen) == 0 {

@@ -35,6 +35,7 @@ type Rec struct {
 type storeOpts struct {
 	entityKeyOf func(Rec) string
 	versionOf   func(Rec) int64
+	indexes     []s3parquet.IndexDef[Rec]
 }
 
 // newStore builds a fresh s3parquet.Store against a freshly
@@ -56,6 +57,7 @@ func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		EntityKeyOf:        opts.entityKeyOf,
 		VersionOf:          opts.versionOf,
+		Indexes:            opts.indexes,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
@@ -74,7 +76,6 @@ func newStore(t *testing.T, opts storeOpts) *s3parquet.Store[Rec] {
 // deduplicates to 4 markers despite 5 source records.
 func TestIndex_WriteAndLookup(t *testing.T) {
 	ctx := context.Background()
-	store := newStore(t, storeOpts{})
 
 	type SkuPeriodEntry struct {
 		SKU      string `parquet:"sku"`
@@ -82,20 +83,23 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 		Customer string `parquet:"customer"`
 	}
 
-	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
-		s3parquet.IndexDef[Rec, SkuPeriodEntry]{
-			IndexLookupDef: s3parquet.IndexLookupDef[SkuPeriodEntry]{
-				Name:    "sku_period_idx",
-				Columns: []string{"sku", "period", "customer"},
+	store := newStore(t, storeOpts{
+		indexes: []s3parquet.IndexDef[Rec]{{
+			Name:    "sku_period_idx",
+			Columns: []string{"sku", "period", "customer"},
+			Of: func(r Rec) ([]string, error) {
+				return []string{r.SKU, r.Period, r.Customer}, nil
 			},
-			Of: func(r Rec) []SkuPeriodEntry {
-				return []SkuPeriodEntry{{
-					SKU: r.SKU, Period: r.Period, Customer: r.Customer,
-				}}
-			},
+		}},
+	})
+
+	idx, err := s3parquet.NewIndexReader(store.Target(),
+		s3parquet.IndexLookupDef[SkuPeriodEntry]{
+			Name:    "sku_period_idx",
+			Columns: []string{"sku", "period", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+		t.Fatalf("NewIndexReader: %v", err)
 	}
 
 	in := []Rec{
@@ -157,6 +161,18 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 func TestIndex_LookupReadAfterWrite(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	indexDef := s3parquet.IndexDef[Rec]{
+		Name:    "sku_idx",
+		Columns: []string{"sku", "customer"},
+		Of: func(r Rec) ([]string, error) {
+			return []string{r.SKU, r.Customer}, nil
+		},
+	}
 	store, err := s3parquet.New(s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
@@ -171,27 +187,19 @@ func TestIndex_LookupReadAfterWrite(t *testing.T) {
 		// is that Lookup ignores SettleWindow entirely.
 		SettleWindow:       5 * time.Second,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
+		Indexes:            []s3parquet.IndexDef[Rec]{indexDef},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	type Entry struct {
-		SKU      string `parquet:"sku"`
-		Customer string `parquet:"customer"`
-	}
-	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
-		s3parquet.IndexDef[Rec, Entry]{
-			IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
-				Name:    "sku_idx",
-				Columns: []string{"sku", "customer"},
-			},
-			Of: func(r Rec) []Entry {
-				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
-			},
+	idx, err := s3parquet.NewIndexReader(store.Target(),
+		s3parquet.IndexLookupDef[Entry]{
+			Name:    "sku_idx",
+			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+		t.Fatalf("NewIndexReader: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{
@@ -222,38 +230,56 @@ func TestIndex_LookupReadAfterWrite(t *testing.T) {
 // call.
 func TestBackfillIndex(t *testing.T) {
 	ctx := context.Background()
-	store := newStore(t, storeOpts{})
 
-	// Phase 1: write records with no index registered. These are
-	// the "historical" records BackfillIndex will have to recover.
+	// Phase 1: build a store with no index, write the "historical"
+	// records BackfillIndex will have to recover.
+	preStore := newStore(t, storeOpts{})
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	def := s3parquet.IndexDef[Rec]{
+		Name:    "sku_idx",
+		Columns: []string{"sku", "customer"},
+		Of: func(r Rec) ([]string, error) {
+			return []string{r.SKU, r.Customer}, nil
+		},
+	}
+
 	historical := []Rec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Ts: time.UnixMilli(100)},
 		{Period: "2026-03-17", Customer: "def", SKU: "s1", Ts: time.UnixMilli(200)},
 		{Period: "2026-03-18", Customer: "abc", SKU: "s2", Ts: time.UnixMilli(300)},
 		{Period: "2026-04-01", Customer: "abc", SKU: "s3", Ts: time.UnixMilli(400)},
 	}
-	if _, err := store.Write(ctx, historical); err != nil {
+	if _, err := preStore.Write(ctx, historical); err != nil {
 		t.Fatalf("historical Write: %v", err)
 	}
 
-	// Phase 2: register the index so subsequent writes are
-	// self-indexing. Historical records are not yet covered.
-	type Entry struct {
-		SKU      string `parquet:"sku"`
-		Customer string `parquet:"customer"`
+	// Phase 2: build a second store wired with the index. Reuses
+	// the same target (Bucket / Prefix) so subsequent writes share
+	// the dataset with the historical writes.
+	target := preStore.Target()
+	store, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
+		Target: target,
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		Indexes: []s3parquet.IndexDef[Rec]{def},
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
 	}
-	def := s3parquet.IndexDef[Rec, Entry]{
-		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+
+	idx, err := s3parquet.NewIndexReader(target,
+		s3parquet.IndexLookupDef[Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
-		},
-		Of: func(r Rec) []Entry {
-			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
-		},
-	}
-	idx, err := s3parquet.NewIndexFromStoreWithRegister(store, def)
+		})
 	if err != nil {
-		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+		t.Fatalf("NewIndexReader: %v", err)
 	}
 
 	// Write a post-registration record so we can verify
@@ -277,11 +303,9 @@ func TestBackfillIndex(t *testing.T) {
 		t.Errorf("pre-backfill: got %v, want just {s3, abc}", got)
 	}
 
-	target := store.Target()
-
 	// BackfillIndex with empty until covers everything.
 	stats, err := s3parquet.BackfillIndex(
-		ctx, target, def, []string{"*"}, s3parquet.Offset(""), nil)
+		ctx, target, def, []string{"*"}, time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
@@ -334,7 +358,7 @@ func TestBackfillIndex(t *testing.T) {
 	// are no-ops at the semantic level. We only check it doesn't
 	// error and reports the same scan volume.
 	stats2, err := s3parquet.BackfillIndex(
-		ctx, target, def, []string{"*"}, s3parquet.Offset(""), nil)
+		ctx, target, def, []string{"*"}, time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("second BackfillIndex: %v", err)
 	}
@@ -348,7 +372,7 @@ func TestBackfillIndex(t *testing.T) {
 	scoped, err := s3parquet.BackfillIndex(
 		ctx, target, def,
 		[]string{"period=2026-03-17/customer=*"},
-		s3parquet.Offset(""), nil)
+		time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("scoped BackfillIndex: %v", err)
 	}
@@ -393,39 +417,24 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 		t.Fatalf("late Write: %v", err)
 	}
 
-	type Entry struct {
-		SKU      string `parquet:"sku"`
-		Customer string `parquet:"customer"`
-	}
-	def := s3parquet.IndexDef[Rec, Entry]{
-		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
-			Name:    "bounded_idx",
-			Columns: []string{"sku", "customer"},
-		},
-		Of: func(r Rec) []Entry {
-			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+	def := s3parquet.IndexDef[Rec]{
+		Name:    "bounded_idx",
+		Columns: []string{"sku", "customer"},
+		Of: func(r Rec) ([]string, error) {
+			return []string{r.SKU, r.Customer}, nil
 		},
 	}
 
 	target := store.Target()
-	until := store.OffsetAt(midpoint)
 
 	stats, err := s3parquet.BackfillIndex(
-		ctx, target, def, []string{"*"}, until, nil)
+		ctx, target, def, []string{"*"}, midpoint, nil)
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
 	if stats.DataObjects != 1 {
 		t.Errorf("DataObjects: got %d, want 1 (only early write "+
 			"should be below until)", stats.DataObjects)
-	}
-
-	// A bogus until rejects — callers must pass an Offset from
-	// OffsetAt or Offset("") for unbounded.
-	_, err = s3parquet.BackfillIndex(
-		ctx, target, def, []string{"*"}, s3parquet.Offset("not-an-offset"), nil)
-	if err == nil {
-		t.Error("expected error for malformed until, got nil")
 	}
 }
 
@@ -469,17 +478,11 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	type Entry struct {
-		SKU      string `parquet:"sku"`
-		Customer string `parquet:"customer"`
-	}
-	def := s3parquet.IndexDef[Rec, Entry]{
-		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
-			Name:    "missing_idx",
-			Columns: []string{"sku", "customer"},
-		},
-		Of: func(r Rec) []Entry {
-			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+	def := s3parquet.IndexDef[Rec]{
+		Name:    "missing_idx",
+		Columns: []string{"sku", "customer"},
+		Of: func(r Rec) ([]string, error) {
+			return []string{r.SKU, r.Customer}, nil
 		},
 	}
 
@@ -491,7 +494,7 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 		missed   []string
 	)
 	stats, err := s3parquet.BackfillIndex(
-		ctx, store.Target(), def, []string{"*"}, s3parquet.Offset(""),
+		ctx, store.Target(), def, []string{"*"}, time.Time{},
 		func(p string) {
 			missedMu.Lock()
 			defer missedMu.Unlock()
@@ -979,24 +982,28 @@ func TestRead_WithHistory(t *testing.T) {
 // index.
 func TestLookup_EmptyAndBadPattern(t *testing.T) {
 	ctx := context.Background()
-	store := newStore(t, storeOpts{})
 
 	type Entry struct {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
-		s3parquet.IndexDef[Rec, Entry]{
-			IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
-				Name:    "empty_bad_idx",
-				Columns: []string{"sku", "customer"},
+	store := newStore(t, storeOpts{
+		indexes: []s3parquet.IndexDef[Rec]{{
+			Name:    "empty_bad_idx",
+			Columns: []string{"sku", "customer"},
+			Of: func(r Rec) ([]string, error) {
+				return []string{r.SKU, r.Customer}, nil
 			},
-			Of: func(r Rec) []Entry {
-				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
-			},
+		}},
+	})
+
+	idx, err := s3parquet.NewIndexReader(store.Target(),
+		s3parquet.IndexLookupDef[Entry]{
+			Name:    "empty_bad_idx",
+			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+		t.Fatalf("NewIndexReader: %v", err)
 	}
 
 	got, err := idx.Lookup(ctx, nil)
@@ -1025,23 +1032,17 @@ func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	type Entry struct {
-		SKU      string `parquet:"sku"`
-		Customer string `parquet:"customer"`
-	}
-	def := s3parquet.IndexDef[Rec, Entry]{
-		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
-			Name:    "empty_bad_backfill_idx",
-			Columns: []string{"sku", "customer"},
-		},
-		Of: func(r Rec) []Entry {
-			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
+	def := s3parquet.IndexDef[Rec]{
+		Name:    "empty_bad_backfill_idx",
+		Columns: []string{"sku", "customer"},
+		Of: func(r Rec) ([]string, error) {
+			return []string{r.SKU, r.Customer}, nil
 		},
 	}
 	target := store.Target()
 
 	stats, err := s3parquet.BackfillIndex(
-		ctx, target, def, nil, s3parquet.Offset(""), nil)
+		ctx, target, def, nil, time.Time{}, nil)
 	if err != nil {
 		t.Errorf("BackfillIndex(nil): %v", err)
 	}
@@ -1053,7 +1054,7 @@ func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 	_, err = s3parquet.BackfillIndex(ctx, target, def, []string{
 		"period=2026-03-17/customer=abc",
 		"not-a-valid-pattern",
-	}, s3parquet.Offset(""), nil)
+	}, time.Time{}, nil)
 	if err == nil {
 		t.Fatal("expected error for bad pattern, got nil")
 	}
@@ -1067,24 +1068,28 @@ func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 // (sku, customer) pairs and verify only those markers come back.
 func TestLookup_NonCartesian(t *testing.T) {
 	ctx := context.Background()
-	store := newStore(t, storeOpts{})
 
 	type Entry struct {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
-		s3parquet.IndexDef[Rec, Entry]{
-			IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
-				Name:    "sku_customer_idx",
-				Columns: []string{"sku", "customer"},
+	store := newStore(t, storeOpts{
+		indexes: []s3parquet.IndexDef[Rec]{{
+			Name:    "sku_customer_idx",
+			Columns: []string{"sku", "customer"},
+			Of: func(r Rec) ([]string, error) {
+				return []string{r.SKU, r.Customer}, nil
 			},
-			Of: func(r Rec) []Entry {
-				return []Entry{{SKU: r.SKU, Customer: r.Customer}}
-			},
+		}},
+	})
+
+	idx, err := s3parquet.NewIndexReader(store.Target(),
+		s3parquet.IndexLookupDef[Entry]{
+			Name:    "sku_customer_idx",
+			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+		t.Fatalf("NewIndexReader: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{
@@ -1138,6 +1143,23 @@ func TestLookup_NonCartesian(t *testing.T) {
 // is deduplicated when patterns overlap.
 func TestBackfillIndex_NonCartesian(t *testing.T) {
 	ctx := context.Background()
+
+	type Entry struct {
+		SKU      string `parquet:"sku"`
+		Customer string `parquet:"customer"`
+	}
+	def := s3parquet.IndexDef[Rec]{
+		Name:    "many_idx",
+		Columns: []string{"sku", "customer"},
+		Of: func(r Rec) ([]string, error) {
+			return []string{r.SKU, r.Customer}, nil
+		},
+	}
+
+	// No-index store for the historical writes: backfill must
+	// run from a clean state so the test pins down what the
+	// scoped patterns covered (vs. the live writer covering
+	// everything).
 	store := newStore(t, storeOpts{})
 
 	historical := []Rec{
@@ -1150,22 +1172,13 @@ func TestBackfillIndex_NonCartesian(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	type Entry struct {
-		SKU      string `parquet:"sku"`
-		Customer string `parquet:"customer"`
-	}
-	def := s3parquet.IndexDef[Rec, Entry]{
-		IndexLookupDef: s3parquet.IndexLookupDef[Entry]{
+	idx, err := s3parquet.NewIndexReader(store.Target(),
+		s3parquet.IndexLookupDef[Entry]{
 			Name:    "many_idx",
 			Columns: []string{"sku", "customer"},
-		},
-		Of: func(r Rec) []Entry {
-			return []Entry{{SKU: r.SKU, Customer: r.Customer}}
-		},
-	}
-	idx, err := s3parquet.NewIndexFromStoreWithRegister(store, def)
+		})
 	if err != nil {
-		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+		t.Fatalf("NewIndexReader: %v", err)
 	}
 
 	// Backfill just the two March partitions via explicit patterns.
@@ -1175,7 +1188,7 @@ func TestBackfillIndex_NonCartesian(t *testing.T) {
 			"period=2026-03-17/customer=*",
 			"period=2026-03-18/customer=*",
 		},
-		s3parquet.Offset(""), nil)
+		time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
@@ -2201,6 +2214,12 @@ func TestDisableRefStream_WriteWithKey(t *testing.T) {
 func TestDisableRefStream_IndexLookup(t *testing.T) {
 	ctx := context.Background()
 	f := testutil.New(t)
+
+	type SkuEntry struct {
+		SKU      string `parquet:"sku"`
+		Period   string `parquet:"period"`
+		Customer string `parquet:"customer"`
+	}
 	store, err := s3parquet.New[Rec](s3parquet.Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
@@ -2213,30 +2232,25 @@ func TestDisableRefStream_IndexLookup(t *testing.T) {
 		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 		DisableRefStream:   true,
+		Indexes: []s3parquet.IndexDef[Rec]{{
+			Name:    "sku_idx",
+			Columns: []string{"sku", "period", "customer"},
+			Of: func(r Rec) ([]string, error) {
+				return []string{r.SKU, r.Period, r.Customer}, nil
+			},
+		}},
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.New: %v", err)
 	}
 
-	type SkuEntry struct {
-		SKU      string `parquet:"sku"`
-		Period   string `parquet:"period"`
-		Customer string `parquet:"customer"`
-	}
-	idx, err := s3parquet.NewIndexFromStoreWithRegister(store,
-		s3parquet.IndexDef[Rec, SkuEntry]{
-			IndexLookupDef: s3parquet.IndexLookupDef[SkuEntry]{
-				Name:    "sku_idx",
-				Columns: []string{"sku", "period", "customer"},
-			},
-			Of: func(r Rec) []SkuEntry {
-				return []SkuEntry{{
-					SKU: r.SKU, Period: r.Period, Customer: r.Customer,
-				}}
-			},
+	idx, err := s3parquet.NewIndexReader(store.Target(),
+		s3parquet.IndexLookupDef[SkuEntry]{
+			Name:    "sku_idx",
+			Columns: []string{"sku", "period", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexFromStoreWithRegister: %v", err)
+		t.Fatalf("NewIndexReader: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{

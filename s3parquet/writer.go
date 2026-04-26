@@ -1,6 +1,8 @@
 package s3parquet
 
 import (
+	"fmt"
+
 	"github.com/parquet-go/parquet-go/compress"
 	"github.com/ueisele/s3store/internal/core"
 )
@@ -19,6 +21,20 @@ type WriterConfig[T any] struct {
 	Target         S3Target
 	PartitionKeyOf func(T) string
 	Compression    CompressionCodec
+
+	// Indexes lists the secondary indexes the writer should
+	// maintain. Every Write iterates each entry, calls Of per
+	// record, and PUTs one empty marker per distinct
+	// (index, column-values) tuple in the batch under
+	// <Prefix>/_index/<Name>/. Validation runs at NewWriter:
+	// Name non-empty + free of '/', Columns valid + unique,
+	// Of non-nil, Names unique across the slice.
+	//
+	// Constructed at writer-creation time so registration cannot
+	// race with Write and "registered after the first Write" is
+	// not a reachable state. Use BackfillIndex to retroactively
+	// cover records written before an index existed.
+	Indexes []IndexDef[T]
 
 	// InsertedAtField names a time.Time field on T that the writer
 	// populates with its wall-clock time.Now() just before parquet
@@ -47,8 +63,8 @@ type WriterConfig[T any] struct {
 }
 
 // Writer is the write-side half of a Store. Owns the write path
-// (Write / WriteWithKey) and the in-writer registration list that
-// drives marker emission on Write.
+// (Write / WriteWithKey) and the index list that drives marker
+// emission on Write.
 //
 // Construct directly via NewWriter when a service only writes;
 // embed in Store when it also reads.
@@ -62,11 +78,10 @@ type Writer[T any] struct {
 	// re-switch on the string.
 	compressionCodec compress.Codec
 
-	// indexes is the list of registered secondary-index writers
-	// that the write path iterates per record to emit marker
-	// objects. RegisterIndex appends here; the entry type K is
-	// erased at the closure boundary so the slice stays
-	// homogeneous over T.
+	// indexes is the resolved per-index marker emitter list,
+	// built once at NewWriter from cfg.Indexes. Immutable after
+	// construction — no concurrency story needed on the write
+	// path.
 	indexes []indexWriter[T]
 
 	// insertedAtFieldIndex is the reflect struct-field path for
@@ -76,26 +91,17 @@ type Writer[T any] struct {
 	insertedAtFieldIndex []int
 }
 
-// indexWriter is the internal, entry-type-erased contract
-// between RegisterIndex (called once per index) and the write
-// path. Given a record, it returns the S3 object keys of the
-// markers that record produces, already validated and ready to
-// PUT.
+// indexWriter is the internal, K-erased per-index marker emitter
+// the write path consumes. Given a record, pathOf returns the S3
+// marker key the record produces under this index, or "" when
+// IndexDef.Of returned (nil, nil) signalling no marker.
 type indexWriter[T any] struct {
-	name    string
-	pathsOf func(T) ([]string, error)
-}
-
-// registerIndex appends an indexWriter closure to the write
-// path's iteration list. Called by RegisterIndex. Not
-// concurrency-safe: registration must happen before the first
-// Write.
-func (w *Writer[T]) registerIndex(iw indexWriter[T]) {
-	w.indexes = append(w.indexes, iw)
+	name   string
+	pathOf func(T) (string, error)
 }
 
 // Target returns the untyped S3Target this Writer is bound to.
-// Use when constructing read-only tools (NewIndex, BackfillIndex)
+// Use when constructing read-only tools (NewIndexReader, BackfillIndex)
 // against the same dataset without carrying the Writer's T into
 // their call graph.
 func (w *Writer[T]) Target() S3Target {
@@ -122,7 +128,9 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 //
 // Validation mirrors the writer-side half of New: the Target
 // must carry Bucket / Prefix / S3Client / PartitionKeyParts;
-// Compression resolves to a codec (zero value → snappy).
+// Compression resolves to a codec (zero value → snappy);
+// every IndexDef in cfg.Indexes is shape-validated and Of must
+// be non-nil. Index names must be unique across the slice.
 // PartitionKeyOf is optional at construction — Write errors if
 // called without it, but WriteWithKey works regardless.
 //
@@ -146,11 +154,64 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err != nil {
 		return nil, err
 	}
+	indexes, err := buildIndexWriters(cfg.Target, cfg.Indexes)
+	if err != nil {
+		return nil, err
+	}
 	return &Writer[T]{
 		cfg:                  cfg,
 		dataPath:             core.DataPath(cfg.Target.Prefix()),
 		refPath:              core.RefPath(cfg.Target.Prefix()),
 		compressionCodec:     codec,
 		insertedAtFieldIndex: insertedAtIdx,
+		indexes:              indexes,
 	}, nil
+}
+
+// buildIndexWriters validates each IndexDef and resolves it into
+// an indexWriter[T] closure ready for the write path. Rejects
+// duplicate Names so two indexes can't silently share the same
+// _index/<Name>/ subtree.
+func buildIndexWriters[T any](
+	target S3Target, defs []IndexDef[T],
+) ([]indexWriter[T], error) {
+	if len(defs) == 0 {
+		return nil, nil
+	}
+	seenNames := make(map[string]struct{}, len(defs))
+	out := make([]indexWriter[T], 0, len(defs))
+	for _, def := range defs {
+		if err := validateIndexDefShape(def.Name, def.Columns); err != nil {
+			return nil, err
+		}
+		if _, dup := seenNames[def.Name]; dup {
+			return nil, fmt.Errorf(
+				"s3parquet: duplicate index name %q in WriterConfig.Indexes",
+				def.Name)
+		}
+		seenNames[def.Name] = struct{}{}
+
+		of, err := resolveOf(def)
+		if err != nil {
+			return nil, err
+		}
+
+		indexPath := core.IndexPath(target.Prefix(), def.Name)
+		name := def.Name
+		columns := def.Columns
+		out = append(out, indexWriter[T]{
+			name: name,
+			pathOf: func(rec T) (string, error) {
+				values, err := of(rec)
+				if err != nil {
+					return "", err
+				}
+				if values == nil {
+					return "", nil
+				}
+				return markerPathFromValues(name, indexPath, columns, values)
+			},
+		})
+	}
+	return out, nil
 }

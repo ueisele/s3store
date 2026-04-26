@@ -142,6 +142,15 @@ type Config[T any] struct {
 	// inherit one and the same value — NetApp's "same consistency
 	// for paired operations" rule is enforced by construction.
 	ConsistencyControl s3parquet.ConsistencyLevel
+
+	// Indexes lists the secondary indexes the writer should
+	// maintain. Every Write iterates each entry, calls Of per
+	// record, and PUTs one empty marker per distinct
+	// (index, column-values) tuple in the batch under
+	// <Prefix>/_index/<Name>/. See s3parquet.WriterConfig.Indexes
+	// for the full contract; build a typed query handle with
+	// s3parquet.NewIndexReader(store.Target(), s3parquet.IndexLookupDef[K]{...}).
+	Indexes []s3parquet.IndexDef[T]
 }
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /

@@ -160,6 +160,11 @@ type Config[T any] struct {
 	// so both Writer and Reader see the same cap. See
 	// S3Target.MaxInflightRequests for the full contract.
 	MaxInflightRequests int
+
+	// Indexes lists the secondary indexes the writer should
+	// maintain. See WriterConfig.Indexes for the full contract.
+	// Forwarded to WriterConfig only — readers don't emit markers.
+	Indexes []IndexDef[T]
 }
 
 // dedupEnabled reports whether latest-per-entity dedup applies.
@@ -233,6 +238,7 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 		Compression:     c.Compression,
 		InsertedAtField: c.InsertedAtField,
 		DisableCleanup:  c.DisableCleanup,
+		Indexes:         c.Indexes,
 	}
 }
 

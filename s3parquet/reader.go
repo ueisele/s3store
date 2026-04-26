@@ -49,7 +49,7 @@ type Reader[T any] struct {
 }
 
 // Target returns the untyped S3Target this Reader is bound to.
-// Use when constructing an Index[K] or running BackfillIndex
+// Use when constructing an IndexReader[K] or running BackfillIndex
 // against the same dataset without carrying T through the
 // caller's signatures.
 func (r *Reader[T]) Target() S3Target {

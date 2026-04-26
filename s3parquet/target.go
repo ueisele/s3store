@@ -46,9 +46,9 @@ func consistencyAPIOpts(level ConsistencyLevel) []func(*middleware.Stack) error 
 // Embedded indirectly via WriterConfig.Target / ReaderConfig.Target
 // (which carry an S3Target — the live form) so the four S3-wiring
 // fields plus knobs live in exactly one place. Surfaced on
-// Writer/Reader/Store via .Target() so read-only tools (NewIndex,
-// BackfillIndex) can address the same dataset without carrying T
-// through their call graph.
+// Writer/Reader/Store via .Target() so read-only tools
+// (NewIndexReader, BackfillIndex) can address the same dataset
+// without carrying T through their call graph.
 type S3TargetConfig struct {
 	// Bucket is the S3 bucket name.
 	Bucket string
@@ -193,12 +193,12 @@ func (c S3TargetConfig) Validate() error {
 
 // ValidateLookup is the reduced check for constructors that
 // only LIST / GET / PUT under a known prefix (no partition-key
-// predicates): Bucket, Prefix, S3Client. Used by NewIndex —
-// Lookup walks the <Prefix>/_index/<name>/ subtree, which is
+// predicates): Bucket, Prefix, S3Client. Used by NewIndexReader
+// — Lookup walks the <Prefix>/_index/<name>/ subtree, which is
 // keyed by the index's own Columns, not the config's
 // PartitionKeyParts. A read-only analytics service can pass a
 // minimally-populated S3TargetConfig and still build a working
-// Index.
+// IndexReader.
 func (c S3TargetConfig) ValidateLookup() error {
 	if c.Bucket == "" {
 		return fmt.Errorf("s3parquet: Bucket is required")
@@ -235,7 +235,7 @@ type S3Target struct {
 
 // NewS3Target constructs a live S3Target from config, allocating
 // the shared in-flight semaphore. Performs no field validation —
-// downstream constructors (NewWriter, NewReader, NewIndex,
+// downstream constructors (NewWriter, NewReader, NewIndexReader,
 // BackfillIndex) call Validate / ValidateLookup as appropriate.
 //
 // Logs a warning when ConsistencyControl is non-empty but doesn't

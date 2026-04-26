@@ -1135,52 +1135,122 @@ zero parquet reads, no cgo, no DuckDB.
 
 ### Shape
 
-You define an index by a typed entry struct (one parquet-tagged
-string field per column) and an `Of` function that emits
-zero-or-more entries per record:
+An index has two halves that are wired separately:
+
+- **Write side (`IndexDef[T]`)** lives in `Config.Indexes` /
+  `WriterConfig.Indexes`. `Of` returns the per-record column
+  values as a `[]string` aligned to `Columns` (positional, in
+  declared order). `Of` is optional — nil means the library
+  reflects T's `parquet` tags + `Columns` once at `NewWriter` and
+  emits markers without any caller code.
+- **Read side (`IndexLookupDef[K]`)** is consumed by
+  `s3parquet.NewIndexReader(target, lookupDef)` to build a typed
+  `IndexReader[K]` query handle. `From` projects each marker back into
+  K. Same convention: nil means reflect K's parquet tags against
+  `Columns`; a non-nil custom `From` overrides.
 
 ```go
+// Usage carries parquet tags for the partition columns:
+//   SKUID             string    `parquet:"sku_id"`
+//   CausingCustomer   string    `parquet:"causing_customer"`
+//   ChargePeriodStart time.Time `parquet:"charge_period_start"`
+//   ChargePeriodEnd   time.Time `parquet:"charge_period_end"`
+
+cfg.Indexes = []s3store.IndexDef[Usage]{{
+    Name: "sku_period_idx",
+    Columns: []string{
+        "sku_id", "charge_period_start",
+        "causing_customer", "charge_period_end",
+    },
+    // String fields auto-project. The two time.Time columns
+    // share one Layout.Time format — RFC3339 here. No Of needed.
+    Layout: s3store.Layout{Time: time.RFC3339},
+}}
+
+store, _ := s3store.New[Usage](cfg)
+
+// Build the typed query handle. From is nil, so the library
+// reflects SkuPeriodEntry's parquet tags to project each marker
+// back into a typed struct. K can carry time.Time fields directly
+// — Layout.Time on the read side mirrors the write side, parsing
+// path segments back into time.Time via time.Parse.
 type SkuPeriodEntry struct {
-    SKUID             string `parquet:"sku_id"`
-    ChargePeriodStart string `parquet:"charge_period_start"`
-    CausingCustomer   string `parquet:"causing_customer"`
-    ChargePeriodEnd   string `parquet:"charge_period_end"`
+    SKUID             string    `parquet:"sku_id"`
+    ChargePeriodStart time.Time `parquet:"charge_period_start"`
+    CausingCustomer   string    `parquet:"causing_customer"`
+    ChargePeriodEnd   time.Time `parquet:"charge_period_end"`
 }
 
-store, _ := s3store.New[Usage](ctx, cfg)
-
-skuIdx, err := s3store.NewIndex[Usage, SkuPeriodEntry](store,
-    s3store.IndexDef[Usage, SkuPeriodEntry]{
-        IndexLookupDef: s3store.IndexLookupDef[SkuPeriodEntry]{
-            Name:    "sku_period_idx",
-            Columns: []string{
-                "sku_id", "charge_period_start",
-                "causing_customer", "charge_period_end",
-            },
+skuIdx, _ := s3parquet.NewIndexReader(store.Target(),
+    s3parquet.IndexLookupDef[SkuPeriodEntry]{
+        Name: "sku_period_idx",
+        Columns: []string{
+            "sku_id", "charge_period_start",
+            "causing_customer", "charge_period_end",
         },
-        Of: func(u Usage) []SkuPeriodEntry {
-            return []SkuPeriodEntry{{
-                SKUID:             u.SKUID,
-                ChargePeriodStart: u.ChargePeriodStart.Format(time.RFC3339),
-                CausingCustomer:   u.CausingCustomer,
-                ChargePeriodEnd:   u.ChargePeriodEnd.Format(time.RFC3339),
-            }}
-        },
+        Layout: s3store.Layout{Time: time.RFC3339}, // must match write-side
     })
-// skuIdx is *s3store.Index[SkuPeriodEntry] — T-free, so a
-// read-only service can share the same handle type.
 ```
 
-The returned `Index[K]` is T-free. `IndexDef[T, K]` embeds
-`IndexLookupDef[K]` (just `Name` + `Columns`); read-only callers
-that don't need `Of` can build an `Index[K]` directly from an
-`S3Target` + `IndexLookupDef[K]` via `s3parquet.NewIndex`.
+When every `Columns` entry is already a `parquet:"..."`-tagged
+string field on T, both `Of` and `Layout` can be left zero:
+
+```go
+cfg.Indexes = []s3store.IndexDef[Usage]{{
+    Name:    "sku_customer_idx",
+    Columns: []string{"sku_id", "causing_customer"},
+    // Of: nil — library auto-projects from Usage's parquet tags.
+}}
+```
+
+When time.Time columns need different layouts per column, or
+column values come from somewhere other than parquet-tagged
+fields on T, fall back to writing `Of` explicitly:
+
+```go
+cfg.Indexes = []s3store.IndexDef[Usage]{{
+    Name:    "mixed_idx",
+    Columns: []string{"sku_id", "month", "at"},
+    Of: func(u Usage) ([]string, error) {
+        return []string{
+            u.SKUID,
+            u.ChargePeriodStart.Format("2006-01"),    // month bucketing
+            u.ChargePeriodStart.Format(time.RFC3339), // full timestamp
+        }, nil
+    },
+}}
+```
+
+Indexes are wired at construction time, so registration cannot
+race with `Write` and "registered after the first Write" is not
+a reachable state. Use `BackfillIndex` (below) to retroactively
+cover records written before an index existed.
+
+`IndexReader[K]` is T-free — a read-only service can build the handle
+without depending on the writer's record type.
 
 Every `Write` call iterates each registered index, collects a
-deduplicated set of entries across the batch, and PUTs one empty
-marker per distinct entry under
+deduplicated set of marker paths across the batch, and PUTs one
+empty marker per distinct path under
 `<Prefix>/_index/<name>/<col>=<val>/.../m.idx`. Duplicate writes
 are idempotent (same S3 key, same empty body).
+
+#### Of and From: positional, aligned to Columns
+
+`Of` returns `[]string` and `From` takes `[]string`, both
+positional to `Columns`. Two consequences:
+
+- **Ordering discipline.** A custom `Of`/`From` that disagrees
+  with `Columns` (e.g. swapping the order of two values) writes
+  the wrong markers — silently. The library checks length but
+  not semantics. Refactor `Columns` and the function together,
+  or rely on the auto-projection (nil) which can't get order
+  wrong.
+- **No helper needed for the default case.** With nil `Of` /
+  nil `From`, the library does the reflection itself. Custom
+  closures only when transformation is needed (formatted
+  timestamps on write, post-processing on read) or when K has
+  no parquet tags.
 
 ### Lookup
 
@@ -1260,7 +1330,8 @@ when they need a non-Cartesian set.
 
 ### What's in scope for v1
 
-- Register + auto-write on `Write` + `Lookup` via the typed handle.
+- Wire indexes via `Config.Indexes`; auto-write on `Write` +
+  `Lookup` via the typed `IndexReader[K]` handle.
 - Read-after-write on Lookup: the marker PUT and the marker LIST
   both inherit `ConsistencyControl` from the shared `S3Target`,
   so a `Lookup` issued immediately after `Write` sees the new
@@ -1272,15 +1343,15 @@ when they need a non-Cartesian set.
 
 ### Backfill
 
-The normal path is to register an index before the first `Write`
-so every record produces markers. When that isn't possible —
-adding an index to a store that already has data — the typical
-shape is:
+The normal path is to wire an index into `Config.Indexes` before
+the first `Write` so every record produces markers. When that
+isn't possible — adding an index to a store that already has
+data — the typical shape is:
 
-1. Deploy the live app with the index registered (`NewIndex`);
-   every new `Write` emits markers from time T0 onward.
-2. Capture `until := store.OffsetAt(T0)` — the watermark before
-   which historical data is uncovered.
+1. Deploy the live app with the index in `Config.Indexes`; every
+   new `Write` emits markers from time T0 onward.
+2. Capture `until := T0` — the watermark before which historical
+   data is uncovered.
 3. Run a **one-off migration job** using the package-level
    `s3store.BackfillIndex` that scans files with `LastModified <
    until` and PUTs the retroactive markers.
@@ -1290,7 +1361,7 @@ stats, err := s3store.BackfillIndex(ctx,
     store.Target(),     // or construct via s3parquet.NewS3Target
     def,                // the same IndexDef the live app registered
     []string{"*"},      // patterns (PartitionKeyParts grammar)
-    until,              // exclusive upper bound on LastModified
+    until,              // exclusive upper bound on LastModified (time.Time)
     func(path string) { slog.Warn("missing data", "path", path) },
 )
 // stats.DataObjects / Records / Markers
@@ -1299,11 +1370,12 @@ stats, err := s3store.BackfillIndex(ctx,
 `BackfillIndex` is deliberately standalone — no `Writer` /
 `Reader` argument — so the migration job doesn't need the live
 app's full config. It runs through the same `S3Target`
-abstraction used by `NewIndex`, issuing both parquet GETs and
-marker PUTs via `target.S3Client`. Typically invoked from a
-dedicated binary (`cmd/backfill-<name>/main.go` in your repo): a
-~30-line `main` that builds an S3 client + `S3Target` + `def`
-and calls `BackfillIndex` is the idiomatic shape.
+abstraction used by the read-side `NewIndexReader`, issuing both
+parquet GETs and marker PUTs via `target.S3Client`. Typically
+invoked from a dedicated binary (`cmd/backfill-<name>/main.go`
+in your repo): a ~30-line `main` that builds an S3 client +
+`S3Target` + the same `IndexDef[T]` the live app uses, then calls
+`BackfillIndex`.
 
 The pattern is evaluated against the target's `PartitionKeyParts`
 (same grammar as `Read`), **not** against the index's `Columns`
@@ -1313,10 +1385,10 @@ partition. A migration job can shard itself by partition
 instead of running a single multi-hour call. The `until` bound
 lets the live writer and the migration job cooperate without
 overlap: live markers for everything from T0, backfill markers
-for everything before. Pass `s3store.OffsetUnbounded` to disable
-the bound (covers every file currently present — harmless but
-redundant if the live writer has been up for a while, since PUT
-is idempotent).
+for everything before. Pass `time.Time{}` (the zero value) to
+disable the bound (covers every file currently present —
+harmless but redundant if the live writer has been up for a
+while, since PUT is idempotent).
 
 Idempotent at the S3 level (same empty marker, same key), so a
 retry after cancel or crash is a no-op on work already done. Safe
@@ -1344,10 +1416,17 @@ S3 LIST prefix, so a query that specifies them literally narrows
 the LIST. Trailing columns are always parsed out of the marker
 filename — correct but slower when there's nothing to prune on.
 
-### String-only entry fields
+### Column values are strings on disk
 
-`K`'s fields must be Go `string` (validated at `NewIndex`).
-Format times and numbers in your `Of` function, the same way
+Column values land on disk as hive-encoded strings — `Of`
+returns `[]string`, marker keys are strings, and the default
+binder accepts only `string` and `time.Time` fields on T / K.
+String fields project directly. `time.Time` fields are
+formatted (write) and parsed (read) via `Layout.Time`, which
+must be set on both sides to the same layout.
+
+For other types (numbers, bools, custom enums), format them in
+a custom `Of` and post-process in a custom `From` — same way
 `PartitionKeyOf` already does for data paths. Keeps the read
 path a pure round-trip.
 
@@ -2305,6 +2384,104 @@ the exact fields.
 
 ## Migration from earlier versions
 
+Breaking changes in the indexes-in-config release:
+
+- **`IndexDef[T, K]` → `IndexDef[T]`.** The K type parameter is
+  gone from the write-side def.
+- **`Of func(T) []K` → `Of func(T) ([]string, error)`.** `Of`
+  now returns the per-record column values as a slice positional
+  to `Columns`. Returning `(nil, nil)` skips the record. **`Of`
+  is also optional** — nil triggers auto-projection: the library
+  reflects T's parquet tags + `Columns` once at `NewWriter` and
+  emits markers without any caller code. String columns project
+  directly; `time.Time` columns are formatted with `Layout.Time`
+  (a new field on `IndexDef`, e.g. `Layout: Layout{Time: time.RFC3339}`).
+  Provide a custom `Of` only when transformation is needed
+  beyond what `Layout` covers (per-column time formats, derived
+  values, computed strings).
+- **Indexes now live in `Config.Indexes` /
+  `WriterConfig.Indexes`.** Wired at construction time; the old
+  `RegisterIndex`, `NewIndexWithRegister`, and
+  `NewIndexFromStoreWithRegister` are gone. The "registered
+  after first Write" footgun and the registration-vs-Write race
+  are no longer reachable. `BackfillIndex` still covers the
+  retroactive case.
+- **`From func(map[string]string) (K, error)` → `From func([]string) (K, error)`.**
+  Read-side mirror of `Of`'s shape change. `values` is positional
+  to `Columns`; nil `From` reflects K's parquet tags as before.
+  K may carry `time.Time` fields when `IndexLookupDef.Layout.Time`
+  is set — the auto-default parses each marker's segment via
+  `time.Parse(Layout.Time, ...)`. Layouts on the read and write
+  sides must agree; define one constant and reuse it. The
+  intermediate per-result map allocation in `Lookup` is gone.
+- **`Index[K]` → `IndexReader[K]`; `NewIndex` → `NewIndexReader`.**
+  The read handle now matches the `Reader[T]` / `Writer[T]`
+  naming used by the rest of the package. Mechanical rename.
+- **`s3parquet.NewIndexReader` is the only constructor for `IndexReader[K]`.**
+  It takes the target + `IndexLookupDef[K]`. The umbrella's
+  `s3store.NewIndex(store, def)` forwarder has been removed —
+  call `s3parquet.NewIndexReader(store.Target(), def)` directly.
+  `store.Target()` also works on a `*s3parquet.Writer`, so the
+  same constructor covers writer-only and full-store paths.
+  `IndexReader[K]` is T-free, so a forwarder would only
+  re-introduce a stray T type parameter on the call site.
+- **`BackfillIndex` lost its K type parameter** — it now takes
+  `IndexDef[T]` only.
+- **`BackfillIndex.until` is now `time.Time`, not `Offset`.**
+  `until` was always semantically a time bound on `LastModified`;
+  the previous `Offset` shape was indirection that callers
+  immediately unwrapped. Pass the time directly; `time.Time{}`
+  (the zero value) is the new "no bound" sentinel (replaces
+  `Offset("")` / `OffsetUnbounded` for this call). The dual-shape
+  acceptance (RefCutoff prefix vs full ref key) is gone — there's
+  no Offset to parse.
+- **`s3store.IndexValues` and `s3store.IndexBind` removed.** The
+  helpers were map-shape glue; with `Of`/`From` operating on
+  `[]string` and the auto-default doing the reflection itself,
+  there's nothing for them to do.
+- **K's fields must be Go `string` regardless of `From`.** With
+  the default reflection binder, the rule is enforced at
+  `NewIndexReader`. With a custom `From`, the caller is
+  responsible for producing a valid K.
+
+  ```go
+  // Before
+  idx, _ := s3store.NewIndex[Usage, SkuKey](store,
+      s3store.IndexDef[Usage, SkuKey]{
+          IndexLookupDef: s3store.IndexLookupDef[SkuKey]{
+              Name:    "sku_idx",
+              Columns: []string{"sku", "customer"},
+          },
+          Of: func(u Usage) []SkuKey {
+              return []SkuKey{{SKU: u.SKU, Customer: u.Customer}}
+          },
+      })
+
+  // After — when Usage has parquet:"sku" and parquet:"customer"
+  // string fields, Of can be left nil and the library projects
+  // them automatically.
+  cfg.Indexes = []s3store.IndexDef[Usage]{{
+      Name:    "sku_idx",
+      Columns: []string{"sku", "customer"},
+  }}
+  store, _ := s3store.New[Usage](cfg)
+  idx, _ := s3parquet.NewIndexReader(store.Target(),
+      s3parquet.IndexLookupDef[SkuKey]{
+          Name:    "sku_idx",
+          Columns: []string{"sku", "customer"},
+      })
+
+  // After — when Of needs to compute / format values, supply it
+  // explicitly. Order MUST match Columns:
+  cfg.Indexes = []s3store.IndexDef[Usage]{{
+      Name:    "sku_period_idx",
+      Columns: []string{"sku", "period"},
+      Of: func(u Usage) ([]string, error) {
+          return []string{u.SKU, u.At.Format(time.RFC3339)}, nil
+      },
+  }}
+  ```
+
 Breaking changes in the consistency-on-target release:
 
 - **`ConsistencyControl` moved to `s3parquet.S3TargetConfig`.**
@@ -2349,8 +2526,7 @@ Breaking changes in the consistency-on-target release:
   })
   ```
 
-  `IndexLookupDef.ConsistencyControl` and the implicit
-  inheritance in `NewIndexWithRegister` are also gone — marker
+  `IndexLookupDef.ConsistencyControl` is also gone — marker
   PUTs and LISTs go through the writer's / index's target, which
   already carries the level.
 
@@ -2493,39 +2669,17 @@ Breaking changes in the `s3sql`-as-Reader refactor:
 
 
 
-Breaking changes in the Index refactor (s3parquet only; umbrella
-`s3store.NewIndex` still bundles register + handle in one call):
+Breaking changes in the Index refactor (superseded by the
+indexes-in-config release above; included here for callers
+upgrading across both):
 
-- **`Index[T, K]` → `Index[K]`.** Lookup never touches T, so the
-  query handle is now T-free. A read-only service (dashboard,
-  query API) can share one `Index[K]` across any `T` that
-  produced the markers.
-- **`IndexDef` split.** `IndexLookupDef[K]` holds the read-side
-  `Name` + `Columns`; `IndexDef[T, K]` embeds it and adds `Of`.
-  Existing struct literals need an extra layer:
-
-  ```go
-  s3parquet.IndexDef[T, K]{
-      IndexLookupDef: s3parquet.IndexLookupDef[K]{
-          Name:    "...",
-          Columns: []string{"..."},
-      },
-      Of: func(T) []K { ... },
-  }
-  ```
-
-- **`s3parquet.NewIndex` re-signed.** The primary `NewIndex` now
-  takes an untyped `S3Target` + `IndexLookupDef[K]` — pure-read
-  flow, no writer registration, no `T` on the call site. For the
-  old "register + handle" shape use
-  `s3parquet.NewIndexWithRegister(writer, def)` or
-  `s3parquet.NewIndexFromStoreWithRegister(store, def)`.
+- **`Index[T, K]` → `IndexReader[K]`.** Lookup never touches T, so the
+  query handle is now T-free.
 - **`Index.Backfill` removed; use the package-level
-  `s3parquet.BackfillIndex` / `s3store.BackfillIndex`.** The new
-  function takes an `S3Target` + `IndexDef` + `[]string` patterns
-  + `until Offset` + `onMissingData` hook, with no writer/reader
-  argument. The common shape is a standalone migration job; see
-  the [Backfill](#backfill) section for the expected flow.
+  `s3parquet.BackfillIndex` / `s3store.BackfillIndex`.** Takes an
+  `S3Target` + `IndexDef[T]` + `[]string` patterns + `until
+  time.Time` + `onMissingData` hook, with no writer/reader
+  argument. See the [Backfill](#backfill) section.
 - **`s3parquet.Store.Close()` removed.** The method was a documented
   no-op (pure-Go Store held no resources). Delete the call sites.
   `s3sql.Reader.Close()` and `s3store.Store.Close()` still exist — only

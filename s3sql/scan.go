@@ -4,11 +4,11 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/go-viper/mapstructure/v2"
+	"github.com/ueisele/s3store/internal/core"
 )
 
 // ScanAll materializes every row from rows into a []T, binding
@@ -110,33 +110,19 @@ func buildScanBinder(t reflect.Type) (*scanBinder, error) {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	if t.Kind() != reflect.Struct {
-		return nil, fmt.Errorf(
-			"target type must be a struct, got %s", t.Kind())
+	fields, err := core.ParquetFields(t)
+	if err != nil {
+		return nil, err
 	}
-
-	b := &scanBinder{byName: make(map[string]*fieldScanBinder)}
-	for i := range t.NumField() {
-		sf := t.Field(i)
-		if !sf.IsExported() {
-			continue
-		}
-		tag, ok := sf.Tag.Lookup("parquet")
-		if !ok {
-			continue
-		}
-		name := strings.SplitN(tag, ",", 2)[0]
-		if name == "" || name == "-" {
-			continue
-		}
-
-		makeDest, assign, err := makeFieldScanner(sf.Type)
+	b := &scanBinder{byName: make(map[string]*fieldScanBinder, len(fields))}
+	for _, pf := range fields {
+		makeDest, assign, err := makeFieldScanner(pf.Field.Type)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"field %s (%s): %w", sf.Name, sf.Type, err)
+				"field %s (%s): %w", pf.Field.Name, pf.Field.Type, err)
 		}
-		b.byName[name] = &fieldScanBinder{
-			fieldIndex: sf.Index,
+		b.byName[pf.Name] = &fieldScanBinder{
+			fieldIndex: pf.Field.Index,
 			makeDest:   makeDest,
 			assign:     assign,
 		}

@@ -56,6 +56,7 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		Compression:     cfg.Compression,
 		InsertedAtField: cfg.InsertedAtField,
 		DisableCleanup:  cfg.DisableCleanup,
+		Indexes:         cfg.Indexes,
 	})
 	if err != nil {
 		return nil, err
@@ -82,9 +83,10 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 }
 
 // Writer returns the underlying s3parquet.Writer. Use when a
-// feature lives only on the sub-package (e.g. index registration
-// via s3parquet.NewIndexWithRegister) without giving up the
-// umbrella's ergonomics.
+// caller needs a write-side method that the umbrella doesn't
+// re-expose without giving up the umbrella's ergonomics. Index
+// registration is handled at construction via Config.Indexes —
+// no Writer access is needed for that.
 func (s *Store[T]) Writer() *s3parquet.Writer[T] {
 	return s.writer
 }
