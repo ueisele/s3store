@@ -9,6 +9,12 @@ go test -tags=integration -count=1 -timeout=10m ./...
 golangci-lint run ./...
 ```
 
+Only required when the change touches Go code (`.go` files,
+`go.mod`, `go.sum`, build tags, generated code). Pure
+documentation, comment, or asset changes (e.g. `README.md`,
+`CLAUDE.md`, image files) don't need them — none of these gates
+exercise non-Go content.
+
 `go vet -tags=integration` is the cheapest way to catch
 non-compiling integration test files — `go test` without the tag
 silently skips them.
