@@ -1,6 +1,6 @@
 package s3store
 
-import "log"
+import "log/slog"
 
 // ConsistencyLevel is the value passed in the Consistency-Control
 // HTTP header on S3 requests that require stronger-than-default
@@ -87,10 +87,10 @@ func warnIfUnknownConsistency(c ConsistencyLevel, configKind string) {
 	if c == "" || c.IsKnown() {
 		return
 	}
-	log.Printf(
-		"s3store: %s.ConsistencyControl %q is not one of the "+
-			"known levels (all, strong-global, strong-site, "+
+	slog.Warn(
+		"s3store: ConsistencyControl is not one of the known "+
+			"levels (all, strong-global, strong-site, "+
 			"read-after-new-write, available) — header will be "+
 			"sent verbatim; verify the backend accepts it",
-		configKind, c)
+		"configKind", configKind, "level", string(c))
 }
