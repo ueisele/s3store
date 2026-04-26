@@ -25,21 +25,21 @@ import (
 func validateIdempotencyToken(token string) error {
 	if token == "" {
 		return fmt.Errorf(
-			"s3parquet: IdempotencyToken must not be empty")
+			"s3store: IdempotencyToken must not be empty")
 	}
 	if len(token) > 200 {
 		return fmt.Errorf(
-			"s3parquet: IdempotencyToken must be <= 200 characters "+
+			"s3store: IdempotencyToken must be <= 200 characters "+
 				"(got %d)", len(token))
 	}
 	if strings.Contains(token, "/") {
 		return fmt.Errorf(
-			"s3parquet: IdempotencyToken %q must not contain '/'",
+			"s3store: IdempotencyToken %q must not contain '/'",
 			token)
 	}
 	if strings.Contains(token, "..") {
 		return fmt.Errorf(
-			"s3parquet: IdempotencyToken %q must not contain "+
+			"s3store: IdempotencyToken %q must not contain "+
 				"'..' (reserved by the key-pattern grammar)",
 			token)
 	}
@@ -47,7 +47,7 @@ func validateIdempotencyToken(token string) error {
 		c := token[i]
 		if c < 0x21 || c > 0x7E {
 			return fmt.Errorf(
-				"s3parquet: IdempotencyToken %q contains a "+
+				"s3store: IdempotencyToken %q contains a "+
 					"non-printable-ASCII byte at index %d "+
 					"(want 0x21..0x7E)", token, i)
 		}

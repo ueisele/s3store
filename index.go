@@ -132,14 +132,14 @@ type Layout struct {
 // NewIndexReader and the write-side validation in NewWriter.
 func validateIndexDefShape(name string, columns []string) error {
 	if name == "" {
-		return fmt.Errorf("s3parquet: index: Name is required")
+		return fmt.Errorf("s3store: index: Name is required")
 	}
 	if strings.Contains(name, "/") {
 		return fmt.Errorf(
-			"s3parquet: index: Name %q must not contain '/'", name)
+			"s3store: index: Name %q must not contain '/'", name)
 	}
 	if err := validatePartitionKeyParts(columns); err != nil {
-		return fmt.Errorf("s3parquet: index %q: %w", name, err)
+		return fmt.Errorf("s3store: index %q: %w", name, err)
 	}
 	return nil
 }
@@ -253,7 +253,7 @@ func resolveOf[T any](def IndexDef[T]) (func(T) ([]string, error), error) {
 	plans, err := buildFieldPlans(
 		reflect.TypeFor[T](), def.Columns, def.Layout, false, "Of")
 	if err != nil {
-		return nil, fmt.Errorf("s3parquet: index %q: %w", def.Name, err)
+		return nil, fmt.Errorf("s3store: index %q: %w", def.Name, err)
 	}
 	return func(rec T) ([]string, error) {
 		v := reflect.ValueOf(rec)
@@ -310,21 +310,21 @@ func parseIndexMarkerKey(
 	prefix := indexPath + "/"
 	if !strings.HasPrefix(markerKey, prefix) {
 		return nil, fmt.Errorf(
-			"s3parquet: marker key %q outside index path %q",
+			"s3store: marker key %q outside index path %q",
 			markerKey, indexPath)
 	}
 	body := markerKey[len(prefix):]
 	tail := "/" + indexMarkerFilename
 	if !strings.HasSuffix(body, tail) {
 		return nil, fmt.Errorf(
-			"s3parquet: marker key %q missing %q suffix",
+			"s3store: marker key %q missing %q suffix",
 			markerKey, indexMarkerFilename)
 	}
 	body = body[:len(body)-len(tail)]
 	segs := strings.Split(body, "/")
 	if len(segs) != len(columns) {
 		return nil, fmt.Errorf(
-			"s3parquet: marker key %q has %d segments, want %d",
+			"s3store: marker key %q has %d segments, want %d",
 			markerKey, len(segs), len(columns))
 	}
 	out := make([]string, len(columns))
@@ -332,7 +332,7 @@ func parseIndexMarkerKey(
 		colPrefix := columns[i] + "="
 		if !strings.HasPrefix(seg, colPrefix) {
 			return nil, fmt.Errorf(
-				"s3parquet: marker key %q segment %d is %q, "+
+				"s3store: marker key %q segment %d is %q, "+
 					"expected prefix %q",
 				markerKey, i, seg, colPrefix)
 		}
@@ -357,19 +357,19 @@ func markerPathFromValues(
 ) (string, error) {
 	if len(values) != len(columns) {
 		return "", fmt.Errorf(
-			"s3parquet: index %q: Of returned %d values, want %d "+
+			"s3store: index %q: Of returned %d values, want %d "+
 				"(one per Column)", name, len(values), len(columns))
 	}
 	for j, col := range columns {
 		if err := validateHivePartitionValue(values[j]); err != nil {
 			return "", fmt.Errorf(
-				"s3parquet: index %q column %q: %w", name, col, err)
+				"s3store: index %q column %q: %w", name, col, err)
 		}
 	}
 	p := buildIndexMarkerPath(indexPath, columns, values)
 	if len(p) > maxMarkerKeyLen {
 		return "", fmt.Errorf(
-			"s3parquet: index %q marker key is %d bytes, exceeds "+
+			"s3store: index %q marker key is %d bytes, exceeds "+
 				"%d (S3 limit is 1024; narrow Columns or shorten "+
 				"values)", name, len(p), maxMarkerKeyLen)
 	}

@@ -88,7 +88,7 @@ func warnIfUnknownConsistency(c ConsistencyLevel, configKind string) {
 		return
 	}
 	log.Printf(
-		"s3parquet: %s.ConsistencyControl %q is not one of the "+
+		"s3store: %s.ConsistencyControl %q is not one of the "+
 			"known levels (all, strong-global, strong-site, "+
 			"read-after-new-write, available) — header will be "+
 			"sent verbatim; verify the backend accepts it",

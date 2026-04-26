@@ -44,7 +44,7 @@ func NewIndexReader[K comparable](
 		b, err := defaultBinder[K](def.Columns, def.Layout)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3parquet: index %q: %w", def.Name, err)
+				"s3store: index %q: %w", def.Name, err)
 		}
 		bind = b
 	}
@@ -123,7 +123,7 @@ func (i *IndexReader[K]) Lookup(
 	plans, err := buildReadPlans(patterns, i.indexPath, i.columns)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"s3parquet: index %q Lookup %w", i.name, err)
+			"s3store: index %q Lookup %w", i.name, err)
 	}
 
 	keys, err := i.listAllMatchingMarkers(ctx, plans)
@@ -141,7 +141,7 @@ func (i *IndexReader[K]) Lookup(
 		k, err := i.bind(values)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3parquet: index %q: %w", i.name, err)
+				"s3store: index %q: %w", i.name, err)
 		}
 		out = append(out, k)
 	}
@@ -182,7 +182,7 @@ func (i *IndexReader[K]) listAllMatchingMarkers(
 				})
 			if err != nil {
 				return nil, fmt.Errorf(
-					"s3parquet: index %q list: %w", i.name, err)
+					"s3store: index %q list: %w", i.name, err)
 			}
 			return keys, nil
 		},

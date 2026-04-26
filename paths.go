@@ -124,7 +124,7 @@ func parseRefKey(refKey string) (
 	parts := strings.SplitN(name, refSeparator, 2)
 	if len(parts) != 2 {
 		return "", 0, "", 0, fmt.Errorf(
-			"s3parquet: invalid ref key: %s", refKey)
+			"s3store: invalid ref key: %s", refKey)
 	}
 
 	// pre-sep is "{refTsMicros}-{id}-{dataTsMicros}". The id may
@@ -136,7 +136,7 @@ func parseRefKey(refKey string) (
 	lastDash := strings.LastIndexByte(parts[0], '-')
 	if firstDash <= 0 || lastDash <= firstDash {
 		return "", 0, "", 0, fmt.Errorf(
-			"s3parquet: invalid ref key: %s", refKey)
+			"s3store: invalid ref key: %s", refKey)
 	}
 	refTsStr := parts[0][:firstDash]
 	shortID = parts[0][firstDash+1 : lastDash]
@@ -144,18 +144,18 @@ func parseRefKey(refKey string) (
 	refTsMicros, err = strconv.ParseInt(refTsStr, 10, 64)
 	if err != nil {
 		return "", 0, "", 0, fmt.Errorf(
-			"s3parquet: invalid ref ts in ref key %q: %w", refKey, err)
+			"s3store: invalid ref ts in ref key %q: %w", refKey, err)
 	}
 	dataTsMicros, err = strconv.ParseInt(dataTsStr, 10, 64)
 	if err != nil {
 		return "", 0, "", 0, fmt.Errorf(
-			"s3parquet: invalid data ts in ref key %q: %w", refKey, err)
+			"s3store: invalid data ts in ref key %q: %w", refKey, err)
 	}
 
 	hiveKey, err = url.PathUnescape(parts[1])
 	if err != nil {
 		return "", 0, "", 0, fmt.Errorf(
-			"s3parquet: invalid ref key %q: %w", refKey, err)
+			"s3store: invalid ref key %q: %w", refKey, err)
 	}
 	return hiveKey, refTsMicros, shortID, dataTsMicros, nil
 }

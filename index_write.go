@@ -34,7 +34,7 @@ func buildIndexWriters[T any](
 		}
 		if _, dup := seenNames[def.Name]; dup {
 			return nil, fmt.Errorf(
-				"s3parquet: duplicate index name %q in WriterConfig.Indexes",
+				"s3store: duplicate index name %q in WriterConfig.Indexes",
 				def.Name)
 		}
 		seenNames[def.Name] = struct{}{}
@@ -79,7 +79,7 @@ func (s *Writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 			p, err := idx.pathOf(rec)
 			if err != nil {
 				return nil, fmt.Errorf(
-					"s3parquet: index %q: %w", idx.name, err)
+					"s3store: index %q: %w", idx.name, err)
 			}
 			if p == "" {
 				continue

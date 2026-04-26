@@ -86,7 +86,7 @@ func BackfillIndex[T any](
 	plans, err := buildReadPlans(keyPatterns, dataPath, target.PartitionKeyParts())
 	if err != nil {
 		return stats, fmt.Errorf(
-			"s3parquet: BackfillIndex %w", err)
+			"s3store: BackfillIndex %w", err)
 	}
 
 	keys, err := listDataFiles(ctx, target, plans)
@@ -142,7 +142,7 @@ func BackfillIndex[T any](
 					ctx, p, nil, "application/octet-stream",
 				); err != nil {
 					return fmt.Errorf(
-						"s3parquet: backfill index %q: put marker: %w",
+						"s3store: backfill index %q: put marker: %w",
 						def.Name, err)
 				}
 			}
@@ -173,12 +173,12 @@ func backfillMarkersForObject[T any](
 	data, err := target.get(ctx, key)
 	if err != nil {
 		return nil, 0, fmt.Errorf(
-			"s3parquet: backfill get %s: %w", key, err)
+			"s3store: backfill get %s: %w", key, err)
 	}
 	recs, err := decodeParquet[T](data)
 	if err != nil {
 		return nil, 0, fmt.Errorf(
-			"s3parquet: backfill decode %s: %w", key, err)
+			"s3store: backfill decode %s: %w", key, err)
 	}
 
 	seen := make(map[string]struct{})
@@ -186,7 +186,7 @@ func backfillMarkersForObject[T any](
 		values, err := of(rec)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"s3parquet: backfill index %q on %s: %w",
+				"s3store: backfill index %q on %s: %w",
 				name, key, err)
 		}
 		if values == nil {
@@ -195,7 +195,7 @@ func backfillMarkersForObject[T any](
 		p, err := markerPathFromValues(name, indexPath, columns, values)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"s3parquet: backfill index %q on %s: %w",
+				"s3store: backfill index %q on %s: %w",
 				name, key, err)
 		}
 		seen[p] = struct{}{}

@@ -81,7 +81,7 @@ func isTransientS3Error(err error) bool {
 // the write path that the current attempt is a retry of a
 // previously-persisted logical write; callers scope-LIST the ref
 // stream to decide whether the ref also needs re-emission.
-var ErrAlreadyExists = errors.New("s3parquet: object already exists")
+var ErrAlreadyExists = errors.New("s3store: object already exists")
 
 // consistencyHeader is the HTTP header name routed through every
 // correctness-critical S3 call when ConsistencyControl is set.
@@ -283,13 +283,13 @@ func (c S3TargetConfig) Validate() error {
 // IndexReader.
 func (c S3TargetConfig) ValidateLookup() error {
 	if c.Bucket == "" {
-		return fmt.Errorf("s3parquet: Bucket is required")
+		return fmt.Errorf("s3store: Bucket is required")
 	}
 	if c.Prefix == "" {
-		return fmt.Errorf("s3parquet: Prefix is required")
+		return fmt.Errorf("s3store: Prefix is required")
 	}
 	if c.S3Client == nil {
-		return fmt.Errorf("s3parquet: S3Client is required")
+		return fmt.Errorf("s3store: S3Client is required")
 	}
 	return nil
 }

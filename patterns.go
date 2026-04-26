@@ -19,22 +19,22 @@ import (
 // separator), and duplicate names.
 func validatePartitionKeyParts(parts []string) error {
 	if len(parts) == 0 {
-		return fmt.Errorf("s3parquet: PartitionKeyParts is required")
+		return fmt.Errorf("s3store: PartitionKeyParts is required")
 	}
 	seen := make(map[string]bool, len(parts))
 	for i, p := range parts {
 		if p == "" {
 			return fmt.Errorf(
-				"s3parquet: PartitionKeyParts[%d] is empty", i)
+				"s3store: PartitionKeyParts[%d] is empty", i)
 		}
 		if strings.ContainsAny(p, "=/") {
 			return fmt.Errorf(
-				"s3parquet: PartitionKeyParts[%d] %q must not contain "+
+				"s3store: PartitionKeyParts[%d] %q must not contain "+
 					"'=' or '/'", i, p)
 		}
 		if seen[p] {
 			return fmt.Errorf(
-				"s3parquet: PartitionKeyParts[%d] %q is duplicated", i, p)
+				"s3store: PartitionKeyParts[%d] %q is duplicated", i, p)
 		}
 		seen[p] = true
 	}
@@ -98,7 +98,7 @@ func validateKeyPattern(pattern string, partitionKeyParts []string) error {
 	segments := strings.Split(pattern, "/")
 	if len(segments) != len(partitionKeyParts) {
 		return fmt.Errorf(
-			"s3parquet: key pattern %q has %d segments, "+
+			"s3store: key pattern %q has %d segments, "+
 				"expected %d (%v)",
 			pattern, len(segments), len(partitionKeyParts), partitionKeyParts)
 	}
@@ -110,14 +110,14 @@ func validateKeyPattern(pattern string, partitionKeyParts []string) error {
 		prefix := part + "="
 		if !strings.HasPrefix(seg, prefix) {
 			return fmt.Errorf(
-				"s3parquet: key pattern %q segment %d is %q, "+
+				"s3store: key pattern %q segment %d is %q, "+
 					"expected %q=... or %q",
 				pattern, i, seg, part, "*")
 		}
 		value := seg[len(prefix):]
 		if err := validatePatternValue(value); err != nil {
 			return fmt.Errorf(
-				"s3parquet: key pattern %q segment %d: %w",
+				"s3store: key pattern %q segment %d: %w",
 				pattern, i, err)
 		}
 	}

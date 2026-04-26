@@ -65,7 +65,7 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	}
 	if (cfg.EntityKeyOf == nil) != (cfg.VersionOf == nil) {
 		return nil, fmt.Errorf(
-			"s3parquet: EntityKeyOf and VersionOf must be set together")
+			"s3store: EntityKeyOf and VersionOf must be set together")
 	}
 	return &Reader[T]{
 		cfg:      cfg,
@@ -113,7 +113,7 @@ func NewReaderFromWriter[T, U any](
 ) (*Reader[T], error) {
 	if w == nil {
 		return nil, fmt.Errorf(
-			"s3parquet: NewReaderFromWriter: writer is nil")
+			"s3store: NewReaderFromWriter: writer is nil")
 	}
 	cfg.Target = w.cfg.Target
 	return NewReader(cfg)
@@ -129,7 +129,7 @@ func NewReaderFromStore[T, U any](
 ) (*Reader[T], error) {
 	if s == nil {
 		return nil, fmt.Errorf(
-			"s3parquet: NewReaderFromStore: store is nil")
+			"s3store: NewReaderFromStore: store is nil")
 	}
 	return NewReaderFromWriter(s.Writer, cfg)
 }

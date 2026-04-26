@@ -35,7 +35,7 @@ func (s *Reader[T]) Read(
 	keys, err := ResolvePatterns(
 		ctx, s.cfg.Target, keyPatterns, &o)
 	if err != nil {
-		return nil, fmt.Errorf("s3parquet: Read %w", err)
+		return nil, fmt.Errorf("s3store: Read %w", err)
 	}
 	if len(keys) == 0 {
 		return nil, nil
@@ -123,11 +123,11 @@ func (s *Reader[T]) downloadAndDecodeOne(
 			}
 			return nil, nil
 		}
-		return nil, fmt.Errorf("s3parquet: get %s: %w", key, err)
+		return nil, fmt.Errorf("s3store: get %s: %w", key, err)
 	}
 	recs, err := decodeParquet[T](data)
 	if err != nil {
-		return nil, fmt.Errorf("s3parquet: decode %s: %w", key, err)
+		return nil, fmt.Errorf("s3store: decode %s: %w", key, err)
 	}
 	return recs, nil
 }
