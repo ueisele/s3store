@@ -3,6 +3,7 @@ package s3store
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -68,7 +69,7 @@ func (s *Reader[T]) Poll(
 	}
 	if maxEntries <= 0 {
 		return nil, since, fmt.Errorf(
-			"s3parquet: maxEntries must be > 0")
+			"s3store: maxEntries must be > 0")
 	}
 
 	var o pollOpts
@@ -98,7 +99,15 @@ func (s *Reader[T]) Poll(
 			}
 			key, _, id, dataTsMicros, err := parseRefKey(objKey)
 			if err != nil {
-				return false, fmt.Errorf("parse ref: %w", err)
+				// Malformed refs (externally written, or a future
+				// schema this binary doesn't understand) shouldn't
+				// break the consumer pipeline. Log via slog.Default
+				// — applications inherit their configured handler —
+				// and skip. Mirrors findExistingRef's tolerance on
+				// the write side, just visible.
+				slog.Warn("s3store: skipping malformed ref",
+					"key", objKey, "err", err)
+				return true, nil
 			}
 			entries = append(entries, StreamEntry{
 				Offset:     Offset(objKey),
@@ -111,7 +120,7 @@ func (s *Reader[T]) Poll(
 			return true, nil
 		})
 	if err != nil {
-		return nil, since, fmt.Errorf("s3parquet: list refs: %w", err)
+		return nil, since, fmt.Errorf("s3store: list refs: %w", err)
 	}
 
 	if lastKey != "" {

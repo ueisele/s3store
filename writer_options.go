@@ -51,6 +51,13 @@ func (o *WriteOpts) Apply(opts ...WriteOption) {
 //     not found (scenario B: data landed but ref didn't) writes
 //     the ref to complete the interrupted attempt.
 //
+// Tokens are unique per (partition key, logical write), not
+// globally — the same token may be reused across different
+// partition keys without colliding. Orchestrators that batch one
+// job-id across many partitions can reuse the job-id verbatim;
+// each partition's retry-dedup runs independently. Within one
+// partition the token must remain unique per logical write.
+//
 // token must pass validateIdempotencyToken (non-empty, no "/",
 // no "..", printable ASCII, <= 200 chars) — validation runs at
 // resolve time so bad tokens fail at the call site rather than

@@ -3063,6 +3063,77 @@ func TestWriteWithIdempotencyToken_RejectsZeroMaxRetryAge(t *testing.T) {
 	}
 }
 
+// TestWriteWithIdempotencyToken_SameTokenAcrossPartitions: the
+// same token may be reused across distinct partition keys without
+// colliding. findExistingRef scopes its match to (partitionKey,
+// token) so each partition's retry-dedup runs independently.
+// Two writes with the same token to different partitions both
+// produce fresh data + ref; a retry of either is dedup'd to its
+// own partition's prior attempt.
+func TestWriteWithIdempotencyToken_SameTokenAcrossPartitions(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	const token = "job-2026-04-22-multi"
+	keyA := "period=2026-04-22/customer=alpha"
+	keyB := "period=2026-04-22/customer=beta"
+	recA := []Rec{{Period: "2026-04-22", Customer: "alpha",
+		SKU: "s1", Value: 1, Ts: time.UnixMilli(1)}}
+	recB := []Rec{{Period: "2026-04-22", Customer: "beta",
+		SKU: "s2", Value: 2, Ts: time.UnixMilli(2)}}
+
+	// Fresh writes: same token, different partitions. Both must
+	// land their own data + ref (no cross-partition dedup).
+	freshA, err := store.WriteWithKey(ctx, keyA, recA,
+		WithIdempotencyToken(token, time.Hour))
+	if err != nil {
+		t.Fatalf("fresh A: %v", err)
+	}
+	freshB, err := store.WriteWithKey(ctx, keyB, recB,
+		WithIdempotencyToken(token, time.Hour))
+	if err != nil {
+		t.Fatalf("fresh B: %v", err)
+	}
+	if freshA.RefPath == freshB.RefPath {
+		t.Fatalf("partitions collided on RefPath: %q", freshA.RefPath)
+	}
+	if freshA.DataPath == freshB.DataPath {
+		t.Fatalf("partitions collided on DataPath: %q", freshA.DataPath)
+	}
+
+	// Retry of A: must dedup to A's own ref, not B's.
+	retryA, err := store.WriteWithKey(ctx, keyA, recA,
+		WithIdempotencyToken(token, time.Hour))
+	if err != nil {
+		t.Fatalf("retry A: %v", err)
+	}
+	if retryA.RefPath != freshA.RefPath {
+		t.Errorf("retry A returned wrong RefPath: got %q, want %q",
+			retryA.RefPath, freshA.RefPath)
+	}
+
+	// Retry of B: must dedup to B's own ref.
+	retryB, err := store.WriteWithKey(ctx, keyB, recB,
+		WithIdempotencyToken(token, time.Hour))
+	if err != nil {
+		t.Fatalf("retry B: %v", err)
+	}
+	if retryB.RefPath != freshB.RefPath {
+		t.Errorf("retry B returned wrong RefPath: got %q, want %q",
+			retryB.RefPath, freshB.RefPath)
+	}
+
+	// End-to-end: both records visible, exactly one per partition.
+	time.Sleep(400 * time.Millisecond)
+	got, err := store.Read(ctx, []string{keyA, keyB})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2 (one per partition)", len(got))
+	}
+}
+
 // TestWriteWithIdempotencyToken_RejectsBadToken: tokens that fail
 // ValidateIdempotencyToken surface their error at the Write call
 // site without touching S3.

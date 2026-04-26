@@ -53,7 +53,7 @@ func (s *Writer[T]) Write(
 	}
 	if s.cfg.PartitionKeyOf == nil {
 		return nil, fmt.Errorf(
-			"s3parquet: PartitionKeyOf is required for Write; " +
+			"s3store: PartitionKeyOf is required for Write; " +
 				"use WriteWithKey for explicit keys")
 	}
 	writeOpts, err := resolveWriteOpts(opts)
@@ -80,7 +80,7 @@ func resolveWriteOpts(opts []WriteOption) (WriteOpts, error) {
 		}
 		if w.MaxRetryAge <= 0 {
 			return WriteOpts{}, fmt.Errorf(
-				"s3parquet: MaxRetryAge must be > 0 (got %s) "+
+				"s3store: MaxRetryAge must be > 0 (got %s) "+
 					"when IdempotencyToken is set",
 				w.MaxRetryAge)
 		}
@@ -189,7 +189,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 		records, s.compressionCodec)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"s3parquet: parquet encode: %w", err)
+			"s3store: parquet encode: %w", err)
 	}
 	return s.writeEncodedPayload(
 		ctx, key, records, parquetBytes, writeStartTime, opts)
@@ -253,7 +253,7 @@ func (s *Writer[T]) writeEncodedPayload(
 		})
 	isRetry := errors.Is(putErr, ErrAlreadyExists)
 	if putErr != nil && !isRetry {
-		return nil, fmt.Errorf("s3parquet: put data: %w", putErr)
+		return nil, fmt.Errorf("s3store: put data: %w", putErr)
 	}
 
 	// Phase 2: on retry, scoped-LIST the ref stream for a still-
@@ -264,10 +264,10 @@ func (s *Writer[T]) writeEncodedPayload(
 	// advanced past it.
 	if isRetry {
 		existingRefKey, err := s.findExistingRef(
-			ctx, opts.IdempotencyToken, opts.MaxRetryAge)
+			ctx, key, opts.IdempotencyToken, opts.MaxRetryAge)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3parquet: scoped LIST for retry: %w", err)
+				"s3store: scoped LIST for retry: %w", err)
 		}
 		if existingRefKey != "" {
 			return &WriteResult{
@@ -287,7 +287,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	if err := s.putMarkers(ctx, markerPaths); err != nil {
 		_ = s.cleanupOrphanData(ctx, dataKey, idempotent)
 		return nil, fmt.Errorf(
-			"s3parquet: put index markers: %w", err)
+			"s3store: put index markers: %w", err)
 	}
 
 	// DisableRefStream: skip the ref PUT entirely. Offset and
@@ -348,10 +348,10 @@ func (s *Writer[T]) commitRef(
 	); err != nil {
 		if delErr := s.cleanupOrphanData(ctx, dataKey, idempotent); delErr != nil {
 			return nil, fmt.Errorf(
-				"s3parquet: put ref: %w (orphan data at %s: %v)",
+				"s3store: put ref: %w (orphan data at %s: %v)",
 				err, dataKey, delErr)
 		}
-		return nil, fmt.Errorf("s3parquet: put ref: %w", err)
+		return nil, fmt.Errorf("s3store: put ref: %w", err)
 	}
 
 	return &WriteResult{
@@ -396,10 +396,24 @@ func (s *Writer[T]) commitRef(
 // resolveWriteOpts validates that maxRetryAge > 0 when an
 // idempotency token is set, so callers never reach here with a
 // non-positive value.
+//
+// The match is scoped to (partitionKey, token): a ref counts as
+// "the prior attempt of this write" only when both its hive key
+// and its id match. Tokens are therefore unique per
+// (partition, logical write), not globally — orchestrators that
+// reuse one job-id across many partitions get correct retry
+// semantics for each partition independently.
 func (s *Writer[T]) findExistingRef(
-	ctx context.Context, token string, maxRetryAge time.Duration,
+	ctx context.Context, partitionKey, token string, maxRetryAge time.Duration,
 ) (string, error) {
 	now := time.Now()
+	// lo/hi are {refPath}/{tsMicros} prefixes — bare timestamp, no
+	// trailing dash. Real ref keys always include "-{shortID}-..."
+	// after the timestamp, so a ref published exactly at lo's
+	// tsMicros is lex-strictly-greater than lo and survives S3's
+	// exclusive StartAfter; a ref at hi's tsMicros is similarly
+	// lex-greater than hi and is correctly excluded as "newer than
+	// the retry window".
 	lo, hi := refRangeForRetry(s.refPath, now, maxRetryAge)
 	settleCutoffUs := now.Add(
 		-s.cfg.Target.EffectiveSettleWindow()).UnixMicro()
@@ -417,7 +431,7 @@ func (s *Writer[T]) findExistingRef(
 				// RefRangeForRetry's lo already rely on.
 				return false, nil
 			}
-			_, refTsMicros, id, _, err := parseRefKey(*obj.Key)
+			hiveKey, refTsMicros, id, _, err := parseRefKey(*obj.Key)
 			if err != nil {
 				// Malformed ref keys (externally written or a
 				// future schema the parser doesn't understand)
@@ -425,7 +439,7 @@ func (s *Writer[T]) findExistingRef(
 				// the write.
 				return true, nil //nolint:nilerr // intentional: skip malformed
 			}
-			if id != token {
+			if id != token || hiveKey != partitionKey {
 				return true, nil
 			}
 			if refTsMicros < settleCutoffUs {
@@ -493,7 +507,7 @@ func (s *Writer[T]) validateKey(key string) error {
 	segments := strings.Split(key, "/")
 	if len(segments) != len(s.cfg.Target.PartitionKeyParts()) {
 		return fmt.Errorf(
-			"s3parquet: key %q has %d segments, "+
+			"s3store: key %q has %d segments, "+
 				"expected %d (%v)",
 			key, len(segments),
 			len(s.cfg.Target.PartitionKeyParts()), s.cfg.Target.PartitionKeyParts())
@@ -503,14 +517,14 @@ func (s *Writer[T]) validateKey(key string) error {
 		prefix := part + "="
 		if !strings.HasPrefix(seg, prefix) {
 			return fmt.Errorf(
-				"s3parquet: key %q segment %d is %q, "+
+				"s3store: key %q segment %d is %q, "+
 					"expected prefix %q",
 				key, i, seg, prefix)
 		}
 		value := seg[len(prefix):]
 		if err := validateHivePartitionValue(value); err != nil {
 			return fmt.Errorf(
-				"s3parquet: key %q segment %d (%q): %w",
+				"s3store: key %q segment %d (%q): %w",
 				key, i, part, err)
 		}
 	}
