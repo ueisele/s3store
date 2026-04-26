@@ -157,4 +157,3 @@ func HiveKeyOfDataFile(s3Key, dataPath string) (string, bool) {
 	}
 	return rest[:slash], true
 }
-
