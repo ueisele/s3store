@@ -595,21 +595,38 @@ after the call started are not picked up. To keep up with new
 writes, call again from the last seen offset (`PollRecords` exposes
 the next offset between batches).
 
-For manual paging (e.g. checkpointing offsets between batches), use
-`PollRecords` with `WithUntilOffset`:
+For CDC / change-processing where every update matters and the
+caller checkpoints offsets between batches, use `PollRecords`
+(cursor-based, Kafka-style):
 
 ```go
-start := store.OffsetAt(yesterdayStart)
-end   := store.OffsetAt(yesterdayEnd)
+start := lastCheckpoint
 for {
     records, next, err := store.PollRecords(ctx, start, 100,
         s3store.WithUntilOffset(end))
     if err != nil { return err }
     if len(records) == 0 { break }
-    // process records
+    // process every record (no version collapse — see dedup below)
     start = next
+    checkpoint(start)
 }
 ```
+
+**Dedup asymmetry between the two poll APIs**:
+
+- `PollRecordsIter` (range-bounded, snapshot-style): default
+  latest-per-entity per partition, matching `Read` / `ReadIter`.
+  You're reading "the state of this window"; collapsing to the
+  latest version is what you want.
+- `PollRecords` (cursor-based, CDC-style): replica-dedup only —
+  every distinct `(entity, version)` flows through. Per-batch
+  latest-per-entity is meaningless on a cursor (the next batch
+  may carry a newer version of the same entity), so it's not
+  offered. `WithHistory` is accepted but is the default here.
+
+`WithIdempotentRead` is supported on `PollRecordsIter` (snapshot
+semantics) and ignored on `PollRecords` (the offset cursor
+already provides retry-safety).
 
 `OffsetAt` is pure computation — no S3 call. `WithUntilOffset` breaks
 the paginator early once offsets reach `until`, so long streams aren't

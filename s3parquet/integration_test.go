@@ -1645,6 +1645,12 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 // TestPollRecords mirrors TestPoll for the typed-record path,
 // with dedup behaviour verified against the same expectations
 // as Read.
+// TestPollRecords pins the cursor-based contract: both versions
+// of an entity flow through (CDC semantics — caller must see
+// every change). WithHistory is accepted but is the default
+// behavior on this path; latest-per-entity collapse is NOT
+// offered, because per-batch latest is meaningless on a cursor.
+// Use PollRecordsIter for snapshot semantics over a range.
 func TestPollRecords(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
@@ -1669,14 +1675,21 @@ func TestPollRecords(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	deduped, off, err := store.PollRecords(ctx, "", 100)
+	// Default: both versions of the same entity flow through.
+	got, off, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
 	}
-	if len(deduped) != 1 || deduped[0].Value != 2 {
-		t.Errorf("deduped: got %+v, want one record with Value=2", deduped)
+	if len(got) != 2 {
+		t.Fatalf("default: got %d records, want 2 (CDC: no version collapse)", len(got))
+	}
+	seen := map[int64]bool{got[0].Value: true, got[1].Value: true}
+	if !seen[1] || !seen[2] {
+		t.Errorf("default: got values %v, want {1,2}",
+			[]int64{got[0].Value, got[1].Value})
 	}
 
+	// WithHistory: same behavior — accepted but no-op on cursor path.
 	full, _, err := store.PollRecords(ctx, "", 100, s3parquet.WithHistory())
 	if err != nil {
 		t.Fatalf("PollRecords history: %v", err)

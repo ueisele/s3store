@@ -92,24 +92,32 @@ func (s *Reader[T]) Poll(
 
 // PollRecords returns a flat slice of typed records from the
 // files referenced by up to maxEntries refs after the offset.
-// Downloads run in parallel (limit pollDownloadConcurrency).
+// Cursor-based, CDC-style: caller checkpoints the returned
+// offset between calls and the next call resumes from there.
 //
-// By default applies latest-per-entity dedup within the batch
-// (consistent with Read). Pass WithHistory() to disable dedup
-// and get every record in ref order.
+// Dedup: replica-dedup only — records sharing (entity, version)
+// collapse to one (literal duplicates from a retried ref are
+// rare but possible). Distinct versions of the same entity all
+// flow. WithHistory is accepted but is effectively the default
+// here; latest-per-entity dedup is NOT offered, because per-batch
+// "latest" is meaningless on a cursor (the next batch may carry
+// a newer version of the same entity).
 //
-// When dedup is disabled (no EntityKeyOf, or WithHistory()), the
-// returned records follow ref order (= timestamp order) and then
-// parquet-file row order within each ref.
+// WithIdempotentRead is accepted but ignored on this path: the
+// offset cursor already provides retry-safety, and the token-
+// barrier filter's "by-LastModified" semantics don't compose
+// cleanly with offset-window semantics. Use WithIdempotentRead
+// on Read / ReadIter / PollRecordsIter (snapshot-style reads)
+// instead.
+//
+// Records follow ref order (= timestamp order) and parquet-file
+// row order within each ref.
 func (s *Reader[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
 	opts ...QueryOption,
 ) ([]T, Offset, error) {
-	var o core.QueryOpts
-	o.Apply(opts...)
-
 	entries, newOffset, err := s.Poll(ctx, since, maxEntries, opts...)
 	if err != nil {
 		return nil, since, err
@@ -130,19 +138,13 @@ func (s *Reader[T]) PollRecords(
 		}
 	}
 
-	keys, err = core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
-	if err != nil {
-		return nil, since, fmt.Errorf("s3parquet: %w", err)
-	}
-	if len(keys) == 0 {
-		return nil, newOffset, nil
-	}
-
 	records, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, since, err
 	}
-	return s.sortAndCollect(records, o.IncludeHistory), newOffset, nil
+	// includeHistory=true: replica-dedup only, no version collapse.
+	// See method docstring for why latest-per-entity isn't offered.
+	return s.sortAndCollect(records, true), newOffset, nil
 }
 
 // PollRecordsIter streams every record in [since, until) as an

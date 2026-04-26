@@ -84,12 +84,14 @@ func WithReadAheadBytes(n int64) QueryOption {
 	return core.WithReadAheadBytes(n)
 }
 
-// WithIdempotentRead makes Read / ReadIter / ReadMany /
-// ReadManyIter / PollRecords retry-safe: the result reflects
-// state as of the first write of the given idempotency token.
-// Pair with WithIdempotencyToken on the write side so one token
-// drives both sides of the retry. See core.WithIdempotentRead
-// for the full contract.
+// WithIdempotentRead makes snapshot reads retry-safe: the result
+// reflects state as of the first write of the given idempotency
+// token. Applies to Read / ReadIter / ReadMany / ReadManyIter /
+// PollRecordsIter. Ignored on PollRecords — the offset cursor
+// already provides retry-safety on that path. Pair with
+// WithIdempotencyToken on the write side so one token drives
+// both sides of the retry. See core.WithIdempotentRead for the
+// full contract.
 func WithIdempotentRead(token string) QueryOption {
 	return core.WithIdempotentRead(token)
 }

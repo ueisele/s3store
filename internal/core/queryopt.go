@@ -135,13 +135,20 @@ func WithReadAheadBytes(n int64) QueryOption {
 	}
 }
 
-// WithIdempotentRead makes a read retry-safe: the result reflects
-// state as of the first write of the given idempotency token.
-// Pairs with WithIdempotencyToken on the write side so a read-
-// modify-write cycle is deterministic across retries — the second
-// attempt's Read sees the same state the first attempt saw,
-// computes the same diff, and writes the same bytes. One token,
-// both sides.
+// WithIdempotentRead makes a snapshot read retry-safe: the result
+// reflects state as of the first write of the given idempotency
+// token. Pairs with WithIdempotencyToken on the write side so a
+// read-modify-write cycle is deterministic across retries — the
+// second attempt's Read sees the same state the first attempt
+// saw, computes the same diff, and writes the same bytes. One
+// token, both sides.
+//
+// Applies to snapshot-style reads: Read / ReadIter / ReadMany /
+// ReadManyIter / PollRecordsIter / Query / QueryMany. NOT applied
+// on PollRecords (cursor-based, CDC-style) — the offset cursor
+// already provides retry-safety on that path, and the by-
+// LastModified barrier doesn't compose cleanly with offset-window
+// semantics.
 //
 // Two filters apply at LIST time, per partition:
 //
