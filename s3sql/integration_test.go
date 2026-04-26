@@ -5,7 +5,6 @@ package s3sql_test
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -312,9 +311,10 @@ func TestIdempotentRead_QueryRejectsBadToken(t *testing.T) {
 }
 
 // TestIdempotentRead_QueryZeroMatches guards that a barrier
-// which filters every file away produces an
-// isNoFilesMatchedError-compatible error on Query, so callers
-// that already branch on that helper keep working unchanged.
+// which filters every file away yields a clean empty iteration on
+// Query — matching the unified contract that "zero matches" is an
+// empty *sql.Rows, not an error. Callers using the standard
+// for-rows.Next loop see no rows and no error.
 func TestIdempotentRead_QueryZeroMatches(t *testing.T) {
 	ctx := context.Background()
 	f := newIdempotentFixture(t)
@@ -333,13 +333,17 @@ func TestIdempotentRead_QueryZeroMatches(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	_, err := f.sql.Query(ctx, []string{key},
+	rows, err := f.sql.Query(ctx, []string{key},
 		"SELECT COUNT(*) FROM records",
 		s3sql.WithIdempotentRead(token))
-	if err == nil {
-		t.Fatal("Query: want no-files-matched error, got nil")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
 	}
-	if !strings.Contains(err.Error(), "No files found that match") {
-		t.Errorf("Query: err %q missing the expected fragment", err)
+	defer rows.Close()
+	if rows.Next() {
+		t.Error("Query: expected zero rows, got at least one")
+	}
+	if err := rows.Err(); err != nil {
+		t.Errorf("Query: rows.Err = %v, want nil", err)
 	}
 }

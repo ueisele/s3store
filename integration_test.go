@@ -156,8 +156,9 @@ func TestUmbrella_WritePoll(t *testing.T) {
 }
 
 // TestUmbrella_WritePollRecords verifies umbrella.PollRecords
-// forwards to s3parquet.PollRecords (in-memory dedup via
-// EntityKeyOf), and that WithHistory opts out of dedup.
+// forwards to s3parquet.PollRecords with cursor semantics: every
+// distinct (entity, version) flows through (no latest-per-entity
+// collapse), and WithHistory is accepted but is the default.
 func TestUmbrella_WritePollRecords(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
@@ -177,20 +178,30 @@ func TestUmbrella_WritePollRecords(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	deduped, _, err := store.PollRecords(ctx, "", 100)
+	// Default: both versions of the same entity flow through.
+	got, off, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
 	}
-	if len(deduped) != 1 || deduped[0].Amount != 99 {
-		t.Errorf("deduped: got %+v, want Amount=99", deduped)
+	if len(got) != 2 {
+		t.Fatalf("default: got %d records, want 2 (CDC: no version collapse)", len(got))
+	}
+	seen := map[float64]bool{got[0].Amount: true, got[1].Amount: true}
+	if !seen[10] || !seen[99] {
+		t.Errorf("default: got amounts %v, want {10,99}",
+			[]float64{got[0].Amount, got[1].Amount})
+	}
+	if string(off) == "" {
+		t.Error("offset empty after non-empty PollRecords")
 	}
 
+	// WithHistory: same behavior — accepted but no-op on cursor path.
 	full, _, err := store.PollRecords(ctx, "", 100, WithHistory())
 	if err != nil {
 		t.Fatalf("PollRecords history: %v", err)
 	}
 	if len(full) != 2 {
-		t.Errorf("history: got %d records, want 2", len(full))
+		t.Errorf("history: got %d, want 2", len(full))
 	}
 }
 
