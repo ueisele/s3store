@@ -44,31 +44,6 @@ type WriterConfig[T any] struct {
 	// (common in StorageGRID deployments with a narrowly-
 	// scoped service account).
 	DisableCleanup bool
-
-	// ConsistencyControl sets the Consistency-Control HTTP header
-	// on S3 operations where the library's correctness depends on
-	// strong read-after-write / list-after-write visibility: the
-	// data PUT of an idempotent write, the scoped LIST used to
-	// dedup refs on the retry path, and every registered index's
-	// marker PUT (so a paired Lookup sees it read-after-write).
-	//
-	// Zero value (ConsistencyDefault) sends no header — bucket
-	// default applies. On AWS S3 / MinIO that's strongly
-	// consistent by default so the field can stay empty. On
-	// NetApp StorageGRID the bucket default is typically
-	// read-after-new-write, which is insufficient for the library's
-	// at-least-once correctness conditions — set
-	// ConsistencyStrongGlobal (multi-site) or ConsistencyStrongSite
-	// (single-site) explicitly.
-	//
-	// NetApp requires PUT and paired GET to use matching
-	// consistency levels, so WriterConfig.ConsistencyControl and
-	// ReaderConfig.ConsistencyControl should match. NewWriter /
-	// NewReader can't cross-validate (they're independent
-	// constructors), so this is a caller contract documented
-	// here. NewIndexWithRegister copies this value onto the
-	// returned Index so the marker-LIST side matches automatically.
-	ConsistencyControl ConsistencyLevel
 }
 
 // Writer is the write-side half of a Store. Owns the write path
@@ -171,7 +146,6 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err != nil {
 		return nil, err
 	}
-	warnIfUnknownConsistency(cfg.ConsistencyControl, "WriterConfig")
 	return &Writer[T]{
 		cfg:                  cfg,
 		dataPath:             core.DataPath(cfg.Target.Prefix()),

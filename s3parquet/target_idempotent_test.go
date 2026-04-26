@@ -57,7 +57,7 @@ func TestPutIfAbsent_Fresh_OK(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil, "")
+		[]byte("x"), "application/octet-stream", nil)
 	if err != nil {
 		t.Fatalf("putIfAbsent: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestPutIfAbsent_412(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil, "")
+		[]byte("x"), "application/octet-stream", nil)
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("want ErrAlreadyExists, got %v", err)
 	}
@@ -108,7 +108,7 @@ func TestPutIfAbsent_403ThenHeadFound(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil, "")
+		[]byte("x"), "application/octet-stream", nil)
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("want ErrAlreadyExists, got %v", err)
 	}
@@ -132,7 +132,7 @@ func TestPutIfAbsent_403ThenHeadMissing(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.putIfAbsent(context.Background(), "k",
-		[]byte("x"), "application/octet-stream", nil, "")
+		[]byte("x"), "application/octet-stream", nil)
 	if err == nil {
 		t.Fatal("want non-nil error")
 	}
@@ -144,9 +144,10 @@ func TestPutIfAbsent_403ThenHeadMissing(t *testing.T) {
 	}
 }
 
-// TestConsistencyControl_HeaderSentOnPUT: the withConsistencyControl
-// option plumbs through to a Consistency-Control HTTP header on the
-// outgoing PUT. Confirms the middleware attach point.
+// TestConsistencyControl_HeaderSentOnPUT: a target configured
+// with ConsistencyControl plumbs the value through as a
+// Consistency-Control HTTP header on the outgoing PUT. Confirms
+// the middleware attach point.
 func TestConsistencyControl_HeaderSentOnPUT(t *testing.T) {
 	stubBackoff(t)
 	var sawHeader atomic.Value
@@ -156,11 +157,10 @@ func TestConsistencyControl_HeaderSentOnPUT(t *testing.T) {
 			w.WriteHeader(200)
 		},
 		nil)
-	tgt := newTestTarget(t, srv.URL)
+	tgt := newTestTarget(t, srv.URL, ConsistencyStrongGlobal)
 
 	err := tgt.put(context.Background(), "k",
-		[]byte("x"), "application/octet-stream",
-		ConsistencyStrongGlobal)
+		[]byte("x"), "application/octet-stream")
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -186,8 +186,7 @@ func TestConsistencyControl_EmptyOmitsHeader(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.put(context.Background(), "k",
-		[]byte("x"), "application/octet-stream",
-		ConsistencyDefault)
+		[]byte("x"), "application/octet-stream")
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -197,9 +196,9 @@ func TestConsistencyControl_EmptyOmitsHeader(t *testing.T) {
 	}
 }
 
-// TestConsistencyControl_HeaderSentOnGET: reader-side GETs propagate
-// the configured consistency level too, matching the writer. Uses
-// the library's get() method directly.
+// TestConsistencyControl_HeaderSentOnGET: reader-side GETs
+// propagate the target's configured consistency level too,
+// matching the writer. Uses the library's get() method directly.
 func TestConsistencyControl_HeaderSentOnGET(t *testing.T) {
 	stubBackoff(t)
 	var sawHeader atomic.Value
@@ -211,10 +210,9 @@ func TestConsistencyControl_HeaderSentOnGET(t *testing.T) {
 			_, _ = w.Write([]byte("x"))
 		}))
 	t.Cleanup(srv.Close)
-	tgt := newTestTarget(t, srv.URL)
+	tgt := newTestTarget(t, srv.URL, ConsistencyStrongSite)
 
-	_, err := tgt.get(context.Background(), "k",
-		ConsistencyStrongSite)
+	_, err := tgt.get(context.Background(), "k")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

@@ -26,8 +26,8 @@ var ErrAlreadyExists = errors.New("s3parquet: object already exists")
 // consistencyAPIOpts returns the SDK APIOptions slice that
 // installs the Consistency-Control header for an S3 call. Empty
 // level → nil → no header, which is the correct behaviour on
-// AWS S3 / MinIO; on NetApp StorageGRID callers pass the
-// configured ConsistencyLevel through their target methods.
+// AWS S3 / MinIO; on NetApp StorageGRID the target's configured
+// ConsistencyLevel is sent on every routed call.
 func consistencyAPIOpts(level ConsistencyLevel) []func(*middleware.Stack) error {
 	if level == "" {
 		return nil
@@ -123,6 +123,32 @@ type S3TargetConfig struct {
 	// MaxInflightRequests, otherwise excess requests queue at the
 	// transport layer instead of running in parallel.
 	MaxInflightRequests int
+
+	// ConsistencyControl sets the Consistency-Control HTTP header
+	// applied to every correctness-critical S3 operation routed
+	// through this target — data PUTs (idempotent and unconditional),
+	// ref PUTs, index marker PUTs, data GETs, HEADs, and every LIST
+	// (partition LIST on the read path, marker LIST in Index.Lookup,
+	// ref-stream LIST in Poll/PollRecords/ReadRangeIter, and the
+	// scoped retry-LIST in findExistingRef).
+	//
+	// Zero value (ConsistencyDefault) sends no header — bucket
+	// default applies. Correct on AWS S3 and MinIO (strongly
+	// consistent out of the box). On NetApp StorageGRID the bucket
+	// default is read-after-new-write, which is insufficient for
+	// list-after-write — set ConsistencyStrongGlobal (multi-site)
+	// or ConsistencyStrongSite (single-site) explicitly. See the
+	// README's "Consistency levels × S3 operations" section for
+	// the full matrix.
+	//
+	// Setting the level on the target rather than on the Writer /
+	// Reader / Index configs enforces NetApp's "same consistency
+	// for paired operations" rule by construction: every operation
+	// routed through this target uses one and the same value.
+	// A handful of call sites (DuckDB-issued GETs in s3sql,
+	// best-effort cleanup DELETEs) deliberately do not carry the
+	// header — see the same README section.
+	ConsistencyControl ConsistencyLevel
 }
 
 // EffectiveSettleWindow returns the configured SettleWindow, or
@@ -211,7 +237,12 @@ type S3Target struct {
 // the shared in-flight semaphore. Performs no field validation —
 // downstream constructors (NewWriter, NewReader, NewIndex,
 // BackfillIndex) call Validate / ValidateLookup as appropriate.
+//
+// Logs a warning when ConsistencyControl is non-empty but doesn't
+// match a named ConsistencyLevel constant — typo guard with no
+// effect on behaviour (the value is still sent verbatim).
 func NewS3Target(cfg S3TargetConfig) S3Target {
+	warnIfUnknownConsistency(cfg.ConsistencyControl, "S3TargetConfig")
 	return S3Target{
 		cfg: cfg,
 		sem: make(chan struct{}, cfg.EffectiveMaxInflightRequests()),
@@ -238,6 +269,12 @@ func (t S3Target) PartitionKeyParts() []string { return t.cfg.PartitionKeyParts 
 // DisableRefStream reports whether the dataset is configured to
 // skip ref-stream emission.
 func (t S3Target) DisableRefStream() bool { return t.cfg.DisableRefStream }
+
+// ConsistencyControl returns the configured Consistency-Control
+// header value applied to every routed S3 call.
+func (t S3Target) ConsistencyControl() ConsistencyLevel {
+	return t.cfg.ConsistencyControl
+}
 
 // EffectiveSettleWindow forwards to S3TargetConfig.EffectiveSettleWindow.
 func (t S3Target) EffectiveSettleWindow() time.Duration {
@@ -275,15 +312,16 @@ func (t S3Target) release() { <-t.sem }
 
 // get downloads a single object into memory. Used by the read
 // path (Read, PollRecords) and by BackfillIndex when scanning
-// historical parquet data.
+// historical parquet data. Carries the target's
+// ConsistencyControl on every call.
 func (t S3Target) get(
-	ctx context.Context, key string, consistency ConsistencyLevel,
+	ctx context.Context, key string,
 ) ([]byte, error) {
 	if err := t.acquire(ctx); err != nil {
 		return nil, err
 	}
 	defer t.release()
-	apiOpts := consistencyAPIOpts(consistency)
+	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var data []byte
 	err := retry(ctx, func() error {
 		resp, err := t.cfg.S3Client.GetObject(ctx, &s3.GetObjectInput{
@@ -304,16 +342,16 @@ func (t S3Target) get(
 
 // put uploads data under key. Used by the write path (parquet +
 // ref + markers) and by BackfillIndex for retroactive marker
-// emission.
+// emission. Carries the target's ConsistencyControl on every
+// call.
 func (t S3Target) put(
 	ctx context.Context, key string, data []byte, contentType string,
-	consistency ConsistencyLevel,
 ) error {
 	if err := t.acquire(ctx); err != nil {
 		return err
 	}
 	defer t.release()
-	apiOpts := consistencyAPIOpts(consistency)
+	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	return retry(ctx, func() error {
 		_, err := t.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.cfg.Bucket),
@@ -347,13 +385,12 @@ func (t S3Target) put(
 func (t S3Target) putIfAbsent(
 	ctx context.Context, key string, data []byte,
 	contentType string, meta map[string]string,
-	consistency ConsistencyLevel,
 ) error {
 	if err := t.acquire(ctx); err != nil {
 		return err
 	}
 	defer t.release()
-	apiOpts := consistencyAPIOpts(consistency)
+	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	putErr := retry(ctx, func() error {
 		_, err := t.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.cfg.Bucket),
@@ -391,7 +428,7 @@ func (t S3Target) putIfAbsent(
 			// (we're inside the acquire/release pair) — calling
 			// the public exists() would deadlock waiting for our
 			// own slot.
-			ok, headErr := t.existsLocked(ctx, key, consistency)
+			ok, headErr := t.existsLocked(ctx, key)
 			if headErr == nil && ok {
 				return ErrAlreadyExists
 			}
@@ -409,11 +446,12 @@ func (t S3Target) putIfAbsent(
 // from putIfAbsent's 403 branch where the caller is already inside
 // an acquire/release pair — re-acquiring would deadlock when the
 // semaphore is sized to 1 (or saturated by the writer's other
-// concurrent calls).
+// concurrent calls). Carries the target's ConsistencyControl so
+// the HEAD pairs with the PUT under NetApp's "same level" rule.
 func (t S3Target) existsLocked(
-	ctx context.Context, key string, consistency ConsistencyLevel,
+	ctx context.Context, key string,
 ) (bool, error) {
-	apiOpts := consistencyAPIOpts(consistency)
+	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	err := retry(ctx, func() error {
 		_, err := t.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
@@ -457,13 +495,12 @@ func (t S3Target) del(ctx context.Context, key string) error {
 // outside this file.
 func (t S3Target) listPage(
 	ctx context.Context, p *s3.ListObjectsV2Paginator,
-	consistency ConsistencyLevel,
 ) (*s3.ListObjectsV2Output, error) {
 	if err := t.acquire(ctx); err != nil {
 		return nil, err
 	}
 	defer t.release()
-	apiOpts := consistencyAPIOpts(consistency)
+	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var out *s3.ListObjectsV2Output
 	err := retry(ctx, func() error {
 		var err error
@@ -491,12 +528,12 @@ func (t S3Target) listPage(
 // index marker LIST, ref-stream LIST (Poll), and the bounded
 // retry-dedup LIST (findExistingRef) all funnel through here so
 // the "semaphore + retry + consistency header" wrapping is
-// implemented once.
+// implemented once. Carries the target's ConsistencyControl on
+// every page fetch.
 func (t S3Target) listEach(
 	ctx context.Context,
 	prefix, startAfter string,
 	pageSize int32,
-	consistency ConsistencyLevel,
 	fn func(s3types.Object) (cont bool, err error),
 ) error {
 	input := &s3.ListObjectsV2Input{
@@ -511,7 +548,7 @@ func (t S3Target) listEach(
 	}
 	paginator := s3.NewListObjectsV2Paginator(t.cfg.S3Client, input)
 	for paginator.HasMorePages() {
-		page, err := t.listPage(ctx, paginator, consistency)
+		page, err := t.listPage(ctx, paginator)
 		if err != nil {
 			return err
 		}

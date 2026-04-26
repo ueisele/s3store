@@ -11,21 +11,19 @@ import "log"
 // (ConsistencyLevel("future-level") still compiles and passes
 // through verbatim).
 //
-// The header only needs to be set on operations where the
-// library's correctness depends on strong read-after-write /
-// list-after-write visibility — today that's:
+// Configured on S3TargetConfig.ConsistencyControl, applied
+// uniformly to every correctness-critical S3 call routed through
+// the target — data PUTs (idempotent and unconditional), ref
+// PUTs, index marker PUTs, GETs, HEADs, and every LIST
+// (partition LIST, marker LIST, ref-stream LIST in Poll, scoped
+// retry-LIST in findExistingRef). Setting it on the target rather
+// than per-config struct enforces NetApp's "same consistency for
+// paired operations" rule by construction. See the README's
+// "StorageGRID consistency" section for the full matrix.
 //
-//   - the writer's data PUT when idempotency is on (so
-//     overwrite-prevention fires across nodes);
-//   - the writer's scoped LIST on the retry path (so the ref
-//     dedup scan sees prior refs);
-//   - the reader's data-file GET following a LIST (so the GET
-//     pairs with the writer's PUT per NetApp's "same consistency
-//     for both" rule).
-//
-// Marker PUTs, ref PUTs, and the Poll/partition LISTs stay at
-// the bucket default — they're uniquely keyed or absorb
-// propagation skew via SettleWindow.
+// A handful of call sites deliberately do not carry the header
+// — the cleanup DELETE path and the DuckDB-issued GET in s3sql.
+// Both are documented in the README.
 type ConsistencyLevel string
 
 const (
@@ -81,11 +79,11 @@ func (c ConsistencyLevel) IsKnown() bool {
 
 // warnIfUnknownConsistency logs a warning when c is non-empty
 // but doesn't match any named ConsistencyLevel constant. configKind
-// names the surrounding config struct ("WriterConfig",
-// "ReaderConfig") so the message points at the right
-// construction site. Forward-compatible levels (e.g. a
-// StorageGRID release adding a new value) still pass through —
-// this is just a typo guard.
+// names the surrounding config struct ("S3TargetConfig" — the only
+// caller today) so the message points at the right construction
+// site. Forward-compatible levels (e.g. a StorageGRID release
+// adding a new value) still pass through — this is just a typo
+// guard.
 func warnIfUnknownConsistency(c ConsistencyLevel, configKind string) {
 	if c == "" || c.IsKnown() {
 		return

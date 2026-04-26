@@ -50,33 +50,33 @@ type testFixture struct {
 func newFixture(t *testing.T, opts sqlOpts) *testFixture {
 	t.Helper()
 	f := testutil.New(t)
+	// MinIO is in fact strongly consistent; the strong-global
+	// claim on the target keeps idempotent writes on the
+	// conditional-PUT path and lets the scoped retry LIST
+	// linearize against prior writes — and the umbrella reader
+	// inherits the same level by sharing the target.
 	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      300 * time.Millisecond,
+		Bucket:             f.Bucket,
+		Prefix:             "store",
+		S3Client:           f.S3Client,
+		PartitionKeyParts:  []string{"period", "customer"},
+		SettleWindow:       300 * time.Millisecond,
+		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
-	// MinIO is in fact strongly consistent; the claim keeps
-	// idempotent writes on the conditional-PUT path and lets the
-	// scoped retry LIST linearize against prior writes.
-	const testConsistency = s3parquet.ConsistencyStrongGlobal
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
-		Target:             target,
-		PartitionKeyOf:     partitionKeyOfRec,
-		ConsistencyControl: testConsistency,
+		Target:         target,
+		PartitionKeyOf: partitionKeyOfRec,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.NewWriter: %v", err)
 	}
 
 	s, err := s3sql.NewReader(s3sql.ReaderConfig{
-		Target:             target,
-		TableAlias:         "records",
-		VersionColumn:      opts.versionColumn,
-		EntityKeyColumns:   opts.entityKeyColumns,
-		ExtraInitSQL:       f.DuckDBCredentials(),
-		ConsistencyControl: testConsistency,
+		Target:           target,
+		TableAlias:       "records",
+		VersionColumn:    opts.versionColumn,
+		EntityKeyColumns: opts.entityKeyColumns,
+		ExtraInitSQL:     f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("s3sql.NewReader: %v", err)
@@ -217,29 +217,27 @@ func newIdempotentFixture(t *testing.T) *testFixture {
 	t.Helper()
 	f := testutil.New(t)
 	target := s3parquet.NewS3Target(s3parquet.S3TargetConfig{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		SettleWindow:      300 * time.Millisecond,
+		Bucket:             f.Bucket,
+		Prefix:             "store",
+		S3Client:           f.S3Client,
+		PartitionKeyParts:  []string{"period", "customer"},
+		SettleWindow:       300 * time.Millisecond,
+		ConsistencyControl: s3parquet.ConsistencyStrongGlobal,
 	})
-	const testConsistency = s3parquet.ConsistencyStrongGlobal
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[Rec]{
-		Target:             target,
-		PartitionKeyOf:     partitionKeyOfRec,
-		ConsistencyControl: testConsistency,
+		Target:         target,
+		PartitionKeyOf: partitionKeyOfRec,
 	})
 	if err != nil {
 		t.Fatalf("s3parquet.NewWriter: %v", err)
 	}
 
 	s, err := s3sql.NewReader(s3sql.ReaderConfig{
-		Target:             target,
-		TableAlias:         "records",
-		VersionColumn:      "ts",
-		EntityKeyColumns:   []string{"period", "customer", "sku"},
-		ExtraInitSQL:       f.DuckDBCredentials(),
-		ConsistencyControl: testConsistency,
+		Target:           target,
+		TableAlias:       "records",
+		VersionColumn:    "ts",
+		EntityKeyColumns: []string{"period", "customer", "sku"},
+		ExtraInitSQL:     f.DuckDBCredentials(),
 	})
 	if err != nil {
 		t.Fatalf("s3sql.NewReader: %v", err)

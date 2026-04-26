@@ -22,9 +22,13 @@ import (
 // S3Target because it composes higher-level concepts (read plans,
 // idempotency tokens, QueryOpts) that the low-level S3 handle
 // shouldn't carry.
+//
+// The partition LIST inherits the target's ConsistencyControl
+// from t — every t.listEach call does — so callers don't need
+// to thread the level explicitly.
 func ResolvePatterns(
 	ctx context.Context, t S3Target, patterns []string,
-	opts *core.QueryOpts, consistency ConsistencyLevel,
+	opts *core.QueryOpts,
 ) ([]core.KeyMeta, error) {
 	if len(patterns) == 0 {
 		return nil, nil
@@ -34,7 +38,7 @@ func ResolvePatterns(
 	if err != nil {
 		return nil, err
 	}
-	keys, err := listDataFiles(ctx, t, plans, consistency)
+	keys, err := listDataFiles(ctx, t, plans)
 	if err != nil {
 		return nil, err
 	}
@@ -56,14 +60,14 @@ func ResolvePatterns(
 // so files outside the partition tree are silently skipped.
 func listDataFiles(
 	ctx context.Context, t S3Target,
-	plans []*core.ReadPlan, consistency ConsistencyLevel,
+	plans []*core.ReadPlan,
 ) ([]core.KeyMeta, error) {
 	dataPath := core.DataPath(t.Prefix())
 	return core.FanOutMapReduce(ctx, plans,
 		t.EffectiveMaxInflightRequests(),
 		func(ctx context.Context, plan *core.ReadPlan) ([]core.KeyMeta, error) {
 			var out []core.KeyMeta
-			err := t.listEach(ctx, plan.ListPrefix, "", 0, consistency,
+			err := t.listEach(ctx, plan.ListPrefix, "", 0,
 				func(obj s3types.Object) (bool, error) {
 					objKey := aws.ToString(obj.Key)
 					if !strings.HasSuffix(objKey, ".parquet") {

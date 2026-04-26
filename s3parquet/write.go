@@ -237,8 +237,7 @@ func (s *Writer[T]) writeEncodedPayload(
 		"application/octet-stream",
 		map[string]string{
 			"created-at": writeStartTime.Format(time.RFC3339Nano),
-		},
-		s.cfg.ConsistencyControl)
+		})
 	isRetry := errors.Is(putErr, ErrAlreadyExists)
 	if putErr != nil && !isRetry {
 		return nil, fmt.Errorf("s3parquet: put data: %w", putErr)
@@ -333,7 +332,6 @@ func (s *Writer[T]) commitRef(
 
 	if err := s.cfg.Target.put(
 		putCtx, refKey, []byte{}, "application/octet-stream",
-		s.cfg.ConsistencyControl,
 	); err != nil {
 		if delErr := s.cleanupOrphanData(ctx, dataKey, idempotent); delErr != nil {
 			return nil, fmt.Errorf(
@@ -376,10 +374,11 @@ func (s *Writer[T]) commitRef(
 //     ack was lost after server-side persistence; the retry then
 //     emits a fresh in-budget ref.
 //
-// Uses the Writer's ConsistencyControl on the LIST so the scan
-// sees all prior refs on StorageGRID-style backends — a weak-
-// consistency LIST can miss a ref the writer just published on
-// another node, silently breaking dedup.
+// Inherits the target's ConsistencyControl on the LIST (every
+// listEach call does) so the scan sees all prior refs on
+// StorageGRID-style backends — a weak-consistency LIST can miss
+// a ref the writer just published on another node, silently
+// breaking dedup.
 //
 // resolveWriteOpts validates that maxRetryAge > 0 when an
 // idempotency token is set, so callers never reach here with a
@@ -393,7 +392,6 @@ func (s *Writer[T]) findExistingRef(
 		-s.cfg.Target.EffectiveSettleWindow()).UnixMicro()
 	var found string
 	err := s.cfg.Target.listEach(ctx, s.refPath+"/", lo, 0,
-		s.cfg.ConsistencyControl,
 		func(obj s3types.Object) (bool, error) {
 			if obj.Key == nil {
 				return true, nil
@@ -553,7 +551,6 @@ func (s *Writer[T]) putMarkers(
 		func(ctx context.Context, _ int, p string) error {
 			return s.cfg.Target.put(
 				ctx, p, nil, "application/octet-stream",
-				s.cfg.ConsistencyControl,
 			)
 		})
 }

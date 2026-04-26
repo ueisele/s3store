@@ -56,19 +56,6 @@ type ReaderConfig struct {
 	// the object-cache pragma, in order. Use for CREATE SECRET,
 	// credential overrides, or other extension loads.
 	ExtraInitSQL []string
-
-	// ConsistencyControl sets the Consistency-Control HTTP header
-	// on the Go-side LIST that resolves the file set for Query.
-	// Together with the writer's matching setting, this gives
-	// read-after-write file discovery on strong-consistent backends
-	// like StorageGRID.
-	//
-	// The DuckDB-issued GET that fetches each parquet body cannot
-	// carry the header — DuckDB's httpfs has no per-request hook
-	// for s3:// URLs. In practice this is fine: data files are
-	// write-once and StorageGRID's read-after-new-write covers the
-	// first read of any new key.
-	ConsistencyControl s3parquet.ConsistencyLevel
 }
 
 // dedupEnabled reports whether the reader should emit a dedup

@@ -26,19 +26,6 @@ type ReaderConfig[T any] struct {
 	EntityKeyOf   func(T) string
 	VersionOf     func(T) int64
 	OnMissingData func(dataPath string)
-
-	// ConsistencyControl sets the Consistency-Control HTTP header
-	// on data-file GETs following a LIST, matching the WriterConfig
-	// ConsistencyControl value per NetApp's "same consistency for
-	// paired PUT and GET" rule. Zero (ConsistencyDefault) sends no
-	// header and is correct on AWS S3 / MinIO; on StorageGRID
-	// match the writer's setting explicitly.
-	//
-	// Only the data-file GET applies the header — LIST of the ref
-	// stream and of partitions stay at the bucket default (their
-	// consistency needs are absorbed by SettleWindow, not the
-	// header).
-	ConsistencyControl ConsistencyLevel
 }
 
 // Reader is the read-side half of a Store. Owns Read / ReadIter /
@@ -82,7 +69,6 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 		return nil, fmt.Errorf(
 			"s3parquet: EntityKeyOf and VersionOf must be set together")
 	}
-	warnIfUnknownConsistency(cfg.ConsistencyControl, "ReaderConfig")
 	return &Reader[T]{
 		cfg:      cfg,
 		dataPath: core.DataPath(cfg.Target.Prefix()),
@@ -117,8 +103,9 @@ func resolveSortCmp[T any](
 // from U — typically a narrower struct that omits heavy
 // write-only columns (parquet-go skips unlisted columns on
 // decode). The Writer's Target overrides whatever Target cfg
-// carries (or doesn't); read-side knobs (EntityKeyOf, VersionOf,
-// OnMissingData, ConsistencyControl) come from cfg.
+// carries (or doesn't), so the resulting Reader inherits the
+// writer's ConsistencyControl automatically; read-side knobs
+// (EntityKeyOf, VersionOf, OnMissingData) come from cfg.
 //
 // Dedup closures (EntityKeyOf / VersionOf) on the Writer are
 // typed over U and cannot be auto-transformed to T; the caller

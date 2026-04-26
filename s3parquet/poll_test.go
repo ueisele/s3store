@@ -63,12 +63,12 @@ func newTestReader(
 	t.Helper()
 	r, err := NewReader[int](ReaderConfig[int]{
 		Target: NewS3Target(S3TargetConfig{
-			Bucket:            "bucket",
-			Prefix:            "p",
-			S3Client:          newTestS3Client(endpoint),
-			PartitionKeyParts: []string{"period"},
+			Bucket:             "bucket",
+			Prefix:             "p",
+			S3Client:           newTestS3Client(endpoint),
+			PartitionKeyParts:  []string{"period"},
+			ConsistencyControl: consistency,
 		}),
-		ConsistencyControl: consistency,
 	})
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)

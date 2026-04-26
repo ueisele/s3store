@@ -47,7 +47,6 @@ func (s *Reader[T]) Poll(
 	err := s.cfg.Target.listEach(ctx,
 		s.refPath+"/", string(since),
 		min(maxEntries, s3ListMaxKeys),
-		s.cfg.ConsistencyControl,
 		func(obj s3types.Object) (bool, error) {
 			if int32(len(entries)) >= maxEntries {
 				return false, nil

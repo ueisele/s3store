@@ -36,8 +36,7 @@ func (s *Reader[T]) Read(
 	o.Apply(opts...)
 
 	keys, err := ResolvePatterns(
-		ctx, s.cfg.Target, core.DedupePatterns(keyPatterns),
-		&o, s.cfg.ConsistencyControl)
+		ctx, s.cfg.Target, core.DedupePatterns(keyPatterns), &o)
 	if err != nil {
 		return nil, fmt.Errorf("s3parquet: Read %w", err)
 	}
@@ -181,8 +180,7 @@ func (s *Reader[T]) downloadAndDecodeOne(
 ) ([]T, error) {
 	key := km.Key
 
-	data, err := s.cfg.Target.get(
-		ctx, key, s.cfg.ConsistencyControl)
+	data, err := s.cfg.Target.get(ctx, key)
 	if err != nil {
 		if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
 			if s.cfg.OnMissingData != nil {

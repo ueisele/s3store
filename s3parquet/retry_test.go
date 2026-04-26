@@ -177,8 +177,12 @@ func respErr(status int) error {
 
 // newTestTarget builds an S3Target pointed at the given httptest
 // server. SDK retry is disabled via aws.NopRetryer so the tests
-// observe only the package-level retry layer.
-func newTestTarget(t *testing.T, endpoint string) S3Target {
+// observe only the package-level retry layer. Pass an optional
+// ConsistencyLevel to bake it onto the target — only the
+// consistency-header tests need this.
+func newTestTarget(
+	t *testing.T, endpoint string, consistency ...ConsistencyLevel,
+) S3Target {
 	t.Helper()
 	cli := s3.NewFromConfig(aws.Config{
 		Region: "us-east-1",
@@ -189,7 +193,11 @@ func newTestTarget(t *testing.T, endpoint string) S3Target {
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
 	})
-	return NewS3Target(S3TargetConfig{Bucket: "bucket", S3Client: cli})
+	cfg := S3TargetConfig{Bucket: "bucket", S3Client: cli}
+	if len(consistency) > 0 {
+		cfg.ConsistencyControl = consistency[0]
+	}
+	return NewS3Target(cfg)
 }
 
 // statusServer returns an httptest server that responds with
@@ -220,7 +228,7 @@ func TestTarget_PutRetriesOn5xx(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	if err := tgt.put(context.Background(), "key",
-		[]byte("x"), "application/octet-stream", ""); err != nil {
+		[]byte("x"), "application/octet-stream"); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if got := count.Load(); got != 3 {
@@ -234,7 +242,7 @@ func TestTarget_PutRetriesOn429(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	if err := tgt.put(context.Background(), "key",
-		[]byte("x"), "application/octet-stream", ""); err != nil {
+		[]byte("x"), "application/octet-stream"); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if got := count.Load(); got != 2 {
@@ -248,7 +256,7 @@ func TestTarget_PutNoRetryOn404(t *testing.T) {
 	tgt := newTestTarget(t, srv.URL)
 
 	err := tgt.put(context.Background(), "key",
-		[]byte("x"), "application/octet-stream", "")
+		[]byte("x"), "application/octet-stream")
 	if err == nil {
 		t.Fatal("want error on 404, got nil")
 	}
@@ -276,7 +284,7 @@ func TestTarget_GetRetriesOn5xx(t *testing.T) {
 	t.Cleanup(srv.Close)
 	tgt := newTestTarget(t, srv.URL)
 
-	got, err := tgt.get(context.Background(), "key", "")
+	got, err := tgt.get(context.Background(), "key")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

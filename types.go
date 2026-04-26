@@ -133,11 +133,14 @@ type Config[T any] struct {
 	DisableCleanup bool
 
 	// ConsistencyControl sets the Consistency-Control HTTP header
-	// on correctness-critical S3 operations. Empty value sends no
-	// header (AWS S3 / MinIO default). On NetApp StorageGRID, set
-	// to one of the stronger levels for Phase 3's idempotency
-	// guarantees. Forwarded to all three sub-handles so they
-	// cannot drift.
+	// applied to every correctness-critical S3 operation. Empty
+	// value sends no header (AWS S3 / MinIO default). On NetApp
+	// StorageGRID, set to one of the stronger levels for the
+	// library's idempotency and read-after-write guarantees.
+	// Forwarded onto the shared s3parquet.S3Target so all three
+	// sub-handles (parquet writer, parquet reader, SQL reader)
+	// inherit one and the same value — NetApp's "same consistency
+	// for paired operations" rule is enforced by construction.
 	ConsistencyControl s3parquet.ConsistencyLevel
 }
 

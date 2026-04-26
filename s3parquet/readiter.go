@@ -44,8 +44,7 @@ func (s *Reader[T]) ReadIter(
 		defer cancel()
 
 		keys, err := ResolvePatterns(
-			ctx, s.cfg.Target, core.DedupePatterns(keyPatterns),
-			&o, s.cfg.ConsistencyControl)
+			ctx, s.cfg.Target, core.DedupePatterns(keyPatterns), &o)
 		if err != nil {
 			yield(*new(T), fmt.Errorf("s3parquet: ReadIter %w", err))
 			return
@@ -381,8 +380,7 @@ func (s *Reader[T]) runDownloader(
 			continue
 		}
 		key := state.parts[job.partIdx].files[job.fileIdx].Key
-		body, err := s.cfg.Target.get(
-			ctx, key, s.cfg.ConsistencyControl)
+		body, err := s.cfg.Target.get(ctx, key)
 		if err != nil {
 			// No body materialised — return the slot.
 			state.releaseBodySlots(1)

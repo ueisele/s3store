@@ -149,9 +149,10 @@ type Config[T any] struct {
 
 	// ConsistencyControl is the Consistency-Control HTTP header
 	// value applied to correctness-critical S3 operations.
-	// Forwarded to both WriterConfig and ReaderConfig so the two
-	// halves of the Store share the same value. See
-	// WriterConfig.ConsistencyControl for the contract.
+	// Forwarded onto the shared S3Target so every S3 call (write
+	// path, read path, marker LISTs) uses the same value, which
+	// is what NetApp StorageGRID requires for paired operations.
+	// See S3TargetConfig.ConsistencyControl for the full contract.
 	ConsistencyControl ConsistencyLevel
 
 	// MaxInflightRequests caps S3 requests in flight per call.
@@ -207,7 +208,8 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 // targetFrom lifts the S3-wiring fields off a unified Config[T]
 // into a constructed S3Target. Called once inside New() so the
 // Writer and Reader projections share one S3Target instance —
-// and therefore one MaxInflightRequests semaphore — automatically.
+// and therefore one MaxInflightRequests semaphore + one
+// ConsistencyControl value — automatically.
 func targetFrom[T any](c Config[T]) S3Target {
 	return NewS3Target(S3TargetConfig{
 		Bucket:              c.Bucket,
@@ -217,6 +219,7 @@ func targetFrom[T any](c Config[T]) S3Target {
 		SettleWindow:        c.SettleWindow,
 		DisableRefStream:    c.DisableRefStream,
 		MaxInflightRequests: c.MaxInflightRequests,
+		ConsistencyControl:  c.ConsistencyControl,
 	})
 }
 
@@ -225,12 +228,11 @@ func targetFrom[T any](c Config[T]) S3Target {
 // is easy to spot.
 func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 	return WriterConfig[T]{
-		Target:             targetFrom(c),
-		PartitionKeyOf:     c.PartitionKeyOf,
-		Compression:        c.Compression,
-		InsertedAtField:    c.InsertedAtField,
-		DisableCleanup:     c.DisableCleanup,
-		ConsistencyControl: c.ConsistencyControl,
+		Target:          targetFrom(c),
+		PartitionKeyOf:  c.PartitionKeyOf,
+		Compression:     c.Compression,
+		InsertedAtField: c.InsertedAtField,
+		DisableCleanup:  c.DisableCleanup,
 	}
 }
 
@@ -240,11 +242,10 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 // natively into T by parquet-go.
 func readerConfigFrom[T any](c Config[T]) ReaderConfig[T] {
 	return ReaderConfig[T]{
-		Target:             targetFrom(c),
-		EntityKeyOf:        c.EntityKeyOf,
-		VersionOf:          c.VersionOf,
-		OnMissingData:      c.OnMissingData,
-		ConsistencyControl: c.ConsistencyControl,
+		Target:        targetFrom(c),
+		EntityKeyOf:   c.EntityKeyOf,
+		VersionOf:     c.VersionOf,
+		OnMissingData: c.OnMissingData,
 	}
 }
 

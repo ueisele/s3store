@@ -181,7 +181,7 @@ func (s *Reader) listAllMatchingURIs(
 	opts *core.QueryOpts,
 ) ([]string, error) {
 	keys, err := s3parquet.ResolvePatterns(
-		ctx, s.cfg.Target, patterns, opts, s.cfg.ConsistencyControl)
+		ctx, s.cfg.Target, patterns, opts)
 	if err != nil {
 		return nil, fmt.Errorf("s3sql: %w", err)
 	}

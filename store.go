@@ -48,34 +48,32 @@ func New[T any](cfg Config[T]) (*Store[T], error) {
 		SettleWindow:        cfg.SettleWindow,
 		DisableRefStream:    cfg.DisableRefStream,
 		MaxInflightRequests: cfg.MaxInflightRequests,
+		ConsistencyControl:  cfg.ConsistencyControl,
 	})
 	w, err := s3parquet.NewWriter(s3parquet.WriterConfig[T]{
-		Target:             target,
-		PartitionKeyOf:     cfg.PartitionKeyOf,
-		Compression:        cfg.Compression,
-		InsertedAtField:    cfg.InsertedAtField,
-		DisableCleanup:     cfg.DisableCleanup,
-		ConsistencyControl: cfg.ConsistencyControl,
+		Target:          target,
+		PartitionKeyOf:  cfg.PartitionKeyOf,
+		Compression:     cfg.Compression,
+		InsertedAtField: cfg.InsertedAtField,
+		DisableCleanup:  cfg.DisableCleanup,
 	})
 	if err != nil {
 		return nil, err
 	}
 	pr, err := s3parquet.NewReader(s3parquet.ReaderConfig[T]{
-		Target:             target,
-		EntityKeyOf:        cfg.EntityKeyOf,
-		VersionOf:          cfg.VersionOf,
-		ConsistencyControl: cfg.ConsistencyControl,
+		Target:      target,
+		EntityKeyOf: cfg.EntityKeyOf,
+		VersionOf:   cfg.VersionOf,
 	})
 	if err != nil {
 		return nil, err
 	}
 	sr, err := s3sql.NewReader(s3sql.ReaderConfig{
-		Target:             target,
-		TableAlias:         cfg.TableAlias,
-		VersionColumn:      cfg.VersionColumn,
-		EntityKeyColumns:   cfg.EntityKeyColumns,
-		ExtraInitSQL:       cfg.ExtraInitSQL,
-		ConsistencyControl: cfg.ConsistencyControl,
+		Target:           target,
+		TableAlias:       cfg.TableAlias,
+		VersionColumn:    cfg.VersionColumn,
+		EntityKeyColumns: cfg.EntityKeyColumns,
+		ExtraInitSQL:     cfg.ExtraInitSQL,
 	})
 	if err != nil {
 		return nil, err
