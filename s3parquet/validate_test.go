@@ -1,4 +1,4 @@
-package core
+package s3parquet
 
 import (
 	"strings"
@@ -21,7 +21,7 @@ func TestValidateHivePartitionValue(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateHivePartitionValue(tc.value)
+			err := validateHivePartitionValue(tc.value)
 			if tc.wantErr != (err != nil) {
 				t.Errorf("value=%q: wantErr=%v got %v",
 					tc.value, tc.wantErr, err)
@@ -45,7 +45,7 @@ func TestValidatePartitionKeyParts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidatePartitionKeyParts(tc.parts)
+			err := validatePartitionKeyParts(tc.parts)
 			if tc.wantSub == "" {
 				if err != nil {
 					t.Errorf("expected nil, got %v", err)
@@ -100,7 +100,7 @@ func TestValidateKeyPattern(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateKeyPattern(tc.pattern, partitionKeyParts)
+			err := validateKeyPattern(tc.pattern, partitionKeyParts)
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("expected error for %q, got nil", tc.pattern)

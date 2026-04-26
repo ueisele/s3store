@@ -2,6 +2,7 @@ package s3parquet
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -65,7 +66,7 @@ func TestBuildIndexBinder_Valid(t *testing.T) {
 // the entry struct, and a non-struct type.
 func TestBuildIndexBinder_Rejects(t *testing.T) {
 	t.Run("missing tag on entry", func(t *testing.T) {
-		if _, err := buildReadBinders[SkuIndexEntry](
+		if _, err := defaultBinder[SkuIndexEntry](
 			[]string{"sku", "period", "not_on_struct"},
 			Layout{},
 		); err == nil {
@@ -78,7 +79,7 @@ func TestBuildIndexBinder_Rejects(t *testing.T) {
 			SKU    string `parquet:"sku"`
 			Amount int    `parquet:"amount"`
 		}
-		if _, err := buildReadBinders[BadEntry](
+		if _, err := defaultBinder[BadEntry](
 			[]string{"sku", "amount"},
 			Layout{},
 		); err == nil {
@@ -87,7 +88,7 @@ func TestBuildIndexBinder_Rejects(t *testing.T) {
 	})
 
 	t.Run("extra tag on entry not in columns", func(t *testing.T) {
-		if _, err := buildReadBinders[SkuIndexEntry](
+		if _, err := defaultBinder[SkuIndexEntry](
 			[]string{"sku", "period"}, // customer missing
 			Layout{},
 		); err == nil {
@@ -96,7 +97,7 @@ func TestBuildIndexBinder_Rejects(t *testing.T) {
 	})
 
 	t.Run("non-struct", func(t *testing.T) {
-		if _, err := buildReadBinders[string](
+		if _, err := defaultBinder[string](
 			[]string{"a"},
 			Layout{},
 		); err == nil {
@@ -109,7 +110,7 @@ func TestBuildIndexBinder_Rejects(t *testing.T) {
 			First  string `parquet:"shared"`
 			Second string `parquet:"shared"`
 		}
-		if _, err := buildReadBinders[DupEntry](
+		if _, err := defaultBinder[DupEntry](
 			[]string{"shared"},
 			Layout{},
 		); err == nil {
@@ -620,5 +621,66 @@ func TestNewIndexReader_LayoutTimeParseError(t *testing.T) {
 	}
 	if _, err := idx.bind([]string{"s1", "not-a-time"}); err == nil {
 		t.Error("expected parse error for malformed time, got nil")
+	}
+}
+
+func TestIndexBasePath(t *testing.T) {
+	got := indexBasePath("store", "sku_period_idx")
+	want := "store/_index/sku_period_idx"
+	if got != want {
+		t.Errorf("indexBasePath = %q, want %q", got, want)
+	}
+}
+
+func TestBuildAndParseIndexMarkerKey(t *testing.T) {
+	const indexPath = "store/_index/sku_period_idx"
+	columns := []string{
+		"sku_id", "charge_period_start",
+		"causing_customer", "charge_period_end",
+	}
+	values := []string{
+		"SKU-123", "2026-03-01T00",
+		"abc", "2026-04-01T00",
+	}
+
+	key := buildIndexMarkerPath(indexPath, columns, values)
+
+	if !strings.HasSuffix(key, "/m.idx") {
+		t.Errorf("buildIndexMarkerPath %q missing /m.idx suffix", key)
+	}
+	if !strings.HasPrefix(key, indexPath+"/") {
+		t.Errorf("buildIndexMarkerPath %q missing %q prefix",
+			key, indexPath)
+	}
+
+	got, err := parseIndexMarkerKey(key, indexPath, columns)
+	if err != nil {
+		t.Fatalf("parseIndexMarkerKey: %v", err)
+	}
+	if !reflect.DeepEqual(got, values) {
+		t.Errorf("round-trip: got %v, want %v", got, values)
+	}
+}
+
+func TestParseIndexMarkerKey_Rejects(t *testing.T) {
+	const indexPath = "store/_index/idx"
+	columns := []string{"a", "b"}
+
+	cases := []struct {
+		name, key string
+	}{
+		{"wrong prefix", "other/_index/idx/a=1/b=2/m.idx"},
+		{"wrong suffix", "store/_index/idx/a=1/b=2/other.txt"},
+		{"wrong segment count", "store/_index/idx/a=1/m.idx"},
+		{"wrong column name", "store/_index/idx/x=1/b=2/m.idx"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseIndexMarkerKey(
+				tc.key, indexPath, columns,
+			); err == nil {
+				t.Errorf("expected error, got nil for %q", tc.key)
+			}
+		})
 	}
 }

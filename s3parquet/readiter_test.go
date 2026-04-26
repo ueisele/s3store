@@ -5,8 +5,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/ueisele/s3store/internal/core"
 )
 
 func newTestStreamState() *streamState {
@@ -223,7 +221,7 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 	s := newTestStreamState()
 	s.parts = []*partState{
 		{
-			files:  make([]core.KeyMeta, 3), // only len matters
+			files:  make([]KeyMeta, 3), // only len matters
 			bodies: make([][]byte, 3),
 			errs:   make([]error, 3),
 		},

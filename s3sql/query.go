@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ueisele/s3store/internal/core"
 	"github.com/ueisele/s3store/s3parquet"
 )
 
@@ -17,7 +16,7 @@ import (
 //
 // Deduplicated by EntityKeyColumns + VersionColumn when both are
 // configured (pass WithHistory to opt out). Pass WithIdempotentRead
-// for retry-safe read-modify-write (see core.WithIdempotentRead).
+// for retry-safe read-modify-write (see s3parquet.WithIdempotentRead).
 //
 // Empty patterns slice or zero file matches returns a *sql.Rows
 // that yields zero rows on Next() — the standard for-rows.Next
@@ -28,12 +27,11 @@ func (s *Reader) Query(
 	sqlQuery string,
 	opts ...QueryOption,
 ) (*sql.Rows, error) {
-	keyPatterns = core.DedupePatterns(keyPatterns)
 	if len(keyPatterns) == 0 {
 		return s.emptyRows(ctx)
 	}
 
-	var o core.QueryOpts
+	var o s3parquet.QueryOpts
 	o.Apply(opts...)
 
 	uris, err := s.listAllMatchingURIs(ctx, keyPatterns, &o)
@@ -175,10 +173,10 @@ func (s *Reader) emptyRows(ctx context.Context) (*sql.Rows, error) {
 // union of file URIs (s3://bucket/key form, ready to pass into
 // DuckDB's read_parquet) via S3Target.ResolvePatterns. Callers
 // should already have dropped literal-duplicate patterns via
-// core.DedupePatterns — this function doesn't repeat that work.
+// s3parquet.DedupePatterns — this function doesn't repeat that work.
 func (s *Reader) listAllMatchingURIs(
 	ctx context.Context, patterns []string,
-	opts *core.QueryOpts,
+	opts *s3parquet.QueryOpts,
 ) ([]string, error) {
 	keys, err := s3parquet.ResolvePatterns(
 		ctx, s.cfg.Target, patterns, opts)

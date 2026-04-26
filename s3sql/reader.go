@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	_ "github.com/duckdb/duckdb-go/v2"
-	"github.com/ueisele/s3store/internal/core"
 	"github.com/ueisele/s3store/s3parquet"
 )
 
@@ -110,7 +109,7 @@ func NewReader(cfg ReaderConfig) (*Reader, error) {
 	return &Reader{
 		cfg:      cfg,
 		db:       db,
-		dataPath: core.DataPath(cfg.Target.Prefix()),
+		dataPath: s3parquet.DataPath(cfg.Target.Prefix()),
 	}, nil
 }
 
@@ -137,20 +136,20 @@ func sqlQuote(value string) string {
 }
 
 // QueryOption configures read-path behavior.
-type QueryOption = core.QueryOption
+type QueryOption = s3parquet.QueryOption
 
 // WithHistory disables latest-per-entity deduplication on Query.
 // When EntityKeyColumns is empty, dedup is already a no-op
 // regardless of this option.
 func WithHistory() QueryOption {
-	return core.WithHistory()
+	return s3parquet.WithHistory()
 }
 
 // WithIdempotentRead makes Query retry-safe: the result reflects
 // state as of the first write of the given idempotency token.
 // Pair with WithIdempotencyToken on the write side so one token
-// drives both sides. See core.WithIdempotentRead for the full
+// drives both sides. See s3parquet.WithIdempotentRead for the full
 // contract.
 func WithIdempotentRead(token string) QueryOption {
-	return core.WithIdempotentRead(token)
+	return s3parquet.WithIdempotentRead(token)
 }

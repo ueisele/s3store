@@ -1701,13 +1701,16 @@ func TestPollRecords(t *testing.T) {
 			[]int64{got[0].Value, got[1].Value})
 	}
 
-	// WithHistory: same behavior — accepted but no-op on cursor path.
-	full, _, err := store.PollRecords(ctx, "", 100, s3parquet.WithHistory())
+	// PollRecords always runs replica-dedup; no IncludeHistory
+	// knob on PollOption (type-enforced — WithHistory wouldn't
+	// even compile here). Re-poll from the head to confirm the
+	// same shape regardless.
+	full, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
-		t.Fatalf("PollRecords history: %v", err)
+		t.Fatalf("PollRecords replay: %v", err)
 	}
 	if len(full) != 2 {
-		t.Errorf("history: got %d, want 2", len(full))
+		t.Errorf("replay: got %d, want 2", len(full))
 	}
 	if string(off) == "" {
 		t.Error("offset empty after non-empty PollRecords")
@@ -2868,7 +2871,7 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 		iterGot = append(iterGot, rec)
 	}
 
-	pollGot, _, err := store.PollRecords(ctx, "", 100, s3parquet.WithHistory())
+	pollGot, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
 	}

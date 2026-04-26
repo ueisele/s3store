@@ -21,7 +21,7 @@
 //   - Glob patterns are restricted to the shared grammar:
 //     whole-segment "*" and a single trailing "*" inside a
 //     value (e.g. "period=2026-03-*"). See
-//     internal/core.ValidateKeyPattern for the full spec.
+//     internal/validateKeyPattern for the full spec.
 //   - Deduplication is in-memory; large key cardinalities can
 //     exceed available RAM. Route those workloads to s3sql.
 package s3parquet

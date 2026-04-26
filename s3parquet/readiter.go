@@ -12,7 +12,6 @@ import (
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // ReadIter returns an iter.Seq2[T, error] yielding records one
@@ -37,14 +36,14 @@ func (s *Reader[T]) ReadIter(
 	ctx context.Context, keyPatterns []string, opts ...QueryOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
-		var o core.QueryOpts
+		var o QueryOpts
 		o.Apply(opts...)
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
 		keys, err := ResolvePatterns(
-			ctx, s.cfg.Target, core.DedupePatterns(keyPatterns), &o)
+			ctx, s.cfg.Target, keyPatterns, &o)
 		if err != nil {
 			yield(*new(T), fmt.Errorf("s3parquet: ReadIter %w", err))
 			return
@@ -104,13 +103,13 @@ func (s *Reader[T]) ReadRangeIter(
 	} else {
 		untilOffset = s.OffsetAt(until)
 	}
-	// Append Until last so it wins over any WithUntilOffset the
-	// caller snuck in via opts — the until parameter is the
-	// method's contract.
-	opts = append(opts, WithUntilOffset(untilOffset))
+	// Poll only honours WithUntilOffset; the snapshot-side opts
+	// (WithHistory, WithReadAhead*, WithIdempotentRead) flow into
+	// the snapshot-style decode pipeline below, not into Poll.
+	pollOpts := []PollOption{WithUntilOffset(untilOffset)}
 
 	return func(yield func(T, error) bool) {
-		var o core.QueryOpts
+		var o QueryOpts
 		o.Apply(opts...)
 
 		// Walk the ref stream into a flat KeyMeta slice. LIST-only
@@ -118,10 +117,10 @@ func (s *Reader[T]) ReadRangeIter(
 		// the LIST page max as the per-Poll cap to minimize round
 		// trips — the slice growth here is bounded metadata, not
 		// decoded record memory.
-		var keys []core.KeyMeta
+		var keys []KeyMeta
 		cur := sinceOffset
 		for {
-			entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, opts...)
+			entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, pollOpts...)
 			if err != nil {
 				yield(*new(T), err)
 				return
@@ -130,7 +129,7 @@ func (s *Reader[T]) ReadRangeIter(
 				break
 			}
 			for _, e := range entries {
-				keys = append(keys, core.KeyMeta{
+				keys = append(keys, KeyMeta{
 					Key:        e.DataPath,
 					InsertedAt: e.InsertedAt,
 				})
@@ -141,7 +140,7 @@ func (s *Reader[T]) ReadRangeIter(
 			return
 		}
 
-		keys, err := core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
+		keys, err := applyIdempotentReadOpts(keys, s.dataPath, &o)
 		if err != nil {
 			yield(*new(T), fmt.Errorf("s3parquet: %w", err))
 			return
@@ -185,8 +184,8 @@ func (s *Reader[T]) ReadRangeIter(
 // partition still flows (the cap can't bind below partition
 // granularity without row-group-level streaming).
 func (s *Reader[T]) downloadAndDecodeIter(
-	ctx context.Context, keys []core.KeyMeta,
-	opts *core.QueryOpts, yield func(T, error) bool,
+	ctx context.Context, keys []KeyMeta,
+	opts *QueryOpts, yield func(T, error) bool,
 ) {
 	if len(keys) == 0 {
 		return
@@ -299,7 +298,7 @@ func (s *Reader[T]) emitPartition(
 // by S3 key (deterministic download order), and allocates the
 // per-partition slots.
 func (s *Reader[T]) preparePartitions(
-	keys []core.KeyMeta,
+	keys []KeyMeta,
 ) []*partState {
 	byPartition := s.groupKeysByPartition(keys)
 	if len(byPartition) == 0 {
@@ -329,11 +328,11 @@ func (s *Reader[T]) preparePartitions(
 // level sort in emitPartition — groupKeysByPartition itself no
 // longer implies chronological-within-partition output.
 func (s *Reader[T]) groupKeysByPartition(
-	keys []core.KeyMeta,
-) map[string][]core.KeyMeta {
-	out := make(map[string][]core.KeyMeta)
+	keys []KeyMeta,
+) map[string][]KeyMeta {
+	out := make(map[string][]KeyMeta)
 	for _, k := range keys {
-		hk, ok := core.HiveKeyOfDataFile(k.Key, s.dataPath)
+		hk, ok := hiveKeyOfDataFile(k.Key, s.dataPath)
 		if !ok {
 			// Defensively skip keys that don't parse. List paths
 			// already filtered to .parquet, so reaching here means
@@ -409,7 +408,7 @@ func (s *Reader[T]) runDownloader(
 // decodedCh.
 func (s *Reader[T]) runDecoder(
 	ctx context.Context, state *streamState,
-	opts *core.QueryOpts, decodedCh chan<- decodedBatch[T],
+	opts *QueryOpts, decodedCh chan<- decodedBatch[T],
 ) {
 	defer close(decodedCh)
 	for pi := range state.parts {
@@ -505,7 +504,7 @@ type downloadJob struct {
 // fixed at preparePartitions time; bodies + errs + completed
 // are mutated by downloaders under streamState.mu.
 type partState struct {
-	files     []core.KeyMeta
+	files     []KeyMeta
 	bodies    [][]byte
 	errs      []error
 	completed int

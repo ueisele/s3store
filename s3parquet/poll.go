@@ -7,11 +7,70 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // s3ListMaxKeys is the per-request page-size cap enforced by S3.
 const s3ListMaxKeys int32 = 1000
+
+// Offset represents a position in the stream. Use the empty
+// string Offset("") as the unbounded sentinel: as `since` it
+// means stream head; as the upper bound (via WithUntilOffset)
+// it means walk to the live tip (now - SettleWindow) as of
+// the call. To keep up with new writes, call again from the
+// last offset. ReadRangeIter takes time.Time bounds and uses
+// time.Time{} as its own unbounded sentinel.
+type Offset string
+
+// StreamEntry is a lightweight ref returned by Poll.
+//
+//   - Offset and RefPath carry the same underlying S3 key string.
+//     Offset is typed for cursor-advancing in Poll-style APIs;
+//     RefPath exposes the same value as an explicit S3 object
+//     path for callers that want to GET the ref directly. Mirrors
+//     the Offset / RefPath split on WriteResult.
+//   - Key is the Hive-style partition key ("period=X/customer=Y")
+//     that the writer originally passed to WriteWithKey — useful
+//     for consumers to route records by partition without parsing
+//     DataPath.
+//   - DataPath is the S3 object key of the data file this ref
+//     points at; GET it to fetch the parquet payload.
+//   - InsertedAt is the writer's wall-clock capture at write-start,
+//     decoded from the dataTsMicros embedded in the ref filename.
+//     Identical to what the writer stamped into the InsertedAtField
+//     parquet column, so consumers see the write time without
+//     reading the data file.
+type StreamEntry struct {
+	Offset     Offset
+	Key        string
+	DataPath   string
+	RefPath    string
+	InsertedAt time.Time
+}
+
+// PollOption configures Poll / PollRecords. Separate from
+// QueryOption (which serves the snapshot read paths) so each
+// option type only carries knobs its read path actually
+// honours — no "ignored on this path" footguns.
+type PollOption func(*pollOpts)
+
+// pollOpts is the resolved set of Poll / PollRecords options.
+type pollOpts struct {
+	// until, when non-empty, is an exclusive upper bound on
+	// stream offsets returned: entries whose offset is >= until
+	// are skipped, giving a half-open [since, until) range.
+	// Matches Kafka's offset semantics.
+	until Offset
+}
+
+// WithUntilOffset bounds Poll / PollRecords from above: only
+// entries with offset < until are returned (half-open range).
+// Pair with Reader.OffsetAt to read records in a time window.
+// Zero-value offset disables the bound.
+func WithUntilOffset(until Offset) PollOption {
+	return func(o *pollOpts) {
+		o.until = until
+	}
+}
 
 // Poll returns up to maxEntries stream entries (refs only) after
 // the given offset, capped at now - SettleWindow to avoid races
@@ -25,7 +84,7 @@ func (s *Reader[T]) Poll(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
-	opts ...QueryOption,
+	opts ...PollOption,
 ) ([]StreamEntry, Offset, error) {
 	if s.cfg.Target.DisableRefStream() {
 		return nil, since, ErrRefStreamDisabled
@@ -35,10 +94,12 @@ func (s *Reader[T]) Poll(
 			"s3parquet: maxEntries must be > 0")
 	}
 
-	var o core.QueryOpts
-	o.Apply(opts...)
+	var o pollOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
 
-	cutoffPrefix := core.RefCutoff(s.refPath, time.Now(),
+	cutoffPrefix := refCutoff(s.refPath, time.Now(),
 		s.cfg.Target.EffectiveSettleWindow())
 
 	var entries []StreamEntry
@@ -55,17 +116,17 @@ func (s *Reader[T]) Poll(
 			if objKey > cutoffPrefix {
 				return false, nil
 			}
-			if o.Until != "" && objKey >= string(o.Until) {
+			if o.until != "" && objKey >= string(o.until) {
 				return false, nil
 			}
-			key, _, id, dataTsMicros, err := core.ParseRefKey(objKey)
+			key, _, id, dataTsMicros, err := parseRefKey(objKey)
 			if err != nil {
 				return false, fmt.Errorf("parse ref: %w", err)
 			}
 			entries = append(entries, StreamEntry{
 				Offset:     Offset(objKey),
 				Key:        key,
-				DataPath:   core.BuildDataFilePath(s.dataPath, key, id),
+				DataPath:   buildDataFilePath(s.dataPath, key, id),
 				RefPath:    objKey,
 				InsertedAt: time.UnixMicro(dataTsMicros),
 			})
@@ -103,7 +164,7 @@ func (s *Reader[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
-	opts ...QueryOption,
+	opts ...PollOption,
 ) ([]T, Offset, error) {
 	entries, newOffset, err := s.Poll(ctx, since, maxEntries, opts...)
 	if err != nil {
@@ -117,9 +178,9 @@ func (s *Reader[T]) PollRecords(
 	// filename) on the KeyMeta. Used as the fallback when the
 	// reader has no InsertedAtField configured — same value the
 	// writer captured, so dedup / sort matches the column path.
-	keys := make([]core.KeyMeta, len(entries))
+	keys := make([]KeyMeta, len(entries))
 	for i, e := range entries {
-		keys[i] = core.KeyMeta{
+		keys[i] = KeyMeta{
 			Key:        e.DataPath,
 			InsertedAt: e.InsertedAt,
 		}
@@ -141,5 +202,5 @@ func (s *Reader[T]) PollRecords(
 // read records within a time window — or use ReadRangeIter, which
 // takes time.Time bounds directly.
 func (s *Reader[T]) OffsetAt(t time.Time) Offset {
-	return Offset(core.RefCutoff(s.refPath, t, 0))
+	return Offset(refCutoff(s.refPath, t, 0))
 }

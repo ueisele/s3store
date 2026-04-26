@@ -3,8 +3,6 @@ package s3parquet
 import (
 	"cmp"
 	"fmt"
-
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // ReaderConfig is the narrower Config form for constructing a
@@ -71,8 +69,8 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	}
 	return &Reader[T]{
 		cfg:      cfg,
-		dataPath: core.DataPath(cfg.Target.Prefix()),
-		refPath:  core.RefPath(cfg.Target.Prefix()),
+		dataPath: DataPath(cfg.Target.Prefix()),
+		refPath:  refPath(cfg.Target.Prefix()),
 		sortCmp:  resolveSortCmp(cfg.EntityKeyOf, cfg.VersionOf),
 	}, nil
 }

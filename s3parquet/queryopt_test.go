@@ -1,4 +1,4 @@
-package core
+package s3parquet
 
 import "testing"
 

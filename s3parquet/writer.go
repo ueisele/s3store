@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/parquet-go/parquet-go/compress"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // WriterConfig is the narrower Config form for constructing a
@@ -160,8 +159,8 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	}
 	return &Writer[T]{
 		cfg:                  cfg,
-		dataPath:             core.DataPath(cfg.Target.Prefix()),
-		refPath:              core.RefPath(cfg.Target.Prefix()),
+		dataPath:             DataPath(cfg.Target.Prefix()),
+		refPath:              refPath(cfg.Target.Prefix()),
 		compressionCodec:     codec,
 		insertedAtFieldIndex: insertedAtIdx,
 		indexes:              indexes,
@@ -196,7 +195,7 @@ func buildIndexWriters[T any](
 			return nil, err
 		}
 
-		indexPath := core.IndexPath(target.Prefix(), def.Name)
+		indexPath := indexBasePath(target.Prefix(), def.Name)
 		name := def.Name
 		columns := def.Columns
 		out = append(out, indexWriter[T]{

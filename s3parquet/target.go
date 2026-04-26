@@ -13,7 +13,6 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // ErrAlreadyExists is the sentinel returned by putIfAbsent when
@@ -23,18 +22,41 @@ import (
 // stream to decide whether the ref also needs re-emission.
 var ErrAlreadyExists = errors.New("s3parquet: object already exists")
 
+// consistencyHeader is the HTTP header name routed through every
+// correctness-critical S3 call when ConsistencyControl is set.
+// NetApp StorageGRID interprets the value to override the
+// bucket's default consistency; AWS S3 and MinIO ignore the
+// header entirely.
+const consistencyHeader = "Consistency-Control"
+
 // consistencyAPIOpts returns the SDK APIOptions slice that
 // installs the Consistency-Control header for an S3 call. Empty
 // level → nil → no header, which is the correct behaviour on
 // AWS S3 / MinIO; on NetApp StorageGRID the target's configured
 // ConsistencyLevel is sent on every routed call.
+//
+// Registered at the Build step (after Serialize, before Finalize)
+// so it runs once per operation regardless of retries, and sees
+// the assembled smithyhttp.Request.
 func consistencyAPIOpts(level ConsistencyLevel) []func(*middleware.Stack) error {
 	if level == "" {
 		return nil
 	}
+	value := string(level)
 	return []func(*middleware.Stack) error{
-		core.AddHeaderMiddleware(
-			"Consistency-Control", string(level)),
+		func(stack *middleware.Stack) error {
+			return stack.Build.Add(middleware.BuildMiddlewareFunc(
+				"s3parquet.addHeader."+consistencyHeader,
+				func(
+					ctx context.Context, in middleware.BuildInput,
+					next middleware.BuildHandler,
+				) (middleware.BuildOutput, middleware.Metadata, error) {
+					if req, ok := in.Request.(*smithyhttp.Request); ok {
+						req.Header.Set(consistencyHeader, value)
+					}
+					return next.HandleBuild(ctx, in)
+				}), middleware.After)
+		},
 	}
 }
 
@@ -188,7 +210,7 @@ func (c S3TargetConfig) Validate() error {
 	if err := c.ValidateLookup(); err != nil {
 		return err
 	}
-	return core.ValidatePartitionKeyParts(c.PartitionKeyParts)
+	return validatePartitionKeyParts(c.PartitionKeyParts)
 }
 
 // ValidateLookup is the reduced check for constructors that

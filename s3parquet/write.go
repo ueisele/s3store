@@ -15,8 +15,21 @@ import (
 	"github.com/google/uuid"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
-	"github.com/ueisele/s3store/internal/core"
 )
+
+// WriteResult contains metadata about a completed write.
+// InsertedAt is the writer's wall-clock capture at write-start
+// — the same value that populates the configured InsertedAtField
+// column, the x-amz-meta-created-at header, and the dataTsMicros
+// component of the ref filename. Exposed on the result so callers
+// can log / persist it (e.g., into an outbox table) without
+// parsing the data path or issuing a HEAD.
+type WriteResult struct {
+	Offset     Offset
+	DataPath   string
+	RefPath    string
+	InsertedAt time.Time
+}
 
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
@@ -54,19 +67,19 @@ func (s *Writer[T]) Write(
 }
 
 // resolveWriteOpts folds the variadic WriteOption chain into a
-// core.WriteOpts and validates embedded values (IdempotencyToken
+// WriteOpts and validates embedded values (IdempotencyToken
 // passes ValidateIdempotencyToken). Done once per Write call so
 // per-partition dispatch doesn't re-validate on every goroutine.
-func resolveWriteOpts(opts []WriteOption) (core.WriteOpts, error) {
-	var w core.WriteOpts
+func resolveWriteOpts(opts []WriteOption) (WriteOpts, error) {
+	var w WriteOpts
 	w.Apply(opts...)
 	if w.IdempotencyToken != "" {
-		if err := core.ValidateIdempotencyToken(
+		if err := validateIdempotencyToken(
 			w.IdempotencyToken); err != nil {
-			return core.WriteOpts{}, err
+			return WriteOpts{}, err
 		}
 		if w.MaxRetryAge <= 0 {
-			return core.WriteOpts{}, fmt.Errorf(
+			return WriteOpts{}, fmt.Errorf(
 				"s3parquet: MaxRetryAge must be > 0 (got %s) "+
 					"when IdempotencyToken is set",
 				w.MaxRetryAge)
@@ -77,11 +90,11 @@ func resolveWriteOpts(opts []WriteOption) (core.WriteOpts, error) {
 
 // writeGroupedFanOut is the partition-level fan-out used by
 // Write. Groups records by PartitionKeyOf, runs perPartition
-// through core.FanOut bounded by
+// through fanOut bounded by
 // Target.MaxInflightRequests. Returns results in sorted-key order
 // regardless of completion order; first real (non-cancel) failure
 // wins; caller-cancel surfaces as an error even when no real
-// failure occurred (handled in core.FanOut).
+// failure occurred (handled in fanOut).
 //
 // Partial success is the accepted outcome: on error, results that
 // committed before the cancel still appear in the returned slice.
@@ -99,7 +112,7 @@ func (s *Writer[T]) writeGroupedFanOut(
 	// execution.
 	results := make([]*WriteResult, len(keys))
 
-	err := core.FanOut(ctx, keys,
+	err := fanOut(ctx, keys,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
 		func(ctx context.Context, i int, key string) error {
 			r, err := perPartition(ctx, key, grouped[key])
@@ -136,7 +149,7 @@ func (s *Writer[T]) writeGroupedFanOut(
 // data filename is derived from the token, so retries produce
 // the same path and the backend's overwrite-prevention triggers
 // without re-uploading the parquet body. See
-// core.WithIdempotencyToken for the full contract.
+// WithIdempotencyToken for the full contract.
 func (s *Writer[T]) WriteWithKey(
 	ctx context.Context, key string, records []T, opts ...WriteOption,
 ) (*WriteResult, error) {
@@ -156,7 +169,7 @@ func (s *Writer[T]) WriteWithKey(
 // partition revalidation that calling WriteWithKey in the fan-out
 // closure would imply.
 func (s *Writer[T]) writeWithKeyResolved(
-	ctx context.Context, key string, records []T, opts core.WriteOpts,
+	ctx context.Context, key string, records []T, opts WriteOpts,
 ) (*WriteResult, error) {
 	if err := s.validateKey(key); err != nil {
 		return nil, err
@@ -202,7 +215,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 // retry-dedup branch.
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
-	writeStartTime time.Time, opts core.WriteOpts,
+	writeStartTime time.Time, opts WriteOpts,
 ) (*WriteResult, error) {
 	// Compute marker paths up-front so a bad IndexDef.Of fails the
 	// whole Write before we touch S3, matching how validateKey
@@ -223,9 +236,9 @@ func (s *Writer[T]) writeEncodedPayload(
 	if idempotent {
 		id = opts.IdempotencyToken
 	} else {
-		id = core.MakeAutoID(tsMicros, uuid.New().String()[:8])
+		id = makeAutoID(tsMicros, uuid.New().String()[:8])
 	}
-	dataKey := core.BuildDataFilePath(s.dataPath, key, id)
+	dataKey := buildDataFilePath(s.dataPath, key, id)
 
 	// Phase 1: data PUT (always conditional via If-None-Match: *).
 	// Auto-generated dataKeys are unique per attempt so the check
@@ -323,7 +336,7 @@ func (s *Writer[T]) commitRef(
 ) (*WriteResult, error) {
 	refCaptureTime := time.Now()
 	refTsMicros := refCaptureTime.UnixMicro()
-	refKey := core.EncodeRefKey(
+	refKey := encodeRefKey(
 		s.refPath, refTsMicros, id, dataTsMicros, hiveKey)
 
 	settle := s.cfg.Target.EffectiveSettleWindow()
@@ -387,7 +400,7 @@ func (s *Writer[T]) findExistingRef(
 	ctx context.Context, token string, maxRetryAge time.Duration,
 ) (string, error) {
 	now := time.Now()
-	lo, hi := core.RefRangeForRetry(s.refPath, now, maxRetryAge)
+	lo, hi := refRangeForRetry(s.refPath, now, maxRetryAge)
 	settleCutoffUs := now.Add(
 		-s.cfg.Target.EffectiveSettleWindow()).UnixMicro()
 	var found string
@@ -404,7 +417,7 @@ func (s *Writer[T]) findExistingRef(
 				// RefRangeForRetry's lo already rely on.
 				return false, nil
 			}
-			_, refTsMicros, id, _, err := core.ParseRefKey(*obj.Key)
+			_, refTsMicros, id, _, err := parseRefKey(*obj.Key)
 			if err != nil {
 				// Malformed ref keys (externally written or a
 				// future schema the parser doesn't understand)
@@ -495,7 +508,7 @@ func (s *Writer[T]) validateKey(key string) error {
 				key, i, seg, prefix)
 		}
 		value := seg[len(prefix):]
-		if err := core.ValidateHivePartitionValue(value); err != nil {
+		if err := validateHivePartitionValue(value); err != nil {
 			return fmt.Errorf(
 				"s3parquet: key %q segment %d (%q): %w",
 				key, i, part, err)
@@ -537,7 +550,7 @@ func (s *Writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 	return out, nil
 }
 
-// putMarkers fans marker PUTs out through core.FanOut. The
+// putMarkers fans marker PUTs out through fanOut. The
 // per-target MaxInflightRequests semaphore inside target.put caps
 // net in-flight S3 requests, so the fan-out can't overshoot
 // http.Transport.MaxConnsPerHost — extra goroutines just queue at
@@ -547,7 +560,7 @@ func (s *Writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
 func (s *Writer[T]) putMarkers(
 	ctx context.Context, paths []string,
 ) error {
-	return core.FanOut(ctx, paths,
+	return fanOut(ctx, paths,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
 		func(ctx context.Context, _ int, p string) error {
 			return s.cfg.Target.put(

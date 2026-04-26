@@ -1,9 +1,8 @@
 package s3parquet
 
 import (
+	"reflect"
 	"testing"
-
-	"github.com/ueisele/s3store/internal/core"
 )
 
 func TestBuildReadPlan_ListPrefix(t *testing.T) {
@@ -42,14 +41,14 @@ func TestBuildReadPlan_ListPrefix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plans, err := core.BuildReadPlans(
+			plans, err := buildReadPlans(
 				[]string{tc.pattern}, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if plans[0].ListPrefix != tc.want {
-				t.Errorf("ListPrefix = %q, want %q",
-					plans[0].ListPrefix, tc.want)
+			if plans[0].listPrefix != tc.want {
+				t.Errorf("listPrefix = %q, want %q",
+					plans[0].listPrefix, tc.want)
 			}
 		})
 	}
@@ -108,13 +107,13 @@ func TestBuildReadPlan_Match(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plans, err := core.BuildReadPlans(
+			plans, err := buildReadPlans(
 				[]string{tc.pattern}, dataPath, partitionKeyParts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got := plans[0].Match(tc.hiveKey); got != tc.want {
-				t.Errorf("Match(%q) under pattern %q = %v, want %v",
+			if got := plans[0].match(tc.hiveKey); got != tc.want {
+				t.Errorf("match(%q) under pattern %q = %v, want %v",
 					tc.hiveKey, tc.pattern, got, tc.want)
 			}
 		})
@@ -131,9 +130,9 @@ func TestBuildReadPlans_RejectsInvalidPattern(t *testing.T) {
 	}
 	for _, p := range cases {
 		t.Run(p, func(t *testing.T) {
-			if _, err := core.BuildReadPlans(
+			if _, err := buildReadPlans(
 				[]string{p}, "pre/data", partitionKeyParts); err == nil {
-				t.Errorf("core.BuildReadPlans(%q): expected error", p)
+				t.Errorf("buildReadPlans(%q): expected error", p)
 			}
 		})
 	}
@@ -158,12 +157,107 @@ func TestHiveKeyOfDataFile(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := core.HiveKeyOfDataFile(tc.s3Key, tc.dp)
+			got, ok := hiveKeyOfDataFile(tc.s3Key, tc.dp)
 			if ok != tc.wantOK {
 				t.Errorf("ok = %v, want %v", ok, tc.wantOK)
 			}
 			if got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseKeyPattern(t *testing.T) {
+	parts := []string{"period", "customer"}
+	cases := []struct {
+		name    string
+		pattern string
+		want    []segment
+	}{
+		{"match all empty", "", nil},
+		{"match all star", "*", nil},
+		{"whole-segment wild head", "*/customer=abc",
+			[]segment{
+				{kind: segWildAll, keyPart: "period"},
+				{kind: segExact, keyPart: "customer", value: "abc"},
+			}},
+		{"two exacts", "period=X/customer=Y",
+			[]segment{
+				{kind: segExact, keyPart: "period", value: "X"},
+				{kind: segExact, keyPart: "customer", value: "Y"},
+			}},
+		{"trailing star", "period=2026-03-*/customer=abc",
+			[]segment{
+				{kind: segPrefix, keyPart: "period", value: "2026-03-"},
+				{kind: segExact, keyPart: "customer", value: "abc"},
+			}},
+		{"range both sides", "period=2026-03-01..2026-04-01/customer=abc",
+			[]segment{
+				{kind: segRange, keyPart: "period",
+					value: "2026-03-01", toValue: "2026-04-01"},
+				{kind: segExact, keyPart: "customer", value: "abc"},
+			}},
+		{"range unbounded upper", "period=2026-03-01../customer=abc",
+			[]segment{
+				{kind: segRange, keyPart: "period",
+					value: "2026-03-01", toValue: ""},
+				{kind: segExact, keyPart: "customer", value: "abc"},
+			}},
+		{"range unbounded lower", "period=..2026-04-01/customer=abc",
+			[]segment{
+				{kind: segRange, keyPart: "period",
+					value: "", toValue: "2026-04-01"},
+				{kind: segExact, keyPart: "customer", value: "abc"},
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseKeyPattern(tc.pattern, parts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("\ngot  %+v\nwant %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseKeyPattern_SurfacesValidationErrors(t *testing.T) {
+	parts := []string{"period", "customer"}
+	bad := []string{
+		"period=2026-*-17/customer=abc",
+		"period=../customer=abc",
+		"period=a..b..c/customer=abc",
+		"period=X",
+	}
+	for _, p := range bad {
+		t.Run(p, func(t *testing.T) {
+			if _, err := parseKeyPattern(p, parts); err == nil {
+				t.Errorf("parseKeyPattern(%q): expected error", p)
+			}
+		})
+	}
+}
+
+func TestCommonPrefix(t *testing.T) {
+	cases := []struct {
+		a, b, want string
+	}{
+		{"2026-03-01", "2026-04-01", "2026-0"},
+		{"2026-03-01", "2026-03-15", "2026-03-"},
+		{"a", "z", ""},
+		{"abc", "abc", "abc"},
+		{"", "abc", ""},
+		{"abc", "", ""},
+		{"", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.a+"|"+tc.b, func(t *testing.T) {
+			if got := commonPrefix(tc.a, tc.b); got != tc.want {
+				t.Errorf("commonPrefix(%q, %q) = %q, want %q",
+					tc.a, tc.b, got, tc.want)
 			}
 		})
 	}

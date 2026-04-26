@@ -1,4 +1,4 @@
-package core
+package s3parquet
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 )
 
 // goid returns the calling goroutine's runtime ID. Used by
-// FanOut tests to assert that the single-item fast path runs work
+// fanOut tests to assert that the single-item fast path runs work
 // in the caller's goroutine instead of spawning. Lifted from the
 // standard "parse runtime.Stack header" trick — there's no public
 // API for goroutine ID and the test cost is marginal.
@@ -30,7 +30,7 @@ func goid() int {
 // goroutines, nil error.
 func TestFanOut_Empty(t *testing.T) {
 	called := false
-	err := FanOut(context.Background(), []int{}, 4,
+	err := fanOut(context.Background(), []int{}, 4,
 		func(_ context.Context, _ int, _ int) error {
 			called = true
 			return nil
@@ -44,13 +44,11 @@ func TestFanOut_Empty(t *testing.T) {
 }
 
 // TestFanOut_SingleItemDirect verifies len(items)==1 runs work in
-// the caller's goroutine without spawning. Compares goroutine IDs
-// directly — robust against background goroutines (GC, scheduler)
-// that would make a runtime.NumGoroutine() comparison flaky.
+// the caller's goroutine without spawning.
 func TestFanOut_SingleItemDirect(t *testing.T) {
 	caller := goid()
 	var workGoid int
-	err := FanOut(context.Background(), []int{42}, 4,
+	err := fanOut(context.Background(), []int{42}, 4,
 		func(_ context.Context, _ int, _ int) error {
 			workGoid = goid()
 			return nil
@@ -65,9 +63,7 @@ func TestFanOut_SingleItemDirect(t *testing.T) {
 }
 
 // TestFanOut_SlotStableResults verifies that results land in the
-// caller-chosen slot regardless of completion order. Each work
-// invocation sleeps a different amount so completion order
-// reverses input order, but slot indices must stay stable.
+// caller-chosen slot regardless of completion order.
 func TestFanOut_SlotStableResults(t *testing.T) {
 	const n = 10
 	items := make([]int, n)
@@ -76,9 +72,8 @@ func TestFanOut_SlotStableResults(t *testing.T) {
 	}
 	results := make([]int, n)
 
-	err := FanOut(context.Background(), items, 4,
+	err := fanOut(context.Background(), items, 4,
 		func(_ context.Context, i int, item int) error {
-			// Reverse completion order: item 0 sleeps longest.
 			time.Sleep(time.Duration(n-item) * time.Millisecond)
 			results[i] = item * 10
 			return nil
@@ -95,22 +90,16 @@ func TestFanOut_SlotStableResults(t *testing.T) {
 
 // TestFanOut_FirstRealErrorWins verifies that when one work fails
 // and siblings get cancelled, the returned error is the real
-// failure, not the fallout context.Canceled. The error fires from
-// item 0 so the worker pool definitely claims it (workers pull
-// via an atomic counter — items beyond the pool size only run
-// after earlier items complete).
+// failure, not the fallout context.Canceled.
 func TestFanOut_FirstRealErrorWins(t *testing.T) {
 	sentinel := errors.New("boom")
 	items := make([]int, 20)
 
-	err := FanOut(context.Background(), items, 4,
+	err := fanOut(context.Background(), items, 4,
 		func(ctx context.Context, i int, _ int) error {
 			if i == 0 {
 				return sentinel
 			}
-			// Block until cancelled so item 0's error wins the race.
-			// Worker that picks item 0 fires sentinel, the rest see
-			// cancelled ctx (either before claiming or via this select).
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -124,10 +113,10 @@ func TestFanOut_FirstRealErrorWins(t *testing.T) {
 // rather than nil.
 func TestFanOut_ParentCancelSurfaces(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already cancelled before FanOut runs
+	cancel()
 
 	items := make([]int, 8)
-	err := FanOut(ctx, items, 4,
+	err := fanOut(ctx, items, 4,
 		func(ctx context.Context, _ int, _ int) error {
 			<-ctx.Done()
 			return ctx.Err()
@@ -138,12 +127,7 @@ func TestFanOut_ParentCancelSurfaces(t *testing.T) {
 }
 
 // TestFanOut_BoundedGoroutineCount verifies the worker pool caps
-// goroutines at min(concurrency, len(items)) regardless of N. With
-// 1000 items and concurrency=4, peak goroutines must stay near
-// baseline+4 even though items are large in count.
-//
-// Workers block on a barrier so they accumulate before any can
-// exit — peak measurement is meaningful.
+// goroutines at min(concurrency, len(items)) regardless of N.
 func TestFanOut_BoundedGoroutineCount(t *testing.T) {
 	const items = 1000
 	const concurrency = 4
@@ -154,11 +138,8 @@ func TestFanOut_BoundedGoroutineCount(t *testing.T) {
 	var releaseOnce sync.Once
 	release := make(chan struct{})
 
-	// Once we've seen `concurrency` workers in flight (proves the
-	// pool is full), unblock them so they finish the items.
 	checkAndRelease := func() {
 		cur := inFlight.Add(1)
-		// Track peak.
 		for {
 			old := peak.Load()
 			if cur <= old || peak.CompareAndSwap(old, cur) {
@@ -172,7 +153,7 @@ func TestFanOut_BoundedGoroutineCount(t *testing.T) {
 		inFlight.Add(-1)
 	}
 
-	err := FanOut(context.Background(), in, concurrency,
+	err := fanOut(context.Background(), in, concurrency,
 		func(_ context.Context, _ int, _ int) error {
 			checkAndRelease()
 			return nil
@@ -180,9 +161,6 @@ func TestFanOut_BoundedGoroutineCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("got err %v, want nil", err)
 	}
-	// Peak must equal concurrency exactly: the barrier guarantees
-	// all workers accumulate before any can exit (peak ≥ N), and
-	// the pool spawns exactly N workers (peak ≤ N).
 	if peak.Load() != int32(concurrency) {
 		t.Errorf("peak in-flight workers = %d, want %d",
 			peak.Load(), concurrency)
@@ -197,7 +175,7 @@ func TestFanOut_AllItemsProcessed(t *testing.T) {
 	items := make([]int, n)
 	var seen [n]atomic.Int32
 
-	err := FanOut(context.Background(), items, 8,
+	err := fanOut(context.Background(), items, 8,
 		func(_ context.Context, i int, _ int) error {
 			seen[i].Add(1)
 			return nil
@@ -217,7 +195,7 @@ func TestFanOut_AllItemsProcessed(t *testing.T) {
 // deadlocking on a 0-sized pool.
 func TestFanOut_ConcurrencyZeroOrNegative(t *testing.T) {
 	for _, c := range []int{0, -1, -100} {
-		err := FanOut(context.Background(), []int{1, 2, 3}, c,
+		err := fanOut(context.Background(), []int{1, 2, 3}, c,
 			func(_ context.Context, _ int, _ int) error {
 				return nil
 			})

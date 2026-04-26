@@ -1,4 +1,4 @@
-package core
+package s3parquet
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 )
 
-// FanOut runs work in parallel across items[0..len(items)) using a
+// fanOut runs work in parallel across items[0..len(items)) using a
 // worker pool of at most min(concurrency, len(items)) goroutines.
 // Each work invocation gets a per-call ctx that's cancelled when
 // any sibling errors or the caller cancels, so blocked S3 calls
@@ -38,12 +38,12 @@ import (
 // a goroutine, avoiding scheduler overhead for the sugar-wrapper
 // single-item case.
 //
-// Used as the single fan-out primitive across the library —
+// Used as the single fan-out primitive across the package —
 // partition writes, parallel data-file downloads, multi-pattern
 // LISTs, BackfillIndex, etc. all funnel through here so the
 // "first error wins, parent cancel surfaces" semantics are
 // implemented once.
-func FanOut[I any](
+func fanOut[I any](
 	ctx context.Context,
 	items []I,
 	concurrency int,
@@ -101,9 +101,9 @@ func FanOut[I any](
 	return parentCtx.Err()
 }
 
-// FanOutMapReduce runs mapFn across items in parallel via FanOut,
+// fanOutMapReduce runs mapFn across items in parallel via fanOut,
 // then folds the per-item slices through reduceFn. The map step
-// reuses every guarantee of FanOut (worker pool, first-error wins,
+// reuses every guarantee of fanOut (worker pool, first-error wins,
 // cancellation propagation); the reduce step runs once on the main
 // goroutine after all workers finish, so reduceFn does not need to
 // be safe for concurrent use.
@@ -114,7 +114,7 @@ func FanOut[I any](
 //
 // Empty input returns reduceFn(nil) — reducers that need a different
 // empty-case answer should check for it themselves.
-func FanOutMapReduce[I, O, R any](
+func fanOutMapReduce[I, O, R any](
 	ctx context.Context,
 	items []I,
 	concurrency int,
@@ -122,7 +122,7 @@ func FanOutMapReduce[I, O, R any](
 	reduceFn func([][]O) R,
 ) (R, error) {
 	results := make([][]O, len(items))
-	err := FanOut(ctx, items, concurrency,
+	err := fanOut(ctx, items, concurrency,
 		func(ctx context.Context, i int, item I) error {
 			r, err := mapFn(ctx, item)
 			if err != nil {

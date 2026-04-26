@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/ueisele/s3store/internal/core"
 	"github.com/ueisele/s3store/s3parquet"
 )
 
@@ -159,33 +158,30 @@ type Config[T any] struct {
 // which sub-handle produced the error.
 var ErrRefStreamDisabled = s3parquet.ErrRefStreamDisabled
 
-// Re-export core types so callers of the umbrella never need
-// to import internal/core directly.
+// Re-export sub-package types so callers of the umbrella never
+// need to import s3parquet / internal/core directly.
 
-// Offset represents a position in the stream.
-type Offset = core.Offset
-
-// OffsetUnbounded is the "no bound on this side" sentinel for
-// Poll / PollRecords. As `since` it means stream head; as the
-// upper bound on a single call it means up to the live tip. See
-// core.OffsetUnbounded. ReadRangeIter takes time.Time bounds and
-// uses time.Time{} as its own unbounded sentinel.
-const OffsetUnbounded = core.OffsetUnbounded
+// Offset represents a position in the stream. Use the empty
+// string Offset("") as the unbounded sentinel: as `since` it
+// means stream head; as the upper bound it means up to the
+// live tip (now - SettleWindow). ReadRangeIter takes time.Time
+// bounds and uses time.Time{} as its own unbounded sentinel.
+type Offset = s3parquet.Offset
 
 // StreamEntry is a lightweight ref.
-type StreamEntry = core.StreamEntry
+type StreamEntry = s3parquet.StreamEntry
 
 // WriteResult contains metadata about a completed write.
-type WriteResult = core.WriteResult
+type WriteResult = s3parquet.WriteResult
 
 // WriteOption configures write-path behavior. See
 // s3parquet.WriteOption for the full contract — this umbrella
 // alias exists so callers don't have to import s3parquet just to
 // pass WithIdempotencyToken through.
-type WriteOption = core.WriteOption
+type WriteOption = s3parquet.WriteOption
 
 // WithIdempotencyToken marks a write as a retry-safe logical unit.
-// See core.WithIdempotencyToken for the full contract (token
+// See s3parquet.WithIdempotencyToken for the full contract (token
 // replaces the library-default id in the data filename; retries
 // trigger overwrite-prevention so the parquet body is not re-
 // uploaded; maxRetryAge bounds the scoped LIST used to dedup
@@ -193,25 +189,30 @@ type WriteOption = core.WriteOption
 func WithIdempotencyToken(
 	token string, maxRetryAge time.Duration,
 ) WriteOption {
-	return core.WithIdempotencyToken(token, maxRetryAge)
+	return s3parquet.WithIdempotencyToken(token, maxRetryAge)
 }
 
 // QueryOption configures read-path behavior.
-type QueryOption = core.QueryOption
+type QueryOption = s3parquet.QueryOption
 
 // WithHistory disables latest-per-key deduplication on any
 // read path. When neither EntityKeyOf (parquet path) nor
 // EntityKeyColumns (SQL path) is configured, dedup is a no-op
 // regardless of this option.
 func WithHistory() QueryOption {
-	return core.WithHistory()
+	return s3parquet.WithHistory()
 }
+
+// PollOption configures Poll / PollRecords. Aliased to the
+// s3parquet type so callers don't import the sub-package just
+// to construct WithUntilOffset.
+type PollOption = s3parquet.PollOption
 
 // WithUntilOffset bounds Poll / PollRecords from above: only
 // entries with offset < until are returned (half-open range).
 // Pair with OffsetAt to read records in a time window.
-func WithUntilOffset(until Offset) QueryOption {
-	return core.WithUntilOffset(until)
+func WithUntilOffset(until Offset) PollOption {
+	return s3parquet.WithUntilOffset(until)
 }
 
 // WithReadAheadPartitions tells partition-streaming readers
@@ -219,7 +220,7 @@ func WithUntilOffset(until Offset) QueryOption {
 // the yield position. Default is 1 (one partition lookahead so
 // decode of N+1 overlaps yield of N). Values < 1 are floored to 1.
 func WithReadAheadPartitions(n int) QueryOption {
-	return core.WithReadAheadPartitions(n)
+	return s3parquet.WithReadAheadPartitions(n)
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
@@ -227,9 +228,9 @@ func WithReadAheadPartitions(n int) QueryOption {
 // ReadIter / ReadRangeIter. Composes with
 // WithReadAheadPartitions — whichever cap binds first holds the
 // producer back. Useful for skewed partition sizes. See
-// core.WithReadAheadBytes for the full contract.
+// s3parquet.WithReadAheadBytes for the full contract.
 func WithReadAheadBytes(n int64) QueryOption {
-	return core.WithReadAheadBytes(n)
+	return s3parquet.WithReadAheadBytes(n)
 }
 
 // WithIdempotentRead makes snapshot reads retry-safe: the result
@@ -241,7 +242,7 @@ func WithReadAheadBytes(n int64) QueryOption {
 // the offset cursor already provides retry-safety on that path.
 // Pair with WithIdempotencyToken on the write side; one token
 // drives both halves of a retry-safe read-modify-write. See
-// core.WithIdempotentRead for the full contract.
+// s3parquet.WithIdempotentRead for the full contract.
 func WithIdempotentRead(token string) QueryOption {
-	return core.WithIdempotentRead(token)
+	return s3parquet.WithIdempotentRead(token)
 }

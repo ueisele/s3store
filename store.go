@@ -173,7 +173,7 @@ func (s *Store[T]) Query(
 // See s3parquet.Reader.Poll for the full contract.
 func (s *Store[T]) Poll(
 	ctx context.Context, since Offset, maxEntries int32,
-	opts ...QueryOption,
+	opts ...PollOption,
 ) ([]StreamEntry, Offset, error) {
 	return s.parquetReader.Poll(ctx, since, maxEntries, opts...)
 }
@@ -184,7 +184,7 @@ func (s *Store[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
 	maxEntries int32,
-	opts ...QueryOption,
+	opts ...PollOption,
 ) ([]T, Offset, error) {
 	return s.parquetReader.PollRecords(ctx, since, maxEntries, opts...)
 }

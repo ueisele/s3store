@@ -9,7 +9,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/parquet-go/parquet-go"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 type testRec struct {
@@ -242,7 +241,7 @@ func TestOffsetAt(t *testing.T) {
 	anchor := time.UnixMicro(2_000_000_000_000_000)
 	off := s.OffsetAt(anchor)
 
-	earlier := core.EncodeRefKey(
+	earlier := encodeRefKey(
 		s.refPath, anchor.Add(-time.Millisecond).UnixMicro(),
 		"abcd1234", anchor.Add(-time.Millisecond).UnixMicro(),
 		"period=X/customer=y")
@@ -250,7 +249,7 @@ func TestOffsetAt(t *testing.T) {
 		t.Errorf("earlier ref %q should sort before offset %q",
 			earlier, off)
 	}
-	same := core.EncodeRefKey(
+	same := encodeRefKey(
 		s.refPath, anchor.UnixMicro(),
 		"abcd1234", anchor.UnixMicro(),
 		"period=X/customer=y")
@@ -258,7 +257,7 @@ func TestOffsetAt(t *testing.T) {
 		t.Errorf("same-time ref %q should sort >= offset %q",
 			same, off)
 	}
-	later := core.EncodeRefKey(
+	later := encodeRefKey(
 		s.refPath, anchor.Add(time.Second).UnixMicro(),
 		"abcd1234", anchor.Add(time.Second).UnixMicro(),
 		"period=X/customer=y")

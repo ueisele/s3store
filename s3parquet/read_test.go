@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/parquet-go/parquet-go"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // dedupRec is a pure-Go scratch record used to exercise the dedup
@@ -185,7 +184,7 @@ func TestDedupePatterns(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := core.DedupePatterns(tc.in)
+			got := dedupePatterns(tc.in)
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %v (len %d), want %v (len %d)",
 					got, len(got), tc.want, len(tc.want))

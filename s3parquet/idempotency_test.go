@@ -1,9 +1,43 @@
-package core
+package s3parquet
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestValidateIdempotencyToken(t *testing.T) {
+	cases := []struct {
+		name    string
+		token   string
+		wantErr bool
+	}{
+		{"ok simple", "batch42", false},
+		{"ok with dashes", "2026-04-22T10:15:00Z-batch42", false},
+		{"ok with digits", "job.1234567890", false},
+		{"ok max length", strings.Repeat("a", 200), false},
+		{"empty", "", true},
+		{"too long", strings.Repeat("a", 201), true},
+		{"contains slash", "ns/job42", true},
+		{"contains dotdot", "job..42", true},
+		{"contains space", "job 42", true},
+		{"contains tab", "job\t42", true},
+		{"contains null", "job\x0042", true},
+		{"contains unicode", "jöb42", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateIdempotencyToken(tc.token)
+			if tc.wantErr && err == nil {
+				t.Errorf("want error for %q, got nil", tc.token)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("want nil error for %q, got %v",
+					tc.token, err)
+			}
+		})
+	}
+}
 
 // TestApplyIdempotentRead_NoTokenNoFilter guards the
 // fast-path: empty token means the helper returns its input.
@@ -11,7 +45,7 @@ func TestApplyIdempotentRead_NoTokenNoFilter(t *testing.T) {
 	in := []KeyMeta{
 		{Key: "p/data/period=A/1.parquet", InsertedAt: time.UnixMicro(1)},
 	}
-	got := ApplyIdempotentRead(in, "p/data", "")
+	got := applyIdempotentRead(in, "p/data", "")
 	if len(got) != len(in) {
 		t.Fatalf("empty token filtered: got %d, want %d", len(got), len(in))
 	}
@@ -26,7 +60,7 @@ func TestApplyIdempotentRead_FirstAttempt(t *testing.T) {
 		{Key: "p/data/period=A/other-1.parquet", InsertedAt: now},
 		{Key: "p/data/period=B/other-2.parquet", InsertedAt: now},
 	}
-	got := ApplyIdempotentRead(in, "p/data", "tok42")
+	got := applyIdempotentRead(in, "p/data", "tok42")
 	if len(got) != 2 {
 		t.Fatalf("no token match expected pass-through, got %d", len(got))
 	}
@@ -40,9 +74,9 @@ func TestApplyIdempotentRead_SelfExclusion(t *testing.T) {
 	earlier := now.Add(-time.Second)
 	in := []KeyMeta{
 		{Key: "p/data/period=A/tok42.parquet", InsertedAt: now},
-		{Key: "p/data/period=A/x.parquet", InsertedAt: earlier}, // pre-barrier → kept
+		{Key: "p/data/period=A/x.parquet", InsertedAt: earlier},
 	}
-	got := ApplyIdempotentRead(in, "p/data", "tok42")
+	got := applyIdempotentRead(in, "p/data", "tok42")
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1 (pre-barrier only)", len(got))
 	}
@@ -64,7 +98,7 @@ func TestApplyIdempotentRead_LaterWriteExclusion(t *testing.T) {
 		{Key: "p/data/period=A/later.parquet", InsertedAt: laterTs},
 		{Key: "p/data/period=A/earlier.parquet", InsertedAt: earlierTs},
 	}
-	got := ApplyIdempotentRead(in, "p/data", "tok42")
+	got := applyIdempotentRead(in, "p/data", "tok42")
 
 	if len(got) != 1 {
 		t.Fatalf("got %d survivors, want 1", len(got))
@@ -75,8 +109,7 @@ func TestApplyIdempotentRead_LaterWriteExclusion(t *testing.T) {
 }
 
 // TestApplyIdempotentRead_PerPartitionIsolation guards that
-// each partition's barrier is computed independently: partition
-// A has a token; partition B does not. B's files flow through.
+// each partition's barrier is computed independently.
 func TestApplyIdempotentRead_PerPartitionIsolation(t *testing.T) {
 	ownTs := time.UnixMicro(1_000)
 	laterTs := time.UnixMicro(2_000)
@@ -86,7 +119,7 @@ func TestApplyIdempotentRead_PerPartitionIsolation(t *testing.T) {
 		{Key: "p/data/period=A/blocked.parquet", InsertedAt: laterTs},
 		{Key: "p/data/period=B/unfiltered.parquet", InsertedAt: laterTs},
 	}
-	got := ApplyIdempotentRead(in, "p/data", "tok42")
+	got := applyIdempotentRead(in, "p/data", "tok42")
 
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1", len(got))
@@ -97,32 +130,25 @@ func TestApplyIdempotentRead_PerPartitionIsolation(t *testing.T) {
 }
 
 // TestApplyIdempotentRead_MultipleOwnAttempts handles the case
-// where the same token produced two files in the same partition
-// (e.g. at-least-once retry without overwrite-prevention). The
-// barrier is min(LastModified of own files) so the earliest
-// attempt defines the cutoff, and the later attempt is also
-// self-excluded.
+// where the same token produced two files in the same partition.
+// The barrier is min(LastModified of own files) so the earliest
+// attempt defines the cutoff.
 func TestApplyIdempotentRead_MultipleOwnAttempts(t *testing.T) {
 	t1 := time.UnixMicro(1_000)
 	t2 := time.UnixMicro(2_000)
 
-	// A pre-barrier record (< t1) should survive; one record at
-	// the barrier, one after it — both must go.
 	pre := time.UnixMicro(500)
 	atBar := time.UnixMicro(1_000)
 	postBar := time.UnixMicro(1_500)
 
 	in := []KeyMeta{
 		{Key: "p/data/period=A/tok42.parquet", InsertedAt: t1},
-		// At-least-once retry produced another token file at t2.
-		// With overwrite-prevention this is impossible, but defend
-		// against it anyway — ApplyIdempotentRead is a pure filter.
 		{Key: "p/data/period=A/tok42.parquet", InsertedAt: t2},
 		{Key: "p/data/period=A/pre.parquet", InsertedAt: pre},
 		{Key: "p/data/period=A/at.parquet", InsertedAt: atBar},
 		{Key: "p/data/period=A/post.parquet", InsertedAt: postBar},
 	}
-	got := ApplyIdempotentRead(in, "p/data", "tok42")
+	got := applyIdempotentRead(in, "p/data", "tok42")
 
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1", len(got))
@@ -142,10 +168,8 @@ func TestApplyIdempotentRead_NonDataFileKeysPassThrough(t *testing.T) {
 		{Key: "p/data/period=A/blocked.parquet", InsertedAt: time.UnixMicro(2_000)},
 		{Key: "some/other/path.txt", InsertedAt: time.UnixMicro(5_000)},
 	}
-	got := ApplyIdempotentRead(in, "p/data", "tok42")
+	got := applyIdempotentRead(in, "p/data", "tok42")
 
-	// Only "some/other/path.txt" should survive among non-token,
-	// non-partition entries; "blocked.parquet" is dropped.
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1", len(got))
 	}
@@ -155,10 +179,8 @@ func TestApplyIdempotentRead_NonDataFileKeysPassThrough(t *testing.T) {
 }
 
 // TestApplyIdempotentRead_TokenWithDashes guards that token
-// values containing dashes (e.g. the "{ISO-time}-{suffix}"
-// convention callers often use) are matched via exact basename
-// comparison rather than any parsing that might misread the
-// internal dashes.
+// values containing dashes are matched via exact basename
+// comparison.
 func TestApplyIdempotentRead_TokenWithDashes(t *testing.T) {
 	t1 := time.UnixMicro(1_000)
 	tLater := time.UnixMicro(2_000)
@@ -168,7 +190,7 @@ func TestApplyIdempotentRead_TokenWithDashes(t *testing.T) {
 		{Key: "p/data/period=A/" + token + ".parquet", InsertedAt: t1},
 		{Key: "p/data/period=A/blocked.parquet", InsertedAt: tLater},
 	}
-	got := ApplyIdempotentRead(in, "p/data", token)
+	got := applyIdempotentRead(in, "p/data", token)
 
 	if len(got) != 0 {
 		t.Fatalf("got %d survivors, want 0 (both filtered)", len(got))

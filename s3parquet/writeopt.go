@@ -1,14 +1,10 @@
-package core
+package s3parquet
 
 import "time"
 
-// WriteOption configures write-path behavior. Mirrors the existing
+// WriteOption configures write-path behavior. Mirrors the
 // QueryOption pattern so the write side has the same mental model:
 // one option type, one accumulator, one place to add new knobs.
-//
-// Today only WithIdempotencyToken exists; future write-side knobs
-// (e.g. retry tuning, consistency overrides per call) land on the
-// same type without changing any Write / WriteWithKey signature.
 type WriteOption func(*WriteOpts)
 
 // WriteOpts is the resolved set of write-path options after
@@ -20,7 +16,7 @@ type WriteOpts struct {
 	// {tsMicros}-{shortID} id inside the data filename. Retries
 	// of the same logical write produce deterministic data paths
 	// so overwrite-prevention fires and no parquet body is
-	// re-uploaded. Validated via ValidateIdempotencyToken at the
+	// re-uploaded. Validated via validateIdempotencyToken at the
 	// option-application site, not at PUT time, so typos / illegal
 	// characters surface immediately.
 	IdempotencyToken string
@@ -55,10 +51,10 @@ func (o *WriteOpts) Apply(opts ...WriteOption) {
 //     not found (scenario B: data landed but ref didn't) writes
 //     the ref to complete the interrupted attempt.
 //
-// token must pass ValidateIdempotencyToken (non-empty, no "/",
-// no "..", printable ASCII, <= 200 chars) — validation runs here
-// so bad tokens fail at the call site rather than inside the
-// write path.
+// token must pass validateIdempotencyToken (non-empty, no "/",
+// no "..", printable ASCII, <= 200 chars) — validation runs at
+// resolve time so bad tokens fail at the call site rather than
+// inside the write path.
 //
 // maxRetryAge bounds how far back the scoped LIST scans on the
 // retry path. Required (> 0); pick based on your retry SLA:

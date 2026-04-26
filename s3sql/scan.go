@@ -8,7 +8,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/go-viper/mapstructure/v2"
-	"github.com/ueisele/s3store/internal/core"
+	"github.com/ueisele/s3store/s3parquet"
 )
 
 // ScanAll materializes every row from rows into a []T, binding
@@ -110,7 +110,7 @@ func buildScanBinder(t reflect.Type) (*scanBinder, error) {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	fields, err := core.ParquetFields(t)
+	fields, err := s3parquet.ParquetFields(t)
 	if err != nil {
 		return nil, err
 	}

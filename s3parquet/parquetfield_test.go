@@ -1,4 +1,4 @@
-package core
+package s3parquet
 
 import (
 	"reflect"
@@ -14,9 +14,6 @@ func TestParquetFields_Valid(t *testing.T) {
 		Empty    string `parquet:""`                                // empty name → skipped
 		Dash     string `parquet:"-"`                               // "-" → skipped
 	}
-	// Unexported fields are skipped silently — exercised by
-	// TestParquetFields_Order's struct (no unexported there) and
-	// implicitly by every caller; tested separately here.
 	type RecWithUnexported struct {
 		Public  string `parquet:"public"`
 		private string `parquet:"private"` //nolint:unused // intentional: tests skip-unexported rule
@@ -98,7 +95,6 @@ func TestParquetFields_PreservesField(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1", len(got))
 	}
-	// Verify Field carries through the original tag string + index.
 	if got[0].Field.Tag.Get("parquet") != "sku,extra" {
 		t.Errorf("Field.Tag did not round-trip the original tag")
 	}

@@ -7,34 +7,34 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/ueisele/s3store/internal/core"
 )
 
 // ResolvePatterns chains the standard pattern→keys pipeline:
-// BuildReadPlans → listDataFiles → ApplyIdempotentReadOpts.
-// Returns the deduplicated KeyMetas matching any pattern, with
-// IdempotentRead filtering applied when opts.IdempotentReadToken
-// is set. Empty patterns slice or no matches → (nil, nil).
+// dedupe → buildReadPlans → listDataFiles →
+// applyIdempotentReadOpts. Returns the deduplicated KeyMetas
+// matching any pattern, with IdempotentRead filtering applied
+// when opts.IdempotentReadToken is set. Empty patterns slice or
+// no matches → (nil, nil).
 //
 // Used by every snapshot-style read entry point (Read / ReadIter /
 // ReadRangeIter on the parquet side, Query on the SQL side) so
-// the three-step chain lives in exactly one place. Lives outside
-// S3Target because it composes higher-level concepts (read plans,
-// idempotency tokens, QueryOpts) that the low-level S3 handle
-// shouldn't carry.
+// the chain lives in exactly one place. Pattern dedupe runs here
+// rather than at every call site so accidental duplicates don't
+// cause duplicate LIST round-trips, regardless of caller.
 //
 // The partition LIST inherits the target's ConsistencyControl
 // from t — every t.listEach call does — so callers don't need
 // to thread the level explicitly.
 func ResolvePatterns(
 	ctx context.Context, t S3Target, patterns []string,
-	opts *core.QueryOpts,
-) ([]core.KeyMeta, error) {
+	opts *QueryOpts,
+) ([]KeyMeta, error) {
+	patterns = dedupePatterns(patterns)
 	if len(patterns) == 0 {
 		return nil, nil
 	}
-	dataPath := core.DataPath(t.Prefix())
-	plans, err := core.BuildReadPlans(patterns, dataPath, t.PartitionKeyParts())
+	dataPath := DataPath(t.Prefix())
+	plans, err := buildReadPlans(patterns, dataPath, t.PartitionKeyParts())
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +42,7 @@ func ResolvePatterns(
 	if err != nil {
 		return nil, err
 	}
-	return core.ApplyIdempotentReadOpts(keys, dataPath, opts)
+	return applyIdempotentReadOpts(keys, dataPath, opts)
 }
 
 // listDataFiles returns the deduplicated union of parquet objects
@@ -60,25 +60,25 @@ func ResolvePatterns(
 // so files outside the partition tree are silently skipped.
 func listDataFiles(
 	ctx context.Context, t S3Target,
-	plans []*core.ReadPlan,
-) ([]core.KeyMeta, error) {
-	dataPath := core.DataPath(t.Prefix())
-	return core.FanOutMapReduce(ctx, plans,
+	plans []*readPlan,
+) ([]KeyMeta, error) {
+	dataPath := DataPath(t.Prefix())
+	return fanOutMapReduce(ctx, plans,
 		t.EffectiveMaxInflightRequests(),
-		func(ctx context.Context, plan *core.ReadPlan) ([]core.KeyMeta, error) {
-			var out []core.KeyMeta
-			err := t.listEach(ctx, plan.ListPrefix, "", 0,
+		func(ctx context.Context, plan *readPlan) ([]KeyMeta, error) {
+			var out []KeyMeta
+			err := t.listEach(ctx, plan.listPrefix, "", 0,
 				func(obj s3types.Object) (bool, error) {
 					objKey := aws.ToString(obj.Key)
 					if !strings.HasSuffix(objKey, ".parquet") {
 						return true, nil
 					}
-					hiveKey, ok := core.HiveKeyOfDataFile(objKey, dataPath)
+					hiveKey, ok := hiveKeyOfDataFile(objKey, dataPath)
 					if !ok {
 						return true, nil
 					}
-					if plan.Match(hiveKey) {
-						out = append(out, core.KeyMeta{
+					if plan.match(hiveKey) {
+						out = append(out, KeyMeta{
 							Key:        objKey,
 							InsertedAt: aws.ToTime(obj.LastModified),
 							Size:       aws.ToInt64(obj.Size),
@@ -91,7 +91,7 @@ func listDataFiles(
 			}
 			return out, nil
 		},
-		func(per [][]core.KeyMeta) []core.KeyMeta {
-			return core.UnionKeys(per, func(k core.KeyMeta) string { return k.Key })
+		func(per [][]KeyMeta) []KeyMeta {
+			return unionKeys(per, func(k KeyMeta) string { return k.Key })
 		})
 }

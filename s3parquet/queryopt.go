@@ -1,8 +1,10 @@
-package core
+package s3parquet
 
 // QueryOption configures read-path behavior. Shared across
-// every read API (Read, Query, QueryRow, PollRecords) so there's
-// one option type and one mental model for every read.
+// every read API (Read, Query, QueryRow) so there's one option
+// type and one mental model for every read. Poll/PollRecords
+// have their own PollOption type — the option spaces don't
+// overlap.
 type QueryOption func(*QueryOpts)
 
 // QueryOpts is the resolved set of read-path options after
@@ -11,11 +13,6 @@ type QueryOption func(*QueryOpts)
 // second layer of indirection.
 type QueryOpts struct {
 	IncludeHistory bool
-	// Until, when non-empty, is an exclusive upper bound on
-	// stream offsets returned by Poll / PollRecords: entries
-	// whose offset is >= Until are skipped, giving a half-open
-	// [since, Until) range. Matches Kafka's offset semantics.
-	Until Offset
 	// ReadAheadPartitions controls how many partitions ahead of
 	// the current yield position a streaming read (ReadIter) may
 	// download. Zero keeps the current strict-serial behavior
@@ -42,7 +39,7 @@ type QueryOpts struct {
 	// the barrier is dropped too (per partition). Enables retry-
 	// safe read-modify-write: the second attempt reads the same
 	// state the first attempt saw, computes the same diff, writes
-	// the same bytes. Validated via ValidateIdempotencyToken at
+	// the same bytes. Validated via validateIdempotencyToken at
 	// read time — shares the grammar with WithIdempotencyToken so
 	// the token a caller stores for their write also drives the
 	// matching read.
@@ -67,16 +64,6 @@ func (o *QueryOpts) Apply(opts ...QueryOption) {
 func WithHistory() QueryOption {
 	return func(o *QueryOpts) {
 		o.IncludeHistory = true
-	}
-}
-
-// WithUntilOffset bounds Poll / PollRecords from above: only
-// entries with offset < until are returned (half-open range).
-// Pair with OffsetAt to read records in a time window.
-// Zero-value offset disables the bound.
-func WithUntilOffset(until Offset) QueryOption {
-	return func(o *QueryOpts) {
-		o.Until = until
 	}
 }
 
@@ -176,7 +163,7 @@ func WithReadAheadBytes(n int64) QueryOption {
 // side LIST path (the single-pattern DuckDB-glob fast path is
 // skipped) so the same filter applies consistently.
 //
-// token must pass ValidateIdempotencyToken — same grammar as
+// token must pass validateIdempotencyToken — same grammar as
 // WithIdempotencyToken so one stored token drives both sides.
 // Invalid tokens surface at LIST time (not option-application
 // time, since QueryOption has no error return).

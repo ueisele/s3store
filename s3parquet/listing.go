@@ -1,4 +1,4 @@
-package core
+package s3parquet
 
 import "time"
 
@@ -31,14 +31,14 @@ type KeyMeta struct {
 	Size       int64
 }
 
-// UnionKeys flattens a set of per-plan LIST results into a
+// unionKeys flattens a set of per-plan LIST results into a
 // single deduplicated slice, preserving first-seen order so the
 // downstream GET pipeline is deterministic. keyOf extracts the
 // dedup key from each result (use the identity function when R
 // is itself a string).
-func UnionKeys[R any](perPlan [][]R, keyOf func(R) string) []R {
+func unionKeys[R any](elements [][]R, keyOf func(R) string) []R {
 	total := 0
-	for _, r := range perPlan {
+	for _, r := range elements {
 		total += len(r)
 	}
 	if total == 0 {
@@ -46,7 +46,7 @@ func UnionKeys[R any](perPlan [][]R, keyOf func(R) string) []R {
 	}
 	seen := make(map[string]struct{}, total)
 	out := make([]R, 0, total)
-	for _, r := range perPlan {
+	for _, r := range elements {
 		for _, v := range r {
 			k := keyOf(v)
 			if _, ok := seen[k]; ok {
@@ -59,26 +59,20 @@ func UnionKeys[R any](perPlan [][]R, keyOf func(R) string) []R {
 	return out
 }
 
-// DedupePatterns removes literal-duplicate entries from a
+// dedupePatterns removes literal-duplicate entries from a
 // patterns slice, preserving first-seen order. Cheap pre-step
 // for the multi-pattern read paths so accidental duplicates
 // (e.g. from a generated list with possible repeats) don't cause
 // duplicate LIST round-trips. Doesn't catch semantic overlap —
 // patterns like "*" and "2026-*" both list overlapping files but
-// aren't string-equal; that case is still handled by UnionKeys
+// aren't string-equal; that case is still handled by unionKeys
 // at the key level, just at the cost of one extra LIST.
-func DedupePatterns(patterns []string) []string {
+//
+// Implemented as a thin wrapper around unionKeys (single batch +
+// identity key) so the dedup loop lives in one place.
+func dedupePatterns(patterns []string) []string {
 	if len(patterns) <= 1 {
 		return patterns
 	}
-	seen := make(map[string]struct{}, len(patterns))
-	out := make([]string, 0, len(patterns))
-	for _, p := range patterns {
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
-	}
-	return out
+	return unionKeys([][]string{patterns}, func(s string) string { return s })
 }

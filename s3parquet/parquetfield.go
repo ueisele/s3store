@@ -1,4 +1,4 @@
-package core
+package s3parquet
 
 import (
 	"fmt"
@@ -22,9 +22,9 @@ type ParquetField struct {
 
 // ParquetFields returns one entry per exported parquet-tagged
 // field on t, in field-declaration order. Shared by the index
-// projector/binder builders (s3parquet) and the SQL scan binder
-// (s3sql) so the parquet tag convention is interpreted in
-// exactly one place.
+// projector/binder builders and the SQL scan binder (s3sql) so
+// the parquet tag convention is interpreted in exactly one
+// place.
 //
 // Tag handling matches the project's convention everywhere:
 //
