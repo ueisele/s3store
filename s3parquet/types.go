@@ -8,7 +8,7 @@ import (
 )
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /
-// PollRecordsIter when the Target has DisableRefStream set. The
+// ReadRangeIter when the Target has DisableRefStream set. The
 // dataset was written without ref files, so there is no stream
 // to tail. OffsetAt stays usable (pure timestamp encoding).
 //
@@ -16,14 +16,16 @@ import (
 // matches whether the caller imported s3store or s3parquet.
 var ErrRefStreamDisabled = errors.New(
 	"ref stream disabled on this Store; " +
-		"Poll/PollRecords/PollRecordsIter unavailable")
+		"Poll/PollRecords/ReadRangeIter unavailable")
 
 // Offset represents a position in the stream.
 type Offset = core.Offset
 
 // OffsetUnbounded is the "no bound on this side" sentinel for
-// Poll / PollRecords / PollRecordsIter. As `since` it means
-// stream head; as `until` it means live tip. See core.OffsetUnbounded.
+// Poll / PollRecords. As `since` it means stream head; as the
+// upper bound on a single call it means up to the live tip. See
+// core.OffsetUnbounded. ReadRangeIter takes time.Time bounds and
+// uses time.Time{} as its own unbounded sentinel.
 const OffsetUnbounded = core.OffsetUnbounded
 
 // StreamEntry is a lightweight ref returned by Poll.
@@ -65,7 +67,7 @@ func WithUntilOffset(until Offset) QueryOption {
 	return core.WithUntilOffset(until)
 }
 
-// WithReadAheadPartitions tells ReadIter / PollRecordsIter to
+// WithReadAheadPartitions tells ReadIter / ReadRangeIter to
 // prefetch n partitions ahead of the yield position. Default is 1
 // (one partition lookahead so decode of N+1 overlaps yield of N).
 // Values < 1 are floored to 1. See core.WithReadAheadPartitions
@@ -75,7 +77,7 @@ func WithReadAheadPartitions(n int) QueryOption {
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
-// bytes that may sit decoded in the ReadIter / PollRecordsIter
+// bytes that may sit decoded in the ReadIter / ReadRangeIter
 // pipeline ahead of the current yield position. Composes with
 // WithReadAheadPartitions — whichever cap binds first holds the
 // producer back. See core.WithReadAheadBytes for the full
@@ -86,7 +88,7 @@ func WithReadAheadBytes(n int64) QueryOption {
 
 // WithIdempotentRead makes snapshot reads retry-safe: the result
 // reflects state as of the first write of the given idempotency
-// token. Applies to Read / ReadIter / PollRecordsIter. Ignored
+// token. Applies to Read / ReadIter / ReadRangeIter. Ignored
 // on PollRecords — the offset cursor already provides retry-safety
 // on that path. Pair with WithIdempotencyToken on the write side
 // so one token drives both sides of the retry. See

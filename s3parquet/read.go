@@ -52,49 +52,6 @@ func (s *Reader[T]) Read(
 	return s.sortAndCollect(records, o.IncludeHistory), nil
 }
 
-// ReadIter returns an iter.Seq2[T, error] yielding records one
-// at a time, streaming partition-by-partition. Use when Read's
-// O(records) memory is a problem.
-//
-// Dedup is per-partition (not global like Read): correct only
-// when the partition key strictly determines every component of
-// EntityKeyOf so no entity ever spans partitions. For layouts
-// that don't satisfy this invariant, use Read or pass WithHistory
-// and dedup yourself. Partitions emit in lex order; within a
-// partition, records emit in lex/insertion order.
-//
-// Memory: O(one partition's records) by default. Tune with
-// WithReadAheadPartitions (default 1; overlap decode of N+1 with
-// yield of N) and/or WithReadAheadBytes (uncompressed-size cap).
-//
-// Breaking out of the for-range loop cancels in-flight downloads —
-// no manual Close. Empty patterns slice yields nothing; a
-// malformed pattern surfaces as the iter's first error.
-func (s *Reader[T]) ReadIter(
-	ctx context.Context, keyPatterns []string, opts ...QueryOption,
-) iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		var o core.QueryOpts
-		o.Apply(opts...)
-
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		keys, err := ResolvePatterns(
-			ctx, s.cfg.Target, core.DedupePatterns(keyPatterns),
-			&o, s.cfg.ConsistencyControl)
-		if err != nil {
-			yield(*new(T), fmt.Errorf("s3parquet: ReadIter %w", err))
-			return
-		}
-		if len(keys) == 0 {
-			return
-		}
-
-		s.streamEager(ctx, keys, &o, yield)
-	}
-}
-
 // sortKeyMetasByKey orders a partition's files by their S3 key
 // for deterministic download order. Emission order is then
 // decided by emitPartition's record-content sort, so this only
@@ -144,24 +101,6 @@ func (s *Reader[T]) sortAndIterate(
 	return dedupLatestSeq(records, s.cfg.EntityKeyOf)
 }
 
-// emitPartition yields one partition's records to the consumer
-// through sortAndIterate, so the iter paths observe the same
-// order / replica-collapse / latest-per-entity semantics as the
-// materialised Read paths. Returns false when the consumer asked
-// to stop (yield returned false), so the outer loop can break
-// cleanly.
-func (s *Reader[T]) emitPartition(
-	recs []T, includeHistory bool,
-	yield func(T, error) bool,
-) bool {
-	for r := range s.sortAndIterate(recs, includeHistory) {
-		if !yield(r, nil) {
-			return false
-		}
-	}
-	return true
-}
-
 // sortAndCollect is the sync-caller wrapper around sortAndIterate
 // that materialises the result into a []T. When dedup is disabled
 // (sortCmp == nil) the input slice is returned as-is — no copy,
@@ -186,8 +125,8 @@ func (s *Reader[T]) sortAndCollect(
 }
 
 // identityKey is the keyOf function for []string fan-outs — the
-// element is itself the dedup key. Used by the index/backfill
-// callers that haven't been migrated to []core.KeyMeta.
+// element is itself the dedup key. Used by index/backfill
+// callers that union per-pattern lookup results.
 func identityKey(s string) string { return s }
 
 // downloadAndDecodeAll fans out a bounded set of parallel
@@ -258,28 +197,6 @@ func (s *Reader[T]) downloadAndDecodeOne(
 		return nil, fmt.Errorf("s3parquet: decode %s: %w", key, err)
 	}
 	return recs, nil
-}
-
-// groupKeysByPartition splits a flat list of data-file KeyMetas
-// into one slice per Hive partition (the path between dataPath
-// and the filename). Emission order is decided by the record-
-// level sort in emitPartition — groupKeysByPartition itself no
-// longer implies chronological-within-partition output.
-func (s *Reader[T]) groupKeysByPartition(
-	keys []core.KeyMeta,
-) map[string][]core.KeyMeta {
-	out := make(map[string][]core.KeyMeta)
-	for _, k := range keys {
-		hk, ok := core.HiveKeyOfDataFile(k.Key, s.dataPath)
-		if !ok {
-			// Defensively skip keys that don't parse. List paths
-			// already filtered to .parquet, so reaching here means
-			// a layout corruption — drop, don't error.
-			continue
-		}
-		out[hk] = append(out[hk], k)
-	}
-	return out
 }
 
 // decodeParquet reads all rows of a parquet file into []T. T

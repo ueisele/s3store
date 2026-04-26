@@ -20,8 +20,8 @@ import (
 // Method forwarding:
 //
 //   - Write, WriteWithKey, PartitionKey           → s3parquet.Writer
-//   - Read, ReadIter, Poll, OffsetAt,
-//     PollRecords, PollRecordsIter                → s3parquet.Reader
+//   - Read, ReadIter, ReadRangeIter, Poll,
+//     PollRecords, OffsetAt                       → s3parquet.Reader
 //   - Query                                       → s3sql.Reader
 //
 // Importing this package transitively pulls in DuckDB (cgo). For
@@ -189,20 +189,20 @@ func (s *Store[T]) PollRecords(
 	return s.parquetReader.PollRecords(ctx, since, maxEntries, opts...)
 }
 
-// PollRecordsIter delegates to the parquet Reader.
-// See s3parquet.Reader.PollRecordsIter for the full contract.
-func (s *Store[T]) PollRecordsIter(
+// ReadRangeIter delegates to the parquet Reader.
+// See s3parquet.Reader.ReadRangeIter for the full contract.
+func (s *Store[T]) ReadRangeIter(
 	ctx context.Context,
-	since, until Offset,
+	since, until time.Time,
 	opts ...QueryOption,
 ) iter.Seq2[T, error] {
-	return s.parquetReader.PollRecordsIter(ctx, since, until, opts...)
+	return s.parquetReader.ReadRangeIter(ctx, since, until, opts...)
 }
 
 // OffsetAt returns the stream offset corresponding to wall-clock
 // time t. Pure computation — no S3 call. Pair with WithUntilOffset
-// on Poll / PollRecords (or PollRecordsIter's until parameter) to
-// read records within a time window.
+// on Poll / PollRecords to read records within a time window —
+// or use ReadRangeIter, which takes time.Time bounds directly.
 func (s *Store[T]) OffsetAt(t time.Time) Offset {
 	return s.parquetReader.OffsetAt(t)
 }

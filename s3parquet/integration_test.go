@@ -1649,7 +1649,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 // every change). WithHistory is accepted but is the default
 // behavior on this path; latest-per-entity collapse is NOT
 // offered, because per-batch latest is meaningless on a cursor.
-// Use PollRecordsIter for snapshot semantics over a range.
+// Use ReadRangeIter for snapshot semantics over a range.
 func TestPollRecords(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{
@@ -1782,12 +1782,12 @@ func TestPollTimeWindow(t *testing.T) {
 	}
 }
 
-// TestPollRecordsIter exercises the streaming iter: a small
-// stream of writes, then PollRecordsIter drains the full window
-// via range. Also checks that zero offsets ("" / "") mean
+// TestReadRangeIter exercises the streaming iter: a small
+// stream of writes, then ReadRangeIter drains the full window
+// via range. Also checks that zero time.Time bounds mean
 // "stream head → live tip" and that an empty window terminates
 // without error or yielded records.
-func TestPollRecordsIter(t *testing.T) {
+func TestReadRangeIter(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1806,10 +1806,9 @@ func TestPollRecordsIter(t *testing.T) {
 
 	// Bounded window: all 5 records.
 	var got []Rec
-	for r, err := range store.PollRecordsIter(ctx,
-		store.OffsetAt(before), store.OffsetAt(after)) {
+	for r, err := range store.ReadRangeIter(ctx, before, after) {
 		if err != nil {
-			t.Fatalf("PollRecordsIter: %v", err)
+			t.Fatalf("ReadRangeIter: %v", err)
 		}
 		got = append(got, r)
 	}
@@ -1817,11 +1816,11 @@ func TestPollRecordsIter(t *testing.T) {
 		t.Fatalf("got %d, want 5", len(got))
 	}
 
-	// Open until (zero-value offset) reads to the live tip.
+	// Open bounds (zero-value time) read from stream head to live tip.
 	var open []Rec
-	for r, err := range store.PollRecordsIter(ctx, "", "") {
+	for r, err := range store.ReadRangeIter(ctx, time.Time{}, time.Time{}) {
 		if err != nil {
-			t.Fatalf("PollRecordsIter open: %v", err)
+			t.Fatalf("ReadRangeIter open: %v", err)
 		}
 		open = append(open, r)
 	}
@@ -1831,11 +1830,10 @@ func TestPollRecordsIter(t *testing.T) {
 
 	// Empty window yields nothing without error.
 	var empty []Rec
-	for r, err := range store.PollRecordsIter(ctx,
-		store.OffsetAt(before.Add(-time.Hour)),
-		store.OffsetAt(before.Add(-time.Minute))) {
+	for r, err := range store.ReadRangeIter(ctx,
+		before.Add(-time.Hour), before.Add(-time.Minute)) {
 		if err != nil {
-			t.Fatalf("PollRecordsIter empty: %v", err)
+			t.Fatalf("ReadRangeIter empty: %v", err)
 		}
 		empty = append(empty, r)
 	}
@@ -1844,14 +1842,14 @@ func TestPollRecordsIter(t *testing.T) {
 	}
 }
 
-// TestPollRecordsIter_EarlyBreak proves the streamEager break
+// TestReadRangeIter_EarlyBreak proves the downloadAndDecodeIter break
 // contract: breaking out of the range loop after the first
 // record stops further yielding (and cancels in-flight downloads
-// inside streamEager via its defer cancel). Note: the LIST walk
+// via the streaming pipeline's defer cancel). Note: the LIST walk
 // runs upfront before any record yields, so this test does not
 // claim "no further LIST" — it claims "no further records
 // yielded after break".
-func TestPollRecordsIter_EarlyBreak(t *testing.T) {
+func TestReadRangeIter_EarlyBreak(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1869,9 +1867,9 @@ func TestPollRecordsIter_EarlyBreak(t *testing.T) {
 	// Break after first record. The closure must observe yield
 	// returning false and stop — no further work, no error.
 	count := 0
-	for _, err := range store.PollRecordsIter(ctx, "", "") {
+	for _, err := range store.ReadRangeIter(ctx, time.Time{}, time.Time{}) {
 		if err != nil {
-			t.Fatalf("PollRecordsIter: %v", err)
+			t.Fatalf("ReadRangeIter: %v", err)
 		}
 		count++
 		if count == 1 {
@@ -1883,14 +1881,14 @@ func TestPollRecordsIter_EarlyBreak(t *testing.T) {
 	}
 }
 
-// TestPollRecordsIter_SnapshotsLiveTipCutoff guards the
-// snapshot-at-entry contract for OffsetUnbounded(until):
+// TestReadRangeIter_SnapshotsLiveTipCutoff guards the
+// snapshot-at-entry contract for the zero-time `until` bound:
 // writes that land AFTER the iter starts must not appear in the
 // yielded records. Without the snapshot, sustained writes during
 // the walk would keep the now-SettleWindow cutoff advancing and
 // the loop could expose them — defeating the "single-pass over
 // the stream as of this call" guarantee.
-func TestPollRecordsIter_SnapshotsLiveTipCutoff(t *testing.T) {
+func TestReadRangeIter_SnapshotsLiveTipCutoff(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -1933,10 +1931,9 @@ func TestPollRecordsIter_SnapshotsLiveTipCutoff(t *testing.T) {
 
 	// Drain — should only see the 3 pre-writes, not the 5 post-writes.
 	got := map[string]bool{}
-	for r, err := range store.PollRecordsIter(ctx,
-		s3parquet.OffsetUnbounded, s3parquet.OffsetUnbounded) {
+	for r, err := range store.ReadRangeIter(ctx, time.Time{}, time.Time{}) {
 		if err != nil {
-			t.Fatalf("PollRecordsIter: %v", err)
+			t.Fatalf("ReadRangeIter: %v", err)
 		}
 		got[r.Customer] = true
 	}
@@ -2121,8 +2118,8 @@ func TestDisableRefStream(t *testing.T) {
 		t.Errorf("Read: got %d, want %d", len(got), len(in))
 	}
 
-	// Poll + PollRecords + PollRecordsIter all refuse with the
-	// shared sentinel. PollRecordsIter surfaces the error via the
+	// Poll + PollRecords + ReadRangeIter all refuse with the
+	// shared sentinel. ReadRangeIter surfaces the error via the
 	// first yielded (zero, err) tuple.
 	if _, _, err := store.Poll(ctx, "", 10); !errors.Is(err, s3parquet.ErrRefStreamDisabled) {
 		t.Errorf("Poll: got %v, want ErrRefStreamDisabled", err)
@@ -2131,14 +2128,14 @@ func TestDisableRefStream(t *testing.T) {
 		t.Errorf("PollRecords: got %v, want ErrRefStreamDisabled", err)
 	}
 	var iterErr error
-	for _, err := range store.PollRecordsIter(ctx, "", "") {
+	for _, err := range store.ReadRangeIter(ctx, time.Time{}, time.Time{}) {
 		if err != nil {
 			iterErr = err
 			break
 		}
 	}
 	if !errors.Is(iterErr, s3parquet.ErrRefStreamDisabled) {
-		t.Errorf("PollRecordsIter: got %v, want ErrRefStreamDisabled", iterErr)
+		t.Errorf("ReadRangeIter: got %v, want ErrRefStreamDisabled", iterErr)
 	}
 
 	// OffsetAt stays usable: pure timestamp encoding, no S3

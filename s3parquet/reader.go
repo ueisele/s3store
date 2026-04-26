@@ -41,8 +41,8 @@ type ReaderConfig[T any] struct {
 	ConsistencyControl ConsistencyLevel
 }
 
-// Reader is the read-side half of a Store. Owns Read / Poll /
-// PollRecords / PollRecordsIter / OffsetAt. Construct directly
+// Reader is the read-side half of a Store. Owns Read / ReadIter /
+// ReadRangeIter / Poll / PollRecords / OffsetAt. Construct directly
 // via NewReader in read-only services, or via
 // NewReaderFromWriter / NewReaderFromStore for a (possibly
 // narrower-T) Reader over a Writer's / Store's data.

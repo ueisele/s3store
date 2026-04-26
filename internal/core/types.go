@@ -26,21 +26,18 @@ const RefSeparator = ";"
 type Offset string
 
 // OffsetUnbounded is the "no bound on this side" sentinel used by
-// Poll / PollRecords / PollRecordsIter. The interpretation depends
-// on which parameter it's passed to:
+// Poll / PollRecords. The interpretation depends on which
+// parameter it's passed to:
 //
 //   - As `since`: start at the stream head (earliest available).
-//   - As `until`: walk to the live tip (now - SettleWindow) as
-//     of the call. PollRecordsIter snapshots this cutoff at
-//     entry, so the walk has a stable upper bound and terminates
-//     even under sustained writes — writes landing after the
-//     call started are NOT picked up. Single-call APIs (Poll,
-//     PollRecords) likewise return entries up to the call-time
-//     cutoff. To keep up with new writes, call again from the
-//     last offset.
+//   - As the upper bound (passed via WithUntilOffset, or implied
+//     when no bound is given): walk to the live tip
+//     (now - SettleWindow) as of the call. To keep up with new
+//     writes, call again from the last offset.
 //
 // Equivalent to Offset("") — use the named constant at call sites
-// for self-documenting intent.
+// for self-documenting intent. ReadRangeIter takes time.Time bounds
+// instead and uses time.Time{} as its own unbounded sentinel.
 const OffsetUnbounded Offset = ""
 
 // StreamEntry is a lightweight ref.

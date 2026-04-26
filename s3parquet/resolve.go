@@ -17,7 +17,7 @@ import (
 // is set. Empty patterns slice or no matches → (nil, nil).
 //
 // Used by every snapshot-style read entry point (Read / ReadIter /
-// PollRecordsIter on the parquet side, Query on the SQL side) so
+// ReadRangeIter on the parquet side, Query on the SQL side) so
 // the three-step chain lives in exactly one place. Lives outside
 // S3Target because it composes higher-level concepts (read plans,
 // idempotency tokens, QueryOpts) that the low-level S3 handle

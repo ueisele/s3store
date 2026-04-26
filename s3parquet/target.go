@@ -92,7 +92,7 @@ type S3TargetConfig struct {
 	// records by key and calls WriteWithKey once per group, each
 	// of which issues one ref PUT without this flag). Read /
 	// Query / Lookup / BackfillIndex are unaffected; Poll /
-	// PollRecords / PollRecordsIter return ErrRefStreamDisabled.
+	// PollRecords / ReadRangeIter return ErrRefStreamDisabled.
 	// OffsetAt still works (pure timestamp encoding — no S3
 	// dependency).
 	//

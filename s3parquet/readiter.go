@@ -5,16 +5,159 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"slices"
 	"sync"
+	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
 	"github.com/ueisele/s3store/internal/core"
 )
 
-// streamEager is the byte-budget-aware streaming pipeline backing
-// ReadIter. Three concurrent stages plus the caller's yield loop:
+// ReadIter returns an iter.Seq2[T, error] yielding records one
+// at a time, streaming partition-by-partition. Use when Read's
+// O(records) memory is a problem.
+//
+// Dedup is per-partition (not global like Read): correct only
+// when the partition key strictly determines every component of
+// EntityKeyOf so no entity ever spans partitions. For layouts
+// that don't satisfy this invariant, use Read or pass WithHistory
+// and dedup yourself. Partitions emit in lex order; within a
+// partition, records emit in lex/insertion order.
+//
+// Memory: O(one partition's records) by default. Tune with
+// WithReadAheadPartitions (default 1; overlap decode of N+1 with
+// yield of N) and/or WithReadAheadBytes (uncompressed-size cap).
+//
+// Breaking out of the for-range loop cancels in-flight downloads —
+// no manual Close. Empty patterns slice yields nothing; a
+// malformed pattern surfaces as the iter's first error.
+func (s *Reader[T]) ReadIter(
+	ctx context.Context, keyPatterns []string, opts ...QueryOption,
+) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var o core.QueryOpts
+		o.Apply(opts...)
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		keys, err := ResolvePatterns(
+			ctx, s.cfg.Target, core.DedupePatterns(keyPatterns),
+			&o, s.cfg.ConsistencyControl)
+		if err != nil {
+			yield(*new(T), fmt.Errorf("s3parquet: ReadIter %w", err))
+			return
+		}
+		if len(keys) == 0 {
+			return
+		}
+
+		s.downloadAndDecodeIter(ctx, keys, &o, yield)
+	}
+}
+
+// ReadRangeIter streams every record written in the [since, until)
+// time window as an iter.Seq2[T, error]. Snapshot view of the ref
+// stream over a wall-clock range — no offset cursor, no resume.
+//
+// Zero time.Time on either bound means unbounded: since=zero starts
+// at the stream head, until=zero walks to the live tip
+// (now - SettleWindow, captured at call entry so the upper bound
+// stays stable under concurrent writes). Pair with non-zero values
+// for time-windowed reads:
+//
+//	start := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+//	end   := time.Date(2026, 4, 18, 0, 0, 0, 0, time.UTC)
+//	for r, err := range store.ReadRangeIter(ctx, start, end) { ... }
+//
+// Same per-partition dedup as ReadIter (default latest-per-entity
+// per partition; pass WithHistory to opt out). Memory bounded by
+// WithReadAheadPartitions / WithReadAheadBytes.
+//
+// The ref-LIST runs upfront before the first record yields — usually
+// sub-100ms but huge windows can take seconds; chunk via since/until.
+// Breaking out of the loop cancels in-flight downloads. Errors are
+// yielded as (zero, err) and terminate the iter.
+//
+// Does NOT expose per-batch offsets — consumer aborts cannot safely
+// resume. Use PollRecords (Kafka-style cursor) when you need to
+// checkpoint between batches.
+func (s *Reader[T]) ReadRangeIter(
+	ctx context.Context,
+	since, until time.Time,
+	opts ...QueryOption,
+) iter.Seq2[T, error] {
+	// Resolve time bounds outside the closure so the live-tip
+	// snapshot freezes at call entry, not at first iteration:
+	// without this, a busy writer could keep the walk running
+	// indefinitely as the now-SettleWindow cutoff advances.
+	var sinceOffset Offset
+	if !since.IsZero() {
+		sinceOffset = s.OffsetAt(since)
+	}
+	var untilOffset Offset
+	if until.IsZero() {
+		settleAt := time.Now().Add(
+			-s.cfg.Target.EffectiveSettleWindow())
+		untilOffset = s.OffsetAt(settleAt)
+	} else {
+		untilOffset = s.OffsetAt(until)
+	}
+	// Append Until last so it wins over any WithUntilOffset the
+	// caller snuck in via opts — the until parameter is the
+	// method's contract.
+	opts = append(opts, WithUntilOffset(untilOffset))
+
+	return func(yield func(T, error) bool) {
+		var o core.QueryOpts
+		o.Apply(opts...)
+
+		// Walk the ref stream into a flat KeyMeta slice. LIST-only
+		// (no parquet bodies fetched), so this phase is cheap. Use
+		// the LIST page max as the per-Poll cap to minimize round
+		// trips — the slice growth here is bounded metadata, not
+		// decoded record memory.
+		var keys []core.KeyMeta
+		cur := sinceOffset
+		for {
+			entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, opts...)
+			if err != nil {
+				yield(*new(T), err)
+				return
+			}
+			if len(entries) == 0 {
+				break
+			}
+			for _, e := range entries {
+				keys = append(keys, core.KeyMeta{
+					Key:        e.DataPath,
+					InsertedAt: e.InsertedAt,
+				})
+			}
+			cur = next
+		}
+		if len(keys) == 0 {
+			return
+		}
+
+		keys, err := core.ApplyIdempotentReadOpts(keys, s.dataPath, &o)
+		if err != nil {
+			yield(*new(T), fmt.Errorf("s3parquet: %w", err))
+			return
+		}
+		if len(keys) == 0 {
+			return
+		}
+
+		s.downloadAndDecodeIter(ctx, keys, &o, yield)
+	}
+}
+
+// downloadAndDecodeIter is the byte-budget-aware streaming pipeline backing
+// ReadIter and ReadRangeIter. Three concurrent stages plus the
+// caller's yield loop:
 //
 //  1. Producer goroutine: walks partitions in lex order and
 //     pushes (partIdx, fileIdx) jobs into a download queue.
@@ -42,7 +185,7 @@ import (
 // footers rather than partition counts, and a single oversized
 // partition still flows (the cap can't bind below partition
 // granularity without row-group-level streaming).
-func (s *Reader[T]) streamEager(
+func (s *Reader[T]) downloadAndDecodeIter(
 	ctx context.Context, keys []core.KeyMeta,
 	opts *core.QueryOpts, yield func(T, error) bool,
 ) {
@@ -134,6 +277,24 @@ func (s *Reader[T]) streamEager(
 	}
 }
 
+// emitPartition yields one partition's records to the consumer
+// through sortAndIterate, so the iter paths observe the same
+// order / replica-collapse / latest-per-entity semantics as the
+// materialised Read paths. Returns false when the consumer asked
+// to stop (yield returned false), so the outer loop can break
+// cleanly.
+func (s *Reader[T]) emitPartition(
+	recs []T, includeHistory bool,
+	yield func(T, error) bool,
+) bool {
+	for r := range s.sortAndIterate(recs, includeHistory) {
+		if !yield(r, nil) {
+			return false
+		}
+	}
+	return true
+}
+
 // preparePartitions groups the LIST result by Hive partition,
 // sorts partition keys lex, sorts files within each partition
 // by S3 key (deterministic download order), and allocates the
@@ -161,6 +322,28 @@ func (s *Reader[T]) preparePartitions(
 		}
 	}
 	return parts
+}
+
+// groupKeysByPartition splits a flat list of data-file KeyMetas
+// into one slice per Hive partition (the path between dataPath
+// and the filename). Emission order is decided by the record-
+// level sort in emitPartition — groupKeysByPartition itself no
+// longer implies chronological-within-partition output.
+func (s *Reader[T]) groupKeysByPartition(
+	keys []core.KeyMeta,
+) map[string][]core.KeyMeta {
+	out := make(map[string][]core.KeyMeta)
+	for _, k := range keys {
+		hk, ok := core.HiveKeyOfDataFile(k.Key, s.dataPath)
+		if !ok {
+			// Defensively skip keys that don't parse. List paths
+			// already filtered to .parquet, so reaching here means
+			// a layout corruption — drop, don't error.
+			continue
+		}
+		out[hk] = append(out[hk], k)
+	}
+	return out
 }
 
 // runProducer walks partitions in order and pushes one download

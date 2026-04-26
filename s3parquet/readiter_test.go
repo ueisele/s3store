@@ -117,7 +117,7 @@ func TestReserveBytes_CtxCancellation(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// Cancellation alone won't wake Wait(); the cond needs a
-	// broadcast. The streamEager pipeline pairs cancel() with a
+	// broadcast. The downloadAndDecodeIter pipeline pairs cancel() with a
 	// watchdog goroutine that broadcasts; here we do it inline.
 	cancel()
 	s.mu.Lock()

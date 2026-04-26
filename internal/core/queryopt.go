@@ -80,7 +80,7 @@ func WithUntilOffset(until Offset) QueryOption {
 	}
 }
 
-// WithReadAheadPartitions tells ReadIter / PollRecordsIter to
+// WithReadAheadPartitions tells ReadIter / ReadRangeIter to
 // prefetch n partitions ahead of the current yield position.
 // Default is 1 — minimum useful lookahead so
 // decode of partition N+1 overlaps yield of partition N. Pass a
@@ -104,7 +104,7 @@ func WithReadAheadPartitions(n int) QueryOption {
 }
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
-// bytes that may sit decoded in the ReadIter / PollRecordsIter
+// bytes that may sit decoded in the ReadIter / ReadRangeIter
 // pipeline ahead of the current yield position.
 // Zero (default) disables the cap; only WithReadAheadPartitions
 // binds.
@@ -144,7 +144,7 @@ func WithReadAheadBytes(n int64) QueryOption {
 // token, both sides.
 //
 // Applies to snapshot-style reads: Read / ReadIter /
-// PollRecordsIter / Query. NOT applied on PollRecords
+// ReadRangeIter / Query. NOT applied on PollRecords
 // (cursor-based, CDC-style) — the offset cursor
 // already provides retry-safety on that path, and the by-
 // LastModified barrier doesn't compose cleanly with offset-window

@@ -544,12 +544,11 @@ VersionOf: func(r Event) int64 { return r.InsertedAt.UnixMicro() }
 ### Stream — time window
 
 To read only records written within a time window (e.g. "yesterday's
-activity"), use `OffsetAt` to turn a wall-clock time into a stream offset.
-The range is half-open `[since, until)`, matching Kafka offset semantics.
+activity"), use `ReadRangeIter` with `time.Time` bounds. The range is
+half-open `[since, until)`, matching Kafka offset semantics.
 
-`PollRecordsIter` is the entry point for bounded windows. It returns
-an `iter.Seq2[T, error]` backed by the same `streamEager` pipeline
-that powers `ReadIter` — partition prefetch
+`ReadRangeIter` returns an `iter.Seq2[T, error]` backed by the same
+streaming pipeline that powers `ReadIter` — partition prefetch
 (`WithReadAheadPartitions`, default 1 = one partition lookahead),
 byte-budget streaming (`WithReadAheadBytes`, default 0 = uncapped),
 cross-file pipelining, per-partition dedup. Memory is bounded by
@@ -557,21 +556,21 @@ whichever cap binds first:
 
 ```go
 // All records written on 2026-04-17 (UTC).
-start := store.OffsetAt(time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC))
-end   := store.OffsetAt(time.Date(2026, 4, 18, 0, 0, 0, 0, time.UTC))
-for r, err := range store.PollRecordsIter(ctx, start, end) {
+start := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+end   := time.Date(2026, 4, 18, 0, 0, 0, 0, time.UTC)
+for r, err := range store.ReadRangeIter(ctx, start, end) {
     if err != nil { return err }
     // process r
 }
 ```
 
-Breaking out of the range loop cleanly cancels in-flight downloads
-inside `streamEager`. The ref LIST walk runs upfront before the first
-record yields — sub-100ms for typical windows, but for huge backfill
-windows chunk via `since`/`until` to stream incrementally instead of
-walking everything first. If you need to checkpoint offsets between
-batches (resume on cancel), use `PollRecords` (Kafka-style batched
-API) — `PollRecordsIter` does not surface per-batch offsets.
+Breaking out of the range loop cleanly cancels in-flight downloads.
+The ref LIST walk runs upfront before the first record yields —
+sub-100ms for typical windows, but for huge backfill windows chunk
+via `since`/`until` to stream incrementally instead of walking
+everything first. If you need to checkpoint offsets between batches
+(resume on cancel), use `PollRecords` (Kafka-style batched API) —
+`ReadRangeIter` does not surface per-batch offsets.
 
 Half-open boundary semantics:
 
@@ -581,19 +580,18 @@ Half-open boundary semantics:
 
 So to cover a full day, `end` is the start of the *next* day.
 
-**Timezone**: `OffsetAt` compares in UTC microseconds internally (offsets
-are encoded from `time.UnixMicro()`). `time.Date(..., time.UTC)` gives
-UTC-day boundaries; `time.Date(..., loc)` gives local-day boundaries —
-both work, as long as `start` and `end` use the same timezone.
+**Timezone**: `ReadRangeIter` compares in UTC microseconds internally
+(bounds are encoded from `time.UnixMicro()`). `time.Date(..., time.UTC)`
+gives UTC-day boundaries; `time.Date(..., loc)` gives local-day
+boundaries — both work, as long as `since` and `until` use the same
+timezone.
 
-Pass `s3store.OffsetUnbounded` (or `s3parquet.OffsetUnbounded` when
-using the sub-package directly) for `since` to start at the stream
+Pass `time.Time{}` (zero value) for `since` to start at the stream
 head, or for `until` to walk to the live tip (settle-window cutoff
 as of the call). The upper bound is **snapshotted at call entry**
 so the walk terminates even under sustained writes — writes landing
 after the call started are not picked up. To keep up with new
-writes, call again from the last seen offset (`PollRecords` exposes
-the next offset between batches).
+writes, use `PollRecords` and checkpoint between batches.
 
 For CDC / change-processing where every update matters and the
 caller checkpoints offsets between batches, use `PollRecords`
@@ -603,7 +601,7 @@ caller checkpoints offsets between batches, use `PollRecords`
 start := lastCheckpoint
 for {
     records, next, err := store.PollRecords(ctx, start, 100,
-        s3store.WithUntilOffset(end))
+        s3store.WithUntilOffset(store.OffsetAt(end)))
     if err != nil { return err }
     if len(records) == 0 { break }
     // process every record (no version collapse — see dedup below)
@@ -612,9 +610,9 @@ for {
 }
 ```
 
-**Dedup asymmetry between the two poll APIs**:
+**Dedup asymmetry between the two stream APIs**:
 
-- `PollRecordsIter` (range-bounded, snapshot-style): default
+- `ReadRangeIter` (range-bounded, snapshot-style): default
   latest-per-entity per partition, matching `Read` / `ReadIter`.
   You're reading "the state of this window"; collapsing to the
   latest version is what you want.
@@ -624,14 +622,14 @@ for {
   may carry a newer version of the same entity), so it's not
   offered. `WithHistory` is accepted but is the default here.
 
-`WithIdempotentRead` is supported on `PollRecordsIter` (snapshot
+`WithIdempotentRead` is supported on `ReadRangeIter` (snapshot
 semantics) and ignored on `PollRecords` (the offset cursor
 already provides retry-safety).
 
-`OffsetAt` is pure computation — no S3 call. `WithUntilOffset` breaks
-the paginator early once offsets reach `until`, so long streams aren't
-scanned past the window of interest. All three APIs — `OffsetAt`,
-`WithUntilOffset`, `PollRecordsIter` — are available on the umbrella,
+`OffsetAt` is pure computation — no S3 call — and bridges
+`time.Time` to the offset cursor used by `Poll` / `PollRecords` /
+`WithUntilOffset`. All four APIs — `OffsetAt`, `WithUntilOffset`,
+`ReadRangeIter`, `PollRecords` — are available on the umbrella,
 `s3parquet`, and `s3sql`.
 
 ### Stream — opting out (`DisableRefStream`)
@@ -658,9 +656,9 @@ Effect on each method:
 - **`Read` / `ReadIter` / `Query` / `Lookup` / `BackfillIndex`**
   — unaffected. They LIST `data/` (or `_index/<name>/`) directly
   and never consult refs.
-- **`Poll` / `PollRecords` / `PollRecordsIter`** — return
+- **`Poll` / `PollRecords` / `ReadRangeIter`** — return
   `s3store.ErrRefStreamDisabled` (shared sentinel, matches
-  `errors.Is` across packages). `PollRecordsIter` surfaces the
+  `errors.Is` across packages). `ReadRangeIter` surfaces the
   error via the first yielded `(zero, err)` tuple.
 - **`OffsetAt`** — still works. It's pure timestamp encoding with no
   S3 dependency, so it keeps returning well-formed offsets even
@@ -1152,8 +1150,8 @@ not diverging ones).
 
 **Scope** — accepted by every read path:
 
-- `s3parquet.Reader`: `Read`, `ReadIter`, `PollRecords`,
-  `PollRecordsIter`.
+- `s3parquet.Reader`: `Read`, `ReadIter`, `ReadRangeIter`,
+  `PollRecords`.
 - `s3sql.Reader`: `Query`.
 - Umbrella `Store`: all of the above forward through.
 
@@ -1515,7 +1513,7 @@ for any reasonable `SettleWindow`.
 
 The contract is **at-least-once** on both sides of the wire, plus
 **read-after-write** on every operation except `Poll` / `PollRecords`
-/ `PollRecordsIter` (which deliberately lag the live tip by
+/ `ReadRangeIter` (which deliberately lag the live tip by
 `SettleWindow` to tolerate S3 LIST propagation skew — see
 [Settle window](#settle-window)).
 
@@ -1544,7 +1542,7 @@ GET sees the committed bytes regardless. See the
 [DuckDB note](#duckdb-httpfs-has-no-per-request-header-hook) for
 the full reasoning.
 
-`Poll` / `PollRecords` / `PollRecordsIter` are the intentional
+`Poll` / `PollRecords` / `ReadRangeIter` are the intentional
 exceptions: they apply the `SettleWindow` cutoff so near-tip refs
 stay hidden until S3 LIST propagation has had time to settle. A
 ref that's written inside the window will be returned by a

@@ -115,7 +115,7 @@ type Config[T any] struct {
 	// DisableRefStream opts the dataset out of writing stream ref
 	// files under <Prefix>/_stream/refs/. Saves one S3 PUT per
 	// distinct partition key touched by a Write. Read / ReadIter /
-	// Query are unaffected; Poll / PollRecords / PollRecordsIter
+	// Query are unaffected; Poll / PollRecords / ReadRangeIter
 	// return ErrRefStreamDisabled. OffsetAt still works (pure
 	// timestamp encoding).
 	DisableRefStream bool
@@ -142,7 +142,7 @@ type Config[T any] struct {
 }
 
 // ErrRefStreamDisabled is returned by Poll / PollRecords /
-// PollRecordsIter when Config.DisableRefStream is set. Aliased
+// ReadRangeIter when Config.DisableRefStream is set. Aliased
 // to the shared sentinel so errors.Is matches regardless of
 // which sub-handle produced the error.
 var ErrRefStreamDisabled = s3parquet.ErrRefStreamDisabled
@@ -154,8 +154,10 @@ var ErrRefStreamDisabled = s3parquet.ErrRefStreamDisabled
 type Offset = core.Offset
 
 // OffsetUnbounded is the "no bound on this side" sentinel for
-// Poll / PollRecords / PollRecordsIter. As `since` it means
-// stream head; as `until` it means live tip. See core.OffsetUnbounded.
+// Poll / PollRecords. As `since` it means stream head; as the
+// upper bound on a single call it means up to the live tip. See
+// core.OffsetUnbounded. ReadRangeIter takes time.Time bounds and
+// uses time.Time{} as its own unbounded sentinel.
 const OffsetUnbounded = core.OffsetUnbounded
 
 // StreamEntry is a lightweight ref.
@@ -201,7 +203,7 @@ func WithUntilOffset(until Offset) QueryOption {
 }
 
 // WithReadAheadPartitions tells partition-streaming readers
-// (ReadIter / PollRecordsIter) to prefetch n partitions ahead of
+// (ReadIter / ReadRangeIter) to prefetch n partitions ahead of
 // the yield position. Default is 1 (one partition lookahead so
 // decode of N+1 overlaps yield of N). Values < 1 are floored to 1.
 func WithReadAheadPartitions(n int) QueryOption {
@@ -210,7 +212,7 @@ func WithReadAheadPartitions(n int) QueryOption {
 
 // WithReadAheadBytes caps the cumulative uncompressed parquet
 // bytes that may sit decoded ahead of the yield position on
-// ReadIter / PollRecordsIter. Composes with
+// ReadIter / ReadRangeIter. Composes with
 // WithReadAheadPartitions — whichever cap binds first holds the
 // producer back. Useful for skewed partition sizes. See
 // core.WithReadAheadBytes for the full contract.
@@ -223,7 +225,7 @@ func WithReadAheadBytes(n int64) QueryOption {
 // token — the caller's own prior attempts are excluded, and every
 // other file with LastModified at or after the barrier is excluded
 // too (per partition). Applies to snapshot-style reads (Read /
-// ReadIter / PollRecordsIter / Query). Ignored on PollRecords —
+// ReadIter / ReadRangeIter / Query). Ignored on PollRecords —
 // the offset cursor already provides retry-safety on that path.
 // Pair with WithIdempotencyToken on the write side; one token
 // drives both halves of a retry-safe read-modify-write. See
