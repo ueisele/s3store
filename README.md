@@ -115,7 +115,7 @@ tags on `T` (parquet-go's `GenericReader[T]`) — no `ScanFunc` or manual
 column-order bookkeeping. A field whose column is missing from a given
 file lands as Go's zero value.
 
-## Writer / Reader / View
+## Writer / Reader / Narrow-T reads
 
 `s3store.Store[T]` is a composition of two public halves: a `Writer[T]`
 for the write path and a `Reader[T]` for the read path. Most users keep
@@ -1572,7 +1572,7 @@ type Config[T any] struct {
 `Config` is the all-in-one form for `New(Config[T])`. Services that
 only write or only read can use the narrower `WriterConfig[T]` /
 `ReaderConfig[T]` directly with `NewWriter` / `NewReader` — see the
-[Writer / Reader / View](#writer--reader--view) section.
+[Writer / Reader / Narrow-T reads](#writer--reader--narrow-t-reads) section.
 
 ## Observability
 
