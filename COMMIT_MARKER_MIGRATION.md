@@ -395,6 +395,225 @@ Commit-ordering enforcement is **opt-in** per write via
 (All open questions resolved — see "Decided design choices"
 and "Decided constraints" above.)
 
+## Implementation order
+
+Each phase is one coherent change that compiles, passes the
+four-gate verification from [CLAUDE.md](CLAUDE.md) (`go vet
+-tags=integration ./...`, `go test -count=1 ./...`, `go test
+-tags=integration -count=1`, `golangci-lint run`), and leaves
+behaviour usable end-to-end. Breaking changes are taken at
+phase boundaries — no backwards-compat shims, no deprecation
+shadows, no flags toggling old vs new behaviour. Order is
+chosen so that user-visible correctness lands as early as
+possible and later phases never need to revisit earlier ones.
+
+### Phase 1 — Pre-v1 cleanups (independent of marker work)
+
+Three breaking removals/renames that shrink the surface every
+later phase has to touch. All three are independent and could
+ship in any sub-order; folding them into one phase signals
+"clear the underbrush before starting".
+
+- **Remove `DisableRefStream`** from `Config[T]` and
+  `S3TargetConfig`; delete every conditional in writer, snapshot
+  reader, stream reader, and S3Target plumbing. Refs are always
+  written.
+- **Remove `MaxRetryAge`** and its handling. Refactor
+  `findExistingRef` to use the data file's `created-at` user
+  metadata (already written by `writer_write.go`) as the lower
+  bound on the ref LIST.
+- **Rename Index → Projection** across the codebase: `IndexDef`
+  → `ProjectionDef`, `IndexReader` → `ProjectionReader`,
+  `IndexLookupDef` → `ProjectionLookupDef`, `BackfillIndex` →
+  `BackfillProjection`, the `_index/` S3 prefix → `_projection/`,
+  internal helpers, doc strings, `dashboards/s3store.json`
+  labels. Every later phase uses the new names from the start.
+
+### Phase 2 — Persisted `SettleWindow`
+
+Make writer/reader agreement load-bearing before any code
+starts depending on the value.
+
+- Define the `<prefix>/_config/settle-window` object: plain-text
+  body parsed by `time.ParseDuration`. Hard floor 2s; default
+  10s; reject values below the floor at parse time.
+- `S3Target` initialization GETs the object once and stamps the
+  resolved value on the Target. Construction fails on missing
+  or unparseable.
+- Delete `SettleWindow` from `S3TargetConfig` and `Config[T]`.
+- Add a `fixture_test.go` helper that PUTs the config object
+  on bucket setup; integration tests call it before
+  constructing any Target.
+- README: copy-pasteable Python `boto3` snippet operators run
+  once when initializing a new prefix; ships writing the
+  default `10s` body so the copy-paste path is correct
+  out-of-the-box.
+
+Required before Phases 3+ — the writer's `SettleWindow / 2`
+budget and the reader's timeliness check both consume the
+resolved value off the Target.
+
+### Phase 3 — Write path: markers-first ordering
+
+Move existing projection-marker PUTs to **before** the data
+PUT (current order is data → markers → ref). Isolated reorder
+plus a test that asserts: after a forced failure between the
+markers PUT and the data PUT, the data file is absent. Any
+data file on S3 now implies all R1 markers landed.
+
+Precondition for the data-PUT-412 fast path in Phase 7 — the
+retry can't reconstruct R1's marker paths from the data file
+because R2's records may differ.
+
+### Phase 4 — Write path: commit marker PUT
+
+The core write-side change. After this phase, every successful
+write produces a commit marker; readers still don't gate on it
+yet, so behaviour from the user's perspective is unchanged.
+
+- PUT `partition=X/key=Y/{id}.commit` (zero-byte) alongside
+  the corresponding `{id}.parquet`, after the ref PUT.
+- User metadata on the marker: `dataTs` (microseconds, matching
+  the data file's `created-at`) + ref filename. Both fields are
+  what the 412 fast path and `LookupCommit` will read in later
+  phases.
+- Apply the `SettleWindow / 2` collective budget across ref PUT
+  + commit-marker PUT via a single `context.WithDeadline` derived
+  from `refTime + SettleWindow / 2`. After the ref PUT returns,
+  abort if the remaining budget is exhausted.
+- On commit-marker PUT failure: return error to caller. No
+  internal retry, no cleanup. The caller must retry within
+  `SettleWindow` of the original data PUT for the marker to
+  pass the readers' timeliness check; retries past that window
+  silently orphan the data file (filtered from every read
+  path).
+- `WriteResult` shape stays exactly as today.
+- Docstring updates owned by this phase: `Write` (at-least-once
+  boundary, retry-within-`SettleWindow` requirement, new failure
+  modes between ref PUT and commit marker PUT).
+
+### Phase 5 — Read path: snapshot gating
+
+Wire snapshot reads through the marker. After this phase, the
+snapshot side enforces atomic per-file visibility end-to-end.
+
+- Add `isCommitValid(dataLM, markerLM time.Time, settleWindow
+  time.Duration) bool` shared helper.
+- Rename `listDataFiles` → `listCommittedDataFiles` (modify in
+  place). LIST on the partition prefix returns both `.parquet`
+  and `.commit` siblings; pair them, drop unpaired data files,
+  apply `isCommitValid` to the pairs.
+- Switch `Read`, `ReadIter`, and `BackfillProjection` to the
+  new helper.
+- Emit `s3store.read.uncommitted_data{reason=missing|stale,
+  method=...}` from the filter.
+- Docstring updates owned by this phase: `Read`, `ReadIter`,
+  `BackfillProjection` (commit-marker gating; explanation that
+  uncommitted data is filtered, not surfaced as an error).
+
+### Phase 6 — Read path: stream gating
+
+Mirror the gating on the change-stream side. After this phase
+the upgraded README Guarantees block (landing in Phase 11) is
+upholdable end-to-end.
+
+- Demote public `Poll` to package-private `poll`. `PollRecords`
+  and `ReadRangeIter` become the public stream entry points.
+- For each polled ref: HEAD the commit marker first →
+  `marker.LastModified`. If the marker is missing, emit
+  `uncommitted_data{reason=missing}` and skip — no GET on the
+  data file (saves the round-trip on uncommitted data). If
+  present, GET the data file (already needed to decode parquet)
+  → `data.LastModified` from the response, then apply
+  `isCommitValid` post-GET; emit
+  `uncommitted_data{reason=stale}` and drop the records on a
+  failed timeliness check.
+- Inline comment on `poll`: "marker existence ≠ validity; the
+  timeliness check runs after GET in the public callers."
+- Docstring updates owned by this phase: `PollRecords`,
+  `ReadRangeIter` (commit-marker gating, the `SettleWindow`
+  lag, post-GET timeliness filter).
+
+### Phase 7 — Write path: data-PUT-412 retry fast path
+
+Pure latency optimization on top of Phase 4 — correctness was
+already established by the existing `findExistingRef` slow
+path. Could be moved earlier (right after Phase 4) without
+correctness consequences; placed here so user-visible read
+correctness ships first.
+
+- On 412 from the data PUT under `WithIdempotencyToken`: HEAD
+  the commit marker first.
+- If present: reconstruct `WriteResult` from marker user
+  metadata (`dataTs` → `InsertedAt`; ref filename → `Offset`
+  and `RefPath`) and return success without writing ref or
+  commit marker.
+- If missing: fall through to existing `findExistingRef` and
+  write whatever's missing (ref alone, marker alone, or both).
+- Docstring updates owned by this phase: `Write` (token-retry
+  fast path, partial-commit recovery shape).
+
+### Phase 8 — Public `LookupCommit` API
+
+Closes the same-token-zero-rows gap: a retry that computes
+empty input never trips the data PUT and so never enters the
+412 fast path.
+
+- `LookupCommit(ctx, partitionKey, token) → (WriteResult, bool,
+  error)`.
+- Implementation: HEAD marker + HEAD data in parallel; apply
+  `isCommitValid`; return `(WriteResult{}, false, nil)` if
+  either is missing or the pair fails the timeliness check.
+- Public docstring: "probe before recomputing on retry".
+
+### Phase 9 — Opt-in fencing: `WithFencedCommit`
+
+The OCC-adjacent backstop for delta workloads.
+
+- Add `WithFencedCommit()` write option.
+- Just before the commit-marker PUT under the option: LIST the
+  partition's `.commit` siblings and reject (return a sentinel
+  error) if any has `LastModified > our dataTs`.
+- Post-rejection state: data PUT and ref PUT have already
+  succeeded; only the commit-marker PUT was refused. Both read
+  paths gate on the marker, so the orphan stays invisible. No
+  cleanup; the operator-driven sweeper from the deferred
+  follow-up reclaims later.
+- Add `s3store.write.fenced_rejections` counter.
+- Docstring updates owned by this phase: `WithFencedCommit`
+  (what it catches and doesn't catch — echo the bullets from
+  "Decided constraints"; the application's re-read-on-retry
+  pattern).
+
+### Phase 10 — Dashboards
+
+Add panels to `dashboards/s3store.json` for
+`s3store.read.uncommitted_data` (split by `reason`) and
+`s3store.write.fenced_rejections`, mirroring the existing
+`read.malformed_refs` / `read.missing_data` panels. No code
+change.
+
+### Phase 11 — Cross-cutting documentation
+
+Method-level docstrings are owned by the phases that change
+each method's behaviour (Phases 4–9, called out per phase).
+This phase covers the cross-cutting docs that depend on the
+final state of every prior phase.
+
+- README's Guarantees section: replace the existing "No atomic
+  write visibility" bullet with the "Atomic per-file visibility
+  on both paths" + Time semantics + Failure modes + Per-file
+  only block from "Decided design choices".
+- [CLAUDE.md](CLAUDE.md) invariants:
+  - Refine "At-least-once at the storage layer" — data durable
+    after data PUT, visible after marker.
+  - Refine "Read stability — no library-driven deletion" —
+    flag that marker presence makes future cleanup safe (the
+    deferred follow-up below).
+  - Add: marker timeliness check; writer/reader `SettleWindow`
+    agreement enforced via the persisted `_config/settle-window`
+    object; persisted-config object is the source of truth.
+
 ## Deferred follow-ups
 
 - **Library-driven cleanup of uncommitted / stale data.**
