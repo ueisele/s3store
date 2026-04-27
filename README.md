@@ -33,6 +33,23 @@ contract follows from that:
 - **Read stability.** Two consecutive snapshot reads with no
   intervening writes return the same records — the library never
   deletes or rewrites data on its own.
+- **No atomic write visibility.** `Write` PUTs the data file
+  before its ref. Snapshot reads (`Read` / `ReadIter` /
+  `IndexReader.Lookup`) LIST the data path directly, so they can
+  observe a data file before its ref has committed — including
+  orphans from a writer that crashed between the two PUTs. The
+  change-stream APIs (`Poll` / `PollRecords` / `ReadRangeIter`)
+  LIST the ref stream and filter those out: a ref only appears
+  once its data file is durable. A multi-partition `Write` is
+  also not atomic across partitions — refs become visible one at
+  a time. For workloads where each write is a self-contained
+  record version (typical CDC), partial visibility is benign:
+  at-least-once dedup on `EntityKeyOf` / `VersionOf` collapses
+  the duplicate. **For workloads that compute deltas against a
+  previously-read snapshot, partial visibility is a correctness
+  hazard** — read the base state via `PollRecords` /
+  `ReadRangeIter` so the read boundary lines up with committed
+  refs, and checkpoint by offset rather than wall-clock.
 
 **Corollary: once a data file is in S3, it stays forever — even if
 the `Write` call returned an error.** A crashed write can leave an
