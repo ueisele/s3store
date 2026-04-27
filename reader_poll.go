@@ -69,9 +69,6 @@ func (s *Reader[T]) Poll(
 		scope.addRecords(int64(len(out)))
 		scope.end(&err)
 	}()
-	if s.cfg.Target.DisableRefStream() {
-		return nil, since, ErrRefStreamDisabled
-	}
 	if maxEntries <= 0 {
 		return nil, since, fmt.Errorf(
 			"s3store: maxEntries must be > 0")

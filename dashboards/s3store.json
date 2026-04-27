@@ -340,7 +340,7 @@
       "id": 4001,
       "type": "timeseries",
       "title": "Records / read call (P50 / P95)",
-      "description": "Records returned per Read / ReadIter / ReadRangeIter / Poll / PollRecords / Lookup / BackfillIndex call.",
+      "description": "Records returned per Read / ReadIter / ReadRangeIter / Poll / PollRecords / Lookup / BackfillProjection call.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 58},
       "targets": [
@@ -430,7 +430,7 @@
       "id": 4005,
       "type": "timeseries",
       "title": "Read missing data — NoSuchKey skips on tolerant paths",
-      "description": "NoSuchKey skips per second on tolerant read paths (PollRecords / ReadRangeIter / BackfillIndex). Strict paths (Read / ReadIter) fail instead, so this panel never includes them. A non-zero rate means data files have been pruned out from under live refs/markers — typically operator-driven pruning, or a LIST-to-GET race (the file vanished between LIST and GET).",
+      "description": "NoSuchKey skips per second on tolerant read paths (PollRecords / ReadRangeIter / BackfillProjection). Strict paths (Read / ReadIter) fail instead, so this panel never includes them. A non-zero rate means data files have been pruned out from under live refs/markers — typically operator-driven pruning, or a LIST-to-GET race (the file vanished between LIST and GET).",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 74},
       "targets": [

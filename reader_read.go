@@ -71,7 +71,7 @@ func sortKeyMetasByKey(files []KeyMeta) {
 }
 
 // identityKey is the keyOf function for []string fan-outs — the
-// element is itself the dedup key. Used by index/backfill
+// element is itself the dedup key. Used by projection/backfill
 // callers that union per-pattern lookup results.
 func identityKey(s string) string { return s }
 
@@ -164,12 +164,12 @@ func (s *Reader[T]) downloadAndDecodeOne(
 // skip-and-warn on NoSuchKey rather than fail. Tolerant: paths
 // where a single missing data file shouldn't poison the whole
 // operation and a caller retry can't easily resolve it (refs and
-// index markers persist beyond the data file).
+// projection markers persist beyond the data file).
 //
 //   - PollRecords / ReadRangeIter walk the ref stream; an
 //     operator-driven prune can leave a ref pointing at nothing
 //     and the consumer must keep advancing.
-//   - BackfillIndex is a long-running operator job; failing on
+//   - BackfillProjection is a long-running operator job; failing on
 //     one race-deleted file would force a full restart.
 //
 // Strict: paths where a NoSuchKey is genuinely a LIST-to-GET

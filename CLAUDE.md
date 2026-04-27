@@ -9,7 +9,7 @@ must preserve them — even when the change appears unrelated.
   PUT leaves an orphan data file. The library never deletes
   data, refs, or markers it has written.
 - **Read-after-write on snapshot reads** — once Write returns
-  success, Read / ReadIter / IndexReader.Lookup / BackfillIndex
+  success, Read / ReadIter / ProjectionReader.Lookup / BackfillProjection
   see the new records immediately. The settle window applies
   only to the change stream (Poll / PollRecords /
   ReadRangeIter).

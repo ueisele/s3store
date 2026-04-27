@@ -33,7 +33,7 @@ type Rec struct {
 type storeOpts struct {
 	entityKeyOf func(Rec) string
 	versionOf   func(Rec) int64
-	indexes     []IndexDef[Rec]
+	projections []ProjectionDef[Rec]
 }
 
 // newStore builds a fresh Store against a freshly
@@ -55,7 +55,7 @@ func newStore(t *testing.T, opts storeOpts) *Store[Rec] {
 		ConsistencyControl: ConsistencyStrongGlobal,
 		EntityKeyOf:        opts.entityKeyOf,
 		VersionOf:          opts.versionOf,
-		Indexes:            opts.indexes,
+		Projections:        opts.projections,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -63,16 +63,16 @@ func newStore(t *testing.T, opts storeOpts) *Store[Rec] {
 	return store
 }
 
-// TestIndex_WriteAndLookup covers the secondary-index feature
-// end-to-end: register an index, Write records, Lookup by an
-// exact partition, Lookup with a range on the first index
-// column, and verify that a pattern with no matches returns an
-// empty slice rather than an error.
+// TestProjection_WriteAndLookup covers the secondary-projection
+// feature end-to-end: register a projection, Write records,
+// Lookup by an exact partition, Lookup with a range on the first
+// projection column, and verify that a pattern with no matches
+// returns an empty slice rather than an error.
 //
-// Index partition: (sku, period). Lookup covers: (customer).
+// Projection partition: (sku, period). Lookup covers: (customer).
 // Two distinct customers × one SKU × two periods ⇒ the batch
 // deduplicates to 4 markers despite 5 source records.
-func TestIndex_WriteAndLookup(t *testing.T) {
+func TestProjection_WriteAndLookup(t *testing.T) {
 	ctx := context.Background()
 
 	type SkuPeriodEntry struct {
@@ -82,7 +82,7 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 	}
 
 	store := newStore(t, storeOpts{
-		indexes: []IndexDef[Rec]{{
+		projections: []ProjectionDef[Rec]{{
 			Name:    "sku_period_idx",
 			Columns: []string{"sku", "period", "customer"},
 			Of: func(r Rec) ([]string, error) {
@@ -91,13 +91,13 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 		}},
 	})
 
-	idx, err := NewIndexReader(store.Target(),
-		IndexLookupDef[SkuPeriodEntry]{
+	idx, err := NewProjectionReader(store.Target(),
+		ProjectionLookupDef[SkuPeriodEntry]{
 			Name:    "sku_period_idx",
 			Columns: []string{"sku", "period", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexReader: %v", err)
+		t.Fatalf("NewProjectionReader: %v", err)
 	}
 
 	in := []Rec{
@@ -150,13 +150,13 @@ func TestIndex_WriteAndLookup(t *testing.T) {
 	}
 }
 
-// TestIndex_LookupReadAfterWrite guards the contract that Lookup
-// is read-after-write when ConsistencyControl is strong: a marker
-// written by Write MUST be returned by the very next Lookup, with
-// no sleep and no SettleWindow filter. Together with the header
-// propagation on marker PUT and marker LIST this is the whole
-// reason Index doesn't need a settle cutoff.
-func TestIndex_LookupReadAfterWrite(t *testing.T) {
+// TestProjection_LookupReadAfterWrite guards the contract that
+// Lookup is read-after-write when ConsistencyControl is strong: a
+// marker written by Write MUST be returned by the very next
+// Lookup, with no sleep and no SettleWindow filter. Together with
+// the header propagation on marker PUT and marker LIST this is
+// the whole reason Projection doesn't need a settle cutoff.
+func TestProjection_LookupReadAfterWrite(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 
@@ -164,7 +164,7 @@ func TestIndex_LookupReadAfterWrite(t *testing.T) {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	indexDef := IndexDef[Rec]{
+	projectionDef := ProjectionDef[Rec]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -185,19 +185,19 @@ func TestIndex_LookupReadAfterWrite(t *testing.T) {
 		// is that Lookup ignores SettleWindow entirely.
 		SettleWindow:       5 * time.Second,
 		ConsistencyControl: ConsistencyStrongGlobal,
-		Indexes:            []IndexDef[Rec]{indexDef},
+		Projections:        []ProjectionDef[Rec]{projectionDef},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	idx, err := NewIndexReader(store.Target(),
-		IndexLookupDef[Entry]{
+	idx, err := NewProjectionReader(store.Target(),
+		ProjectionLookupDef[Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexReader: %v", err)
+		t.Fatalf("NewProjectionReader: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{
@@ -215,29 +215,29 @@ func TestIndex_LookupReadAfterWrite(t *testing.T) {
 	}
 }
 
-// TestBackfillIndex covers the relief-valve path: records
-// written before an index was registered don't produce markers,
-// Lookup under-reports, and BackfillIndex brings the index into
+// TestBackfillProjection covers the relief-valve path: records
+// written before a projection was registered don't produce markers,
+// Lookup under-reports, and BackfillProjection brings the projection into
 // sync. Also checks idempotence (a second call is semantically a
 // no-op) and that pattern scoping narrows the scan.
 //
-// BackfillIndex is a standalone package function — it takes an
+// BackfillProjection is a standalone package function — it takes an
 // S3Target, so a migration job can run it without building a
 // full Writer/Store. The test mirrors that shape: it derives the
 // target from the store but passes it explicitly to the backfill
 // call.
-func TestBackfillIndex(t *testing.T) {
+func TestBackfillProjection(t *testing.T) {
 	ctx := context.Background()
 
-	// Phase 1: build a store with no index, write the "historical"
-	// records BackfillIndex will have to recover.
+	// Phase 1: build a store with no projection, write the "historical"
+	// records BackfillProjection will have to recover.
 	preStore := newStore(t, storeOpts{})
 
 	type Entry struct {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	def := IndexDef[Rec]{
+	def := ProjectionDef[Rec]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -255,7 +255,7 @@ func TestBackfillIndex(t *testing.T) {
 		t.Fatalf("historical Write: %v", err)
 	}
 
-	// Phase 2: build a second store wired with the index. Reuses
+	// Phase 2: build a second store wired with the projection. Reuses
 	// the same target (Bucket / Prefix) so subsequent writes share
 	// the dataset with the historical writes.
 	target := preStore.Target()
@@ -265,23 +265,23 @@ func TestBackfillIndex(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		Indexes: []IndexDef[Rec]{def},
+		Projections: []ProjectionDef[Rec]{def},
 	})
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
 
-	idx, err := NewIndexReader(target,
-		IndexLookupDef[Entry]{
+	idx, err := NewProjectionReader(target,
+		ProjectionLookupDef[Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexReader: %v", err)
+		t.Fatalf("NewProjectionReader: %v", err)
 	}
 
 	// Write a post-registration record so we can verify
-	// BackfillIndex produces the same marker as the live write
+	// BackfillProjection produces the same marker as the live write
 	// path (idempotent overlap).
 	if _, err := store.Write(ctx, []Rec{
 		{Period: "2026-04-01", Customer: "abc", SKU: "s3", Ts: time.UnixMilli(500)},
@@ -291,7 +291,7 @@ func TestBackfillIndex(t *testing.T) {
 
 	time.Sleep(400 * time.Millisecond)
 
-	// Before BackfillIndex: only the post-registration record is
+	// Before BackfillProjection: only the post-registration record is
 	// visible.
 	got, err := idx.Lookup(ctx, []string{"sku=*/customer=*"})
 	if err != nil {
@@ -301,11 +301,11 @@ func TestBackfillIndex(t *testing.T) {
 		t.Errorf("pre-backfill: got %v, want just {s3, abc}", got)
 	}
 
-	// BackfillIndex with empty until covers everything.
-	stats, err := BackfillIndex(
+	// BackfillProjection with empty until covers everything.
+	stats, err := BackfillProjection(
 		ctx, target, def, []string{"*"}, time.Time{})
 	if err != nil {
-		t.Fatalf("BackfillIndex: %v", err)
+		t.Fatalf("BackfillProjection: %v", err)
 	}
 	// 5 parquet objects (4 historical writes, each its own
 	// partition-key group under PartitionKeyOf; plus the post-
@@ -326,7 +326,7 @@ func TestBackfillIndex(t *testing.T) {
 
 	time.Sleep(400 * time.Millisecond)
 
-	// After BackfillIndex: every distinct (sku, customer) is
+	// After BackfillProjection: every distinct (sku, customer) is
 	// visible.
 	got, err = idx.Lookup(ctx, []string{"sku=*/customer=*"})
 	if err != nil {
@@ -344,7 +344,7 @@ func TestBackfillIndex(t *testing.T) {
 	}
 	for _, w := range want {
 		if !gotSet[w] {
-			t.Errorf("missing %+v after BackfillIndex", w)
+			t.Errorf("missing %+v after BackfillProjection", w)
 		}
 	}
 	if len(got) != len(want) {
@@ -352,27 +352,27 @@ func TestBackfillIndex(t *testing.T) {
 			len(got), len(want), got)
 	}
 
-	// Idempotency: a second BackfillIndex re-scans but the PUTs
+	// Idempotency: a second BackfillProjection re-scans but the PUTs
 	// are no-ops at the semantic level. We only check it doesn't
 	// error and reports the same scan volume.
-	stats2, err := BackfillIndex(
+	stats2, err := BackfillProjection(
 		ctx, target, def, []string{"*"}, time.Time{})
 	if err != nil {
-		t.Fatalf("second BackfillIndex: %v", err)
+		t.Fatalf("second BackfillProjection: %v", err)
 	}
 	if stats2.DataObjects != stats.DataObjects {
-		t.Errorf("second BackfillIndex DataObjects: got %d, want %d",
+		t.Errorf("second BackfillProjection DataObjects: got %d, want %d",
 			stats2.DataObjects, stats.DataObjects)
 	}
 
 	// Pattern scoping: backfilling only the 2026-03-17 partition
 	// covers 2 of the 5 objects.
-	scoped, err := BackfillIndex(
+	scoped, err := BackfillProjection(
 		ctx, target, def,
 		[]string{"period=2026-03-17/customer=*"},
 		time.Time{})
 	if err != nil {
-		t.Fatalf("scoped BackfillIndex: %v", err)
+		t.Fatalf("scoped BackfillProjection: %v", err)
 	}
 	if scoped.DataObjects != 2 {
 		t.Errorf("scoped DataObjects: got %d, want 2",
@@ -380,13 +380,13 @@ func TestBackfillIndex(t *testing.T) {
 	}
 }
 
-// TestBackfillIndex_UntilBound verifies the typical migration
+// TestBackfillProjection_UntilBound verifies the typical migration
 // shape: the live writer "starts" at time T0, backfill covers
 // only files with LastModified < T0 so the live path's markers
 // and the backfill's don't overlap. We write two files with a
 // gap between them, pass OffsetAt(midpoint) as until, and assert
 // that only the earlier file is scanned.
-func TestBackfillIndex_UntilBound(t *testing.T) {
+func TestBackfillProjection_UntilBound(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -415,7 +415,7 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 		t.Fatalf("late Write: %v", err)
 	}
 
-	def := IndexDef[Rec]{
+	def := ProjectionDef[Rec]{
 		Name:    "bounded_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -425,10 +425,10 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 
 	target := store.Target()
 
-	stats, err := BackfillIndex(
+	stats, err := BackfillProjection(
 		ctx, target, def, []string{"*"}, midpoint)
 	if err != nil {
-		t.Fatalf("BackfillIndex: %v", err)
+		t.Fatalf("BackfillProjection: %v", err)
 	}
 	if stats.DataObjects != 1 {
 		t.Errorf("DataObjects: got %d, want 1 (only early write "+
@@ -436,9 +436,9 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 	}
 }
 
-// TestBackfillIndex_MissingDataTolerant verifies the at-least-
+// TestBackfillProjection_MissingDataTolerant verifies the at-least-
 // once posture when a data file disappears before backfill: the
-// live files still get markers and BackfillIndex does NOT fail.
+// live files still get markers and BackfillProjection does NOT fail.
 //
 // MinIO's LIST is strongly consistent with DELETE, so the deleted
 // file is fully absent from the subsequent LIST — the LIST-to-GET
@@ -446,7 +446,7 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 // NoSuchKey + slog.Warn + missing-data-metric path is exercised
 // by code review; what this test pins down is that backfill
 // survives the partial-delete scenario without erroring.
-func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
+func TestBackfillProjection_MissingDataTolerant(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -474,7 +474,7 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	def := IndexDef[Rec]{
+	def := ProjectionDef[Rec]{
 		Name:    "missing_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -482,10 +482,10 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 		},
 	}
 
-	stats, err := BackfillIndex(
+	stats, err := BackfillProjection(
 		ctx, store.Target(), def, []string{"*"}, time.Time{})
 	if err != nil {
-		t.Fatalf("BackfillIndex: %v", err)
+		t.Fatalf("BackfillProjection: %v", err)
 	}
 
 	// MinIO's LIST reflects the delete, so backfill sees only
@@ -1029,7 +1029,7 @@ func TestRead_WithHistory(t *testing.T) {
 }
 
 // TestLookup_EmptyAndBadPattern mirrors
-// TestRead_EmptyAndBadPattern at the Index layer: empty
+// TestRead_EmptyAndBadPattern at the Projection layer: empty
 // slice is a no-op, malformed pattern surfaces the offending
 // index.
 func TestLookup_EmptyAndBadPattern(t *testing.T) {
@@ -1040,7 +1040,7 @@ func TestLookup_EmptyAndBadPattern(t *testing.T) {
 		Customer string `parquet:"customer"`
 	}
 	store := newStore(t, storeOpts{
-		indexes: []IndexDef[Rec]{{
+		projections: []ProjectionDef[Rec]{{
 			Name:    "empty_bad_idx",
 			Columns: []string{"sku", "customer"},
 			Of: func(r Rec) ([]string, error) {
@@ -1049,13 +1049,13 @@ func TestLookup_EmptyAndBadPattern(t *testing.T) {
 		}},
 	})
 
-	idx, err := NewIndexReader(store.Target(),
-		IndexLookupDef[Entry]{
+	idx, err := NewProjectionReader(store.Target(),
+		ProjectionLookupDef[Entry]{
 			Name:    "empty_bad_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexReader: %v", err)
+		t.Fatalf("NewProjectionReader: %v", err)
 	}
 
 	got, err := idx.Lookup(ctx, nil)
@@ -1078,13 +1078,13 @@ func TestLookup_EmptyAndBadPattern(t *testing.T) {
 	}
 }
 
-// TestBackfillIndex_EmptyAndBadPattern covers the matching
+// TestBackfillProjection_EmptyAndBadPattern covers the matching
 // edge cases for the migration entry point.
-func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
+func TestBackfillProjection_EmptyAndBadPattern(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	def := IndexDef[Rec]{
+	def := ProjectionDef[Rec]{
 		Name:    "empty_bad_backfill_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -1093,17 +1093,17 @@ func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 	}
 	target := store.Target()
 
-	stats, err := BackfillIndex(
+	stats, err := BackfillProjection(
 		ctx, target, def, nil, time.Time{})
 	if err != nil {
-		t.Errorf("BackfillIndex(nil): %v", err)
+		t.Errorf("BackfillProjection(nil): %v", err)
 	}
 	if stats != (BackfillStats{}) {
-		t.Errorf("BackfillIndex(nil): got %+v, want zero stats",
+		t.Errorf("BackfillProjection(nil): got %+v, want zero stats",
 			stats)
 	}
 
-	_, err = BackfillIndex(ctx, target, def, []string{
+	_, err = BackfillProjection(ctx, target, def, []string{
 		"period=2026-03-17/customer=abc",
 		"not-a-valid-pattern",
 	}, time.Time{})
@@ -1116,7 +1116,7 @@ func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 }
 
 // TestLookup_NonCartesian mirrors TestRead_NonCartesian
-// at the index layer: pick a non-Cartesian tuple set of
+// at the projection layer: pick a non-Cartesian tuple set of
 // (sku, customer) pairs and verify only those markers come back.
 func TestLookup_NonCartesian(t *testing.T) {
 	ctx := context.Background()
@@ -1126,7 +1126,7 @@ func TestLookup_NonCartesian(t *testing.T) {
 		Customer string `parquet:"customer"`
 	}
 	store := newStore(t, storeOpts{
-		indexes: []IndexDef[Rec]{{
+		projections: []ProjectionDef[Rec]{{
 			Name:    "sku_customer_idx",
 			Columns: []string{"sku", "customer"},
 			Of: func(r Rec) ([]string, error) {
@@ -1135,13 +1135,13 @@ func TestLookup_NonCartesian(t *testing.T) {
 		}},
 	})
 
-	idx, err := NewIndexReader(store.Target(),
-		IndexLookupDef[Entry]{
+	idx, err := NewProjectionReader(store.Target(),
+		ProjectionLookupDef[Entry]{
 			Name:    "sku_customer_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexReader: %v", err)
+		t.Fatalf("NewProjectionReader: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{
@@ -1188,19 +1188,19 @@ func TestLookup_NonCartesian(t *testing.T) {
 	}
 }
 
-// TestBackfillIndex_NonCartesian exercises the multi-pattern
+// TestBackfillProjection_NonCartesian exercises the multi-pattern
 // migration shape: write records across several partitions, then
 // backfill only the partitions of interest via a patterns slice.
 // The run covers exactly the selected partitions, and the union
 // is deduplicated when patterns overlap.
-func TestBackfillIndex_NonCartesian(t *testing.T) {
+func TestBackfillProjection_NonCartesian(t *testing.T) {
 	ctx := context.Background()
 
 	type Entry struct {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	def := IndexDef[Rec]{
+	def := ProjectionDef[Rec]{
 		Name:    "many_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -1208,7 +1208,7 @@ func TestBackfillIndex_NonCartesian(t *testing.T) {
 		},
 	}
 
-	// No-index store for the historical writes: backfill must
+	// No-projection store for the historical writes: backfill must
 	// run from a clean state so the test pins down what the
 	// scoped patterns covered (vs. the live writer covering
 	// everything).
@@ -1224,25 +1224,25 @@ func TestBackfillIndex_NonCartesian(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	idx, err := NewIndexReader(store.Target(),
-		IndexLookupDef[Entry]{
+	idx, err := NewProjectionReader(store.Target(),
+		ProjectionLookupDef[Entry]{
 			Name:    "many_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewIndexReader: %v", err)
+		t.Fatalf("NewProjectionReader: %v", err)
 	}
 
 	// Backfill just the two March partitions via explicit patterns.
 	// The April partition should NOT be covered.
-	stats, err := BackfillIndex(ctx, store.Target(), def,
+	stats, err := BackfillProjection(ctx, store.Target(), def,
 		[]string{
 			"period=2026-03-17/customer=*",
 			"period=2026-03-18/customer=*",
 		},
 		time.Time{})
 	if err != nil {
-		t.Fatalf("BackfillIndex: %v", err)
+		t.Fatalf("BackfillProjection: %v", err)
 	}
 	if stats.DataObjects != 3 {
 		t.Errorf("DataObjects: got %d, want 3 (two March-17 + one "+
@@ -2122,209 +2122,6 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 	_ = LogFieldUnknown
 }
 
-// TestDisableRefStream covers the full contract of the
-// write-side opt-out: no /_stream/refs/ objects land in S3,
-// WriteResult.Offset / RefPath are empty, Read still returns
-// every record, Poll returns the shared sentinel, and OffsetAt
-// still returns a well-formed offset (pure timestamp encoding).
-func TestDisableRefStream(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	store, err := New[Rec](Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf: func(r Rec) string {
-			return fmt.Sprintf("period=%s/customer=%s",
-				r.Period, r.Customer)
-		},
-		SettleWindow:       300 * time.Millisecond,
-		ConsistencyControl: ConsistencyStrongGlobal,
-		DisableRefStream:   true,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	in := []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1, Ts: time.UnixMilli(1)},
-		{Period: "2026-03-17", Customer: "def", SKU: "s2", Value: 2, Ts: time.UnixMilli(2)},
-	}
-	results, err := store.Write(ctx, in)
-	if err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	for i, r := range results {
-		if r.Offset != "" || r.RefPath != "" {
-			t.Errorf("result[%d]: expected empty Offset/RefPath, got %+v",
-				i, r)
-		}
-		if r.DataPath == "" {
-			t.Errorf("result[%d]: DataPath empty", i)
-		}
-	}
-
-	// No ref objects exist under /_stream/refs/.
-	page, err := f.S3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(f.Bucket),
-		Prefix: aws.String("store/_stream/refs/"),
-	})
-	if err != nil {
-		t.Fatalf("ListObjectsV2 refs: %v", err)
-	}
-	if len(page.Contents) != 0 {
-		t.Errorf("expected zero ref objects, got %d", len(page.Contents))
-	}
-
-	// Data was actually written — Read returns everything.
-	got, err := store.Read(ctx, []string{"*"})
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if len(got) != len(in) {
-		t.Errorf("Read: got %d, want %d", len(got), len(in))
-	}
-
-	// Poll + PollRecords + ReadRangeIter all refuse with the
-	// shared sentinel. ReadRangeIter surfaces the error via the
-	// first yielded (zero, err) tuple.
-	if _, _, err := store.Poll(ctx, "", 10); !errors.Is(err, ErrRefStreamDisabled) {
-		t.Errorf("Poll: got %v, want ErrRefStreamDisabled", err)
-	}
-	if _, _, err := store.PollRecords(ctx, "", 10); !errors.Is(err, ErrRefStreamDisabled) {
-		t.Errorf("PollRecords: got %v, want ErrRefStreamDisabled", err)
-	}
-	var iterErr error
-	for _, err := range store.ReadRangeIter(ctx, time.Time{}, time.Time{}) {
-		if err != nil {
-			iterErr = err
-			break
-		}
-	}
-	if !errors.Is(iterErr, ErrRefStreamDisabled) {
-		t.Errorf("ReadRangeIter: got %v, want ErrRefStreamDisabled", iterErr)
-	}
-
-	// OffsetAt stays usable: pure timestamp encoding, no S3
-	// dependency. Encodes relative to the ref prefix as a
-	// logical watermark.
-	if store.OffsetAt(time.Now()) == "" {
-		t.Error("OffsetAt: got empty offset, want non-empty")
-	}
-}
-
-// TestDisableRefStream_WriteWithKey mirrors TestDisableRefStream
-// but through the explicit-key path, since WriteWithKey owns the
-// ref-PUT branch we just gated.
-func TestDisableRefStream_WriteWithKey(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	store, err := New[Rec](Config[Rec]{
-		Bucket:             f.Bucket,
-		Prefix:             "store",
-		S3Client:           f.S3Client,
-		PartitionKeyParts:  []string{"period", "customer"},
-		SettleWindow:       300 * time.Millisecond,
-		ConsistencyControl: ConsistencyStrongGlobal,
-		DisableRefStream:   true,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	key := "period=2026-03-17/customer=abc"
-	result, err := store.WriteWithKey(ctx, key, []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 10},
-	})
-	if err != nil {
-		t.Fatalf("WriteWithKey: %v", err)
-	}
-	if result.Offset != "" || result.RefPath != "" {
-		t.Errorf("expected empty Offset/RefPath, got %+v", result)
-	}
-	if result.DataPath == "" {
-		t.Error("DataPath empty")
-	}
-
-	page, err := f.S3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(f.Bucket),
-		Prefix: aws.String("store/_stream/refs/"),
-	})
-	if err != nil {
-		t.Fatalf("ListObjectsV2 refs: %v", err)
-	}
-	if len(page.Contents) != 0 {
-		t.Errorf("expected zero ref objects, got %d", len(page.Contents))
-	}
-}
-
-// TestDisableRefStream_IndexLookup guards the claim in
-// S3Target.DisableRefStream's docstring that Lookup is
-// unaffected: markers must still be PUT and Lookup must still
-// return the registered entries, even when ref writes are
-// disabled. Markers live under /_index/<name>/, refs under
-// /_stream/refs/ — orthogonal features, neither implies the
-// other.
-func TestDisableRefStream_IndexLookup(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-
-	type SkuEntry struct {
-		SKU      string `parquet:"sku"`
-		Period   string `parquet:"period"`
-		Customer string `parquet:"customer"`
-	}
-	store, err := New[Rec](Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf: func(r Rec) string {
-			return fmt.Sprintf("period=%s/customer=%s",
-				r.Period, r.Customer)
-		},
-		SettleWindow:       300 * time.Millisecond,
-		ConsistencyControl: ConsistencyStrongGlobal,
-		DisableRefStream:   true,
-		Indexes: []IndexDef[Rec]{{
-			Name:    "sku_idx",
-			Columns: []string{"sku", "period", "customer"},
-			Of: func(r Rec) ([]string, error) {
-				return []string{r.SKU, r.Period, r.Customer}, nil
-			},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	idx, err := NewIndexReader(store.Target(),
-		IndexLookupDef[SkuEntry]{
-			Name:    "sku_idx",
-			Columns: []string{"sku", "period", "customer"},
-		})
-	if err != nil {
-		t.Fatalf("NewIndexReader: %v", err)
-	}
-
-	if _, err := store.Write(ctx, []Rec{
-		{Period: "2026-03-17", Customer: "abc", SKU: "s1", Value: 1},
-		{Period: "2026-03-17", Customer: "def", SKU: "s1", Value: 2},
-	}); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	time.Sleep(400 * time.Millisecond)
-
-	got, err := idx.Lookup(ctx, []string{"sku=s1/period=2026-03-17/customer=*"})
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
-	}
-	if len(got) != 2 {
-		t.Errorf("Lookup: got %d entries, want 2", len(got))
-	}
-}
-
 // TestWrite_ParallelResultsSorted guards the invariant that Write
 // returns WriteResults in sorted-key order even when partitions
 // complete out-of-order under parallel fan-out. Without slot-index
@@ -3005,7 +2802,7 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 
 	// Fresh write.
 	first, err := store.WriteWithKey(ctx, key, rec,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("fresh write: %v", err)
 	}
@@ -3021,7 +2818,7 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	// scope-LIST finds the ref from attempt #1 → return its
 	// RefPath (no ref PUT on retry, no body re-upload).
 	second, err := store.WriteWithKey(ctx, key, rec,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("retry write: %v", err)
 	}
@@ -3071,12 +2868,12 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 	const token = "job-2026-04-22-batchA"
 
 	first, err := store.WriteWithKey(ctx, key, rec,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("fresh write: %v", err)
 	}
 	second, err := store.WriteWithKey(ctx, key, rec,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("retry write: %v", err)
 	}
@@ -3096,24 +2893,6 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("got %d records, want 1", len(got))
-	}
-}
-
-// TestWriteWithIdempotencyToken_RejectsZeroMaxRetryAge guards
-// the resolveWriteOpts validation: passing maxRetryAge=0 with an
-// idempotency token is a config error, since the write path
-// always needs a positive scoped-LIST window to dedup the ref on
-// retry.
-func TestWriteWithIdempotencyToken_RejectsZeroMaxRetryAge(t *testing.T) {
-	ctx := context.Background()
-	store := newIdempotentStore(t)
-
-	_, err := store.WriteWithKey(ctx, "period=2026-04-22/customer=carol",
-		[]Rec{{Period: "2026-04-22", Customer: "carol",
-			SKU: "sku1", Value: 99, Ts: time.UnixMilli(1)}},
-		WithIdempotencyToken("job-zero", 0))
-	if err == nil {
-		t.Fatal("expected validation error for maxRetryAge=0, got nil")
 	}
 }
 
@@ -3139,12 +2918,12 @@ func TestWriteWithIdempotencyToken_SameTokenAcrossPartitions(t *testing.T) {
 	// Fresh writes: same token, different partitions. Both must
 	// land their own data + ref (no cross-partition dedup).
 	freshA, err := store.WriteWithKey(ctx, keyA, recA,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("fresh A: %v", err)
 	}
 	freshB, err := store.WriteWithKey(ctx, keyB, recB,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("fresh B: %v", err)
 	}
@@ -3157,7 +2936,7 @@ func TestWriteWithIdempotencyToken_SameTokenAcrossPartitions(t *testing.T) {
 
 	// Retry of A: must dedup to A's own ref, not B's.
 	retryA, err := store.WriteWithKey(ctx, keyA, recA,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("retry A: %v", err)
 	}
@@ -3168,7 +2947,7 @@ func TestWriteWithIdempotencyToken_SameTokenAcrossPartitions(t *testing.T) {
 
 	// Retry of B: must dedup to B's own ref.
 	retryB, err := store.WriteWithKey(ctx, keyB, recB,
-		WithIdempotencyToken(token, time.Hour))
+		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("retry B: %v", err)
 	}
@@ -3201,7 +2980,7 @@ func TestWriteWithIdempotencyToken_RejectsBadToken(t *testing.T) {
 		SKU: "sku1", Value: 1, Ts: time.UnixMilli(1),
 	}}
 	_, err := store.WriteWithKey(ctx, key, rec,
-		WithIdempotencyToken("has/slash", time.Hour))
+		WithIdempotencyToken("has/slash"))
 	if err == nil {
 		t.Fatal("want error for token with '/', got nil")
 	}
@@ -3262,7 +3041,7 @@ func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 	_, err = store.WriteWithKey(ctx, key, []Rec{{
 		Period: "2026-04-22", Customer: "alice",
 		SKU: "derived-a", Value: 100, Ts: time.UnixMilli(10),
-	}}, WithIdempotencyToken(token, time.Hour))
+	}}, WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("attempt-1 write: %v", err)
 	}
@@ -3338,7 +3117,7 @@ func TestIdempotentRead_PerPartitionIsolation(t *testing.T) {
 	if _, err := store.WriteWithKey(ctx, keyA, []Rec{{
 		Period: "2026-04-22", Customer: "alice",
 		SKU: "a-derived", Value: 100, Ts: time.UnixMilli(10),
-	}}, WithIdempotencyToken(token, time.Hour)); err != nil {
+	}}, WithIdempotencyToken(token)); err != nil {
 		t.Fatalf("attempt-1 A write: %v", err)
 	}
 	time.Sleep(1100 * time.Millisecond)
@@ -3460,7 +3239,7 @@ func TestIdempotency_FullCycle_ScenarioBRefMissing(t *testing.T) {
 	first, err := store.WriteWithKey(ctx, key, []Rec{{
 		Period: "2026-04-22", Customer: "alice",
 		SKU: "derived", Value: 100, Ts: time.UnixMilli(10),
-	}}, WithIdempotencyToken(token, time.Hour))
+	}}, WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("attempt-1 write: %v", err)
 	}
@@ -3486,7 +3265,7 @@ func TestIdempotency_FullCycle_ScenarioBRefMissing(t *testing.T) {
 	second, err := store.WriteWithKey(ctx, key, []Rec{{
 		Period: "2026-04-22", Customer: "alice",
 		SKU: "derived", Value: 100, Ts: time.UnixMilli(10),
-	}}, WithIdempotencyToken(token, time.Hour))
+	}}, WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("attempt-2 write: %v", err)
 	}

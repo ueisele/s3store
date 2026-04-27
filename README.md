@@ -14,7 +14,7 @@ S3 bucket.
   write, all metadata in the object key.
 - **Read** point-in-time deduplicated snapshots with glob support.
 - **Iterate** large reads with bounded-memory streaming.
-- **Index** secondary lookups with empty marker files (LIST-only Lookup).
+- **Project** secondary lookups with empty marker files (LIST-only Lookup).
 
 ## Guarantees
 
@@ -26,7 +26,7 @@ contract follows from that:
   refs. Dedupe on read via `EntityKeyOf` + `VersionOf`, or shrink
   the duplicate window at storage with `WithIdempotencyToken`.
 - **Read-after-write on snapshot reads.** `Read` / `ReadIter` /
-  `IndexReader.Lookup` / `BackfillIndex` see new records the moment
+  `ProjectionReader.Lookup` / `BackfillProjection` see new records the moment
   `Write` returns. The change-stream APIs (`Poll`, `PollRecords`,
   `ReadRangeIter`) intentionally lag the tip by `SettleWindow` to
   tolerate S3 LIST propagation skew.
@@ -35,7 +35,7 @@ contract follows from that:
   deletes or rewrites data on its own.
 - **No atomic write visibility.** `Write` PUTs the data file
   before its ref. Snapshot reads (`Read` / `ReadIter` /
-  `IndexReader.Lookup`) LIST the data path directly, so they can
+  `ProjectionReader.Lookup`) LIST the data path directly, so they can
   observe a data file before its ref has committed — including
   orphans from a writer that crashed between the two PUTs. The
   change-stream APIs (`Poll` / `PollRecords` / `ReadRangeIter`)
@@ -141,7 +141,7 @@ write or only read can construct a single half with a narrower config:
 
 ```go
 // Build the shared S3 wiring once — Target is the untyped handle
-// Writer, Reader, IndexReader, and BackfillIndex all speak.
+// Writer, Reader, ProjectionReader, and BackfillProjection all speak.
 target := s3store.NewS3Target(s3store.S3TargetConfig{
     Bucket:            "warehouse",
     Prefix:            "billing",
@@ -623,58 +623,6 @@ already provides retry-safety).
 `time.Time` to the offset cursor used by `Poll` / `PollRecords` /
 `WithUntilOffset`.
 
-### Stream — opting out (`DisableRefStream`)
-
-Every `Write` / `WriteWithKey` call issues one extra S3 PUT to
-`_stream/refs/` per distinct partition key it touches. `Write` groups
-records by key and calls `WriteWithKey` once per group, so a batch
-spanning N partitions produces N ref PUTs. For pure batch / analytics
-workloads that never tail the stream, that's pure overhead. Set
-`DisableRefStream: true` on `Config` or on the `S3Target` to skip
-the ref PUT:
-
-```go
-s3store.Config[CostRecord]{
-    // ...
-    DisableRefStream: true,
-}
-```
-
-Effect on each method:
-
-- **`Write` / `WriteWithKey`** — one fewer S3 PUT per call;
-  `WriteResult.Offset` and `WriteResult.RefPath` are empty.
-- **`Read` / `ReadIter` / `Lookup` / `BackfillIndex`** —
-  unaffected. They LIST `data/` (or `_index/<name>/`) directly
-  and never consult refs.
-- **`Poll` / `PollRecords` / `ReadRangeIter`** — return
-  `s3store.ErrRefStreamDisabled`. `ReadRangeIter` surfaces the
-  error via the first yielded `(zero, err)` tuple.
-- **`OffsetAt`** — still works. It's pure timestamp encoding with no
-  S3 dependency, so it keeps returning well-formed offsets even
-  though there's no stream to compare them against.
-
-Per-write irreversible: data written with `DisableRefStream: true`
-has no refs, so flipping the flag back does not retroactively make
-`Poll` see the historical writes.
-
-Both sides of the deployment (writer and reader) must agree on the
-flag — set it on `Config` or on the shared `S3Target` so the
-Writer and Reader read the same value. The two failure modes if
-they drift:
-
-- **Writer disabled + reader enabled** — `Poll` walks an empty
-  `_stream/refs/` prefix and silently returns zero entries with no
-  error. Easy to mistake for "stream is quiet."
-- **Writer enabled + reader disabled** — `Poll` refuses with
-  `ErrRefStreamDisabled` even though refs actually exist in S3.
-  Unset `DisableRefStream` on the reader to recover; no data is
-  lost.
-
-Callers building a `Store` via `New(Config)` can't drift — the
-flag lives on the constructed `S3Target` and both halves read
-from the same value.
-
 ### Snapshot
 
 ```go
@@ -687,8 +635,8 @@ via parquet-go and the parquet tags on `T`. When dedup is configured
 otherwise every version comes through.
 
 For retry-safe read-modify-write, pair the `Read` with
-`WithIdempotentRead(token)` and write with `WithIdempotencyToken(token,
-…)`; see [Idempotent reads](#idempotent-reads-withidempotentread).
+`WithIdempotentRead(token)` and write with `WithIdempotencyToken(token)`;
+see [Idempotent reads](#idempotent-reads-withidempotentread).
 
 ### Snapshot — streaming (`ReadIter`)
 
@@ -808,7 +756,7 @@ common (orchestrator failover, network flakiness, crash-and-resume),
 const token = "job-2026-04-22T10:15:00Z-batch42"
 
 _, err := store.WriteWithKey(ctx, key, records,
-    s3store.WithIdempotencyToken(token, 6*time.Hour))
+    s3store.WithIdempotencyToken(token))
 ```
 
 On retry with the same token:
@@ -817,10 +765,12 @@ On retry with the same token:
   default `{tsMicros}-{shortID}` id in the filename. The backend's
   overwrite-prevention rejects the second PUT, so the parquet body
   is not re-uploaded.
-- **Ref dedup via scoped LIST** — bounded by `maxRetryAge`. If a ref
-  for this token already exists in the window, the retry skips the
-  ref PUT. If the original attempt wrote data but not the ref
-  ("scenario B"), the retry completes by emitting the ref only.
+- **Ref dedup via scoped LIST** — the writer HEADs the existing
+  data file, reads its `x-amz-meta-created-at` stamp, and LISTs
+  refs from that timestamp forward. If a ref for this token
+  already exists, the retry skips the ref PUT. If the original
+  attempt wrote data but not the ref ("scenario B"), the retry
+  completes by emitting the ref only.
 
 ### Idempotency and reader dedup are complementary
 
@@ -833,27 +783,11 @@ reader-side dedup: configure `EntityKeyOf` + `VersionOf` so
 |---|---|---|
 | No token, no dedup | at-least-once | at-least-once |
 | No token, dedup configured | at-least-once | **exactly-once** (per entity) |
-| Token + dedup, strong consistency | at-least-once (minimal duplication) | **exactly-once** (within `maxRetryAge` across sessions) |
+| Token + dedup, strong consistency | at-least-once (minimal duplication) | **exactly-once** (across sessions) |
 | Token + dedup, weak consistency (StorageGRID `read-after-new-write`) | at-least-once (some residual duplication) | **exactly-once** — reader dedup collapses storage replicas |
 
 **Recommendation**: enable reader dedup whenever correctness matters.
 Tokens are additive — they cut S3 cost and traffic on retry.
-
-### `maxRetryAge` — tuning guide
-
-Bounds the scoped LIST on the retry path. Cost is
-`O(writes × maxRetryAge / 1000)` LIST pages per retry. No library
-default — pick based on your retry SLA.
-
-| Value | Use case |
-|---|---|
-| `0` | Disable scoped LIST; retry always writes a duplicate ref. Cheapest retry path, relies on reader dedup. |
-| `1 * time.Hour` | Fast-retry streaming; orchestrator retries within the hour. |
-| `6 * time.Hour` | Same-day recovery (cron-driven jobs that may rerun mid-day). |
-| `24 * time.Hour` | Cross-day orchestrator recovery (overnight batch retries). |
-
-Tokens older than `maxRetryAge` produce a duplicate ref on retry
-(documented tradeoff). Reader dedup absorbs it.
 
 ### Retry-detection mechanism
 
@@ -927,12 +861,11 @@ restart is valid but creates real storage duplication.
 If you already run a transactional database alongside your writers,
 an outbox pattern often composes better than s3store's ref stream:
 
-1. Set `DisableRefStream: true` on the s3store Config.
-2. On every successful write, `INSERT` into an outbox table with
+1. On every successful write, `INSERT` into an outbox table with
    columns `(token, partition_key, data_path, created_at)` and a
    monotonic `id`.
-3. Consumers read by `id`.
-4. Unique constraint on `token` makes zombie/retry writes visible as
+2. Consumers read by `id`.
+3. Unique constraint on `token` makes zombie/retry writes visible as
    constraint violations — Postgres is the authoritative dedup.
 
 This moves the dedup primitive off S3, so on StorageGRID you can
@@ -940,7 +873,8 @@ leave `ConsistencyControl` at the empty default and still get
 exactly-once at the consumer layer. Any rare storage-layer
 duplicate from a weak-consistency race becomes a "ghost" file that
 isn't referenced by an outbox row — wasted bytes, not a visible
-duplicate.
+duplicate. The s3store ref stream still gets written alongside the
+outbox; consumers just ignore it.
 
 s3store does not ship this pattern; document it as a valid
 alternative for callers who already have the transactional
@@ -973,7 +907,7 @@ if err != nil { return err }
 // compute diff against `existing` …
 
 _, err = store.WriteWithKey(ctx, key, changes,
-    s3store.WithIdempotencyToken(token, 6*time.Hour))
+    s3store.WithIdempotencyToken(token))
 ```
 
 The same token drives both sides. Persist only the token between
@@ -1043,28 +977,29 @@ unknown columns are ignored.
 Renames, splits, and row-level computed derivations still require a
 migration tool — rewrite the affected files with the new shape.
 
-## Secondary indexes
+## Secondary projections
 
 When a query filters on a column that isn't a partition key
 (e.g. "list every customer that had usage of SKU X in period
 P"), scanning every data file is prohibitive at scale. A
-secondary index solves this by writing one empty S3 *marker* per
-distinct tuple of the columns you want to query. The query is a
-single LIST under the marker prefix — zero parquet reads.
+secondary projection solves this by writing one empty S3
+*marker* per distinct tuple of the columns you want to query.
+The query is a single LIST under the marker prefix — zero
+parquet reads.
 
 ### Shape
 
-An index has two halves that are wired separately:
+A projection has two halves that are wired separately:
 
-- **Write side (`IndexDef[T]`)** lives in `Config.Indexes` /
-  `WriterConfig.Indexes`. `Of` returns the per-record column
+- **Write side (`ProjectionDef[T]`)** lives in `Config.Projections` /
+  `WriterConfig.Projections`. `Of` returns the per-record column
   values as a `[]string` aligned to `Columns` (positional, in
   declared order). `Of` is optional — nil means the library
   reflects T's `parquet` tags + `Columns` once at `NewWriter` and
   emits markers without any caller code.
-- **Read side (`IndexLookupDef[K]`)** is consumed by
-  `s3store.NewIndexReader(target, lookupDef)` to build a typed
-  `IndexReader[K]` query handle. `From` projects each marker back into
+- **Read side (`ProjectionLookupDef[K]`)** is consumed by
+  `s3store.NewProjectionReader(target, lookupDef)` to build a typed
+  `ProjectionReader[K]` query handle. `From` projects each marker back into
   K. Same convention: nil means reflect K's parquet tags against
   `Columns`; a non-nil custom `From` overrides.
 
@@ -1075,7 +1010,7 @@ An index has two halves that are wired separately:
 //   ChargePeriodStart time.Time `parquet:"charge_period_start"`
 //   ChargePeriodEnd   time.Time `parquet:"charge_period_end"`
 
-cfg.Indexes = []s3store.IndexDef[Usage]{{
+cfg.Projections = []s3store.ProjectionDef[Usage]{{
     Name: "sku_period_idx",
     Columns: []string{
         "sku_id", "charge_period_start",
@@ -1100,8 +1035,8 @@ type SkuPeriodEntry struct {
     ChargePeriodEnd   time.Time `parquet:"charge_period_end"`
 }
 
-skuIdx, _ := s3store.NewIndexReader(store.Target(),
-    s3store.IndexLookupDef[SkuPeriodEntry]{
+skuIdx, _ := s3store.NewProjectionReader(store.Target(),
+    s3store.ProjectionLookupDef[SkuPeriodEntry]{
         Name: "sku_period_idx",
         Columns: []string{
             "sku_id", "charge_period_start",
@@ -1115,7 +1050,7 @@ When every `Columns` entry is already a `parquet:"..."`-tagged
 string field on T, both `Of` and `Layout` can be left zero:
 
 ```go
-cfg.Indexes = []s3store.IndexDef[Usage]{{
+cfg.Projections = []s3store.ProjectionDef[Usage]{{
     Name:    "sku_customer_idx",
     Columns: []string{"sku_id", "causing_customer"},
     // Of: nil — library auto-projects from Usage's parquet tags.
@@ -1127,7 +1062,7 @@ column values come from somewhere other than parquet-tagged
 fields on T, fall back to writing `Of` explicitly:
 
 ```go
-cfg.Indexes = []s3store.IndexDef[Usage]{{
+cfg.Projections = []s3store.ProjectionDef[Usage]{{
     Name:    "mixed_idx",
     Columns: []string{"sku_id", "month", "at"},
     Of: func(u Usage) ([]string, error) {
@@ -1140,19 +1075,19 @@ cfg.Indexes = []s3store.IndexDef[Usage]{{
 }}
 ```
 
-Indexes are wired at construction time, so registration cannot
-race with `Write` and "registered after the first Write" is not
-a reachable state. Use `BackfillIndex` (below) to retroactively
-cover records written before an index existed.
+Projections are wired at construction time, so registration
+cannot race with `Write` and "registered after the first Write"
+is not a reachable state. Use `BackfillProjection` (below) to
+retroactively cover records written before a projection existed.
 
-`IndexReader[K]` is T-free — a read-only service can build the handle
-without depending on the writer's record type.
+`ProjectionReader[K]` is T-free — a read-only service can build
+the handle without depending on the writer's record type.
 
-Every `Write` call iterates each registered index, collects a
-deduplicated set of marker paths across the batch, and PUTs one
-empty marker per distinct path under
-`<Prefix>/_index/<name>/<col>=<val>/.../m.idx`. Duplicate writes
-are idempotent (same S3 key, same empty body).
+Every `Write` call iterates each registered projection, collects
+a deduplicated set of marker paths across the batch, and PUTs
+one empty marker per distinct path under
+`<Prefix>/_projection/<name>/<col>=<val>/.../m.proj`. Duplicate
+writes are idempotent (same S3 key, same empty body).
 
 #### Of and From: positional, aligned to Columns
 
@@ -1183,7 +1118,7 @@ hits, err := skuIdx.Lookup(ctx, []string{
 
 The pattern grammar is the same one `Read` accepts (exact,
 trailing-`*`, whole-segment `*`, `FROM..TO` range). Results are
-unbounded — narrow the pattern if an index has millions of
+unbounded — narrow the pattern if a projection has millions of
 matches.
 
 ### Multi-pattern reads
@@ -1196,8 +1131,8 @@ customer=def)` but *not* the off-diagonal combinations), pass them
 as additional elements of the same `[]string` patterns slice.
 Every read entry point already takes `[]string`:
 
-Every read entry point — `Read`, `ReadIter`, `IndexReader.Lookup`,
-`BackfillIndex` — accepts the same `[]string` shape:
+Every read entry point — `Read`, `ReadIter`, `ProjectionReader.Lookup`,
+`BackfillProjection` — accepts the same `[]string` shape:
 
 ```go
 // Read across non-Cartesian tuples.
@@ -1206,14 +1141,14 @@ recs, _ := store.Read(ctx, []string{
     "period=2026-03-18/customer=def",
 })
 
-// Index lookup over an arbitrary set of (col, col) tuples.
+// Projection lookup over an arbitrary set of (col, col) tuples.
 entries, _ := idx.Lookup(ctx, []string{
     "sku=s1/customer=abc",
     "sku=s4/customer=def",
 })
 
 // One-off migration across several partitions.
-stats, _ := s3store.BackfillIndex(ctx, target, def,
+stats, _ := s3store.BackfillProjection(ctx, target, def,
     []string{"period=2026-03-*/customer=*", "period=2026-04-01/customer=*"},
     until, nil)
 ```
@@ -1231,8 +1166,8 @@ set.
 
 ### What's in scope for v1
 
-- Wire indexes via `Config.Indexes`; auto-write on `Write` +
-  `Lookup` via the typed `IndexReader[K]` handle.
+- Wire projections via `Config.Projections`; auto-write on `Write` +
+  `Lookup` via the typed `ProjectionReader[K]` handle.
 - Read-after-write on Lookup: the marker PUT and the marker LIST
   both inherit `ConsistencyControl` from the shared `S3Target`,
   so a `Lookup` issued immediately after `Write` sees the new
@@ -1244,23 +1179,23 @@ set.
 
 ### Backfill
 
-The normal path is to wire an index into `Config.Indexes` before
-the first `Write` so every record produces markers. When that
-isn't possible — adding an index to a store that already has
-data — the typical shape is:
+The normal path is to wire a projection into `Config.Projections`
+before the first `Write` so every record produces markers. When
+that isn't possible — adding a projection to a store that
+already has data — the typical shape is:
 
-1. Deploy the live app with the index in `Config.Indexes`; every
+1. Deploy the live app with the projection in `Config.Projections`; every
    new `Write` emits markers from time T0 onward.
 2. Capture `until := T0` — the watermark before which historical
    data is uncovered.
 3. Run a **one-off migration job** using the package-level
-   `s3store.BackfillIndex` that scans files with `LastModified <
+   `s3store.BackfillProjection` that scans files with `LastModified <
    until` and PUTs the retroactive markers.
 
 ```go
-stats, err := s3store.BackfillIndex(ctx,
+stats, err := s3store.BackfillProjection(ctx,
     store.Target(),     // or construct via s3store.NewS3Target
-    def,                // the same IndexDef the live app registered
+    def,                // the same ProjectionDef the live app registered
     []string{"*"},      // patterns (PartitionKeyParts grammar)
     until,              // exclusive upper bound on LastModified (time.Time)
     func(path string) { slog.Warn("missing data", "path", path) },
@@ -1268,18 +1203,18 @@ stats, err := s3store.BackfillIndex(ctx,
 // stats.DataObjects / Records / Markers
 ```
 
-`BackfillIndex` is deliberately standalone — no `Writer` /
+`BackfillProjection` is deliberately standalone — no `Writer` /
 `Reader` argument — so the migration job doesn't need the live
 app's full config. It runs through the same `S3Target`
-abstraction used by the read-side `NewIndexReader`, issuing both
+abstraction used by the read-side `NewProjectionReader`, issuing both
 parquet GETs and marker PUTs via `target.S3Client`. Typically
 invoked from a dedicated binary (`cmd/backfill-<name>/main.go`
 in your repo): a ~30-line `main` that builds an S3 client +
-`S3Target` + the same `IndexDef[T]` the live app uses, then calls
-`BackfillIndex`.
+`S3Target` + the same `ProjectionDef[T]` the live app uses, then calls
+`BackfillProjection`.
 
 The pattern is evaluated against the target's `PartitionKeyParts`
-(same grammar as `Read`), **not** against the index's `Columns`
+(same grammar as `Read`), **not** against the projection's `Columns`
 — backfill walks parquet data files, which are keyed by
 partition. A migration job can shard itself by partition
 (`period=2026-01-*` on one pod, `period=2026-02-*` on another)
@@ -1299,12 +1234,12 @@ records.
 Backfilled markers are subject to the same read-after-write
 contract as live-write markers: on a strong-consistent backend
 (AWS, MinIO, or StorageGRID with `ConsistencyControl` set on
-the target) a `Lookup` issued after `BackfillIndex` returns
+the target) a `Lookup` issued after `BackfillProjection` returns
 sees every marker it just wrote.
 
 ### Not in v1 (deferred)
 
-- **Delete index** — no general delete path on the store yet.
+- **Delete projection** — no general delete path on the store yet.
 - **Verification / orphan cleanup tools** — if `Of` changes
   semantically, stale markers remain. Backfill only adds
   missing markers; rebuild (delete-then-re-PUT) is a separate
@@ -1405,7 +1340,7 @@ in-budget ref rather than silently matching the stale one.
 
 ```go
 if _, err := store.Write(ctx, recs,
-    s3store.WithIdempotencyToken(token, time.Hour),
+    s3store.WithIdempotencyToken(token),
 ); err != nil {
     // ctx.DeadlineExceeded indicates the ref PUT missed its
     // SettleWindow/2 budget; any wrapped put error means the
@@ -1463,8 +1398,8 @@ bucket sees the new records immediately — no sleep, no settle
 delay:
 
 - `Reader.Read` / `ReadIter`
-- `IndexReader.Lookup`
-- `BackfillIndex`
+- `ProjectionReader.Lookup`
+- `BackfillProjection`
 
 `Poll` / `PollRecords` / `ReadRangeIter` are the intentional
 exceptions: they apply the `SettleWindow` cutoff so near-tip refs
@@ -1489,7 +1424,7 @@ subsequent poll issued after one `SettleWindow` has elapsed.
 
 If `Write` (or `WriteWithKey`) returns `nil`, every record in
 the batch is durably stored in S3 and will be returned by
-subsequent `Read`, `Poll`, `PollRecords`, and `Index.Lookup` for
+subsequent `Read`, `Poll`, `PollRecords`, and `ProjectionReader.Lookup` for
 the lifetime of the data. The write path commits in order: data
 PUT → marker PUTs → ref PUT, returning success only after the
 final step lands (or, on a lost PUT ack, after a HEAD confirms
@@ -1525,7 +1460,7 @@ response by path:
   GET); a caller retry resolves it because the next LIST won't
   include the deleted key.
 - **Tolerant — skip and signal.** `PollRecords`, `ReadRangeIter`,
-  and `BackfillIndex` walk the ref stream / data tree on a
+  and `BackfillProjection` walk the ref stream / data tree on a
   long-running shape where a single missing file shouldn't poison
   the whole job. They log via `slog.Warn` (level WARN, key=path,
   method=poll_records / read_range_iter / backfill) and increment
@@ -1579,10 +1514,9 @@ type Config[T any] struct {
     // levels × S3 operations" for the full contract.
     ConsistencyControl ConsistencyLevel
 
-    // Optional ref-stream opt-out and tuning knobs.
-    DisableRefStream    bool
+    // Optional tuning knobs.
     MaxInflightRequests int
-    Indexes             []IndexDef[T]
+    Projections         []ProjectionDef[T]
 }
 ```
 
@@ -1646,7 +1580,7 @@ not terminal error class — keeping cardinality bounded).
 
 **Library methods** (recorded at the public entry point of `Write`,
 `WriteWithKey`, `Read`, `ReadIter`, `ReadRangeIter`, `Poll`,
-`PollRecords`, `IndexReader.Lookup`, `BackfillIndex`):
+`PollRecords`, `ProjectionReader.Lookup`, `BackfillProjection`):
 
 | Name | Kind | Unit |
 |---|---|---|
@@ -1663,7 +1597,7 @@ not terminal error class — keeping cardinality bounded).
 
 `s3store.read.missing_data` increments on `NoSuchKey` skips along
 the tolerant read paths (`PollRecords`, `ReadRangeIter`,
-`BackfillIndex`). Carries `s3store.method` so dashboards can
+`BackfillProjection`). Carries `s3store.method` so dashboards can
 split by which path produced the skip. Strict paths (`Read`,
 `ReadIter`) fail instead of recording.
 
@@ -1688,7 +1622,7 @@ double-count.
 | `s3store.target.semaphore.wait.duration` | histogram | s | wait time before a slot was granted |
 | `s3store.target.semaphore.acquires` | counter | 1 | by `outcome` |
 
-**Fan-out** (concurrency primitive used by writer/reader/index work):
+**Fan-out** (concurrency primitive used by writer/reader/projection work):
 
 | Name | Kind | Unit | What |
 |---|---|---|---|
@@ -1730,7 +1664,7 @@ Breaking changes in the single-package collapse:
 
   Mechanical rename — every public symbol moved with the same
   name (`Writer[T]`, `Reader[T]`, `Config[T]`, `S3Target`,
-  `IndexDef[T]`, `IndexReader[K]`, `BackfillIndex`, etc.).
+  `ProjectionDef[T]`, `ProjectionReader[K]`, `BackfillProjection`, etc.).
 - **DuckDB-only umbrella fields removed from `Config`.**
   `TableAlias`, `VersionColumn`, `EntityKeyColumns`,
   `ExtraInitSQL`, `Store.Query`, `Store.Close`, and `Store.SQL`
@@ -1751,22 +1685,22 @@ Breaking changes in the single-package collapse:
   path can drop that permission too. Retries still work
   unchanged via the token + conditional-PUT path.
 - **`OnMissingData` callback removed from `Config` and
-  `ReaderConfig`; `BackfillIndex` no longer takes an
+  `ReaderConfig`; `BackfillProjection` no longer takes an
   `onMissingData` parameter.** Replaced with a built-in
   `slog.Warn` + `s3store.read.missing_data` OTel counter at the
   three tolerant call sites (`PollRecords`, `ReadRangeIter`,
-  `BackfillIndex`). The strict paths (`Read`, `ReadIter`) now
+  `BackfillProjection`). The strict paths (`Read`, `ReadIter`) now
   fail with a wrapped `NoSuchKey` error instead of skip-and-
   notify — a caller retry resolves the LIST-to-GET race. Drop
   the callback from your config and the trailing argument from
-  `BackfillIndex` calls; configure your slog handler to route /
+  `BackfillProjection` calls; configure your slog handler to route /
   count the warning, or alert on the counter via your metrics
   backend.
 
 For anyone upgrading across multiple releases, the older
-breaking-change history (indexes-in-config, consistency-on-target,
+breaking-change history (projections-in-config, consistency-on-target,
 S3Target-as-handle, idempotent-write, bloom-filter removal,
-s3sql-as-Reader, the Index refactor, the package split) is
+s3sql-as-Reader, the Projection refactor, the package split) is
 preserved in git history — `git log -- README.md`.
 
 ## Testing

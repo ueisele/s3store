@@ -78,8 +78,8 @@ const (
 // metrics owns every OTel instrument the library records into and
 // the constant attribute set baked in at construction (bucket,
 // prefix, consistency level when set). One *metrics per S3Target;
-// Writer / Reader / IndexReader inherit it via the Target they
-// hold.
+// Writer / Reader / ProjectionReader inherit it via the Target
+// they hold.
 //
 // Internal — users configure observability by setting
 // S3TargetConfig.MeterProvider; the rest of this struct is the
@@ -280,7 +280,7 @@ func newMetrics(
 		"{file}")
 	m.readMissingData = mustCounter(
 		"s3store.read.missing_data",
-		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / BackfillIndex). Strict paths (Read / ReadIter) fail instead of recording.",
+		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / BackfillProjection). Strict paths (Read / ReadIter) fail instead of recording.",
 		"{event}")
 	m.readMalformedRefs = mustCounter(
 		"s3store.read.malformed_refs",
@@ -672,7 +672,7 @@ func (s *methodScope) addFiles(n int64) {
 
 // recordMissingData increments the missing-data counter for one
 // NoSuchKey skip on a tolerant read path (PollRecords /
-// ReadRangeIter / BackfillIndex). Reuses the scope's method as
+// ReadRangeIter / BackfillProjection). Reuses the scope's method as
 // the attribute so dashboards can split by which path produced
 // the skip — no caller plumbing.
 func (s *methodScope) recordMissingData() {

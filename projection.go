@@ -8,27 +8,27 @@ import (
 	"time"
 )
 
-// IndexLookupDef is the read-side definition of a secondary
-// index. Build an IndexReader[K] from it via NewIndexReader
-// when a service queries an existing index (dashboard, query
-// API).
+// ProjectionLookupDef is the read-side definition of a secondary
+// projection. Build a ProjectionReader[K] from it via
+// NewProjectionReader when a service queries an existing projection
+// (dashboard, query API).
 //
-// Name + Columns identify the index in S3; From projects the
+// Name + Columns identify the projection in S3; From projects the
 // per-marker column values back into a typed K. From is optional
 // — when nil, the library reflects K's parquet-tagged string
 // fields against Columns and assembles K from the values slice.
 // Provide a custom From for K's that have no parquet tags or
 // when extra validation/transformation is needed.
-type IndexLookupDef[K comparable] struct {
-	// Name identifies the index under the target's
-	// <Prefix>/_index/ subtree. Required. Must be non-empty and
-	// free of '/'.
+type ProjectionLookupDef[K comparable] struct {
+	// Name identifies the projection under the target's
+	// <Prefix>/_projection/ subtree. Required. Must be non-empty
+	// and free of '/'.
 	Name string
 
-	// Columns lists the index's column names in the order they
-	// appear in the S3 path. Earlier columns form a narrower LIST
-	// prefix when Lookup specifies them literally. Pick the order
-	// based on how queries filter: most-selective first.
+	// Columns lists the projection's column names in the order
+	// they appear in the S3 path. Earlier columns form a narrower
+	// LIST prefix when Lookup specifies them literally. Pick the
+	// order based on how queries filter: most-selective first.
 	Columns []string
 
 	// From projects a Lookup-result values slice (one entry per
@@ -43,7 +43,7 @@ type IndexLookupDef[K comparable] struct {
 	// From implementations may rely on positional access (e.g.
 	// values[0] for Columns[0]).
 	//
-	// Errors are propagated by Lookup with the index name as
+	// Errors are propagated by Lookup with the projection name as
 	// wrapping context.
 	From func(values []string) (K, error)
 
@@ -53,32 +53,33 @@ type IndexLookupDef[K comparable] struct {
 	// Layout entirely.
 	//
 	// For correctness, Layout.Time on the read side MUST match
-	// IndexDef.Layout.Time on the write side — drift produces
+	// ProjectionDef.Layout.Time on the write side — drift produces
 	// silently wrong values or parse errors. Define one constant
 	// and reuse it on both sides.
 	Layout Layout
 }
 
-// IndexDef is the write-side definition of a secondary index.
-// Pass a slice of these on WriterConfig.Indexes / Config.Indexes
-// at construction; the writer iterates each registered index per
-// record, builds the marker S3 key from Columns + Of's return,
-// and PUTs one empty marker per distinct key.
+// ProjectionDef is the write-side definition of a secondary
+// projection. Pass a slice of these on WriterConfig.Projections /
+// Config.Projections at construction; the writer iterates each
+// registered projection per record, builds the marker S3 key from
+// Columns + Of's return, and PUTs one empty marker per distinct
+// key.
 //
-// The previous late-binding RegisterIndex API is gone: indexes
-// are part of the writer's construction, so registration cannot
-// race with Write and "registered after first Write" is not a
-// reachable state.
-type IndexDef[T any] struct {
-	// Name identifies the index under the target's
-	// <Prefix>/_index/ subtree. Required. Must be non-empty,
-	// free of '/', and unique across IndexDef[T] entries on the
-	// same writer.
+// The previous late-binding RegisterProjection API is gone:
+// projections are part of the writer's construction, so
+// registration cannot race with Write and "registered after first
+// Write" is not a reachable state.
+type ProjectionDef[T any] struct {
+	// Name identifies the projection under the target's
+	// <Prefix>/_projection/ subtree. Required. Must be non-empty,
+	// free of '/', and unique across ProjectionDef[T] entries on
+	// the same writer.
 	Name string
 
-	// Columns lists the index's column names in the order they
-	// appear in the S3 path. Same ordering rules as
-	// IndexLookupDef.Columns (most-selective first for LIST
+	// Columns lists the projection's column names in the order
+	// they appear in the S3 path. Same ordering rules as
+	// ProjectionLookupDef.Columns (most-selective first for LIST
 	// pruning).
 	Columns []string
 
@@ -116,7 +117,8 @@ type IndexDef[T any] struct {
 //
 // Layout choices are part of the marker S3 key — once published,
 // changing the layout orphans every prior marker. Pick a stable
-// format up front (use BackfillIndex if you ever need to migrate).
+// format up front (use BackfillProjection if you ever need to
+// migrate).
 type Layout struct {
 	// Time is the layout string passed to time.Time.Format for
 	// any column matching a time.Time field on T. Examples:
@@ -128,18 +130,19 @@ type Layout struct {
 	Time string
 }
 
-// validateIndexDefShape validates Name + Columns. Shared between
-// NewIndexReader and the write-side validation in NewWriter.
-func validateIndexDefShape(name string, columns []string) error {
+// validateProjectionDefShape validates Name + Columns. Shared
+// between NewProjectionReader and the write-side validation in
+// NewWriter.
+func validateProjectionDefShape(name string, columns []string) error {
 	if name == "" {
-		return fmt.Errorf("s3store: index: Name is required")
+		return fmt.Errorf("s3store: projection: Name is required")
 	}
 	if strings.Contains(name, "/") {
 		return fmt.Errorf(
-			"s3store: index: Name %q must not contain '/'", name)
+			"s3store: projection: Name %q must not contain '/'", name)
 	}
 	if err := validatePartitionKeyParts(columns); err != nil {
-		return fmt.Errorf("s3store: index %q: %w", name, err)
+		return fmt.Errorf("s3store: projection %q: %w", name, err)
 	}
 	return nil
 }
@@ -164,7 +167,7 @@ type fieldPlan struct {
 //
 // requireExact rejects t carrying parquet tags not listed in
 // columns. The write side passes false (record types are
-// typically wider than the index — extra tags ignored). The
+// typically wider than the projection — extra tags ignored). The
 // read side passes true (the entry type must match Columns 1:1
 // — an extra tagged field would silently round-trip nothing).
 func buildFieldPlans(
@@ -193,7 +196,7 @@ func buildFieldPlans(
 		info, ok := tagged[col]
 		if !ok {
 			return nil, fmt.Errorf(
-				"index column %q has no matching parquet-tagged "+
+				"projection column %q has no matching parquet-tagged "+
 					"field on %s (provide a custom %s, or add the tag)",
 				col, t, errCtx)
 		}
@@ -203,7 +206,7 @@ func buildFieldPlans(
 		case info.ftyp == timeType:
 			if layout.Time == "" {
 				return nil, fmt.Errorf(
-					"index column %q matches a time.Time field on "+
+					"projection column %q matches a time.Time field on "+
 						"%s but Layout.Time is empty (set Layout.Time, "+
 						"or provide a custom %s)", col, t, errCtx)
 			}
@@ -214,7 +217,7 @@ func buildFieldPlans(
 			}
 		default:
 			return nil, fmt.Errorf(
-				"index column %q matches a parquet-tagged field on "+
+				"projection column %q matches a parquet-tagged field on "+
 					"%s but it is %s, not string or time.Time "+
 					"(provide a custom %s)",
 				col, t, info.ftyp.Kind(), errCtx)
@@ -241,19 +244,19 @@ func buildFieldPlans(
 // of a supported type) runs once at resolve time so per-record
 // work is just a slice alloc + N field-projection calls.
 //
-// Used by NewWriter (to wire the write path) and BackfillIndex
+// Used by NewWriter (to wire the write path) and BackfillProjection
 // (to walk historical data files), so both code paths share one
 // resolution rule. T may carry parquet tags not in columns —
 // those are ignored, since record types are typically wider
-// than the index.
-func resolveOf[T any](def IndexDef[T]) (func(T) ([]string, error), error) {
+// than the projection.
+func resolveOf[T any](def ProjectionDef[T]) (func(T) ([]string, error), error) {
 	if def.Of != nil {
 		return def.Of, nil
 	}
 	plans, err := buildFieldPlans(
 		reflect.TypeFor[T](), def.Columns, def.Layout, false, "Of")
 	if err != nil {
-		return nil, fmt.Errorf("s3store: index %q: %w", def.Name, err)
+		return nil, fmt.Errorf("s3store: projection %q: %w", def.Name, err)
 	}
 	return func(rec T) ([]string, error) {
 		v := reflect.ValueOf(rec)
@@ -270,55 +273,55 @@ func resolveOf[T any](def IndexDef[T]) (func(T) ([]string, error), error) {
 	}, nil
 }
 
-// indexBasePath returns the prefix under which markers for the
-// named secondary index are stored, relative to the store's
-// top-level Prefix. Each index lives in its own subtree so
-// multiple indexes on one store don't collide.
-func indexBasePath(prefix, name string) string {
-	return prefix + "/_index/" + name
+// projectionBasePath returns the prefix under which markers for
+// the named secondary projection are stored, relative to the
+// store's top-level Prefix. Each projection lives in its own
+// subtree so multiple projections on one store don't collide.
+func projectionBasePath(prefix, name string) string {
+	return prefix + "/_projection/" + name
 }
 
-// indexMarkerFilename is the fixed terminal filename appended to
-// every marker S3 key. The last real path segment is always
+// projectionMarkerFilename is the fixed terminal filename appended
+// to every marker S3 key. The last real path segment is always
 // "col=value"; this constant sits after it so parse code can
 // strip it uniformly and LIST paginators recognise markers.
-const indexMarkerFilename = "m.idx"
+const projectionMarkerFilename = "m.proj"
 
-// buildIndexMarkerPath assembles an S3 object key for an index
-// marker. columns and values are paired by position. Values must
-// pass validateHivePartitionValue before calling; this helper
-// does not revalidate.
-func buildIndexMarkerPath(
-	indexPath string, columns, values []string,
+// buildProjectionMarkerPath assembles an S3 object key for a
+// projection marker. columns and values are paired by position.
+// Values must pass validateHivePartitionValue before calling;
+// this helper does not revalidate.
+func buildProjectionMarkerPath(
+	projectionPath string, columns, values []string,
 ) string {
 	segs := make([]string, len(columns))
 	for i := range columns {
 		segs[i] = columns[i] + "=" + values[i]
 	}
-	return indexPath + "/" + strings.Join(segs, "/") +
-		"/" + indexMarkerFilename
+	return projectionPath + "/" + strings.Join(segs, "/") +
+		"/" + projectionMarkerFilename
 }
 
-// parseIndexMarkerKey is the inverse of buildIndexMarkerPath. It
-// extracts the column values from a marker key in the order they
-// appear in columns. Fails if the key doesn't match the shape
-// (wrong prefix, wrong suffix, wrong segment count, wrong column
-// name in a segment).
-func parseIndexMarkerKey(
-	markerKey, indexPath string, columns []string,
+// parseProjectionMarkerKey is the inverse of
+// buildProjectionMarkerPath. It extracts the column values from a
+// marker key in the order they appear in columns. Fails if the
+// key doesn't match the shape (wrong prefix, wrong suffix, wrong
+// segment count, wrong column name in a segment).
+func parseProjectionMarkerKey(
+	markerKey, projectionPath string, columns []string,
 ) ([]string, error) {
-	prefix := indexPath + "/"
+	prefix := projectionPath + "/"
 	if !strings.HasPrefix(markerKey, prefix) {
 		return nil, fmt.Errorf(
-			"s3store: marker key %q outside index path %q",
-			markerKey, indexPath)
+			"s3store: marker key %q outside projection path %q",
+			markerKey, projectionPath)
 	}
 	body := markerKey[len(prefix):]
-	tail := "/" + indexMarkerFilename
+	tail := "/" + projectionMarkerFilename
 	if !strings.HasSuffix(body, tail) {
 		return nil, fmt.Errorf(
 			"s3store: marker key %q missing %q suffix",
-			markerKey, indexMarkerFilename)
+			markerKey, projectionMarkerFilename)
 	}
 	body = body[:len(body)-len(tail)]
 	segs := strings.Split(body, "/")
@@ -353,23 +356,23 @@ const maxMarkerKeyLen = 1000
 // Validates length match and that values are safe for hive-
 // partition path segments. Enforces the 1000-byte cap.
 func markerPathFromValues(
-	name, indexPath string, columns []string, values []string,
+	name, projectionPath string, columns []string, values []string,
 ) (string, error) {
 	if len(values) != len(columns) {
 		return "", fmt.Errorf(
-			"s3store: index %q: Of returned %d values, want %d "+
+			"s3store: projection %q: Of returned %d values, want %d "+
 				"(one per Column)", name, len(values), len(columns))
 	}
 	for j, col := range columns {
 		if err := validateHivePartitionValue(values[j]); err != nil {
 			return "", fmt.Errorf(
-				"s3store: index %q column %q: %w", name, col, err)
+				"s3store: projection %q column %q: %w", name, col, err)
 		}
 	}
-	p := buildIndexMarkerPath(indexPath, columns, values)
+	p := buildProjectionMarkerPath(projectionPath, columns, values)
 	if len(p) > maxMarkerKeyLen {
 		return "", fmt.Errorf(
-			"s3store: index %q marker key is %d bytes, exceeds "+
+			"s3store: projection %q marker key is %d bytes, exceeds "+
 				"%d (S3 limit is 1024; narrow Columns or shorten "+
 				"values)", name, len(p), maxMarkerKeyLen)
 	}

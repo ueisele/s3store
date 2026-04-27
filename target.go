@@ -125,19 +125,19 @@ func consistencyAPIOpts(level ConsistencyLevel) []func(*middleware.Stack) error 
 // S3TargetConfig is the user-facing config for an s3parquet
 // dataset — pure data, struct-literal-friendly. Convert to a
 // live S3Target via NewS3Target before passing to a Writer/Reader/
-// Index/BackfillIndex.
+// ProjectionReader/BackfillProjection.
 //
 // Embedded indirectly via WriterConfig.Target / ReaderConfig.Target
 // (which carry an S3Target — the live form) so the four S3-wiring
 // fields plus knobs live in exactly one place. Surfaced on
 // Writer/Reader/Store via .Target() so read-only tools
-// (NewIndexReader, BackfillIndex) can address the same dataset
+// (NewProjectionReader, BackfillProjection) can address the same dataset
 // without carrying T through their call graph.
 type S3TargetConfig struct {
 	// Bucket is the S3 bucket name.
 	Bucket string
 
-	// Prefix is the key prefix under which data/ref/index files
+	// Prefix is the key prefix under which data/ref/projection files
 	// live. Must be non-empty — a bare bucket root would collide
 	// with any other tenant of the bucket.
 	Prefix string
@@ -157,9 +157,9 @@ type S3TargetConfig struct {
 	// readers consistent with near-tip writers whose refs may not
 	// yet be visible in S3 LIST.
 	//
-	// Does not apply to Index.Lookup: marker visibility is
-	// delegated to the storage layer via ConsistencyControl, so a
-	// read-after-write Lookup works without any settle delay on
+	// Does not apply to ProjectionReader.Lookup: marker visibility
+	// is delegated to the storage layer via ConsistencyControl, so
+	// a read-after-write Lookup works without any settle delay on
 	// strong-consistent backends.
 	//
 	// Default (zero value): 5s. Zero is treated as "use library
@@ -169,22 +169,6 @@ type S3TargetConfig struct {
 	// window (e.g. 30s on a slow backend, 500ms for low-latency
 	// testing).
 	SettleWindow time.Duration
-
-	// DisableRefStream opts the dataset out of writing stream ref
-	// files under <Prefix>/_stream/refs/. Saves one S3 PUT per
-	// distinct partition key touched by a Write (Write groups
-	// records by key and calls WriteWithKey once per group, each
-	// of which issues one ref PUT without this flag). Read /
-	// Query / Lookup / BackfillIndex are unaffected; Poll /
-	// PollRecords / ReadRangeIter return ErrRefStreamDisabled.
-	// OffsetAt still works (pure timestamp encoding — no S3
-	// dependency).
-	//
-	// Irreversible per write: data written with this flag set has
-	// no refs, so flipping the flag back does not retroactively
-	// make Poll see historical writes. Set only for datasets that
-	// are read purely via Read / Query.
-	DisableRefStream bool
 
 	// MaxInflightRequests caps the number of S3 requests a single
 	// constructed S3Target may have outstanding at once. Enforced
@@ -211,8 +195,8 @@ type S3TargetConfig struct {
 	// ConsistencyControl sets the Consistency-Control HTTP header
 	// applied to every correctness-critical S3 operation routed
 	// through this target — data PUTs (idempotent and unconditional),
-	// ref PUTs, index marker PUTs, data GETs, HEADs, and every LIST
-	// (partition LIST on the read path, marker LIST in Index.Lookup,
+	// ref PUTs, projection marker PUTs, data GETs, HEADs, and every LIST
+	// (partition LIST on the read path, marker LIST in ProjectionReader.Lookup,
 	// ref-stream LIST in Poll/PollRecords/ReadRangeIter, and the
 	// scoped retry-LIST in findExistingRef).
 	//
@@ -226,7 +210,7 @@ type S3TargetConfig struct {
 	// the full matrix.
 	//
 	// Setting the level on the target rather than on the Writer /
-	// Reader / Index configs enforces NetApp's "same consistency
+	// Reader / Projection configs enforces NetApp's "same consistency
 	// for paired operations" rule by construction: every operation
 	// routed through this target uses one and the same value.
 	ConsistencyControl ConsistencyLevel
@@ -277,7 +261,7 @@ func (c S3TargetConfig) EffectiveMaxInflightRequests() int {
 
 // Validate runs the full check for constructors that operate on
 // partitioned data: Bucket, Prefix, S3Client, PartitionKeyParts.
-// Used by NewWriter, NewReader, BackfillIndex — anything that
+// Used by NewWriter, NewReader, BackfillProjection — anything that
 // reads/writes data files keyed by partition.
 func (c S3TargetConfig) Validate() error {
 	if err := c.ValidateLookup(); err != nil {
@@ -288,12 +272,12 @@ func (c S3TargetConfig) Validate() error {
 
 // ValidateLookup is the reduced check for constructors that
 // only LIST / GET / PUT under a known prefix (no partition-key
-// predicates): Bucket, Prefix, S3Client. Used by NewIndexReader
-// — Lookup walks the <Prefix>/_index/<name>/ subtree, which is
-// keyed by the index's own Columns, not the config's
+// predicates): Bucket, Prefix, S3Client. Used by NewProjectionReader
+// — Lookup walks the <Prefix>/_projection/<name>/ subtree, which is
+// keyed by the projection's own Columns, not the config's
 // PartitionKeyParts. A read-only analytics service can pass a
 // minimally-populated S3TargetConfig and still build a working
-// IndexReader.
+// ProjectionReader.
 func (c S3TargetConfig) ValidateLookup() error {
 	if c.Bucket == "" {
 		return fmt.Errorf("s3store: Bucket is required")
@@ -331,8 +315,8 @@ type S3Target struct {
 
 // NewS3Target constructs a live S3Target from config, allocating
 // the shared in-flight semaphore. Performs no field validation —
-// downstream constructors (NewWriter, NewReader, NewIndexReader,
-// BackfillIndex) call Validate / ValidateLookup as appropriate.
+// downstream constructors (NewWriter, NewReader, NewProjectionReader,
+// BackfillProjection) call Validate / ValidateLookup as appropriate.
 //
 // Logs a warning when ConsistencyControl is non-empty but doesn't
 // match a named ConsistencyLevel constant — typo guard with no
@@ -364,10 +348,6 @@ func (t S3Target) S3Client() *s3.Client { return t.cfg.S3Client }
 
 // PartitionKeyParts returns the configured Hive-partition keys.
 func (t S3Target) PartitionKeyParts() []string { return t.cfg.PartitionKeyParts }
-
-// DisableRefStream reports whether the dataset is configured to
-// skip ref-stream emission.
-func (t S3Target) DisableRefStream() bool { return t.cfg.DisableRefStream }
 
 // ConsistencyControl returns the configured Consistency-Control
 // header value applied to every routed S3 call.
@@ -417,7 +397,7 @@ func (t S3Target) release() {
 }
 
 // get downloads a single object into memory. Used by the read
-// path (Read, PollRecords) and by BackfillIndex when scanning
+// path (Read, PollRecords) and by BackfillProjection when scanning
 // historical parquet data. Carries the target's
 // ConsistencyControl on every call.
 func (t S3Target) get(
@@ -453,7 +433,7 @@ func (t S3Target) get(
 }
 
 // put uploads data under key. Used by the write path (parquet +
-// ref + markers) and by BackfillIndex for retroactive marker
+// ref + markers) and by BackfillProjection for retroactive marker
 // emission. Carries the target's ConsistencyControl on every
 // call.
 func (t S3Target) put(
@@ -571,6 +551,40 @@ func (t S3Target) putIfAbsent(
 	return putErr
 }
 
+// headMetadata HEADs key and returns its user-defined metadata
+// (the x-amz-meta-* headers, surfaced by the SDK with lowercase
+// keys). Used on the idempotent-retry path to read the data file's
+// created-at stamp without downloading the body. Carries the
+// target's ConsistencyControl so the HEAD pairs with the
+// preceding data PUT under NetApp's "same level" rule.
+func (t S3Target) headMetadata(
+	ctx context.Context, key string,
+) (_ map[string]string, err error) {
+	scope := t.metrics.s3OpScope(ctx, s3OpHead)
+	defer scope.end(&err)
+	if err = t.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer t.release()
+	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
+	var meta map[string]string
+	err = retry(ctx, func() error {
+		scope.incAttempts()
+		resp, err := t.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(t.cfg.Bucket),
+			Key:    aws.String(key),
+		}, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, apiOpts...)
+		})
+		if err != nil {
+			return err
+		}
+		meta = resp.Metadata
+		return nil
+	})
+	return meta, err
+}
+
 // existsLocked is the slot-already-held variant of exists. Called
 // from putIfAbsent's 403 branch where the caller is already inside
 // an acquire/release pair — re-acquiring would deadlock when the
@@ -654,7 +668,7 @@ func (t S3Target) listPage(
 // single page round-trip suffices.
 //
 // Single LIST primitive across the library — partition LIST,
-// index marker LIST, ref-stream LIST (Poll), and the bounded
+// projection marker LIST, ref-stream LIST (Poll), and the bounded
 // retry-dedup LIST (findExistingRef) all funnel through here so
 // the "semaphore + retry + consistency header" wrapping is
 // implemented once. Carries the target's ConsistencyControl on

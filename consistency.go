@@ -14,7 +14,7 @@ import "log/slog"
 // Configured on S3TargetConfig.ConsistencyControl, applied
 // uniformly to every correctness-critical S3 call routed through
 // the target — data PUTs (idempotent and unconditional), ref
-// PUTs, index marker PUTs, GETs, HEADs, and every LIST
+// PUTs, projection marker PUTs, GETs, HEADs, and every LIST
 // (partition LIST, marker LIST, ref-stream LIST in Poll, scoped
 // retry-LIST in findExistingRef). Setting it on the target rather
 // than per-config struct enforces NetApp's "same consistency for

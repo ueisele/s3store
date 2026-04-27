@@ -1,7 +1,6 @@
 package s3store
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -11,14 +10,6 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
 )
-
-// ErrRefStreamDisabled is returned by Poll / PollRecords /
-// ReadRangeIter when the Target has DisableRefStream set. The
-// dataset was written without ref files, so there is no stream
-// to tail. OffsetAt stays usable (pure timestamp encoding).
-var ErrRefStreamDisabled = errors.New(
-	"ref stream disabled on this Store; " +
-		"Poll/PollRecords/ReadRangeIter unavailable")
 
 // CompressionCodec selects the parquet-level compression applied
 // to every column on Write. String-valued for easy config/YAML
@@ -124,13 +115,6 @@ type Config[T any] struct {
 	// the hot-path Write doesn't reparse it.
 	Compression CompressionCodec
 
-	// DisableRefStream opts this dataset out of writing stream ref
-	// files. Saves one S3 PUT per distinct partition key touched
-	// by a Write. Poll / PollRecords / ReadRangeIter return
-	// ErrRefStreamDisabled when set. See S3Target.DisableRefStream
-	// for the full contract.
-	DisableRefStream bool
-
 	// ConsistencyControl is the Consistency-Control HTTP header
 	// value applied to correctness-critical S3 operations.
 	// Forwarded onto the shared S3Target so every S3 call (write
@@ -145,10 +129,11 @@ type Config[T any] struct {
 	// S3Target.MaxInflightRequests for the full contract.
 	MaxInflightRequests int
 
-	// Indexes lists the secondary indexes the writer should
-	// maintain. See WriterConfig.Indexes for the full contract.
-	// Forwarded to WriterConfig only — readers don't emit markers.
-	Indexes []IndexDef[T]
+	// Projections lists the secondary projections the writer
+	// should maintain. See WriterConfig.Projections for the full
+	// contract. Forwarded to WriterConfig only — readers don't
+	// emit markers.
+	Projections []ProjectionDef[T]
 }
 
 // dedupEnabled reports whether latest-per-entity dedup applies.
@@ -206,7 +191,6 @@ func targetFrom[T any](c Config[T]) S3Target {
 		S3Client:            c.S3Client,
 		PartitionKeyParts:   c.PartitionKeyParts,
 		SettleWindow:        c.SettleWindow,
-		DisableRefStream:    c.DisableRefStream,
 		MaxInflightRequests: c.MaxInflightRequests,
 		ConsistencyControl:  c.ConsistencyControl,
 	})
@@ -221,7 +205,7 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 		PartitionKeyOf:  c.PartitionKeyOf,
 		Compression:     c.Compression,
 		InsertedAtField: c.InsertedAtField,
-		Indexes:         c.Indexes,
+		Projections:     c.Projections,
 	}
 }
 

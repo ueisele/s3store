@@ -11,32 +11,33 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// IndexReader is the typed read-handle for a secondary index.
-// Build via NewIndexReader from a S3Target + IndexLookupDef[K].
-// Lookup issues LIST only — no parquet reads.
-type IndexReader[K comparable] struct {
-	target    S3Target
-	name      string
-	columns   []string
-	indexPath string
-	bind      func(values []string) (K, error)
+// ProjectionReader is the typed read-handle for a secondary
+// projection. Build via NewProjectionReader from a S3Target +
+// ProjectionLookupDef[K]. Lookup issues LIST only — no parquet
+// reads.
+type ProjectionReader[K comparable] struct {
+	target         S3Target
+	name           string
+	columns        []string
+	projectionPath string
+	bind           func(values []string) (K, error)
 }
 
-// NewIndexReader builds a query handle for an index. Validates
-// Name + Columns and, when def.From is nil, K's parquet tags
-// against Columns. With a custom From, only the def-level fields
-// are validated — the caller is responsible for producing valid
-// K's.
-func NewIndexReader[K comparable](
-	target S3Target, def IndexLookupDef[K],
-) (*IndexReader[K], error) {
+// NewProjectionReader builds a query handle for a projection.
+// Validates Name + Columns and, when def.From is nil, K's parquet
+// tags against Columns. With a custom From, only the def-level
+// fields are validated — the caller is responsible for producing
+// valid K's.
+func NewProjectionReader[K comparable](
+	target S3Target, def ProjectionLookupDef[K],
+) (*ProjectionReader[K], error) {
 	// Lookup never consults target.PartitionKeyParts() — the
-	// index's own Columns drive the LIST path — so we use the
+	// projection's own Columns drive the LIST path — so we use the
 	// reduced-validation helper instead of the full Target check.
 	if err := target.ValidateLookup(); err != nil {
 		return nil, err
 	}
-	if err := validateIndexDefShape(def.Name, def.Columns); err != nil {
+	if err := validateProjectionDefShape(def.Name, def.Columns); err != nil {
 		return nil, err
 	}
 	bind := def.From
@@ -44,16 +45,16 @@ func NewIndexReader[K comparable](
 		b, err := defaultBinder[K](def.Columns, def.Layout)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3store: index %q: %w", def.Name, err)
+				"s3store: projection %q: %w", def.Name, err)
 		}
 		bind = b
 	}
-	return &IndexReader[K]{
-		target:    target,
-		name:      def.Name,
-		columns:   def.Columns,
-		indexPath: indexBasePath(target.Prefix(), def.Name),
-		bind:      bind,
+	return &ProjectionReader[K]{
+		target:         target,
+		name:           def.Name,
+		columns:        def.Columns,
+		projectionPath: projectionBasePath(target.Prefix(), def.Name),
+		bind:           bind,
 	}, nil
 }
 
@@ -74,7 +75,7 @@ func defaultBinder[K any](columns []string, layout Layout) (
 		var k K
 		if len(values) != len(columns) {
 			return k, fmt.Errorf(
-				"index bind: got %d values, want %d (one per Column)",
+				"projection bind: got %d values, want %d (one per Column)",
 				len(values), len(columns))
 		}
 		v := reflect.ValueOf(&k).Elem()
@@ -83,7 +84,7 @@ func defaultBinder[K any](columns []string, layout Layout) (
 				ts, err := time.Parse(p.timeLayout, values[j])
 				if err != nil {
 					return k, fmt.Errorf(
-						"index bind: column %q: parse time %q with "+
+						"projection bind: column %q: parse time %q with "+
 							"layout %q: %w",
 						columns[j], values[j], p.timeLayout, err)
 				}
@@ -109,10 +110,11 @@ func defaultBinder[K any](columns []string, layout Layout) (
 // published is visible. Unlike Poll there is no SettleWindow
 // filter.
 //
-// Results are unbounded — narrow the patterns if an index has
+// Results are unbounded — narrow the patterns if a projection has
 // millions of matching markers. Empty patterns slice returns
-// (nil, nil); a malformed pattern fails with the offending index.
-func (i *IndexReader[K]) Lookup(
+// (nil, nil); a malformed pattern fails with the offending
+// projection.
+func (i *ProjectionReader[K]) Lookup(
 	ctx context.Context, patterns []string,
 ) (out []K, err error) {
 	scope := i.target.metrics.methodScope(ctx, methodLookup)
@@ -125,10 +127,10 @@ func (i *IndexReader[K]) Lookup(
 		return nil, nil
 	}
 
-	plans, err := buildReadPlans(patterns, i.indexPath, i.columns)
+	plans, err := buildReadPlans(patterns, i.projectionPath, i.columns)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"s3store: index %q Lookup %w", i.name, err)
+			"s3store: projection %q Lookup %w", i.name, err)
 	}
 
 	keys, err := i.listAllMatchingMarkers(ctx, plans)
@@ -138,15 +140,15 @@ func (i *IndexReader[K]) Lookup(
 
 	out = make([]K, 0, len(keys))
 	for _, key := range keys {
-		values, err := parseIndexMarkerKey(
-			key, i.indexPath, i.columns)
+		values, err := parseProjectionMarkerKey(
+			key, i.projectionPath, i.columns)
 		if err != nil {
 			return nil, err
 		}
 		k, err := i.bind(values)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3store: index %q: %w", i.name, err)
+				"s3store: projection %q: %w", i.name, err)
 		}
 		out = append(out, k)
 	}
@@ -162,10 +164,10 @@ func (i *IndexReader[K]) Lookup(
 // Inherits ConsistencyControl from i.target on every LIST. With
 // a strong level (or AWS S3, which is strong-LIST by default),
 // Lookup is read-after-write — no settle window needed.
-func (i *IndexReader[K]) listAllMatchingMarkers(
+func (i *ProjectionReader[K]) listAllMatchingMarkers(
 	ctx context.Context, plans []*readPlan,
 ) ([]string, error) {
-	suffix := "/" + indexMarkerFilename
+	suffix := "/" + projectionMarkerFilename
 	return fanOutMapReduce(ctx, plans,
 		i.target.EffectiveMaxInflightRequests(),
 		i.target.metrics,
@@ -177,7 +179,7 @@ func (i *IndexReader[K]) listAllMatchingMarkers(
 					if !strings.HasSuffix(key, suffix) {
 						return true, nil
 					}
-					hiveKey, ok := hiveKeyOfMarker(key, i.indexPath)
+					hiveKey, ok := hiveKeyOfMarker(key, i.projectionPath)
 					if !ok {
 						return true, nil
 					}
@@ -188,7 +190,7 @@ func (i *IndexReader[K]) listAllMatchingMarkers(
 				})
 			if err != nil {
 				return nil, fmt.Errorf(
-					"s3store: index %q list: %w", i.name, err)
+					"s3store: projection %q list: %w", i.name, err)
 			}
 			return keys, nil
 		},
@@ -196,16 +198,16 @@ func (i *IndexReader[K]) listAllMatchingMarkers(
 }
 
 // hiveKeyOfMarker returns the "col=val/col=val/..." body of a
-// marker S3 key, stripping the base index path and the terminal
-// "/m.idx" segment. Returns (rest, true) on well-shaped keys and
-// ("", false) otherwise.
-func hiveKeyOfMarker(s3Key, indexPath string) (string, bool) {
-	prefix := indexPath + "/"
+// marker S3 key, stripping the base projection path and the
+// terminal "/m.proj" segment. Returns (rest, true) on well-shaped
+// keys and ("", false) otherwise.
+func hiveKeyOfMarker(s3Key, projectionPath string) (string, bool) {
+	prefix := projectionPath + "/"
 	if !strings.HasPrefix(s3Key, prefix) {
 		return "", false
 	}
 	rest := s3Key[len(prefix):]
-	tail := "/" + indexMarkerFilename
+	tail := "/" + projectionMarkerFilename
 	if !strings.HasSuffix(rest, tail) {
 		return "", false
 	}

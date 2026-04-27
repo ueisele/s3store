@@ -11,7 +11,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// BackfillStats reports the work BackfillIndex did: how many
+// BackfillStats reports the work BackfillProjection did: how many
 // parquet objects it scanned, how many records it decoded, and
 // how many marker PUTs it issued. Markers is per-object, not
 // globally deduplicated — a marker path produced by N parquet
@@ -24,18 +24,20 @@ type BackfillStats struct {
 	Markers     int
 }
 
-// BackfillIndex scans existing parquet data and writes index
-// markers for every record already present. The normal path is
-// to wire indexes via WriterConfig.Indexes / Config.Indexes
-// before the first Write; BackfillIndex is the relief valve for
-// records written before the index existed.
+// BackfillProjection scans existing parquet data and writes
+// projection markers for every record already present. The normal
+// path is to wire projections via WriterConfig.Projections /
+// Config.Projections before the first Write; BackfillProjection is
+// the relief valve for records written before the projection
+// existed.
 //
 // keyPatterns use the grammar from validateKeyPattern,
-// evaluated against target.PartitionKeyParts() (NOT the index's
-// Columns) — backfill walks parquet data files, which are keyed
-// by partition. "*" covers everything; shard across partitions
-// to parallelize a migration. Overlapping patterns are
-// deduplicated, so each parquet file is scanned at most once.
+// evaluated against target.PartitionKeyParts() (NOT the
+// projection's Columns) — backfill walks parquet data files,
+// which are keyed by partition. "*" covers everything; shard
+// across partitions to parallelize a migration. Overlapping
+// patterns are deduplicated, so each parquet file is scanned at
+// most once.
 //
 // until is an exclusive upper bound on data-file LastModified.
 // Typical use: until = deployTime_of_live_writer, so backfill
@@ -56,10 +58,10 @@ type BackfillStats struct {
 // idempotent) and safe to retry after a crash. Empty patterns
 // slice is a no-op: (BackfillStats{}, nil). First malformed
 // pattern fails with its index.
-func BackfillIndex[T any](
+func BackfillProjection[T any](
 	ctx context.Context,
 	target S3Target,
-	def IndexDef[T],
+	def ProjectionDef[T],
 	keyPatterns []string,
 	until time.Time,
 ) (stats BackfillStats, err error) {
@@ -75,13 +77,13 @@ func BackfillIndex[T any](
 		return stats, nil
 	}
 
-	// Full Target check — BackfillIndex LISTs partitioned data
+	// Full Target check — BackfillProjection LISTs partitioned data
 	// files (plan.Match consults PartitionKeyParts), so
 	// validateLookup's reduced subset isn't enough.
 	if err := target.Validate(); err != nil {
 		return stats, err
 	}
-	if err := validateIndexDefShape(def.Name, def.Columns); err != nil {
+	if err := validateProjectionDefShape(def.Name, def.Columns); err != nil {
 		return stats, err
 	}
 	of, err := resolveOf(def)
@@ -89,13 +91,13 @@ func BackfillIndex[T any](
 		return stats, err
 	}
 
-	indexPath := indexBasePath(target.Prefix(), def.Name)
+	projectionPath := projectionBasePath(target.Prefix(), def.Name)
 
 	dataPath := dataPath(target.Prefix())
 	plans, err := buildReadPlans(keyPatterns, dataPath, target.PartitionKeyParts())
 	if err != nil {
 		return stats, fmt.Errorf(
-			"s3store: BackfillIndex %w", err)
+			"s3store: BackfillProjection %w", err)
 	}
 
 	keys, err := listDataFiles(ctx, target, plans)
@@ -127,7 +129,7 @@ func BackfillIndex[T any](
 		func(ctx context.Context, _ int, km KeyMeta) error {
 			key := km.Key
 			paths, nRecs, err := backfillMarkersForObject(
-				ctx, target, def.Name, def.Columns, of, indexPath, key)
+				ctx, target, def.Name, def.Columns, of, projectionPath, key)
 			if err != nil {
 				// Operator-driven deletion (LIST-to-GET race,
 				// lifecycle, manual prune): a data file listed a
@@ -153,7 +155,7 @@ func BackfillIndex[T any](
 					ctx, p, nil, "application/octet-stream",
 				); err != nil {
 					return fmt.Errorf(
-						"s3store: backfill index %q: put marker: %w",
+						"s3store: backfill projection %q: put marker: %w",
 						def.Name, err)
 				}
 			}
@@ -169,7 +171,7 @@ func BackfillIndex[T any](
 // backfillMarkersForObject decodes one parquet data object and
 // returns the deduplicated marker paths its records produce under
 // the resolved Of, plus the record count (for stats). Pulled out
-// of BackfillIndex's main loop so the dedup map doesn't leak
+// of BackfillProjection's main loop so the dedup map doesn't leak
 // across objects — each file stands on its own, keeping memory
 // bounded by the largest file rather than the full backfill set.
 func backfillMarkersForObject[T any](
@@ -178,7 +180,7 @@ func backfillMarkersForObject[T any](
 	name string,
 	columns []string,
 	of func(T) ([]string, error),
-	indexPath string,
+	projectionPath string,
 	key string,
 ) ([]string, int, error) {
 	data, err := target.get(ctx, key)
@@ -197,16 +199,16 @@ func backfillMarkersForObject[T any](
 		values, err := of(rec)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"s3store: backfill index %q on %s: %w",
+				"s3store: backfill projection %q on %s: %w",
 				name, key, err)
 		}
 		if values == nil {
 			continue
 		}
-		p, err := markerPathFromValues(name, indexPath, columns, values)
+		p, err := markerPathFromValues(name, projectionPath, columns, values)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"s3store: backfill index %q on %s: %w",
+				"s3store: backfill projection %q on %s: %w",
 				name, key, err)
 		}
 		seen[p] = struct{}{}

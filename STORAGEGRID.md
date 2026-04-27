@@ -90,12 +90,12 @@ s3.put_bucket_policy(Bucket=BUCKET, Policy=json.dumps(policy))
 > - `data/` — parquet files. Deterministic paths under
 >   `WithIdempotencyToken`; the deny fires here on retry so the
 >   body isn't re-uploaded. **This is what needs the deny.**
-> - `_index/` — secondary-index markers. **Byte-identical
+> - `_projection/` — secondary-projection markers. **Byte-identical
 >   idempotent overwrites by design** — the same
->   `{col}={value}/m.idx` marker is written every time that
+>   `{col}={value}/m.proj` marker is written every time that
 >   `(col, value)` tuple recurs in a batch. A bucket-wide deny
 >   rejects the second write with `403 AccessDenied` and breaks
->   index writes entirely.
+>   projection writes entirely.
 > - `_stream/refs/` — ref files. Unique per-PUT keys
 >   (refTsMicros prefix), so they never overwrite either way.
 >
@@ -130,7 +130,7 @@ target := s3store.NewS3Target(s3store.S3TargetConfig{
 `s3store.Config.ConsistencyControl` forwards onto the target it
 builds, so single-Config callers set the level once at the top of
 the umbrella. Setting it on the *target* (not on `WriterConfig` /
-`ReaderConfig` / `IndexDef`) means every S3 call routed through
+`ReaderConfig` / `ProjectionDef`) means every S3 call routed through
 that target uses one and the same value — NetApp's
 "[same consistency for paired operations][sgcc]" rule is enforced
 by construction. On AWS / MinIO the header is unknown to the
@@ -255,8 +255,8 @@ follows:
 
 - **PUT (new)** — data PUT on first attempt ([writer_write.go](writer_write.go));
   ref PUT ([writer_write.go](writer_write.go)) always (the
-  refTsMicros prefix is unique per call); index marker PUT
-  ([index_write.go](index_write.go)) on first occurrence of a
+  refTsMicros prefix is unique per call); projection marker PUT
+  ([projection_write.go](projection_write.go)) on first occurrence of a
   `(col, value)` tuple.
 - **PUT (overwrite)** — data PUT on retry under
   `WithIdempotencyToken` (deterministic paths produce the same
@@ -265,7 +265,7 @@ follows:
   "overwrite" depends on whether the target key already exists.
 - **GET** — parquet body fetch ([reader_read.go](reader_read.go)).
 - **HEAD** — `putIfAbsent` 403→404 disambiguation ([target.go](target.go)).
-- **LIST** — partition LIST, marker LIST (`IndexReader.Lookup`),
+- **LIST** — partition LIST, marker LIST (`ProjectionReader.Lookup`),
   ref-stream LIST (`Poll` / `PollRecords` / `ReadRangeIter`),
   scoped retry-LIST (`findExistingRef`); all funnel through
   `listEach` ([target.go](target.go)).
@@ -310,7 +310,7 @@ s3store relies on LIST seeing recent PUTs in four places:
    correctness break is on this LIST.)
 2. **`Reader.Read` / `ReadIter`** — partition LIST surfaces
    freshly-written data files for the read-after-write contract.
-3. **`IndexReader.Lookup`** — LIST under `_index/{col}={value}/`
+3. **`ProjectionReader.Lookup`** — LIST under `_projection/{col}={value}/`
    surfaces the marker emitted by the latest write.
 4. **`Poll` / `PollRecords` / `ReadRangeIter`** — ref-stream LIST
    advances the consumer's cutoff. Without `strong-*`,

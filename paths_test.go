@@ -1,7 +1,6 @@
 package s3store
 
 import (
-	"strconv"
 	"testing"
 	"time"
 )
@@ -131,42 +130,5 @@ func TestRefCutoff(t *testing.T) {
 	if later <= cutoff {
 		t.Errorf("later ref %q should sort after cutoff %q",
 			later, cutoff)
-	}
-}
-
-func TestRefRangeForRetry(t *testing.T) {
-	const refPath = "test/_stream/refs"
-	now := time.Date(2026, 4, 22, 10, 15, 0, 0, time.UTC)
-
-	lo, hi := refRangeForRetry(refPath, now, time.Hour)
-	loExpected := refPath + "/" +
-		strconv.FormatInt(now.Add(-time.Hour).UnixMicro(), 10)
-	hiExpected := refPath + "/" +
-		strconv.FormatInt(now.UnixMicro(), 10)
-	if lo != loExpected {
-		t.Errorf("lo = %q, want %q", lo, loExpected)
-	}
-	if hi != hiExpected {
-		t.Errorf("hi = %q, want %q", hi, hiExpected)
-	}
-
-	within := encodeRefKey(refPath,
-		now.Add(-30*time.Minute).UnixMicro(),
-		"abc12345",
-		now.Add(-30*time.Minute).UnixMicro(),
-		"period=X/customer=y")
-	if within < lo || within > hi {
-		t.Errorf("ref inside window %q sorted outside [%q, %q]",
-			within, lo, hi)
-	}
-
-	before := encodeRefKey(refPath,
-		now.Add(-2*time.Hour).UnixMicro(),
-		"abc12345",
-		now.Add(-2*time.Hour).UnixMicro(),
-		"period=X/customer=y")
-	if before >= lo {
-		t.Errorf("ref before window %q should sort below lo %q",
-			before, lo)
 	}
 }

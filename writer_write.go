@@ -82,12 +82,6 @@ func resolveWriteOpts(opts []WriteOption) (WriteOpts, error) {
 			w.IdempotencyToken); err != nil {
 			return WriteOpts{}, err
 		}
-		if w.MaxRetryAge <= 0 {
-			return WriteOpts{}, fmt.Errorf(
-				"s3store: MaxRetryAge must be > 0 (got %s) "+
-					"when IdempotencyToken is set",
-				w.MaxRetryAge)
-		}
 	}
 	return w, nil
 }
@@ -178,9 +172,8 @@ func (s *Writer[T]) WriteWithKey(
 // partition revalidation that calling WriteWithKey in the fan-out
 // closure would imply.
 //
-// scope is the caller's methodScope. On commit (ref PUT succeeded
-// — or the DisableRefStream short-circuit, which has the same
-// "data + markers durable" semantic), this function increments the
+// scope is the caller's methodScope. On commit (ref PUT succeeded),
+// this function increments the
 // scope's record / byte / partition counters via the additive
 // addX methods. Failures before commit don't touch the scope, so
 // the scope reports "what actually landed in S3," not "what we
@@ -220,8 +213,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 	if err == nil && r != nil {
 		// Commit semantics: writeEncodedPayload returned a non-nil
 		// WriteResult ⇒ data is durable, markers are written, and
-		// either the ref PUT succeeded or DisableRefStream was set.
-		// Update the scope here so partial-success Write calls
+		// the ref PUT succeeded. Update the scope here so partial-success Write calls
 		// (some partitions committed, others failed) report the
 		// committed records/bytes/partitions, not the attempted
 		// totals.
@@ -248,16 +240,17 @@ func (s *Writer[T]) writeWithKeyResolved(
 //
 // opts.IdempotencyToken, when set, replaces the default
 // {tsMicros}-{shortID} id so retries produce deterministic data
-// paths; opts.MaxRetryAge bounds the scoped LIST issued on the
-// retry-dedup branch.
+// paths; the retry-dedup branch HEADs the existing data file to
+// read its created-at stamp and bounds the ref LIST to refs at
+// or after that timestamp.
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
 	writeStartTime time.Time, opts WriteOpts,
 ) (*WriteResult, error) {
-	// Compute marker paths up-front so a bad IndexDef.Of fails the
-	// whole Write before we touch S3, matching how validateKey
-	// aborts on a malformed partition key.
-	markerPaths, err := s.collectIndexMarkerPaths(records)
+	// Compute marker paths up-front so a bad ProjectionDef.Of
+	// fails the whole Write before we touch S3, matching how
+	// validateKey aborts on a malformed partition key.
+	markerPaths, err := s.collectProjectionMarkerPaths(records)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +294,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// advanced past it.
 	if isRetry {
 		existingRefKey, err := s.findExistingRef(
-			ctx, key, opts.IdempotencyToken, opts.MaxRetryAge)
+			ctx, dataKey, key, opts.IdempotencyToken)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"s3store: scoped LIST for retry: %w", err)
@@ -323,19 +316,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// means the library never deletes data it has written.
 	if err := s.putMarkers(ctx, markerPaths); err != nil {
 		return nil, fmt.Errorf(
-			"s3store: put index markers: %w", err)
-	}
-
-	// DisableRefStream: skip the ref PUT entirely. Offset and
-	// RefPath go empty so callers can't mistake the returned value
-	// for a Poll-visible stream position.
-	if s.cfg.Target.DisableRefStream() {
-		return &WriteResult{
-			Offset:     "",
-			DataPath:   dataKey,
-			RefPath:    "",
-			InsertedAt: writeStartTime,
-		}, nil
+			"s3store: put projection markers: %w", err)
 	}
 
 	// Phase 4: ref PUT under a SettleWindow/2 client-side timeout.
@@ -400,15 +381,18 @@ func (s *Writer[T]) commitRef(
 //
 // Bounded on three axes:
 //
-//   - Lower bound via listRange(startAfter=lo) so the paginator
-//     starts at (now - maxRetryAge).
-//   - Upper bound via an in-loop compare against hi so we stop as
-//     soon as a page yields a key past the retry window. Without
-//     this the paginator walks every ref newer than "now" —
-//     concurrent writers' refs, the store's tail — which costs
-//     additional LIST pages proportional to traffic beyond "now"
-//     without adding any chance of a match (our token can't
-//     appear with a future refTsMicros).
+//   - Lower bound via listRange(startAfter=lo) where lo is the
+//     data file's x-amz-meta-created-at timestamp, fetched once
+//     up-front via HEAD. The original write captured its
+//     wall-clock at write-start and stamped it on the data PUT, so
+//     the resulting ref publication time is guaranteed to be at or
+//     after that point — anything earlier can't be ours.
+//   - Upper bound via an in-loop compare against hi (= now) so we
+//     stop as soon as a page yields a key past the retry window.
+//     Without this the paginator walks every ref newer than "now"
+//     — concurrent writers' refs, the store's tail — which costs
+//     additional LIST pages without adding any chance of a match
+//     (our token can't appear with a future refTsMicros).
 //   - Freshness via the settle-cutoff filter: a ref with
 //     refTsMicros < now - SettleWindow sits at an offset some
 //     consumers may have advanced past. Treating it as a dedup
@@ -418,15 +402,11 @@ func (s *Writer[T]) commitRef(
 //     ack was lost after server-side persistence; the retry then
 //     emits a fresh in-budget ref.
 //
-// Inherits the target's ConsistencyControl on the LIST (every
-// listEach call does) so the scan sees all prior refs on
+// Inherits the target's ConsistencyControl on the HEAD and LIST
+// (every routed S3 call does) so the scan sees all prior refs on
 // StorageGRID-style backends — a weak-consistency LIST can miss
 // a ref the writer just published on another node, silently
 // breaking dedup.
-//
-// resolveWriteOpts validates that maxRetryAge > 0 when an
-// idempotency token is set, so callers never reach here with a
-// non-positive value.
 //
 // The match is scoped to (partitionKey, token): a ref counts as
 // "the prior attempt of this write" only when both its hive key
@@ -435,8 +415,26 @@ func (s *Writer[T]) commitRef(
 // reuse one job-id across many partitions get correct retry
 // semantics for each partition independently.
 func (s *Writer[T]) findExistingRef(
-	ctx context.Context, partitionKey, token string, maxRetryAge time.Duration,
+	ctx context.Context, dataKey, partitionKey, token string,
 ) (string, error) {
+	meta, err := s.cfg.Target.headMetadata(ctx, dataKey)
+	if err != nil {
+		return "", fmt.Errorf(
+			"s3store: head data file for retry: %w", err)
+	}
+	createdAtRaw, ok := meta["created-at"]
+	if !ok {
+		return "", fmt.Errorf(
+			"s3store: data file %q missing x-amz-meta-created-at",
+			dataKey)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, createdAtRaw)
+	if err != nil {
+		return "", fmt.Errorf(
+			"s3store: data file %q: parse created-at %q: %w",
+			dataKey, createdAtRaw, err)
+	}
+
 	now := time.Now()
 	// lo/hi are {refPath}/{tsMicros} prefixes — bare timestamp, no
 	// trailing dash. Real ref keys always include "-{shortID}-..."
@@ -445,11 +443,12 @@ func (s *Writer[T]) findExistingRef(
 	// exclusive StartAfter; a ref at hi's tsMicros is similarly
 	// lex-greater than hi and is correctly excluded as "newer than
 	// the retry window".
-	lo, hi := refRangeForRetry(s.refPath, now, maxRetryAge)
+	lo := refTsKey(s.refPath, createdAt.UnixMicro())
+	hi := refTsKey(s.refPath, now.UnixMicro())
 	settleCutoffUs := now.Add(
 		-s.cfg.Target.EffectiveSettleWindow()).UnixMicro()
 	var found string
-	err := s.cfg.Target.listEach(ctx, s.refPath+"/", lo, 0,
+	err = s.cfg.Target.listEach(ctx, s.refPath+"/", lo, 0,
 		func(obj s3types.Object) (bool, error) {
 			if obj.Key == nil {
 				return true, nil
@@ -458,8 +457,8 @@ func (s *Writer[T]) findExistingRef(
 				// Past the retry window. Lex compare holds because
 				// all real tsMicros share the same decimal width
 				// (16 digits post-2001), so lex order matches
-				// numeric order — same assumption RefCutoff and
-				// RefRangeForRetry's lo already rely on.
+				// numeric order — same assumption refCutoff already
+				// relies on.
 				return false, nil
 			}
 			hiveKey, refTsMicros, id, _, err := parseRefKey(*obj.Key)

@@ -58,10 +58,10 @@ const refSeparator = ";"
 
 // refTsKey returns the "{refPath}/{tsMicros}" prefix shared by
 // every ref-key string this package produces — both the full
-// encodeRefKey filename and the lex-bound comparators
-// (refCutoff, refRangeForRetry). One place for the format so the
-// "lex compare matches numeric compare" assumption every consumer
-// relies on lives next to its only producer.
+// encodeRefKey filename and the lex-bound comparators (refCutoff,
+// findExistingRef). One place for the format so the "lex compare
+// matches numeric compare" assumption every consumer relies on
+// lives next to its only producer.
 //
 // Lex == numeric ordering holds because the rendered tsMicros is
 // fixed-width across the realistic operating range: time.UnixMicro
@@ -167,19 +167,4 @@ func parseRefKey(refKey string) (
 // is guaranteed by the shared refTsKey helper.
 func refCutoff(refPath string, now time.Time, settleWindow time.Duration) string {
 	return refTsKey(refPath, now.Add(-settleWindow).UnixMicro())
-}
-
-// refRangeForRetry returns the [lo, hi] ref-key string bounds for
-// a scoped LIST on the idempotent-retry path. When the writer
-// detects a retry (overwrite-prevention fired on the data PUT),
-// it LISTs refs whose publication timestamp falls in
-// [now - maxRetryAge, now] and scans for an entry matching the
-// token's id. Lex compatibility with encodeRefKey is guaranteed
-// by the shared refTsKey helper.
-func refRangeForRetry(
-	refPath string, now time.Time, maxRetryAge time.Duration,
-) (lo, hi string) {
-	lo = refTsKey(refPath, now.Add(-maxRetryAge).UnixMicro())
-	hi = refTsKey(refPath, now.UnixMicro())
-	return lo, hi
 }

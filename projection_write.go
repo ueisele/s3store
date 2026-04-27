@@ -5,36 +5,38 @@ import (
 	"fmt"
 )
 
-// Index write side: per-index marker emission during Write.
+// Projection write side: per-projection marker emission during
+// Write.
 //
-// indexWriter is the internal, K-erased per-index marker emitter
-// the write path consumes. Given a record, pathOf returns the S3
-// marker key the record produces under this index, or "" when
-// IndexDef.Of returned (nil, nil) signalling no marker.
-type indexWriter[T any] struct {
+// projectionWriter is the internal, K-erased per-projection
+// marker emitter the write path consumes. Given a record, pathOf
+// returns the S3 marker key the record produces under this
+// projection, or "" when ProjectionDef.Of returned (nil, nil)
+// signalling no marker.
+type projectionWriter[T any] struct {
 	name   string
 	pathOf func(T) (string, error)
 }
 
-// buildIndexWriters validates each IndexDef and resolves it into
-// an indexWriter[T] closure ready for the write path. Rejects
-// duplicate Names so two indexes can't silently share the same
-// _index/<Name>/ subtree.
-func buildIndexWriters[T any](
-	target S3Target, defs []IndexDef[T],
-) ([]indexWriter[T], error) {
+// buildProjectionWriters validates each ProjectionDef and resolves
+// it into a projectionWriter[T] closure ready for the write path.
+// Rejects duplicate Names so two projections can't silently share
+// the same _projection/<Name>/ subtree.
+func buildProjectionWriters[T any](
+	target S3Target, defs []ProjectionDef[T],
+) ([]projectionWriter[T], error) {
 	if len(defs) == 0 {
 		return nil, nil
 	}
 	seenNames := make(map[string]struct{}, len(defs))
-	out := make([]indexWriter[T], 0, len(defs))
+	out := make([]projectionWriter[T], 0, len(defs))
 	for _, def := range defs {
-		if err := validateIndexDefShape(def.Name, def.Columns); err != nil {
+		if err := validateProjectionDefShape(def.Name, def.Columns); err != nil {
 			return nil, err
 		}
 		if _, dup := seenNames[def.Name]; dup {
 			return nil, fmt.Errorf(
-				"s3store: duplicate index name %q in WriterConfig.Indexes",
+				"s3store: duplicate projection name %q in WriterConfig.Projections",
 				def.Name)
 		}
 		seenNames[def.Name] = struct{}{}
@@ -44,10 +46,10 @@ func buildIndexWriters[T any](
 			return nil, err
 		}
 
-		indexPath := indexBasePath(target.Prefix(), def.Name)
+		projectionPath := projectionBasePath(target.Prefix(), def.Name)
 		name := def.Name
 		columns := def.Columns
-		out = append(out, indexWriter[T]{
+		out = append(out, projectionWriter[T]{
 			name: name,
 			pathOf: func(rec T) (string, error) {
 				values, err := of(rec)
@@ -57,29 +59,30 @@ func buildIndexWriters[T any](
 				if values == nil {
 					return "", nil
 				}
-				return markerPathFromValues(name, indexPath, columns, values)
+				return markerPathFromValues(name, projectionPath, columns, values)
 			},
 		})
 	}
 	return out, nil
 }
 
-// collectIndexMarkerPaths iterates every registered index over
-// every record in the batch and returns the deduplicated set of
-// marker S3 keys. Dedup is via map[string]struct{} on the full
-// path, which is correct because different indexes live under
-// different _index/<name>/ prefixes — no cross-index collisions.
-func (s *Writer[T]) collectIndexMarkerPaths(records []T) ([]string, error) {
-	if len(s.indexes) == 0 {
+// collectProjectionMarkerPaths iterates every registered
+// projection over every record in the batch and returns the
+// deduplicated set of marker S3 keys. Dedup is via
+// map[string]struct{} on the full path, which is correct because
+// different projections live under different _projection/<name>/
+// prefixes — no cross-projection collisions.
+func (s *Writer[T]) collectProjectionMarkerPaths(records []T) ([]string, error) {
+	if len(s.projections) == 0 {
 		return nil, nil
 	}
 	seen := make(map[string]struct{})
-	for _, idx := range s.indexes {
+	for _, proj := range s.projections {
 		for _, rec := range records {
-			p, err := idx.pathOf(rec)
+			p, err := proj.pathOf(rec)
 			if err != nil {
 				return nil, fmt.Errorf(
-					"s3store: index %q: %w", idx.name, err)
+					"s3store: projection %q: %w", proj.name, err)
 			}
 			if p == "" {
 				continue
