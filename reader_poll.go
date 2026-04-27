@@ -107,10 +107,13 @@ func (s *Reader[T]) Poll(
 				// schema this binary doesn't understand) shouldn't
 				// break the consumer pipeline. Log via slog.Default
 				// — applications inherit their configured handler —
-				// and skip. Mirrors findExistingRef's tolerance on
-				// the write side, just visible.
+				// and bump the s3store.read.malformed_refs counter
+				// so silent drift stays observable, then skip.
+				// Mirrors findExistingRef's tolerance on the write
+				// side, just visible.
 				slog.Warn("s3store: skipping malformed ref",
 					"key", objKey, "err", err)
+				scope.recordMalformedRefs()
 				return true, nil
 			}
 			out = append(out, StreamEntry{

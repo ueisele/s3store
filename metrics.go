@@ -117,15 +117,16 @@ type metrics struct {
 	s3RespBytes metric.Int64Histogram
 
 	// Library method level.
-	methodDuration  metric.Float64Histogram
-	methodCalls     metric.Int64Counter
-	writeRecords    metric.Int64Histogram
-	writePartitions metric.Int64Histogram
-	writeBytes      metric.Int64Histogram
-	readRecords     metric.Int64Histogram
-	readBytes       metric.Int64Histogram
-	readFiles       metric.Int64Histogram
-	readMissingData metric.Int64Counter
+	methodDuration    metric.Float64Histogram
+	methodCalls       metric.Int64Counter
+	writeRecords      metric.Int64Histogram
+	writePartitions   metric.Int64Histogram
+	writeBytes        metric.Int64Histogram
+	readRecords       metric.Int64Histogram
+	readBytes         metric.Int64Histogram
+	readFiles         metric.Int64Histogram
+	readMissingData   metric.Int64Counter
+	readMalformedRefs metric.Int64Counter
 
 	// Iter pipeline internals (downloadAndDecodeIter): bottleneck
 	// signals for the streamState's body-slot pool and byte-budget
@@ -280,6 +281,10 @@ func newMetrics(
 	m.readMissingData = mustCounter(
 		"s3store.read.missing_data",
 		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / BackfillIndex). Strict paths (Read / ReadIter) fail instead of recording.",
+		"{event}")
+	m.readMalformedRefs = mustCounter(
+		"s3store.read.malformed_refs",
+		"Ref objects whose filename failed to parse during a LIST on the ref stream (Poll / PollRecords / ReadRangeIter). Skipped after a slog.Warn — symmetric with read.missing_data on the data side.",
 		"{event}")
 
 	// Iter pipeline internals.
@@ -676,6 +681,20 @@ func (s *methodScope) recordMissingData() {
 	}
 	cs, vs := s.m.callOpts(attribute.String(attrKeyMethod, string(s.method)))
 	s.m.readMissingData.Add(s.ctx, 1, cs, vs)
+}
+
+// recordMalformedRefs increments the malformed-refs counter for one
+// ref object whose filename failed to parse during a LIST on the
+// ref stream. Symmetric with recordMissingData on the data side —
+// silent skips are an operability hazard, the counter makes the
+// drift visible. Carries the scope's method so dashboards can tell
+// which entry point surfaced the malformed ref.
+func (s *methodScope) recordMalformedRefs() {
+	if s.m == nil {
+		return
+	}
+	cs, vs := s.m.callOpts(attribute.String(attrKeyMethod, string(s.method)))
+	s.m.readMalformedRefs.Add(s.ctx, 1, cs, vs)
 }
 
 // end records the scope's terminal observations: duration,

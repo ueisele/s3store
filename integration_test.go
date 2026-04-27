@@ -592,6 +592,78 @@ func TestMissingData_PollSkipsReadIsLISTConsistent(t *testing.T) {
 	}
 }
 
+// TestPoll_SkipsMalformedRefs simulates an external tool — or a
+// future binary version with a different ref schema — writing a
+// ref-shaped object whose filename this binary's parseRefKey
+// rejects. Poll must keep walking, surface every well-formed
+// entry, and never error on the malformed one.
+//
+// Side effects (slog.Warn + s3store.read.malformed_refs increment)
+// are exercised by code review, not asserted here — wiring the
+// OTel SDK / a slog capture harness into an integration test would
+// drown out the behavioural contract this test pins down (skip,
+// don't fail). The metric being a counter means the inverse
+// signal — "we never increment when a real ref shows up" — is
+// already covered by every other Poll-based integration test.
+func TestPoll_SkipsMalformedRefs(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// 1. Seed one valid ref so the malformed entry sits alongside
+	// real data, and Poll has something concrete to return.
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-04-22/customer=alice", []Rec{{
+			Period: "2026-04-22", Customer: "alice",
+			SKU: "valid", Value: 1, Ts: time.UnixMilli(1),
+		}}); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	// 2. PUT a malformed ref directly under the ref prefix. The
+	// filename has refTsMicros=0 so it sorts strictly before the
+	// live-tip cutoffPrefix and isn't filtered out by Poll's
+	// settle-window check; the body has no refSeparator (";"), so
+	// parseRefKey's SplitN returns one part and surfaces an
+	// "invalid ref key" error → the malformed-ref skip branch
+	// fires.
+	malformedKey := refPath(store.Target().Prefix()) + "/0-malformed.ref"
+	if _, err := store.Target().S3Client().PutObject(ctx,
+		&s3.PutObjectInput{
+			Bucket: aws.String(store.Target().Bucket()),
+			Key:    aws.String(malformedKey),
+			Body:   strings.NewReader(""),
+		}); err != nil {
+		t.Fatalf("PutObject malformed ref: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	// 3. Poll: succeeds and returns only the valid entry. The
+	// malformed ref is logged + metric'd + skipped.
+	entries, _, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("Poll got %d entries, want 1 (malformed ref must "+
+			"be skipped, not surfaced)", len(entries))
+	}
+	if entries[0].Key != "period=2026-04-22/customer=alice" {
+		t.Errorf("Poll entry key %q, want the seeded partition",
+			entries[0].Key)
+	}
+
+	// 4. PollRecords: end-to-end — the GET pipeline runs only on
+	// the surviving valid ref, so one record comes back.
+	recs, _, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords: %v", err)
+	}
+	if len(recs) != 1 || recs[0].SKU != "valid" {
+		t.Fatalf("PollRecords got %+v, want single 'valid' record "+
+			"(malformed ref must not break the pipeline)", recs)
+	}
+}
+
 // TestInsertedAtField_Populate covers the InsertedAtField hook:
 // the writer populates a struct field with its wall-clock
 // time.Now() before parquet encode, and Read / PollRecords

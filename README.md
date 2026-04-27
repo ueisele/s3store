@@ -1642,12 +1642,21 @@ not terminal error class — keeping cardinality bounded).
 | `s3store.read.bytes` | histogram | By |
 | `s3store.read.files` | histogram | 1 |
 | `s3store.read.missing_data` | counter | 1 |
+| `s3store.read.malformed_refs` | counter | 1 |
 
 `s3store.read.missing_data` increments on `NoSuchKey` skips along
 the tolerant read paths (`PollRecords`, `ReadRangeIter`,
 `BackfillIndex`). Carries `s3store.method` so dashboards can
 split by which path produced the skip. Strict paths (`Read`,
 `ReadIter`) fail instead of recording.
+
+`s3store.read.malformed_refs` increments when a ref object's
+filename fails to parse during a LIST on the ref stream. Skipped
+after a `slog.Warn` so consumers don't crash on a future schema or
+externally-written object — the counter makes the drift visible.
+Surfaced under `s3store.method = poll` because the LIST that hit
+it always runs in `Poll`, even when invoked indirectly by
+`PollRecords` or `ReadRangeIter`.
 
 `Write` and `WriteWithKey` show up as distinct `s3store.method`
 values; `Write`'s per-partition dispatch is internal and does not
