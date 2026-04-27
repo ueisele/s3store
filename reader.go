@@ -20,10 +20,9 @@ import (
 // records dedup to the latest-per-entity by VersionOf; when nil,
 // every record flows through.
 type ReaderConfig[T any] struct {
-	Target        S3Target
-	EntityKeyOf   func(T) string
-	VersionOf     func(T) int64
-	OnMissingData func(dataPath string)
+	Target      S3Target
+	EntityKeyOf func(T) string
+	VersionOf   func(T) int64
 }
 
 // Reader is the read-side half of a Store. Owns Read / ReadIter /
@@ -103,7 +102,7 @@ func resolveSortCmp[T any](
 // decode). The Writer's Target overrides whatever Target cfg
 // carries (or doesn't), so the resulting Reader inherits the
 // writer's ConsistencyControl automatically; read-side knobs
-// (EntityKeyOf, VersionOf, OnMissingData) come from cfg.
+// (EntityKeyOf, VersionOf) come from cfg.
 //
 // Dedup closures (EntityKeyOf / VersionOf) on the Writer are
 // typed over U and cannot be auto-transformed to T; the caller

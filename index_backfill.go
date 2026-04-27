@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -43,9 +44,13 @@ type BackfillStats struct {
 // every file currently present (redundant with the live writer
 // but harmless — PUT is idempotent).
 //
-// onMissingData is invoked when a data-file GET returns S3
-// NoSuchKey (dangling ref or LIST-to-GET race); the file is
-// skipped either way. Pass nil to disable the hook.
+// On a data-file GET returning NoSuchKey (LIST-to-GET race,
+// operator-driven prune, or lifecycle deletion), the file is
+// skipped: a slog.Warn at level WARN names the path, the
+// s3store.read.missing_data counter is incremented with
+// method=backfill, and the backfill continues. Failing the whole
+// backfill on one missing file would force a full restart of a
+// long-running operator job.
 //
 // Safe to run concurrently with a live writer (S3 PUT is
 // idempotent) and safe to retry after a crash. Empty patterns
@@ -57,7 +62,6 @@ func BackfillIndex[T any](
 	def IndexDef[T],
 	keyPatterns []string,
 	until time.Time,
-	onMissingData func(dataPath string),
 ) (stats BackfillStats, err error) {
 	scope := target.metrics.methodScope(ctx, methodBackfill)
 	defer func() {
@@ -125,15 +129,15 @@ func BackfillIndex[T any](
 			paths, nRecs, err := backfillMarkersForObject(
 				ctx, target, def.Name, def.Columns, of, indexPath, key)
 			if err != nil {
-				// LIST-to-GET race: a data file listed a moment
-				// ago is gone now. Skip-and-notify matches the
-				// read path's at-least-once posture — one missing
-				// file shouldn't fail the whole backfill. Other
-				// GET errors remain fatal.
+				// Operator-driven deletion (LIST-to-GET race,
+				// lifecycle, manual prune): a data file listed a
+				// moment ago is gone now. Skip and continue — one
+				// missing file shouldn't fail the whole backfill.
+				// Other GET errors remain fatal.
 				if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
-					if onMissingData != nil {
-						onMissingData(key)
-					}
+					slog.Warn("s3store: data file missing, skipping",
+						"path", key, "method", string(methodBackfill))
+					scope.recordMissingData()
 					return nil
 				}
 				return err

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -275,7 +276,7 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	wg.Go(func() { s.runProducer(ctx, jobsCh, parts) })
 	for range concurrency {
 		wg.Go(func() {
-			s.runDownloader(ctx, jobsCh, state, bodyCap, cancel,
+			s.runDownloader(ctx, jobsCh, state, bodyCap, scope, cancel,
 				&bytesDownloaded, &filesDownloaded)
 		})
 	}
@@ -417,15 +418,23 @@ func (s *Reader[T]) runProducer(
 // nils the body. NoSuchKey and hard errors release the slot
 // immediately since no body is materialised.
 //
+// scope drives the missing-data policy via its method: tolerant
+// methods (ReadRangeIter) log + record the missing-data metric
+// and mark the file as visited so the iter continues; strict
+// methods (ReadIter) propagate the NoSuchKey as a wrapped error
+// so the caller's retry resolves it. See
+// methodTolerantOfMissingData.
+//
 // filesDownloaded counts files with a definitive outcome — body
-// fetched OR NoSuchKey (the file was visited, just empty). It is
-// NOT incremented on the acquire-slot cancellation path or on
-// hard transport errors, so the metric reflects "files we
-// genuinely visited," not "files we tried to visit." See
-// downloadAndDecodeIter for how this is surfaced on the scope.
+// fetched OR tolerated NoSuchKey (the file was visited, just
+// empty). It is NOT incremented on the acquire-slot cancellation
+// path, hard transport errors, or strict NoSuchKey, so the metric
+// reflects "files we genuinely visited," not "files we tried to
+// visit." See downloadAndDecodeIter for how this is surfaced on
+// the scope.
 func (s *Reader[T]) runDownloader(
 	ctx context.Context, jobsCh <-chan downloadJob,
-	state *streamState, bodyCap int,
+	state *streamState, bodyCap int, scope *methodScope,
 	cancel context.CancelFunc,
 	bytesDownloaded, filesDownloaded *atomic.Int64,
 ) {
@@ -440,11 +449,17 @@ func (s *Reader[T]) runDownloader(
 			// No body materialised — return the slot.
 			state.releaseBodySlots(1)
 			if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
-				if s.cfg.OnMissingData != nil {
-					s.cfg.OnMissingData(key)
+				if methodTolerantOfMissingData(scope.method) {
+					slog.Warn("s3store: data file missing, skipping",
+						"path", key, "method", string(scope.method))
+					scope.recordMissingData()
+					filesDownloaded.Add(1)
+					state.markComplete(job.partIdx, job.fileIdx, nil, nil)
+					continue
 				}
-				filesDownloaded.Add(1)
-				state.markComplete(job.partIdx, job.fileIdx, nil, nil)
+				state.markComplete(job.partIdx, job.fileIdx, nil,
+					fmt.Errorf("s3store: get %s: %w", key, err))
+				cancel()
 				continue
 			}
 			state.markComplete(job.partIdx, job.fileIdx, nil,
@@ -522,7 +537,8 @@ func (s *Reader[T]) runDecoder(
 // decodePartition parses every successfully-downloaded body in
 // ps and returns the concatenated records. Files that were
 // missing on download (body == nil, err == nil) are skipped —
-// OnMissingData was already invoked by the downloader.
+// the downloader already logged via slog.Warn and incremented
+// the s3store.read.missing_data counter.
 //
 // Each body is nil'd and its body-pool slot released as soon as
 // the file is decoded, so the compressed-byte footprint inside

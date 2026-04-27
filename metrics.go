@@ -125,6 +125,7 @@ type metrics struct {
 	readRecords     metric.Int64Histogram
 	readBytes       metric.Int64Histogram
 	readFiles       metric.Int64Histogram
+	readMissingData metric.Int64Counter
 
 	// Iter pipeline internals (downloadAndDecodeIter): bottleneck
 	// signals for the streamState's body-slot pool and byte-budget
@@ -276,6 +277,10 @@ func newMetrics(
 		"s3store.read.files",
 		"Data files materialised per read-side method call",
 		"{file}")
+	m.readMissingData = mustCounter(
+		"s3store.read.missing_data",
+		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / BackfillIndex). Strict paths (Read / ReadIter) fail instead of recording.",
+		"{event}")
 
 	// Iter pipeline internals.
 	m.iterBodySlotWait = mustHist(
@@ -658,6 +663,19 @@ func (s *methodScope) addFiles(n int64) {
 		return
 	}
 	s.files.Add(n)
+}
+
+// recordMissingData increments the missing-data counter for one
+// NoSuchKey skip on a tolerant read path (PollRecords /
+// ReadRangeIter / BackfillIndex). Reuses the scope's method as
+// the attribute so dashboards can split by which path produced
+// the skip — no caller plumbing.
+func (s *methodScope) recordMissingData() {
+	if s.m == nil {
+		return
+	}
+	cs, vs := s.m.callOpts(attribute.String(attrKeyMethod, string(s.method)))
+	s.m.readMissingData.Add(s.ctx, 1, cs, vs)
 }
 
 // end records the scope's terminal observations: duration,

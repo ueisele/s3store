@@ -303,7 +303,7 @@ func TestBackfillIndex(t *testing.T) {
 
 	// BackfillIndex with empty until covers everything.
 	stats, err := BackfillIndex(
-		ctx, target, def, []string{"*"}, time.Time{}, nil)
+		ctx, target, def, []string{"*"}, time.Time{})
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestBackfillIndex(t *testing.T) {
 	// are no-ops at the semantic level. We only check it doesn't
 	// error and reports the same scan volume.
 	stats2, err := BackfillIndex(
-		ctx, target, def, []string{"*"}, time.Time{}, nil)
+		ctx, target, def, []string{"*"}, time.Time{})
 	if err != nil {
 		t.Fatalf("second BackfillIndex: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestBackfillIndex(t *testing.T) {
 	scoped, err := BackfillIndex(
 		ctx, target, def,
 		[]string{"period=2026-03-17/customer=*"},
-		time.Time{}, nil)
+		time.Time{})
 	if err != nil {
 		t.Fatalf("scoped BackfillIndex: %v", err)
 	}
@@ -426,7 +426,7 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 	target := store.Target()
 
 	stats, err := BackfillIndex(
-		ctx, target, def, []string{"*"}, midpoint, nil)
+		ctx, target, def, []string{"*"}, midpoint)
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
@@ -440,14 +440,12 @@ func TestBackfillIndex_UntilBound(t *testing.T) {
 // once posture when a data file disappears before backfill: the
 // live files still get markers and BackfillIndex does NOT fail.
 //
-// Note on the onMissingData hook: the hook only fires on a
-// LIST-to-GET race. MinIO's LIST is strongly consistent with
-// DELETE, so a pre-delete is fully absent from the subsequent
-// LIST — the race window doesn't exist in this fixture. Same
-// limitation applies to TestMissingData_SkipAndNotify for Read.
-// The hook-firing path is exercised by code review; what this
-// test pins down is that backfill survives the partial-delete
-// scenario without erroring.
+// MinIO's LIST is strongly consistent with DELETE, so the deleted
+// file is fully absent from the subsequent LIST — the LIST-to-GET
+// race window doesn't exist in this fixture. The skip-on-
+// NoSuchKey + slog.Warn + missing-data-metric path is exercised
+// by code review; what this test pins down is that backfill
+// survives the partial-delete scenario without erroring.
 func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
@@ -484,20 +482,8 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 		},
 	}
 
-	// Hook is wired in so a LIST-to-GET race (if one ever
-	// happens in CI) records the missing path rather than
-	// failing. We don't assert it fires — see note above.
-	var (
-		missedMu sync.Mutex
-		missed   []string
-	)
 	stats, err := BackfillIndex(
-		ctx, store.Target(), def, []string{"*"}, time.Time{},
-		func(p string) {
-			missedMu.Lock()
-			defer missedMu.Unlock()
-			missed = append(missed, p)
-		})
+		ctx, store.Target(), def, []string{"*"}, time.Time{})
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}
@@ -514,21 +500,30 @@ func TestBackfillIndex_MissingDataTolerant(t *testing.T) {
 	}
 }
 
-// TestMissingData_SkipAndNotify simulates the dangling-ref
-// failure mode (ref persisted but data deleted) by deleting a
-// parquet object directly from S3 after a successful Write. Read
-// and PollRecords must return the remaining records without
-// error and invoke OnMissingData for the missing path. The
-// alternative — failing on NoSuchKey — would poison every future
-// read of that stream.
-func TestMissingData_SkipAndNotify(t *testing.T) {
+// TestMissingData_PollSkipsReadIsLISTConsistent pins down the
+// post-cleanup-removal split between strict and tolerant read
+// paths. We delete a data file directly, leaving its ref in
+// place — operator-driven prune shape:
+//
+//   - Read is LIST-based and MinIO's LIST is strongly consistent
+//     with DELETE, so the deleted file is absent from Read's
+//     plan; only the surviving record comes back, no missing-
+//     data signal fires.
+//   - PollRecords walks the ref stream, so the ref to the
+//     deleted file is still there. The data GET returns
+//     NoSuchKey; PollRecords logs via slog.Warn, increments the
+//     missing-data metric, and returns the surviving record
+//     without erroring.
+//
+// What this test asserts: both paths return the surviving
+// record, neither errors. The slog and metric side effects are
+// exercised by code review — asserting them in an integration
+// test would couple the test to the slog handler / OTel SDK and
+// obscure the behavioural contract that matters here.
+func TestMissingData_PollSkipsReadIsLISTConsistent(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 
-	var (
-		missedMu sync.Mutex
-		missed   []string
-	)
 	store, err := New(Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
@@ -540,11 +535,6 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 		},
 		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
-		OnMissingData: func(p string) {
-			missedMu.Lock()
-			defer missedMu.Unlock()
-			missed = append(missed, p)
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -566,9 +556,9 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 		t.Fatalf("Write r2: %v", err)
 	}
 
-	// Delete the first data file directly, leaving its ref in
-	// place — the dangling-ref state that the read path must
-	// tolerate.
+	// Operator-driven prune: delete the data file, leave the
+	// ref in place. PollRecords' GET for this ref will see
+	// NoSuchKey.
 	if _, err := f.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(f.Bucket),
 		Key:    aws.String(r1.DataPath),
@@ -578,9 +568,8 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 
 	time.Sleep(400 * time.Millisecond)
 
-	// Read is LIST-based; its LIST already reflects the
-	// deletion, so it never GETs the missing file and the hook
-	// does not fire. The remaining record still comes back.
+	// Read is LIST-based and MinIO LIST reflects the delete,
+	// so Read never tries to GET the missing file.
 	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -590,8 +579,9 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 			got)
 	}
 
-	// PollRecords walks the ref-stream. The dangling ref is
-	// what the skip-on-NoSuchKey path must tolerate.
+	// PollRecords walks the ref stream and will hit NoSuchKey
+	// on the deleted file; it must skip via slog + metric and
+	// keep going.
 	pollGot, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
@@ -599,14 +589,6 @@ func TestMissingData_SkipAndNotify(t *testing.T) {
 	if len(pollGot) != 1 || pollGot[0].Value != 2 {
 		t.Errorf("PollRecords: got %+v, want single record with "+
 			"Value=2", pollGot)
-	}
-
-	missedMu.Lock()
-	gotMissed := append([]string(nil), missed...)
-	missedMu.Unlock()
-	if len(gotMissed) != 1 || gotMissed[0] != r1.DataPath {
-		t.Errorf("OnMissingData: got %v, want [%q]",
-			gotMissed, r1.DataPath)
 	}
 }
 
@@ -1040,7 +1022,7 @@ func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 	target := store.Target()
 
 	stats, err := BackfillIndex(
-		ctx, target, def, nil, time.Time{}, nil)
+		ctx, target, def, nil, time.Time{})
 	if err != nil {
 		t.Errorf("BackfillIndex(nil): %v", err)
 	}
@@ -1052,7 +1034,7 @@ func TestBackfillIndex_EmptyAndBadPattern(t *testing.T) {
 	_, err = BackfillIndex(ctx, target, def, []string{
 		"period=2026-03-17/customer=abc",
 		"not-a-valid-pattern",
-	}, time.Time{}, nil)
+	}, time.Time{})
 	if err == nil {
 		t.Fatal("expected error for bad pattern, got nil")
 	}
@@ -1186,7 +1168,7 @@ func TestBackfillIndex_NonCartesian(t *testing.T) {
 			"period=2026-03-17/customer=*",
 			"period=2026-03-18/customer=*",
 		},
-		time.Time{}, nil)
+		time.Time{})
 	if err != nil {
 		t.Fatalf("BackfillIndex: %v", err)
 	}

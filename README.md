@@ -172,8 +172,8 @@ recs, _ := view.Read(ctx, []string{"*"}) // []NarrowRec — ProcessLog not fetch
 ```
 
 The narrow `ReaderConfig[T']` carries the read-side knobs
-(`EntityKeyOf`, `VersionOf`, `OnMissingData`,
-`ConsistencyControl`); the constructor overwrites the `Target`
+(`EntityKeyOf`, `VersionOf`, `ConsistencyControl`); the
+constructor overwrites the `Target`
 field from the source Writer/Store so `SettleWindow` and the
 S3 wiring are inherited automatically. Dedup closures are typed
 over `T'`, so you supply them explicitly for the narrow shape
@@ -1496,31 +1496,29 @@ deadline returns a wrapped put-ref error so the caller retries
 
 ### Read
 
-`Read`, `PollRecords`, and `BackfillIndex` tolerate a missing
-data file (S3 `NoSuchKey`) by skipping it and invoking an
-optional `Config.OnMissingData(dataPath)` hook. This covers the
-LIST-to-GET race: a data file disappears between a read's LIST
-and its GET — operator action, S3 lifecycle policy, or a manual
-orphan prune (the library itself never deletes data it has
-written, so the case is always operator-driven).
+A data-file GET that returns S3 `NoSuchKey` is operator-driven
+(lifecycle policy, manual prune, or external delete — the library
+itself never deletes data it has written). The library splits the
+response by path:
 
-Failing the whole read on a missing file would turn a single-
-record anomaly into permanent breakage. Every *other* GET error
-(throttle, network, auth, timeout) is still fatal — silently
-dropping records on transient failure is worse than propagating.
+- **Strict — fail loudly.** `Read` and `ReadIter` propagate the
+  `NoSuchKey` as a wrapped error. These paths LIST the partition
+  tree first, so a missing file is genuinely a LIST-to-GET race
+  (the file vanished in the millisecond window between LIST and
+  GET); a caller retry resolves it because the next LIST won't
+  include the deleted key.
+- **Tolerant — skip and signal.** `PollRecords`, `ReadRangeIter`,
+  and `BackfillIndex` walk the ref stream / data tree on a
+  long-running shape where a single missing file shouldn't poison
+  the whole job. They log via `slog.Warn` (level WARN, key=path,
+  method=poll_records / read_range_iter / backfill) and increment
+  the `s3store.read.missing_data` counter, then continue. The
+  caller's slog handler decides what to do with the warning;
+  metrics are picked up by any OTel-configured backend.
 
-```go
-s3store.Config[T]{
-    // ...
-    OnMissingData: func(dataPath string) {
-        slog.Warn("s3store: data file missing, skipping",
-            "path", dataPath)
-    },
-}
-```
-
-The hook is called from the download worker pool and must be
-safe for concurrent invocation. `nil` means "skip silently."
+Every *other* GET error (throttle, network, auth, timeout) is
+still fatal on every path — silently dropping records on
+transient failure is worse than propagating.
 
 ## Configuration
 
@@ -1567,7 +1565,6 @@ type Config[T any] struct {
     // Optional ref-stream opt-out and tuning knobs.
     DisableRefStream    bool
     MaxInflightRequests int
-    OnMissingData       func(dataPath string)
     Indexes             []IndexDef[T]
 }
 ```
@@ -1644,6 +1641,13 @@ not terminal error class — keeping cardinality bounded).
 | `s3store.read.records` | histogram | 1 |
 | `s3store.read.bytes` | histogram | By |
 | `s3store.read.files` | histogram | 1 |
+| `s3store.read.missing_data` | counter | 1 |
+
+`s3store.read.missing_data` increments on `NoSuchKey` skips along
+the tolerant read paths (`PollRecords`, `ReadRangeIter`,
+`BackfillIndex`). Carries `s3store.method` so dashboards can
+split by which path produced the skip. Strict paths (`Read`,
+`ReadIter`) fail instead of recording.
 
 `Write` and `WriteWithKey` show up as distinct `s3store.method`
 values; `Write`'s per-partition dispatch is internal and does not
@@ -1720,6 +1724,19 @@ Breaking changes in the single-package collapse:
   accounts that were granted `s3:DeleteObject` for the cleanup
   path can drop that permission too. Retries still work
   unchanged via the token + conditional-PUT path.
+- **`OnMissingData` callback removed from `Config` and
+  `ReaderConfig`; `BackfillIndex` no longer takes an
+  `onMissingData` parameter.** Replaced with a built-in
+  `slog.Warn` + `s3store.read.missing_data` OTel counter at the
+  three tolerant call sites (`PollRecords`, `ReadRangeIter`,
+  `BackfillIndex`). The strict paths (`Read`, `ReadIter`) now
+  fail with a wrapped `NoSuchKey` error instead of skip-and-
+  notify — a caller retry resolves the LIST-to-GET race. Drop
+  the callback from your config and the trailing argument from
+  `BackfillIndex` calls; configure your slog handler to route /
+  count the warning, or alert on the counter via your metrics
+  backend.
+
 For anyone upgrading across multiple releases, the older
 breaking-change history (indexes-in-config, consistency-on-target,
 S3Target-as-handle, idempotent-write, bloom-filter removal,

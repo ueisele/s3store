@@ -181,7 +181,7 @@ func (s *Reader[T]) PollRecords(
 		}
 	}
 
-	records, bytesTotal, err := s.downloadAndDecodeAll(ctx, keys)
+	records, bytesTotal, err := s.downloadAndDecodeAll(ctx, keys, scope)
 	if err != nil {
 		return nil, since, err
 	}

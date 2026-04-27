@@ -98,22 +98,6 @@ type Config[T any] struct {
 	//	VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
 	VersionOf func(record T) int64
 
-	// OnMissingData is invoked when a data-file GET returns S3
-	// NoSuchKey (404) during Read, PollRecords, or BackfillIndex.
-	// The path is skipped (not treated as an error) and the hook
-	// is called with its S3 key so the caller can log, count, or
-	// alert. Nil disables the hook and retains skip-on-404 behavior.
-	//
-	// Intended to mask the LIST-to-GET race: an object was
-	// deleted between listing and reading (operator action,
-	// bucket lifecycle policy, or a manual orphan prune). Failing
-	// the whole read would turn a one-record anomaly into ongoing
-	// breakage; skip-and-notify is the at-least-once posture.
-	//
-	// Called from the S3 download worker goroutine — must be safe
-	// for concurrent invocation.
-	OnMissingData func(dataPath string)
-
 	// InsertedAtField names a time.Time field on T that the writer
 	// populates with its wall-clock time.Now() captured just before
 	// parquet encoding. The field must carry a non-empty, non-"-"
@@ -247,10 +231,9 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 // natively into T by parquet-go.
 func readerConfigFrom[T any](c Config[T]) ReaderConfig[T] {
 	return ReaderConfig[T]{
-		Target:        targetFrom(c),
-		EntityKeyOf:   c.EntityKeyOf,
-		VersionOf:     c.VersionOf,
-		OnMissingData: c.OnMissingData,
+		Target:      targetFrom(c),
+		EntityKeyOf: c.EntityKeyOf,
+		VersionOf:   c.VersionOf,
 	}
 }
 
