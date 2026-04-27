@@ -293,14 +293,13 @@ s3://warehouse/billing/
       customer=abc/
         1710684000000000-a3f2e1b4.parquet
         1710770400000000-c7d9f0e2.parquet   ← recalculation (sorts after the first)
-  _stream/
-    refs/
-      1710684000000000-a3f2e1b4;charge_period=2026-03-17%2Fcustomer=abc.ref
-      1710770400000000-c7d9f0e2;charge_period=2026-03-17%2Fcustomer=abc.ref
+  _ref/
+    1710684000000000-a3f2e1b4;charge_period=2026-03-17%2Fcustomer=abc.ref
+    1710770400000000-c7d9f0e2;charge_period=2026-03-17%2Fcustomer=abc.ref
 ```
 
 - `data/` holds the actual Parquet files, partitioned Hive-style.
-- `_stream/refs/` holds one **empty** file per write. The filename encodes
+- `_ref/` holds one **empty** file per write. The filename encodes
   the timestamp, a short UUID, and the partition key. `Poll` is a single
   S3 LIST over this prefix — no GETs.
 
@@ -451,7 +450,7 @@ entries, newOffset, err := store.Poll(ctx, lastOffset, 100)
 Each `StreamEntry` carries the ref's `Offset` (opaque cursor, pass back as
 `since` on the next call), the `Key` (partition key as written), and the
 `DataPath` (S3 key of the parquet file). No GETs are issued — the entire
-batch is one S3 LIST call over `_stream/refs/`.
+batch is one S3 LIST call over `_ref/`.
 
 ### Stream — typed records
 

@@ -236,7 +236,7 @@ func TestNewKeepsUserVersionOf(t *testing.T) {
 func TestOffsetAt(t *testing.T) {
 	s := &Reader[testRec]{
 		cfg:     readerConfigFrom(validConfig()),
-		refPath: "p/_stream/refs",
+		refPath: "p/_ref",
 	}
 	anchor := time.UnixMicro(2_000_000_000_000_000)
 	off := s.OffsetAt(anchor)

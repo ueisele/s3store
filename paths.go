@@ -11,8 +11,8 @@ import (
 // Data-file paths.
 //
 // Layout:
-//   <Prefix>/data/<hiveKey>/<id>.parquet            — data files
-//   <Prefix>/_stream/refs/<refTsMicros>-<id>...     — ref files
+//   <Prefix>/data/<hiveKey>/<id>.parquet         — data files
+//   <Prefix>/_ref/<refTsMicros>-<id>...          — ref files
 //
 // id is opaque to these helpers — the writer generates it as
 // either {tsMicros}-{shortID} (the library's default, lex-sortable
@@ -25,10 +25,10 @@ func dataPath(prefix string) string {
 	return prefix + "/data"
 }
 
-// refPath returns the prefix under which stream-ref files are
-// stored, relative to the store's top-level Prefix.
+// refPath returns the prefix under which ref files are stored,
+// relative to the store's top-level Prefix.
 func refPath(prefix string) string {
-	return prefix + "/_stream/refs"
+	return prefix + "/_ref"
 }
 
 // buildDataFilePath returns the S3 object key for a data file.

@@ -96,7 +96,7 @@ s3.put_bucket_policy(Bucket=BUCKET, Policy=json.dumps(policy))
 >   `(col, value)` tuple recurs in a batch. A bucket-wide deny
 >   rejects the second write with `403 AccessDenied` and breaks
 >   projection writes entirely.
-> - `_stream/refs/` — ref files. Unique per-PUT keys
+> - `_ref/` — ref files. Unique per-PUT keys
 >   (refTsMicros prefix), so they never overwrite either way.
 >
 > **Symptom of an over-scoped deny**: data writes succeed, then

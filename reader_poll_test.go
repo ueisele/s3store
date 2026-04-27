@@ -36,7 +36,7 @@ func listServer(
 const xmlEmptyList = `<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
 	<Name>bucket</Name>
-	<Prefix>p/_stream/refs/</Prefix>
+	<Prefix>p/_ref/</Prefix>
 	<KeyCount>0</KeyCount>
 	<MaxKeys>1000</MaxKeys>
 	<IsTruncated>false</IsTruncated>

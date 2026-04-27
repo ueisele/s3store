@@ -6,7 +6,7 @@ import (
 )
 
 func TestRefKeyRoundTrip(t *testing.T) {
-	const refPath = "test-prefix/_stream/refs"
+	const refPath = "test-prefix/_ref"
 	const refTs int64 = 1710684000000000
 	const dataTs int64 = 1710683999500000
 	const shortID = "a3f2e1b4"
@@ -54,7 +54,7 @@ func TestRefKeyRoundTrip(t *testing.T) {
 // via S3 ListObjectsV2's StartAfter to walk the stream
 // chronologically.
 func TestRefKeyLexicalOrdering(t *testing.T) {
-	const refPath = "test-prefix/_stream/refs"
+	const refPath = "test-prefix/_ref"
 	const key = "period=2026-03-17/customer=abc"
 
 	timestamps := []int64{
@@ -106,7 +106,7 @@ func TestParseRefKeyInvalid(t *testing.T) {
 // and lexically greater than or equal to any ref encoded at the
 // cutoff timestamp.
 func TestRefCutoff(t *testing.T) {
-	const refPath = "p/_stream/refs"
+	const refPath = "p/_ref"
 	now := time.UnixMicro(2_000_000_000_000_000)
 	settle := 100 * time.Millisecond
 
