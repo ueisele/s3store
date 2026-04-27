@@ -3323,6 +3323,153 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 	}
 }
 
+// TestIdempotency_FullCycle_ScenarioBRefMissing exercises the
+// end-to-end exactly-once-with-token contract through a simulated
+// "scenario B" partial failure: data PUT landed, ref PUT did not.
+// Pairs the writer's retry-fill-in-ref path with the reader's
+// WithIdempotentRead barrier so a caller that retries a read-
+// modify-write across the failure observes the same state twice
+// and writes the same bytes (idempotently, thanks to the token).
+//
+// Sequence:
+//
+//  1. Seed a baseline record (no token).
+//  2. Attempt-1 reads with WithIdempotentRead(T) → token unmatched,
+//     baseline returned. This is the read half of the would-be
+//     read-modify-write.
+//  3. Attempt-1 writes a derived record with WithIdempotencyToken(T):
+//     data + ref both PUT, caller logically commits.
+//  4. Operator simulates the scenario-B failure: DELETE the ref
+//     out-of-band. The data file remains; no ref exists.
+//  5. Attempt-2 retries the same write with the same token. The
+//     writer detects existing data via overwrite-prevention, scope-
+//     LISTs for the ref, finds none, writes a fresh ref to complete
+//     the interrupted attempt. DataPath is identical to attempt-1's
+//     (token-deterministic); RefPath is freshly minted (refTsMicros
+//     embeds the retry's wall-clock).
+//  6. PollRecords from offset "" sees both refs (baseline +
+//     reconstructed) so downstream consumers don't lose attempt-1's
+//     data across the partial failure.
+//  7. Re-read with WithIdempotentRead(T): the barrier matches the
+//     surviving attempt-1 data file (still under {token}.parquet)
+//     and self-excludes it; baseline-only is returned, matching
+//     attempt-1's pre-write view from step 2.
+//  8. Plain Read (no barrier) returns the full state.
+func TestIdempotency_FullCycle_ScenarioBRefMissing(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	key := "period=2026-04-22/customer=alice"
+	const token = "2026-04-22T10:15:00Z-fullcycle"
+
+	// 1. Seed baseline.
+	if _, err := store.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "baseline", Value: 1, Ts: time.UnixMilli(1),
+	}}); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	// Spread LastModified so the WithIdempotentRead barrier
+	// (LastModified-based) cleanly orders baseline before attempt-1
+	// — MinIO has whole-second granularity on some versions.
+	time.Sleep(1100 * time.Millisecond)
+
+	// 2. Attempt-1 reads with the barrier: no token matches yet,
+	// so the full current state (baseline only) is returned.
+	pre, err := store.Read(ctx, []string{key}, WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("attempt-1 Read: %v", err)
+	}
+	if len(pre) != 1 || pre[0].SKU != "baseline" {
+		t.Fatalf("attempt-1 saw %+v, want [baseline]", pre)
+	}
+
+	// 3. Attempt-1 writes the derived record with the token.
+	first, err := store.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "derived", Value: 100, Ts: time.UnixMilli(10),
+	}}, WithIdempotencyToken(token, time.Hour))
+	if err != nil {
+		t.Fatalf("attempt-1 write: %v", err)
+	}
+	if first.RefPath == "" {
+		t.Fatal("attempt-1 RefPath empty — expected a ref PUT on " +
+			"the fresh-write path")
+	}
+
+	// 4. Simulate scenario-B partial failure: DELETE the ref,
+	// leave the data file in place.
+	if _, err := store.Target().S3Client().DeleteObject(ctx,
+		&s3.DeleteObjectInput{
+			Bucket: aws.String(store.Target().Bucket()),
+			Key:    aws.String(first.RefPath),
+		}); err != nil {
+		t.Fatalf("DeleteObject ref: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	// 5. Attempt-2 retries with the same token. The writer must
+	// detect existing data, scope-LIST for the ref, find none,
+	// then PUT a fresh ref to complete the interrupted attempt.
+	second, err := store.WriteWithKey(ctx, key, []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "derived", Value: 100, Ts: time.UnixMilli(10),
+	}}, WithIdempotencyToken(token, time.Hour))
+	if err != nil {
+		t.Fatalf("attempt-2 write: %v", err)
+	}
+	if second.DataPath != first.DataPath {
+		t.Errorf("retry DataPath drift: fresh=%q retry=%q "+
+			"(token-deterministic path is the contract)",
+			first.DataPath, second.DataPath)
+	}
+	if second.RefPath == "" {
+		t.Errorf("retry RefPath empty — scenario-B fill-in did " +
+			"not PUT a replacement ref")
+	}
+	if second.RefPath == first.RefPath {
+		t.Errorf("retry RefPath %q equals attempt-1's deleted "+
+			"ref — fill-in must mint a fresh ref (refTsMicros "+
+			"embeds the retry's wall-clock)", second.RefPath)
+	}
+
+	// 6. PollRecords sees both refs (baseline + reconstructed
+	// attempt-1). Wait past SettleWindow first.
+	time.Sleep(400 * time.Millisecond)
+	polled, _, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords: %v", err)
+	}
+	if len(polled) != 2 {
+		t.Fatalf("PollRecords got %d records, want 2 "+
+			"(baseline + reconstructed)", len(polled))
+	}
+
+	// 7. Re-read with the barrier. The token file still exists
+	// (only the ref was deleted), so the barrier fires and the
+	// derived record is self-excluded. Baseline survives —
+	// retry-safe read-modify-write across the partial failure.
+	post, err := store.Read(ctx, []string{key},
+		WithIdempotentRead(token))
+	if err != nil {
+		t.Fatalf("post-retry barrier Read: %v", err)
+	}
+	if len(post) != 1 || post[0].SKU != "baseline" {
+		t.Fatalf("post-retry barrier saw %+v, want [baseline] "+
+			"(retry must preserve attempt-1's read view)", post)
+	}
+
+	// 8. Plain Read (no barrier): full state — both records.
+	full, err := store.Read(ctx, []string{key})
+	if err != nil {
+		t.Fatalf("full Read: %v", err)
+	}
+	if len(full) != 2 {
+		t.Fatalf("full Read got %d records, want 2 "+
+			"(baseline + derived)", len(full))
+	}
+}
+
 // TestWrite_RefSettleBudgetEnforced guards that a write whose
 // initial ref PUT exceeds SettleWindow is handled correctly — the
 // library never silently returns success with a stale ref.
