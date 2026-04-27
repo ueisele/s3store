@@ -3351,8 +3351,8 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 //     deadline despite the tight budget (rare on MinIO at 1ms but
 //     not impossible).
 //   - Wrapped put-ref error (typically ctx.DeadlineExceeded): the
-//     PUT was cancelled by the client-side timeout. Orphan-cleanup
-//     ran; the caller retries.
+//     PUT was cancelled by the client-side timeout. The data file
+//     stays in S3 as an orphan; the caller retries.
 //
 // Strong consistency is declared via ConsistencyControl so the
 // idempotent data-PUT and retry LIST take the strong path. The

@@ -46,15 +46,6 @@ type WriterConfig[T any] struct {
 	//
 	//	VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
 	InsertedAtField string
-
-	// DisableCleanup opts out of the best-effort DeleteObject
-	// calls on partial-write failure paths (orphan data after a
-	// marker or ref PUT failure). When true, orphan objects
-	// remain at their S3 keys for bucket lifecycle policies to
-	// garbage-collect. Set when the writer lacks DELETE permission
-	// (common in StorageGRID deployments with a narrowly-
-	// scoped service account).
-	DisableCleanup bool
 }
 
 // Writer is the write-side half of a Store. Owns the write path

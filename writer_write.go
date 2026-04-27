@@ -143,12 +143,13 @@ func (s *Writer[T]) writeGroupedFanOut(
 // writes an empty ref file with all metadata in the key name.
 // Ref timestamp is generated AFTER the data PUT completes.
 //
-// If the ref PUT fails after the data PUT succeeded, WriteWithKey
-// issues a HEAD on the ref key to disambiguate a lost ack (ref
-// actually got written, we just lost the response) from a real
-// failure. On a real failure it best-effort deletes the orphan
-// parquet; if that cleanup also fails, the returned error
-// includes the orphan data path so the operator can clean up.
+// On any failure between data PUT and ref PUT, the returned error
+// is wrapped and the data file is left in S3. This is the
+// at-least-once contract: a failed Write may leave an orphan data
+// file, never deletes one. Snapshot reads (Read / ReadIter) will
+// surface the orphan's records until an operator-driven prune
+// removes it (S3 lifecycle rule, or a manual cleanup with readers
+// quiesced).
 //
 // Passing WithIdempotencyToken makes this call retry-safe: the
 // data filename is derived from the token, so retries produce
@@ -317,11 +318,10 @@ func (s *Writer[T]) writeEncodedPayload(
 
 	// Phase 3: markers. Sequenced after data so a landed marker
 	// implies the backing file exists, and before ref so Poll's
-	// commit semantics are unchanged. On marker-PUT failure,
-	// best-effort cleanup of the orphan data (non-idempotent
-	// writes only; idempotent retries reuse the same data file).
+	// commit semantics are unchanged. A marker-PUT failure leaves
+	// the data file in S3 as an orphan — at-least-once on storage
+	// means the library never deletes data it has written.
 	if err := s.putMarkers(ctx, markerPaths); err != nil {
-		_ = s.cleanupOrphanData(ctx, dataKey, idempotent)
 		return nil, fmt.Errorf(
 			"s3store: put index markers: %w", err)
 	}
@@ -340,14 +340,14 @@ func (s *Writer[T]) writeEncodedPayload(
 
 	// Phase 4: ref PUT under a SettleWindow/2 client-side timeout.
 	return s.commitRef(
-		ctx, dataKey, id, tsMicros, key, writeStartTime, idempotent)
+		ctx, dataKey, id, tsMicros, key, writeStartTime)
 }
 
 // commitRef is phase 4 of writeEncodedPayload: PUT the ref under
 // a SettleWindow/2 client-side timeout. On success returns the
 // WriteResult; on PUT failure (timeout, transport error, etc.)
-// runs best-effort orphan-data cleanup and surfaces the wrapped
-// error so the caller retries.
+// returns a wrapped error and leaves the data file in S3 as an
+// orphan, so the caller retries.
 //
 // refCaptureTime is captured just before the PUT so the ref
 // filename's refTsMicros reflects publication time, not
@@ -368,7 +368,7 @@ func (s *Writer[T]) writeEncodedPayload(
 func (s *Writer[T]) commitRef(
 	ctx context.Context,
 	dataKey, id string, dataTsMicros int64, hiveKey string,
-	writeStartTime time.Time, idempotent bool,
+	writeStartTime time.Time,
 ) (*WriteResult, error) {
 	refCaptureTime := time.Now()
 	refTsMicros := refCaptureTime.UnixMicro()
@@ -382,11 +382,6 @@ func (s *Writer[T]) commitRef(
 	if err := s.cfg.Target.put(
 		putCtx, refKey, []byte{}, "application/octet-stream",
 	); err != nil {
-		if delErr := s.cleanupOrphanData(ctx, dataKey, idempotent); delErr != nil {
-			return nil, fmt.Errorf(
-				"s3store: put ref: %w (orphan data at %s: %v)",
-				err, dataKey, delErr)
-		}
 		return nil, fmt.Errorf("s3store: put ref: %w", err)
 	}
 
@@ -493,31 +488,6 @@ func (s *Writer[T]) findExistingRef(
 		return "", err
 	}
 	return found, nil
-}
-
-// cleanupOrphanData runs the best-effort delete for an orphaned
-// data object on the failure paths. No-op (nil return) when the
-// write is idempotent (retries reuse the same path; deleting
-// would force body re-upload) or when DisableCleanup is set
-// (operator opted into lifecycle-based garbage collection).
-//
-// Uses the caller's ctx — if the caller cancels, the DELETE is
-// interrupted and the orphan stays for bucket lifecycle to
-// collect. Same posture as DisableCleanup, just opportunistic.
-//
-// Returns the del error when the delete actually ran and failed.
-// Fire-and-forget sites (commitMarkers) discard the returned
-// error because they already have a richer error to surface and
-// compounding obscures the root cause. The ref-PUT failure path
-// folds the returned error into its user-facing message so
-// operators without lifecycle policies can find the orphan.
-func (s *Writer[T]) cleanupOrphanData(
-	ctx context.Context, dataKey string, idempotent bool,
-) error {
-	if idempotent || s.cfg.DisableCleanup {
-		return nil
-	}
-	return s.cfg.Target.del(ctx, dataKey)
 }
 
 func (s *Writer[T]) groupByKey(records []T) map[string][]T {

@@ -16,6 +16,38 @@ S3 bucket.
 - **Iterate** large reads with bounded-memory streaming.
 - **Index** secondary lookups with empty marker files (LIST-only Lookup).
 
+## Guarantees
+
+No transactional coordinator — S3 is the only source of truth. The
+contract follows from that:
+
+- **At-least-once on storage.** A successful `Write` is durable; a
+  retry after partial failure may produce duplicate data files and
+  refs. Dedupe on read via `EntityKeyOf` + `VersionOf`, or shrink
+  the duplicate window at storage with `WithIdempotencyToken`.
+- **Read-after-write on snapshot reads.** `Read` / `ReadIter` /
+  `IndexReader.Lookup` / `BackfillIndex` see new records the moment
+  `Write` returns. The change-stream APIs (`Poll`, `PollRecords`,
+  `ReadRangeIter`) intentionally lag the tip by `SettleWindow` to
+  tolerate S3 LIST propagation skew.
+- **Read stability.** Two consecutive snapshot reads with no
+  intervening writes return the same records — the library never
+  deletes or rewrites data on its own.
+
+**Corollary: once a data file is in S3, it stays forever — even if
+the `Write` call returned an error.** A crashed write can leave an
+orphan data file with no matching ref; it's still visible to
+snapshot reads, which is consistent with at-least-once. The library
+can't tell "committed" from "crashed-mid-write" without external
+transactional metadata, and can't know whether a reader has already
+observed a file — so **automatic garbage collection isn't possible
+without breaking read stability**. Cleanup of orphans is an
+operator decision (S3 lifecycle rules, or a manual prune with
+readers quiesced), not a library feature.
+
+Detailed contract and configuration in
+[Durability guarantees](#durability-guarantees).
+
 ## Install
 
 ```bash
@@ -845,9 +877,8 @@ make the scoped retry-LIST list-after-write across nodes are
 the two backend-side settings the library can't apply for you.
 Both are documented in [STORAGEGRID.md](STORAGEGRID.md), along
 with what each consistency level means for every correctness-
-critical call s3store makes, why `strong-*` is required on both
-halves of the library, and where we deliberately leave the
-bucket default.
+critical call s3store makes and why `strong-*` is required on
+both halves of the library.
 
 ### Zombie writers and orchestrators
 
@@ -1346,13 +1377,14 @@ halved budget doesn't cost the happy path anything. The budget
 does **not** vary with `ConsistencyControl`.
 
 If the ref PUT misses the deadline (or fails for any other
-reason), the call returns a wrapped error and the orphan data
-file is best-effort deleted. The caller retries — under
-`WithIdempotencyToken` the retry is deterministic (same data
-path); `findExistingRef`'s freshness filter ignores any stale
-ref a previous attempt may have left behind, so the retry emits
-a fresh in-budget ref rather than silently matching the stale
-one.
+reason), the call returns a wrapped error. The data file is left
+in S3 as an orphan — the library never deletes data it has
+written. The caller retries — under `WithIdempotencyToken` the
+retry is deterministic (same data path), conditional `If-None-
+Match: *` on the data PUT routes into the retry-dedup branch, and
+`findExistingRef`'s freshness filter ignores any stale ref a
+previous attempt may have left behind, so the retry emits a fresh
+in-budget ref rather than silently matching the stale one.
 
 ```go
 if _, err := store.Write(ctx, recs,
@@ -1466,18 +1498,14 @@ deadline returns a wrapped put-ref error so the caller retries
 
 `Read`, `PollRecords`, and `BackfillIndex` tolerate a missing
 data file (S3 `NoSuchKey`) by skipping it and invoking an
-optional `Config.OnMissingData(dataPath)` hook. This covers two
-rare but real scenarios:
+optional `Config.OnMissingData(dataPath)` hook. This covers the
+LIST-to-GET race: a data file disappears between a read's LIST
+and its GET — operator action, S3 lifecycle policy, or a manual
+orphan prune (the library itself never deletes data it has
+written, so the case is always operator-driven).
 
-- **Dangling ref from a write-cleanup race.** The ref PUT "failed"
-  with a lost ack, the cleanup HEAD also failed transiently, and
-  the cleanup DELETE removed the data. Ref lives on in S3 pointing
-  at nothing.
-- **LIST-to-GET race.** A data file disappears between a `Read`'s
-  LIST and its GET (e.g. lifecycle deletion).
-
-Failing the entire read on either would turn a single-record
-anomaly into permanent breakage. Every *other* GET error
+Failing the whole read on a missing file would turn a single-
+record anomaly into permanent breakage. Every *other* GET error
 (throttle, network, auth, timeout) is still fatal — silently
 dropping records on transient failure is worse than propagating.
 
@@ -1528,10 +1556,6 @@ type Config[T any] struct {
 
     // Parquet compression codec (default snappy).
     Compression CompressionCodec
-
-    // Idempotent-write knob (optional; see "Idempotent writes"
-    // for the full contract).
-    DisableCleanup bool
 
     // Consistency-Control HTTP header value applied to every
     // correctness-critical S3 operation (one knob, target-wide).
@@ -1589,7 +1613,7 @@ attributes are added per call — cardinality stays bounded.
 ### Instrument inventory
 
 **S3 ops** (recorded at the wrapper layer in `S3Target.put` / `get`
-/ `del` / `existsLocked` / `listPage`):
+/ `existsLocked` / `listPage`):
 
 | Name | Kind | Unit |
 |---|---|---|
@@ -1599,7 +1623,7 @@ attributes are added per call — cardinality stays bounded.
 | `s3store.s3.request.body.size` | histogram | By |
 | `s3store.s3.response.body.size` | histogram | By |
 
-Per-op attributes: `s3store.operation` ∈ `put|get|head|delete|list`,
+Per-op attributes: `s3store.operation` ∈ `put|get|head|list`,
 `s3store.outcome` ∈ `success|error|canceled`, plus `error.type`
 (`precondition_failed|not_found|slowdown|server|client|transport|canceled|other`)
 on non-success. `s3store.s3.request.attempts` carries only
@@ -1687,7 +1711,15 @@ Breaking changes in the single-package collapse:
 - **`internal/testutil` package removed.** The MinIO test fixture
   is now in `fixture_test.go` in root. Only the integration build
   tag and your own integration tests are affected.
-
+- **`DisableCleanup` field removed from `Config` and
+  `WriterConfig`.** The library no longer DELETEs orphan data on
+  marker / ref PUT failure paths — at-least-once on storage now
+  means data files written to S3 stay until an operator-driven
+  prune removes them (S3 lifecycle rule, or manual cleanup with
+  readers quiesced). Drop the field from your config; service
+  accounts that were granted `s3:DeleteObject` for the cleanup
+  path can drop that permission too. Retries still work
+  unchanged via the token + conditional-PUT path.
 For anyone upgrading across multiple releases, the older
 breaking-change history (indexes-in-config, consistency-on-target,
 S3Target-as-handle, idempotent-write, bloom-filter removal,

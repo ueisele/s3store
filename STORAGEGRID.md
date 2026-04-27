@@ -101,10 +101,10 @@ s3.put_bucket_policy(Bucket=BUCKET, Policy=json.dumps(policy))
 >
 > **Symptom of an over-scoped deny**: data writes succeed, then
 > markers fail with `403 AccessDenied` as soon as any
-> `(col, value)` tuple recurs. The library attempts a cleanup
-> DELETE on the orphan data, which often fails with the same
-> 403, leaving orphan parquet under `data/` with no markers and
-> no ref.
+> `(col, value)` tuple recurs. The library does not delete the
+> data file on this failure (the at-least-once contract), so
+> orphan parquet accumulates under `data/` with no markers and
+> no ref until an operator-driven prune removes it.
 
 ### 2. `ConsistencyControl` on the S3 target
 
@@ -469,22 +469,14 @@ it fires on a sequential retry, the writer skips re-uploading
 the body. It's not a correctness lever. Correctness lives on the
 LIST side.
 
-### Where we deliberately leave the bucket default
+### No per-call consistency overrides
 
-A few call sites do **not** carry the configured
-`ConsistencyControl`. Each is correctness-safe under
-StorageGRID's `read-after-new-write` default:
-
-- **Best-effort cleanup `DELETE`.** [`S3Target.del`](target.go)
-  takes no consistency parameter. Cleanup deletes only fire on
-  rare orphan-data paths (marker / ref PUT failure) and bucket
-  lifecycle GC sweeps anything missed. Eventual deletion
-  visibility costs storage tidiness, not correctness.
-- **No per-call overrides.** Every S3 call routed through an
-  `S3Target` uses that target's level — there is no per-method
-  knob. If a future caller needs a one-off operation at a
-  different level (e.g. an `available`-level maintenance scan),
-  they can construct a separate `S3Target` for that path.
+Every S3 call routed through an `S3Target` uses that target's
+`ConsistencyControl` — there is no per-method knob. If a future
+caller needs a one-off operation at a different level (e.g. an
+`available`-level maintenance scan), they can construct a
+separate `S3Target` for that path. This enforces NetApp's "same
+consistency for paired operations" rule by construction.
 
 ### What's documented vs. inferred
 

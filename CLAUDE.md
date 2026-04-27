@@ -5,18 +5,29 @@ must preserve them — even when the change appears unrelated.
 
 - **At-least-once at the storage layer** — successful Write is
   durable; a retry after partial failure may produce duplicate
-  data files / refs. Read paths surface what's in S3, so
-  duplicates flow through unless dedup is configured.
+  data files / refs. A failed Write between data PUT and ref
+  PUT leaves an orphan data file. The library never deletes
+  data, refs, or markers it has written.
 - **Read-after-write on snapshot reads** — once Write returns
   success, Read / ReadIter / IndexReader.Lookup / BackfillIndex
-  see the new records immediately. The settle window is the
-  *only* deliberate exception, and it applies only to the change
-  stream (Poll / PollRecords / ReadRangeIter).
+  see the new records immediately. The settle window applies
+  only to the change stream (Poll / PollRecords /
+  ReadRangeIter).
+- **Read stability — no library-driven deletion** — two
+  consecutive snapshot reads with no intervening writes return
+  the same records. Without transactional metadata, the library
+  can't tell "committed" from "crashed-mid-write," and can't
+  know if a reader has already observed a file. Refactors must
+  not introduce automatic GC, age-based pruning, rewrite-in-
+  place compaction, or in-Write cleanup of failed-Write
+  orphans. Cleanup is operator-driven only.
 - **Exactly-once at the consumer layer is opt-in via reader
   dedup** — `EntityKeyOf` + `VersionOf` collapse duplicates by
-  (entity, version). `WithIdempotencyToken` + a conditional-PUT
-  backend additionally minimize storage-layer duplication on
-  retries; correctness lives on reader dedup either way.
+  (entity, version). `WithIdempotencyToken` makes retries
+  deterministic via a token-derived data path + always-
+  conditional `If-None-Match: *` on the data PUT, routing
+  retries into the retry-dedup branch. Refactors must not drop
+  the conditional flag.
 - **Deterministic parquet encoding** — same records + same codec
   produce byte-identical bytes. `WithIdempotencyToken` retries
   depend on this; refactors must not introduce non-determinism

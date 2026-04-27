@@ -229,9 +229,6 @@ type S3TargetConfig struct {
 	// Reader / Index configs enforces NetApp's "same consistency
 	// for paired operations" rule by construction: every operation
 	// routed through this target uses one and the same value.
-	// A handful of call sites (best-effort cleanup DELETEs)
-	// deliberately do not carry the header — see the same README
-	// section.
 	ConsistencyControl ConsistencyLevel
 
 	// MeterProvider, when set, supplies the OTel meter used to
@@ -612,25 +609,6 @@ func (t S3Target) existsLocked(
 		return false, nil
 	}
 	return false, s3Err
-}
-
-// del removes an object. Used on the write-cleanup paths.
-func (t S3Target) del(ctx context.Context, key string) (err error) {
-	scope := t.metrics.s3OpScope(ctx, s3OpDelete)
-	defer scope.end(&err)
-	if err = t.acquire(ctx); err != nil {
-		return err
-	}
-	defer t.release()
-	err = retry(ctx, func() error {
-		scope.incAttempts()
-		_, err := t.cfg.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(t.cfg.Bucket),
-			Key:    aws.String(key),
-		})
-		return err
-	})
-	return err
 }
 
 // listPage fetches the next page from p, wrapping NextPage in

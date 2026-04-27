@@ -104,11 +104,9 @@ type Config[T any] struct {
 	// is called with its S3 key so the caller can log, count, or
 	// alert. Nil disables the hook and retains skip-on-404 behavior.
 	//
-	// Intended to mask two rare but known outcomes of the write
-	// path: (1) the ref PUT "failed" with a lost ack but the ref
-	// is persisted while cleanup deleted the data, leaving a
-	// dangling ref; (2) LIST-to-GET race where an object was
-	// deleted between listing and reading. In both cases failing
+	// Intended to mask the LIST-to-GET race: an object was
+	// deleted between listing and reading (operator action,
+	// bucket lifecycle policy, or a manual orphan prune). Failing
 	// the whole read would turn a one-record anomaly into ongoing
 	// breakage; skip-and-notify is the at-least-once posture.
 	//
@@ -148,11 +146,6 @@ type Config[T any] struct {
 	// ErrRefStreamDisabled when set. See S3Target.DisableRefStream
 	// for the full contract.
 	DisableRefStream bool
-
-	// DisableCleanup disables best-effort orphan cleanup on the
-	// write path's failure branches. Forwarded to WriterConfig;
-	// see WriterConfig.DisableCleanup.
-	DisableCleanup bool
 
 	// ConsistencyControl is the Consistency-Control HTTP header
 	// value applied to correctness-critical S3 operations.
@@ -244,7 +237,6 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 		PartitionKeyOf:  c.PartitionKeyOf,
 		Compression:     c.Compression,
 		InsertedAtField: c.InsertedAtField,
-		DisableCleanup:  c.DisableCleanup,
 		Indexes:         c.Indexes,
 	}
 }

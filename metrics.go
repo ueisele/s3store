@@ -26,11 +26,10 @@ const instrumentationName = "github.com/ueisele/s3store"
 type s3OpKind string
 
 const (
-	s3OpPut    s3OpKind = "put"
-	s3OpGet    s3OpKind = "get"
-	s3OpHead   s3OpKind = "head"
-	s3OpDelete s3OpKind = "delete"
-	s3OpList   s3OpKind = "list"
+	s3OpPut  s3OpKind = "put"
+	s3OpGet  s3OpKind = "get"
+	s3OpHead s3OpKind = "head"
+	s3OpList s3OpKind = "list"
 )
 
 // methodKind names a public library method. Used as the

@@ -20,9 +20,6 @@ import "log/slog"
 // than per-config struct enforces NetApp's "same consistency for
 // paired operations" rule by construction. See the README's
 // "StorageGRID consistency" section for the full matrix.
-//
-// A handful of call sites deliberately do not carry the header
-// — the cleanup DELETE path is documented in the README.
 type ConsistencyLevel string
 
 const (
