@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync/atomic"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
@@ -28,7 +29,9 @@ import (
 // a malformed pattern fails with the offending index.
 func (s *Reader[T]) Read(
 	ctx context.Context, keyPatterns []string, opts ...QueryOption,
-) ([]T, error) {
+) (out []T, err error) {
+	scope := s.cfg.Target.metrics.methodScope(ctx, methodRead)
+	defer scope.end(&err)
 	var o QueryOpts
 	o.Apply(opts...)
 
@@ -41,11 +44,15 @@ func (s *Reader[T]) Read(
 		return nil, nil
 	}
 
-	records, err := s.downloadAndDecodeAll(ctx, keys)
+	records, bytesTotal, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, err
 	}
-	return s.sortAndCollect(records, o.IncludeHistory), nil
+	out = s.sortAndCollect(records, o.IncludeHistory)
+	scope.addRecords(int64(len(out)))
+	scope.addFiles(int64(len(keys)))
+	scope.addBytes(bytesTotal)
+	return out, nil
 }
 
 // sortKeyMetasByKey orders a partition's files by their S3 key
@@ -65,30 +72,34 @@ func identityKey(s string) string { return s }
 
 // downloadAndDecodeAll fans out a bounded set of parallel
 // downloads, decodes each parquet file into []T, and returns
-// the concatenated result. The input is sorted by S3 key for
-// deterministic download order; user-visible emission order is
-// set later by the caller's sortAndIterate.
+// the concatenated result plus the sum of compressed body bytes
+// downloaded across every file. The input is sorted by S3 key
+// for deterministic download order; user-visible emission order
+// is set later by the caller's sortAndIterate.
 func (s *Reader[T]) downloadAndDecodeAll(
 	ctx context.Context, keys []KeyMeta,
-) ([]T, error) {
+) ([]T, int64, error) {
 	if len(keys) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	sortKeyMetasByKey(keys)
 
 	results := make([][]T, len(keys))
+	var bytesTotal atomic.Int64
 	if err := fanOut(ctx, keys,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
+		s.cfg.Target.metrics,
 		func(ctx context.Context, i int, km KeyMeta) error {
-			recs, err := s.downloadAndDecodeOne(ctx, km)
+			recs, n, err := s.downloadAndDecodeOne(ctx, km)
 			if err != nil {
 				return err
 			}
+			bytesTotal.Add(n)
 			results[i] = recs
 			return nil
 		}); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Count for preallocation.
@@ -100,19 +111,21 @@ func (s *Reader[T]) downloadAndDecodeAll(
 	for _, r := range results {
 		out = append(out, r...)
 	}
-	return out, nil
+	return out, bytesTotal.Load(), nil
 }
 
 // downloadAndDecodeOne is the per-file body shared by
-// downloadAndDecodeAll and the iter streaming paths. Pulls one
-// parquet object from S3 and decodes it into []T.
+// downloadAndDecodeAll. Pulls one parquet object from S3 and
+// decodes it into []T. Returns the body byte count alongside
+// the records so the caller can sum bytes across the fan-out for
+// the s3store.read.bytes metric.
 //
-// Returns (nil, nil) when the object is missing — a dangling ref
-// or a LIST-to-GET race. The OnMissingData hook is invoked so
-// the caller can log/count without failing the read.
+// Returns (nil, 0, nil) when the object is missing — a dangling
+// ref or a LIST-to-GET race. The OnMissingData hook is invoked
+// so the caller can log/count without failing the read.
 func (s *Reader[T]) downloadAndDecodeOne(
 	ctx context.Context, km KeyMeta,
-) ([]T, error) {
+) ([]T, int64, error) {
 	key := km.Key
 
 	data, err := s.cfg.Target.get(ctx, key)
@@ -121,15 +134,15 @@ func (s *Reader[T]) downloadAndDecodeOne(
 			if s.cfg.OnMissingData != nil {
 				s.cfg.OnMissingData(key)
 			}
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("s3store: get %s: %w", key, err)
+		return nil, 0, fmt.Errorf("s3store: get %s: %w", key, err)
 	}
 	recs, err := decodeParquet[T](data)
 	if err != nil {
-		return nil, fmt.Errorf("s3store: decode %s: %w", key, err)
+		return nil, 0, fmt.Errorf("s3store: decode %s: %w", key, err)
 	}
-	return recs, nil
+	return recs, int64(len(data)), nil
 }
 
 // decodeParquet reads all rows of a parquet file into []T. T

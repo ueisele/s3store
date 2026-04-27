@@ -114,7 +114,12 @@ func defaultBinder[K any](columns []string, layout Layout) (
 // (nil, nil); a malformed pattern fails with the offending index.
 func (i *IndexReader[K]) Lookup(
 	ctx context.Context, patterns []string,
-) ([]K, error) {
+) (out []K, err error) {
+	scope := i.target.metrics.methodScope(ctx, methodLookup)
+	defer func() {
+		scope.addRecords(int64(len(out)))
+		scope.end(&err)
+	}()
 	patterns = dedupePatterns(patterns)
 	if len(patterns) == 0 {
 		return nil, nil
@@ -131,7 +136,7 @@ func (i *IndexReader[K]) Lookup(
 		return nil, err
 	}
 
-	out := make([]K, 0, len(keys))
+	out = make([]K, 0, len(keys))
 	for _, key := range keys {
 		values, err := parseIndexMarkerKey(
 			key, i.indexPath, i.columns)
@@ -163,6 +168,7 @@ func (i *IndexReader[K]) listAllMatchingMarkers(
 	suffix := "/" + indexMarkerFilename
 	return fanOutMapReduce(ctx, plans,
 		i.target.EffectiveMaxInflightRequests(),
+		i.target.metrics,
 		func(ctx context.Context, plan *readPlan) ([]string, error) {
 			var keys []string
 			err := i.target.listEach(ctx, plan.listPrefix, "", 0,

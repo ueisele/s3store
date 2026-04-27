@@ -1553,6 +1553,105 @@ only write or only read can use the narrower `WriterConfig[T]` /
 `ReaderConfig[T]` directly with `NewWriter` / `NewReader` — see the
 [Writer / Reader / View](#writer--reader--view) section.
 
+## Observability
+
+The library emits OpenTelemetry metrics through the `Metrics`
+struct attached to every `S3Target`. Wiring is opt-in: pass a
+`MeterProvider` on `S3TargetConfig`, or — easier — set one
+globally with `otel.SetMeterProvider(...)` before constructing the
+target and the library picks it up automatically.
+
+```go
+import (
+    "go.opentelemetry.io/otel"
+    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+)
+
+// One-time at process start.
+otel.SetMeterProvider(sdkmetric.NewMeterProvider(
+    sdkmetric.WithReader(prometheusReader), // or OTLP, etc.
+))
+
+target := s3store.NewS3Target(s3store.S3TargetConfig{
+    Bucket: "my-bucket", Prefix: "events",
+    S3Client: s3Client,
+    PartitionKeyParts: []string{"period", "customer"},
+    // MeterProvider not set → falls back to otel.GetMeterProvider().
+})
+```
+
+Every observation carries `s3store.bucket` and `s3store.prefix` as
+constant attributes (so multi-target deployments can be split per
+target in dashboards), plus `s3store.consistency_level` when
+`ConsistencyControl` is non-empty. No bucket/key/partition-value
+attributes are added per call — cardinality stays bounded.
+
+### Instrument inventory
+
+**S3 ops** (recorded at the wrapper layer in `S3Target.put` / `get`
+/ `del` / `existsLocked` / `listPage`):
+
+| Name | Kind | Unit |
+|---|---|---|
+| `s3store.s3.request.duration` | histogram | s |
+| `s3store.s3.request.count` | counter | 1 |
+| `s3store.s3.request.attempts` | histogram | 1 |
+| `s3store.s3.request.body.size` | histogram | By |
+| `s3store.s3.response.body.size` | histogram | By |
+
+Per-op attributes: `s3store.operation` ∈ `put|get|head|delete|list`,
+`s3store.outcome` ∈ `success|error|canceled`, plus `error.type`
+(`precondition_failed|not_found|slowdown|server|client|transport|canceled|other`)
+on non-success. `s3store.s3.request.attempts` carries only
+`s3store.operation` + `s3store.outcome` (it measures retry behavior,
+not terminal error class — keeping cardinality bounded).
+
+**Library methods** (recorded at the public entry point of `Write`,
+`WriteWithKey`, `Read`, `ReadIter`, `ReadRangeIter`, `Poll`,
+`PollRecords`, `IndexReader.Lookup`, `BackfillIndex`):
+
+| Name | Kind | Unit |
+|---|---|---|
+| `s3store.method.duration` | histogram | s |
+| `s3store.method.calls` | counter | 1 |
+| `s3store.write.records` | histogram | 1 |
+| `s3store.write.partitions` | histogram | 1 |
+| `s3store.write.bytes` | histogram | By |
+| `s3store.read.records` | histogram | 1 |
+| `s3store.read.bytes` | histogram | By |
+| `s3store.read.files` | histogram | 1 |
+
+`Write` and `WriteWithKey` show up as distinct `s3store.method`
+values; `Write`'s per-partition dispatch is internal and does not
+double-count.
+
+**Target-level state** (per-Target semaphore):
+
+| Name | Kind | Unit | What |
+|---|---|---|---|
+| `s3store.target.inflight` | up-down counter | 1 | currently holding a slot |
+| `s3store.target.waiting` | up-down counter | 1 | currently blocked in `acquire()` (queue depth) |
+| `s3store.target.semaphore.wait.duration` | histogram | s | wait time before a slot was granted |
+| `s3store.target.semaphore.acquires` | counter | 1 | by `outcome` |
+
+**Fan-out** (concurrency primitive used by writer/reader/index work):
+
+| Name | Kind | Unit | What |
+|---|---|---|---|
+| `s3store.fanout.workers` | histogram | 1 | worker goroutines per fan-out call |
+| `s3store.fanout.items` | histogram | 1 | items per fan-out call |
+
+Saturation = `s3store.target.inflight` / `MaxInflightRequests`.
+Sustained `s3store.target.waiting > 0` means callers are queuing
+on the semaphore; raise `MaxInflightRequests` (cost: more
+concurrent S3 connections) or reduce upstream concurrency.
+
+The AWS SDK v2 itself does not ship OTel metrics. If you also want
+per-SDK-attempt observation (e.g. to distinguish smithy retries
+from this library's outer `retry()` retries), attach a smithy
+middleware to your `*s3.Client` directly — the wrapper-level
+metrics above sit one layer outside that.
+
 ## Migration from earlier versions
 
 Breaking changes in the single-package collapse:

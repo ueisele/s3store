@@ -8,6 +8,7 @@ import (
 	"iter"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -36,6 +37,9 @@ func (s *Reader[T]) ReadIter(
 	ctx context.Context, keyPatterns []string, opts ...QueryOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
+		scope := s.cfg.Target.metrics.methodScope(ctx, methodReadIter)
+		var iterErr error
+		defer scope.end(&iterErr)
 		var o QueryOpts
 		o.Apply(opts...)
 
@@ -45,14 +49,15 @@ func (s *Reader[T]) ReadIter(
 		keys, err := ResolvePatterns(
 			ctx, s.cfg.Target, keyPatterns, &o)
 		if err != nil {
-			yield(*new(T), fmt.Errorf("s3store: ReadIter %w", err))
+			iterErr = fmt.Errorf("s3store: ReadIter %w", err)
+			yield(*new(T), iterErr)
 			return
 		}
 		if len(keys) == 0 {
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, yield)
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, yield, &iterErr)
 	}
 }
 
@@ -109,6 +114,9 @@ func (s *Reader[T]) ReadRangeIter(
 	pollOpts := []PollOption{WithUntilOffset(untilOffset)}
 
 	return func(yield func(T, error) bool) {
+		scope := s.cfg.Target.metrics.methodScope(ctx, methodReadRangeIter)
+		var iterErr error
+		defer scope.end(&iterErr)
 		var o QueryOpts
 		o.Apply(opts...)
 
@@ -122,6 +130,7 @@ func (s *Reader[T]) ReadRangeIter(
 		for {
 			entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, pollOpts...)
 			if err != nil {
+				iterErr = err
 				yield(*new(T), err)
 				return
 			}
@@ -142,14 +151,15 @@ func (s *Reader[T]) ReadRangeIter(
 
 		keys, err := applyIdempotentReadOpts(keys, s.dataPath, &o)
 		if err != nil {
-			yield(*new(T), fmt.Errorf("s3store: %w", err))
+			iterErr = fmt.Errorf("s3store: %w", err)
+			yield(*new(T), iterErr)
 			return
 		}
 		if len(keys) == 0 {
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, yield)
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, yield, &iterErr)
 	}
 }
 
@@ -185,7 +195,8 @@ func (s *Reader[T]) ReadRangeIter(
 // granularity without row-group-level streaming).
 func (s *Reader[T]) downloadAndDecodeIter(
 	ctx context.Context, keys []KeyMeta,
-	opts *QueryOpts, yield func(T, error) bool,
+	opts *QueryOpts, scope *methodScope,
+	yield func(T, error) bool, iterErr *error,
 ) {
 	if len(keys) == 0 {
 		return
@@ -196,8 +207,35 @@ func (s *Reader[T]) downloadAndDecodeIter(
 		return
 	}
 
+	// Records / bytes / files counters threaded through the
+	// pipeline; flushed onto the caller's scope before return so
+	// the deferred end sees totals. Each counter reflects work
+	// that actually committed: filesDownloaded is incremented by
+	// the downloader on every file with a definitive outcome
+	// (body fetched OR NoSuchKey — both are "visited"), skipping
+	// hard errors and ctx-cancel; bytesDownloaded sums received
+	// body bytes; recordsYielded counts records the consumer
+	// actually saw post-dedup. Partial-success error paths thus
+	// surface real progress rather than the work plan.
+	totalFiles := 0
+	for _, p := range parts {
+		totalFiles += len(p.files)
+	}
+	var recordsYielded int64
+	var bytesDownloaded, filesDownloaded atomic.Int64
+	defer func() {
+		scope.addRecords(recordsYielded)
+		scope.addBytes(bytesDownloaded.Load())
+		scope.addFiles(filesDownloaded.Load())
+	}()
+
 	ctx, cancel := context.WithCancel(ctx)
 	concurrency := s.cfg.Target.EffectiveMaxInflightRequests()
+	// The iter pipeline spawns exactly `concurrency` worker
+	// goroutines unconditionally (not via fanOut), so workers ==
+	// concurrency by construction. Items = totalFiles. Recording
+	// directly mirrors what fanOut would record for this shape.
+	s.cfg.Target.metrics.recordFanout(ctx, totalFiles, concurrency)
 	// bodyCap bounds the in-memory compressed-body footprint:
 	// downloaders block before fetching the next file once cap
 	// slots are held; the decoder releases slots as it nils each
@@ -214,9 +252,11 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	}
 
 	// Shared state: per-partition download progress + buffered
-	// uncompressed byte total.
+	// uncompressed byte total + metrics handle for the wait-time
+	// observations that acquireBodySlot / reserveBytes emit.
 	state := &streamState{
 		parts: parts,
+		m:     s.cfg.Target.metrics,
 	}
 	state.cond = sync.NewCond(&state.mu)
 
@@ -235,7 +275,8 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	wg.Go(func() { s.runProducer(ctx, jobsCh, parts) })
 	for range concurrency {
 		wg.Go(func() {
-			s.runDownloader(ctx, jobsCh, state, bodyCap, cancel)
+			s.runDownloader(ctx, jobsCh, state, bodyCap, cancel,
+				&bytesDownloaded, &filesDownloaded)
 		})
 	}
 	// Wake up any goroutine sleeping on state.cond when ctx
@@ -264,10 +305,13 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	// byte-budget reservation.
 	for batch := range decodedCh {
 		if batch.err != nil {
+			*iterErr = batch.err
 			yield(*new(T), batch.err)
 			return
 		}
-		ok := s.emitPartition(batch.recs, opts.IncludeHistory, yield)
+		emitted, ok := s.emitPartition(
+			batch.recs, opts.IncludeHistory, yield)
+		recordsYielded += emitted
 		state.releaseBytes(batch.uncompBytes)
 		if !ok {
 			return
@@ -278,19 +322,23 @@ func (s *Reader[T]) downloadAndDecodeIter(
 // emitPartition yields one partition's records to the consumer
 // through sortAndIterate, so the iter paths observe the same
 // order / replica-collapse / latest-per-entity semantics as the
-// materialised Read paths. Returns false when the consumer asked
+// materialised Read paths. Returns the count of records actually
+// yielded plus a continue flag — false when the consumer asked
 // to stop (yield returned false), so the outer loop can break
-// cleanly.
+// cleanly. Counted records flow into the s3store.read.records
+// histogram on the caller's methodScope.
 func (s *Reader[T]) emitPartition(
 	recs []T, includeHistory bool,
 	yield func(T, error) bool,
-) bool {
+) (int64, bool) {
+	var emitted int64
 	for r := range s.sortAndIterate(recs, includeHistory) {
 		if !yield(r, nil) {
-			return false
+			return emitted, false
 		}
+		emitted++
 	}
-	return true
+	return emitted, true
 }
 
 // preparePartitions groups the LIST result by Hive partition,
@@ -368,10 +416,18 @@ func (s *Reader[T]) runProducer(
 // the per-partition slot. The slot stays held until the decoder
 // nils the body. NoSuchKey and hard errors release the slot
 // immediately since no body is materialised.
+//
+// filesDownloaded counts files with a definitive outcome — body
+// fetched OR NoSuchKey (the file was visited, just empty). It is
+// NOT incremented on the acquire-slot cancellation path or on
+// hard transport errors, so the metric reflects "files we
+// genuinely visited," not "files we tried to visit." See
+// downloadAndDecodeIter for how this is surfaced on the scope.
 func (s *Reader[T]) runDownloader(
 	ctx context.Context, jobsCh <-chan downloadJob,
 	state *streamState, bodyCap int,
 	cancel context.CancelFunc,
+	bytesDownloaded, filesDownloaded *atomic.Int64,
 ) {
 	for job := range jobsCh {
 		if !state.acquireBodySlot(ctx, bodyCap) {
@@ -387,6 +443,7 @@ func (s *Reader[T]) runDownloader(
 				if s.cfg.OnMissingData != nil {
 					s.cfg.OnMissingData(key)
 				}
+				filesDownloaded.Add(1)
 				state.markComplete(job.partIdx, job.fileIdx, nil, nil)
 				continue
 			}
@@ -395,8 +452,10 @@ func (s *Reader[T]) runDownloader(
 			cancel()
 			continue
 		}
+		filesDownloaded.Add(1)
 		// Slot stays held; decoder releases it when bodies are
 		// nil'd in decodePartition.
+		bytesDownloaded.Add(int64(len(body)))
 		state.markComplete(job.partIdx, job.fileIdx, body, nil)
 	}
 }
@@ -439,7 +498,9 @@ func (s *Reader[T]) runDecoder(
 			return
 		}
 
+		decodeStart := time.Now()
 		recs, err := s.decodePartition(state, ps, totalRows)
+		state.m.recordIterDecodeDuration(ctx, time.Since(decodeStart))
 		// decodePartition nils each body + releases its body-pool
 		// slot per-file; just clear the errs slice here.
 		ps.errs = nil
@@ -527,12 +588,19 @@ func (p *partState) firstError() error {
 // the in-memory compressed-body counter, and the cond var used
 // to signal across stages (download completion, body slot
 // release, decoded-byte release, ctx cancellation).
+//
+// m is the optional metrics handle. acquireBodySlot and
+// reserveBytes report wait duration via metrics.recordIterBodySlotWait
+// / recordIterByteBudgetWait when the call blocked and ended in
+// success, so operators can see body-slot pool / byte-budget
+// contention. Cancel-during-wait is not recorded (shutdown noise).
 type streamState struct {
 	mu                sync.Mutex
 	cond              *sync.Cond
 	parts             []*partState
 	bufferedBytes     int64
 	outstandingBodies int
+	m                 *metrics
 }
 
 // acquireBodySlot reserves one slot in the compressed-body pool
@@ -544,19 +612,51 @@ type streamState struct {
 // have stored into per-partition slots and the decoder has not
 // yet cleared. It bounds the worst-case compressed-byte
 // footprint of the pipeline to roughly cap × largest_compressed_size.
+//
+// Records to metrics.recordIterBodySlotWait only when the wait
+// fired (cond.Wait at least once) AND the slot was eventually
+// acquired — cancel-during-wait is intentionally not recorded
+// (shutdown noise, near-zero duration would drown out the
+// saturation signal).
+//
+// The wait duration spans all wait iterations, so a thrashing
+// path records one cumulative observation rather than many
+// fragments. The metric record fires after s.mu is unlocked
+// (defer LIFO ordering) to keep the pipeline's hot-path lock
+// free of OTel work.
 func (s *streamState) acquireBodySlot(
 	ctx context.Context, cap int,
 ) bool {
 	if cap <= 0 {
 		return ctx.Err() == nil
 	}
+	var waitDur time.Duration
 	s.mu.Lock()
+	defer func() {
+		// Runs after the s.mu.Unlock below (LIFO defers) so the
+		// metric record happens lock-free.
+		if waitDur > 0 {
+			s.m.recordIterBodySlotWait(ctx, waitDur)
+		}
+	}()
 	defer s.mu.Unlock()
+
+	var waitStart time.Time
+	waited := false
 	for s.outstandingBodies >= cap {
 		if ctx.Err() != nil {
+			// Cancel path: do NOT set waitDur — we only record
+			// successful acquires.
 			return false
 		}
+		if !waited {
+			waitStart = time.Now()
+			waited = true
+		}
 		s.cond.Wait()
+	}
+	if waited {
+		waitDur = time.Since(waitStart)
 	}
 	s.outstandingBodies++
 	return true
@@ -610,19 +710,41 @@ func (s *streamState) waitForPartition(
 // is non-empty; the empty-buffer escape lets a single oversized
 // partition through (otherwise the pipeline would deadlock).
 // Returns false if ctx is cancelled while waiting.
+//
+// Records to metrics.recordIterByteBudgetWait only when the wait
+// fired AND the reservation succeeded — same shape as
+// acquireBodySlot, cancel path is not recorded.
 func (s *streamState) reserveBytes(
 	ctx context.Context, uncomp, cap int64,
 ) bool {
 	if cap <= 0 || uncomp <= 0 {
 		return ctx.Err() == nil
 	}
+	var waitDur time.Duration
 	s.mu.Lock()
+	defer func() {
+		if waitDur > 0 {
+			s.m.recordIterByteBudgetWait(ctx, waitDur)
+		}
+	}()
 	defer s.mu.Unlock()
+
+	var waitStart time.Time
+	waited := false
 	for s.bufferedBytes > 0 && s.bufferedBytes+uncomp > cap {
 		if ctx.Err() != nil {
+			// Cancel path: do NOT set waitDur — only successful
+			// reservations are recorded.
 			return false
 		}
+		if !waited {
+			waitStart = time.Now()
+			waited = true
+		}
 		s.cond.Wait()
+	}
+	if waited {
+		waitDur = time.Since(waitStart)
 	}
 	s.bufferedBytes += uncomp
 	return true

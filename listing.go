@@ -141,6 +141,7 @@ func listDataFiles(
 	dataPath := dataPath(t.Prefix())
 	return fanOutMapReduce(ctx, plans,
 		t.EffectiveMaxInflightRequests(),
+		t.metrics,
 		func(ctx context.Context, plan *readPlan) ([]KeyMeta, error) {
 			var out []KeyMeta
 			err := t.listEach(ctx, plan.listPrefix, "", 0,

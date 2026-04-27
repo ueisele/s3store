@@ -30,7 +30,7 @@ func goid() int {
 // goroutines, nil error.
 func TestFanOut_Empty(t *testing.T) {
 	called := false
-	err := fanOut(context.Background(), []int{}, 4,
+	err := fanOut(context.Background(), []int{}, 4, nil,
 		func(_ context.Context, _ int, _ int) error {
 			called = true
 			return nil
@@ -48,7 +48,7 @@ func TestFanOut_Empty(t *testing.T) {
 func TestFanOut_SingleItemDirect(t *testing.T) {
 	caller := goid()
 	var workGoid int
-	err := fanOut(context.Background(), []int{42}, 4,
+	err := fanOut(context.Background(), []int{42}, 4, nil,
 		func(_ context.Context, _ int, _ int) error {
 			workGoid = goid()
 			return nil
@@ -72,7 +72,7 @@ func TestFanOut_SlotStableResults(t *testing.T) {
 	}
 	results := make([]int, n)
 
-	err := fanOut(context.Background(), items, 4,
+	err := fanOut(context.Background(), items, 4, nil,
 		func(_ context.Context, i int, item int) error {
 			time.Sleep(time.Duration(n-item) * time.Millisecond)
 			results[i] = item * 10
@@ -95,7 +95,7 @@ func TestFanOut_FirstRealErrorWins(t *testing.T) {
 	sentinel := errors.New("boom")
 	items := make([]int, 20)
 
-	err := fanOut(context.Background(), items, 4,
+	err := fanOut(context.Background(), items, 4, nil,
 		func(ctx context.Context, i int, _ int) error {
 			if i == 0 {
 				return sentinel
@@ -116,7 +116,7 @@ func TestFanOut_ParentCancelSurfaces(t *testing.T) {
 	cancel()
 
 	items := make([]int, 8)
-	err := fanOut(ctx, items, 4,
+	err := fanOut(ctx, items, 4, nil,
 		func(ctx context.Context, _ int, _ int) error {
 			<-ctx.Done()
 			return ctx.Err()
@@ -153,7 +153,7 @@ func TestFanOut_BoundedGoroutineCount(t *testing.T) {
 		inFlight.Add(-1)
 	}
 
-	err := fanOut(context.Background(), in, concurrency,
+	err := fanOut(context.Background(), in, concurrency, nil,
 		func(_ context.Context, _ int, _ int) error {
 			checkAndRelease()
 			return nil
@@ -175,7 +175,7 @@ func TestFanOut_AllItemsProcessed(t *testing.T) {
 	items := make([]int, n)
 	var seen [n]atomic.Int32
 
-	err := fanOut(context.Background(), items, 8,
+	err := fanOut(context.Background(), items, 8, nil,
 		func(_ context.Context, i int, _ int) error {
 			seen[i].Add(1)
 			return nil
@@ -195,7 +195,7 @@ func TestFanOut_AllItemsProcessed(t *testing.T) {
 // deadlocking on a 0-sized pool.
 func TestFanOut_ConcurrencyZeroOrNegative(t *testing.T) {
 	for _, c := range []int{0, -1, -100} {
-		err := fanOut(context.Background(), []int{1, 2, 3}, c,
+		err := fanOut(context.Background(), []int{1, 2, 3}, c, nil,
 			func(_ context.Context, _ int, _ int) error {
 				return nil
 			})

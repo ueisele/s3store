@@ -63,7 +63,12 @@ func (s *Reader[T]) Poll(
 	since Offset,
 	maxEntries int32,
 	opts ...PollOption,
-) ([]StreamEntry, Offset, error) {
+) (out []StreamEntry, nextOffset Offset, err error) {
+	scope := s.cfg.Target.metrics.methodScope(ctx, methodPoll)
+	defer func() {
+		scope.addRecords(int64(len(out)))
+		scope.end(&err)
+	}()
 	if s.cfg.Target.DisableRefStream() {
 		return nil, since, ErrRefStreamDisabled
 	}
@@ -80,14 +85,13 @@ func (s *Reader[T]) Poll(
 	cutoffPrefix := refCutoff(s.refPath, time.Now(),
 		s.cfg.Target.EffectiveSettleWindow())
 
-	var entries []StreamEntry
 	var lastKey string
 
-	err := s.cfg.Target.listEach(ctx,
+	err = s.cfg.Target.listEach(ctx,
 		s.refPath+"/", string(since),
 		min(maxEntries, s3ListMaxKeys),
 		func(obj s3types.Object) (bool, error) {
-			if int32(len(entries)) >= maxEntries {
+			if int32(len(out)) >= maxEntries {
 				return false, nil
 			}
 			objKey := aws.ToString(obj.Key)
@@ -109,7 +113,7 @@ func (s *Reader[T]) Poll(
 					"key", objKey, "err", err)
 				return true, nil
 			}
-			entries = append(entries, StreamEntry{
+			out = append(out, StreamEntry{
 				Offset:     Offset(objKey),
 				Key:        key,
 				DataPath:   buildDataFilePath(s.dataPath, key, id),
@@ -124,7 +128,7 @@ func (s *Reader[T]) Poll(
 	}
 
 	if lastKey != "" {
-		return entries, Offset(lastKey), nil
+		return out, Offset(lastKey), nil
 	}
 	return nil, since, nil
 }
@@ -151,7 +155,12 @@ func (s *Reader[T]) PollRecords(
 	since Offset,
 	maxEntries int32,
 	opts ...PollOption,
-) ([]T, Offset, error) {
+) (out []T, nextOffset Offset, err error) {
+	scope := s.cfg.Target.metrics.methodScope(ctx, methodPollRecords)
+	defer func() {
+		scope.addRecords(int64(len(out)))
+		scope.end(&err)
+	}()
 	entries, newOffset, err := s.Poll(ctx, since, maxEntries, opts...)
 	if err != nil {
 		return nil, since, err
@@ -172,10 +181,12 @@ func (s *Reader[T]) PollRecords(
 		}
 	}
 
-	records, err := s.downloadAndDecodeAll(ctx, keys)
+	records, bytesTotal, err := s.downloadAndDecodeAll(ctx, keys)
 	if err != nil {
 		return nil, since, err
 	}
+	scope.addFiles(int64(len(keys)))
+	scope.addBytes(bytesTotal)
 	// includeHistory=true: replica-dedup only, no version collapse.
 	// See method docstring for why latest-per-entity isn't offered.
 	return s.sortAndCollect(records, true), newOffset, nil

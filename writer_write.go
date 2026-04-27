@@ -47,7 +47,9 @@ type WriteResult struct {
 // cases.
 func (s *Writer[T]) Write(
 	ctx context.Context, records []T, opts ...WriteOption,
-) ([]WriteResult, error) {
+) (results []WriteResult, err error) {
+	scope := s.cfg.Target.metrics.methodScope(ctx, methodWrite)
+	defer scope.end(&err)
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -60,10 +62,12 @@ func (s *Writer[T]) Write(
 	if err != nil {
 		return nil, err
 	}
-	return s.writeGroupedFanOut(ctx, records,
+	results, err = s.writeGroupedFanOut(ctx, records,
 		func(ctx context.Context, key string, recs []T) (*WriteResult, error) {
-			return s.writeWithKeyResolved(ctx, key, recs, writeOpts)
+			r, _, err := s.writeWithKeyResolved(ctx, key, recs, writeOpts, scope)
+			return r, err
 		})
+	return results, err
 }
 
 // resolveWriteOpts folds the variadic WriteOption chain into a
@@ -114,6 +118,7 @@ func (s *Writer[T]) writeGroupedFanOut(
 
 	err := fanOut(ctx, keys,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
+		s.cfg.Target.metrics,
 		func(ctx context.Context, i int, key string) error {
 			r, err := perPartition(ctx, key, grouped[key])
 			if err != nil {
@@ -152,7 +157,9 @@ func (s *Writer[T]) writeGroupedFanOut(
 // WithIdempotencyToken for the full contract.
 func (s *Writer[T]) WriteWithKey(
 	ctx context.Context, key string, records []T, opts ...WriteOption,
-) (*WriteResult, error) {
+) (result *WriteResult, err error) {
+	scope := s.cfg.Target.metrics.methodScope(ctx, methodWriteWithKey)
+	defer scope.end(&err)
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -160,7 +167,8 @@ func (s *Writer[T]) WriteWithKey(
 	if err != nil {
 		return nil, err
 	}
-	return s.writeWithKeyResolved(ctx, key, records, writeOpts)
+	result, _, err = s.writeWithKeyResolved(ctx, key, records, writeOpts, scope)
+	return result, err
 }
 
 // writeWithKeyResolved is the post-option-resolution shared entry
@@ -168,11 +176,26 @@ func (s *Writer[T]) WriteWithKey(
 // call). Lets Write resolve options once and avoid the per-
 // partition revalidation that calling WriteWithKey in the fan-out
 // closure would imply.
+//
+// scope is the caller's methodScope. On commit (ref PUT succeeded
+// — or the DisableRefStream short-circuit, which has the same
+// "data + markers durable" semantic), this function increments the
+// scope's record / byte / partition counters via the additive
+// addX methods. Failures before commit don't touch the scope, so
+// the scope reports "what actually landed in S3," not "what we
+// attempted to write." Safe under Write's parallel partition
+// fan-out — addX is atomic.
+//
+// Returns the parquet body byte count alongside the WriteResult
+// because writeEncodedPayload also exposes it; the caller doesn't
+// need it (the scope already has it on commit) but pre-existing
+// signatures are preserved.
 func (s *Writer[T]) writeWithKeyResolved(
 	ctx context.Context, key string, records []T, opts WriteOpts,
-) (*WriteResult, error) {
+	scope *methodScope,
+) (*WriteResult, int, error) {
 	if err := s.validateKey(key); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Capture writeStartTime here (before encode) so the same value
@@ -188,11 +211,24 @@ func (s *Writer[T]) writeWithKeyResolved(
 	parquetBytes, err := encodeParquet(
 		records, s.compressionCodec)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"s3store: parquet encode: %w", err)
 	}
-	return s.writeEncodedPayload(
+	r, err := s.writeEncodedPayload(
 		ctx, key, records, parquetBytes, writeStartTime, opts)
+	if err == nil && r != nil {
+		// Commit semantics: writeEncodedPayload returned a non-nil
+		// WriteResult ⇒ data is durable, markers are written, and
+		// either the ref PUT succeeded or DisableRefStream was set.
+		// Update the scope here so partial-success Write calls
+		// (some partitions committed, others failed) report the
+		// committed records/bytes/partitions, not the attempted
+		// totals.
+		scope.addRecords(int64(len(records)))
+		scope.addBytes(int64(len(parquetBytes)))
+		scope.addPartitions(1)
+	}
+	return r, len(parquetBytes), err
 }
 
 // writeEncodedPayload is the post-encode orchestration for

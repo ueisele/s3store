@@ -109,6 +109,7 @@ func (s *Writer[T]) putMarkers(
 ) error {
 	return fanOut(ctx, paths,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
+		s.cfg.Target.metrics,
 		func(ctx context.Context, _ int, p string) error {
 			return s.cfg.Target.put(
 				ctx, p, nil, "application/octet-stream",

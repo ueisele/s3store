@@ -13,6 +13,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Transient-error retry policy applied by S3Target's helpers
@@ -232,6 +233,21 @@ type S3TargetConfig struct {
 	// deliberately do not carry the header — see the same README
 	// section.
 	ConsistencyControl ConsistencyLevel
+
+	// MeterProvider, when set, supplies the OTel meter used to
+	// record S3 op latencies, library method durations, semaphore
+	// wait/inflight depth, fan-out spans, and bytes/records/files
+	// counters. Zero value falls back to otel.GetMeterProvider() —
+	// users who configure OTel globally pick up metrics without
+	// touching this field; users who don't get the OTel global
+	// no-op (zero overhead).
+	//
+	// Bucket and Prefix from this config plus ConsistencyControl
+	// (when non-empty) are baked into every observation as
+	// constant attributes (s3store.bucket / s3store.prefix /
+	// s3store.consistency_level), so multi-Target deployments
+	// can be distinguished without per-call overhead.
+	MeterProvider metric.MeterProvider
 }
 
 // EffectiveSettleWindow returns the configured SettleWindow, or
@@ -311,8 +327,9 @@ func (c S3TargetConfig) ValidateLookup() error {
 // fresh NewS3Target if you need to change MaxInflightRequests
 // or any other field.
 type S3Target struct {
-	cfg S3TargetConfig
-	sem chan struct{}
+	cfg     S3TargetConfig
+	sem     chan struct{}
+	metrics *metrics
 }
 
 // NewS3Target constructs a live S3Target from config, allocating
@@ -328,6 +345,9 @@ func NewS3Target(cfg S3TargetConfig) S3Target {
 	return S3Target{
 		cfg: cfg,
 		sem: make(chan struct{}, cfg.EffectiveMaxInflightRequests()),
+		metrics: newMetrics(
+			cfg.MeterProvider, cfg.Bucket, cfg.Prefix,
+			cfg.ConsistencyControl),
 	}
 }
 
@@ -381,16 +401,23 @@ func (t S3Target) ValidateLookup() error { return t.cfg.ValidateLookup() }
 // is capped at MaxInflightRequests regardless of how many
 // goroutines call concurrently.
 func (t S3Target) acquire(ctx context.Context) error {
+	sc := t.metrics.semaphoreScope(ctx)
+	defer sc.cleanup()
 	select {
 	case t.sem <- struct{}{}:
+		sc.recordAcquired()
 		return nil
 	case <-ctx.Done():
+		sc.recordCanceled()
 		return ctx.Err()
 	}
 }
 
 // release returns a slot to the semaphore. Paired with acquire.
-func (t S3Target) release() { <-t.sem }
+func (t S3Target) release() {
+	<-t.sem
+	t.metrics.recordReleased()
+}
 
 // get downloads a single object into memory. Used by the read
 // path (Read, PollRecords) and by BackfillIndex when scanning
@@ -398,14 +425,17 @@ func (t S3Target) release() { <-t.sem }
 // ConsistencyControl on every call.
 func (t S3Target) get(
 	ctx context.Context, key string,
-) ([]byte, error) {
-	if err := t.acquire(ctx); err != nil {
+) (_ []byte, err error) {
+	scope := t.metrics.s3OpScope(ctx, s3OpGet)
+	defer scope.end(&err)
+	if err = t.acquire(ctx); err != nil {
 		return nil, err
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var data []byte
-	err := retry(ctx, func() error {
+	err = retry(ctx, func() error {
+		scope.incAttempts()
 		resp, err := t.cfg.S3Client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
 			Key:    aws.String(key),
@@ -419,6 +449,9 @@ func (t S3Target) get(
 		data, err = io.ReadAll(resp.Body)
 		return err
 	})
+	if err == nil {
+		scope.setRespBytes(int64(len(data)))
+	}
 	return data, err
 }
 
@@ -428,13 +461,17 @@ func (t S3Target) get(
 // call.
 func (t S3Target) put(
 	ctx context.Context, key string, data []byte, contentType string,
-) error {
-	if err := t.acquire(ctx); err != nil {
+) (err error) {
+	scope := t.metrics.s3OpScope(ctx, s3OpPut)
+	scope.setReqBytes(int64(len(data)))
+	defer scope.end(&err)
+	if err = t.acquire(ctx); err != nil {
 		return err
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	return retry(ctx, func() error {
+	err = retry(ctx, func() error {
+		scope.incAttempts()
 		_, err := t.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.cfg.Bucket),
 			Key:         aws.String(key),
@@ -445,6 +482,7 @@ func (t S3Target) put(
 		})
 		return err
 	})
+	return err
 }
 
 // putIfAbsent PUTs data at key with an If-None-Match: * header so
@@ -467,13 +505,21 @@ func (t S3Target) put(
 func (t S3Target) putIfAbsent(
 	ctx context.Context, key string, data []byte,
 	contentType string, meta map[string]string,
-) error {
-	if err := t.acquire(ctx); err != nil {
+) (err error) {
+	scope := t.metrics.s3OpScope(ctx, s3OpPut)
+	scope.setReqBytes(int64(len(data)))
+	// Safety-net defer for early-return paths (acquire failure).
+	// Idempotent: a no-op once we manually call end() below after
+	// the PUT, so the disambiguation HEAD on the 403 branch
+	// doesn't inflate the PUT duration histogram.
+	defer scope.end(&err)
+	if err = t.acquire(ctx); err != nil {
 		return err
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	putErr := retry(ctx, func() error {
+		scope.incAttempts()
 		_, err := t.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(t.cfg.Bucket),
 			Key:         aws.String(key),
@@ -486,6 +532,10 @@ func (t S3Target) putIfAbsent(
 		})
 		return err
 	})
+	// End the PUT scope here with the raw S3 outcome — any
+	// follow-up HEAD on the 403 branch must not pollute the PUT
+	// duration histogram. The deferred end() above becomes a no-op.
+	scope.end(&putErr)
 	if putErr == nil {
 		return nil
 	}
@@ -533,8 +583,20 @@ func (t S3Target) putIfAbsent(
 func (t S3Target) existsLocked(
 	ctx context.Context, key string,
 ) (bool, error) {
+	scope := t.metrics.s3OpScope(ctx, s3OpHead)
+	// s3Err is the raw outcome of the HEAD round-trip — including
+	// NotFound, which is a real S3 4xx response. The s3.head
+	// instrument records what S3 actually did (latency + outcome
+	// breakdown), so a 404 lands as outcome=error/error.type=not_found
+	// even though the caller-facing return is (false, nil). Splitting
+	// the metric-level truth from the caller-level abstraction needs
+	// a separate variable — a named-return err would be overwritten
+	// by the explicit `return false, nil` below before the defer runs.
+	var s3Err error
+	defer func() { scope.end(&s3Err) }()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	err := retry(ctx, func() error {
+	s3Err = retry(ctx, func() error {
+		scope.incAttempts()
 		_, err := t.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
 			Key:    aws.String(key),
@@ -543,28 +605,32 @@ func (t S3Target) existsLocked(
 		})
 		return err
 	})
-	if err == nil {
+	if s3Err == nil {
 		return true, nil
 	}
-	if _, ok := errors.AsType[*s3types.NotFound](err); ok {
+	if _, ok := errors.AsType[*s3types.NotFound](s3Err); ok {
 		return false, nil
 	}
-	return false, err
+	return false, s3Err
 }
 
 // del removes an object. Used on the write-cleanup paths.
-func (t S3Target) del(ctx context.Context, key string) error {
-	if err := t.acquire(ctx); err != nil {
+func (t S3Target) del(ctx context.Context, key string) (err error) {
+	scope := t.metrics.s3OpScope(ctx, s3OpDelete)
+	defer scope.end(&err)
+	if err = t.acquire(ctx); err != nil {
 		return err
 	}
 	defer t.release()
-	return retry(ctx, func() error {
+	err = retry(ctx, func() error {
+		scope.incAttempts()
 		_, err := t.cfg.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
 			Key:    aws.String(key),
 		})
 		return err
 	})
+	return err
 }
 
 // listPage fetches the next page from p, wrapping NextPage in
@@ -577,14 +643,17 @@ func (t S3Target) del(ctx context.Context, key string) error {
 // outside this file.
 func (t S3Target) listPage(
 	ctx context.Context, p *s3.ListObjectsV2Paginator,
-) (*s3.ListObjectsV2Output, error) {
-	if err := t.acquire(ctx); err != nil {
+) (_ *s3.ListObjectsV2Output, err error) {
+	scope := t.metrics.s3OpScope(ctx, s3OpList)
+	defer scope.end(&err)
+	if err = t.acquire(ctx); err != nil {
 		return nil, err
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var out *s3.ListObjectsV2Output
-	err := retry(ctx, func() error {
+	err = retry(ctx, func() error {
+		scope.incAttempts()
 		var err error
 		out, err = p.NextPage(ctx, func(o *s3.Options) {
 			o.APIOptions = append(o.APIOptions, apiOpts...)

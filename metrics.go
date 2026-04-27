@@ -1,0 +1,769 @@
+package s3store
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"time"
+
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// instrumentationName is the OTel meter scope. Used as
+// resource.scope.name on every emitted observation so backends
+// can filter to "everything from this library".
+const instrumentationName = "github.com/ueisele/s3store"
+
+// s3OpKind names a low-level S3 operation. Used as the
+// s3store.operation attribute on every s3store.s3.* observation.
+// Typed enum so a caller passing the wrong literal fails at
+// compile time. Internal — users never touch the metrics path
+// directly.
+type s3OpKind string
+
+const (
+	s3OpPut    s3OpKind = "put"
+	s3OpGet    s3OpKind = "get"
+	s3OpHead   s3OpKind = "head"
+	s3OpDelete s3OpKind = "delete"
+	s3OpList   s3OpKind = "list"
+)
+
+// methodKind names a public library method. Used as the
+// s3store.method attribute on every s3store.method.* observation.
+// Write and WriteWithKey are recorded separately even though Write
+// dispatches to WriteWithKey internally — Write's per-partition
+// dispatch goes through writeWithKeyResolved (no scope), so each
+// public entry point yields exactly one observation.
+type methodKind string
+
+const (
+	methodWrite         methodKind = "write"
+	methodWriteWithKey  methodKind = "write_with_key"
+	methodRead          methodKind = "read"
+	methodReadIter      methodKind = "read_iter"
+	methodReadRangeIter methodKind = "read_range_iter"
+	methodPoll          methodKind = "poll"
+	methodPollRecords   methodKind = "poll_records"
+	methodLookup        methodKind = "lookup"
+	methodBackfill      methodKind = "backfill"
+)
+
+// Attribute keys. Kept as constants so callers cannot misspell and
+// so the keys appear once per dimension in code search.
+const (
+	attrKeyBucket           = "s3store.bucket"
+	attrKeyPrefix           = "s3store.prefix"
+	attrKeyConsistency      = "s3store.consistency_level"
+	attrKeyOperation        = "s3store.operation"
+	attrKeyMethod           = "s3store.method"
+	attrKeyOutcome          = "s3store.outcome"
+	attrKeyErrorType        = "error.type"
+	outcomeSuccess          = "success"
+	outcomeError            = "error"
+	outcomeCanceled         = "canceled"
+	errTypeCanceled         = "canceled"
+	errTypePreconditionFail = "precondition_failed"
+	errTypeNotFound         = "not_found"
+	errTypeSlowDown         = "slowdown"
+	errTypeServer           = "server"
+	errTypeClient           = "client"
+	errTypeTransport        = "transport"
+	errTypeOther            = "other"
+)
+
+// metrics owns every OTel instrument the library records into and
+// the constant attribute set baked in at construction (bucket,
+// prefix, consistency level when set). One *metrics per S3Target;
+// Writer / Reader / IndexReader inherit it via the Target they
+// hold.
+//
+// Internal — users configure observability by setting
+// S3TargetConfig.MeterProvider; the rest of this struct is the
+// library's instrumentation surface, not a public API. A nil
+// *metrics is never produced; newMetrics resolves a nil
+// MeterProvider to otel.GetMeterProvider() (global default —
+// no-op when OTel isn't configured).
+type metrics struct {
+	// constSet is the pre-built attribute set of bucket / prefix /
+	// (consistency) — frozen at construction. Combined with per-call
+	// attrs via two MeasurementOptions on every record/add call so
+	// the constants don't re-allocate or re-sort per observation.
+	constSet attribute.Set
+
+	// constSetOpt is metric.WithAttributeSet(constSet) memoised so
+	// every record call passes the same MeasurementOption value
+	// without rebuilding it.
+	constSetOpt metric.MeasurementOption
+
+	// Target / semaphore.
+	semWaiting      metric.Int64UpDownCounter
+	semInflight     metric.Int64UpDownCounter
+	semWaitDuration metric.Float64Histogram
+	semAcquires     metric.Int64Counter
+
+	// Fan-out (generic concurrency primitive — not target state).
+	fanoutWorkers metric.Int64Histogram
+	fanoutItems   metric.Int64Histogram
+
+	// S3 op level.
+	s3Duration  metric.Float64Histogram
+	s3Count     metric.Int64Counter
+	s3Attempts  metric.Int64Histogram
+	s3ReqBytes  metric.Int64Histogram
+	s3RespBytes metric.Int64Histogram
+
+	// Library method level.
+	methodDuration  metric.Float64Histogram
+	methodCalls     metric.Int64Counter
+	writeRecords    metric.Int64Histogram
+	writePartitions metric.Int64Histogram
+	writeBytes      metric.Int64Histogram
+	readRecords     metric.Int64Histogram
+	readBytes       metric.Int64Histogram
+	readFiles       metric.Int64Histogram
+
+	// Iter pipeline internals (downloadAndDecodeIter): bottleneck
+	// signals for the streamState's body-slot pool and byte-budget
+	// reservation, plus per-partition decode duration. Surfaced
+	// only when a wait actually fired and ended in success — the
+	// canceled path is shutdown noise, not a saturation signal.
+	iterBodySlotWait        metric.Float64Histogram
+	iterBodySlotExhausted   metric.Int64Counter
+	iterByteBudgetWait      metric.Float64Histogram
+	iterByteBudgetExhausted metric.Int64Counter
+	iterDecodeDuration      metric.Float64Histogram
+}
+
+// newMetrics constructs all instruments under the OTel meter
+// scope. Falls back to otel.GetMeterProvider() when mp is nil so
+// users who configure OTel globally pick up metrics for free.
+//
+// Errors building any instrument fall back to the noop provider's
+// instrument silently — instrument creation only fails on
+// programmer error (duplicate name with mismatched type) and we
+// don't want that to break NewS3Target.
+func newMetrics(
+	mp metric.MeterProvider, bucket, prefix string,
+	consistency ConsistencyLevel,
+) *metrics {
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	meter := mp.Meter(instrumentationName)
+
+	m := &metrics{}
+	constAttrs := []attribute.KeyValue{
+		attribute.String(attrKeyBucket, bucket),
+		attribute.String(attrKeyPrefix, prefix),
+	}
+	if consistency != "" {
+		constAttrs = append(constAttrs,
+			attribute.String(attrKeyConsistency, string(consistency)))
+	}
+	m.constSet = attribute.NewSet(constAttrs...)
+	m.constSetOpt = metric.WithAttributeSet(m.constSet)
+
+	// Helpers — discard error to keep newMetrics infallible. The
+	// OTel SDK only errors on duplicate-name-with-different-kind,
+	// which is a static bug.
+	mustHist := func(name, desc, unit string) metric.Float64Histogram {
+		h, _ := meter.Float64Histogram(name,
+			metric.WithDescription(desc), metric.WithUnit(unit))
+		return h
+	}
+	mustHistInt := func(name, desc, unit string) metric.Int64Histogram {
+		h, _ := meter.Int64Histogram(name,
+			metric.WithDescription(desc), metric.WithUnit(unit))
+		return h
+	}
+	mustCounter := func(name, desc, unit string) metric.Int64Counter {
+		c, _ := meter.Int64Counter(name,
+			metric.WithDescription(desc), metric.WithUnit(unit))
+		return c
+	}
+	mustUpDown := func(name, desc, unit string) metric.Int64UpDownCounter {
+		c, _ := meter.Int64UpDownCounter(name,
+			metric.WithDescription(desc), metric.WithUnit(unit))
+		return c
+	}
+
+	// Target / semaphore.
+	m.semWaiting = mustUpDown(
+		"s3store.target.waiting",
+		"Goroutines currently blocked acquiring the per-Target in-flight semaphore",
+		"{goroutine}")
+	m.semInflight = mustUpDown(
+		"s3store.target.inflight",
+		"S3 requests currently holding a Target semaphore slot",
+		"{request}")
+	m.semWaitDuration = mustHist(
+		"s3store.target.semaphore.wait.duration",
+		"Time spent waiting in acquire() before a slot became available",
+		"s")
+	m.semAcquires = mustCounter(
+		"s3store.target.semaphore.acquires",
+		"Total semaphore acquire attempts, labelled by outcome",
+		"{acquire}")
+
+	// Fan-out — independent of target state, lives in its own
+	// namespace so dashboards can chart concurrency separately
+	// from the target-bound semaphore gauges.
+	m.fanoutWorkers = mustHistInt(
+		"s3store.fanout.workers",
+		"Worker goroutines spawned per fan-out call",
+		"{goroutine}")
+	m.fanoutItems = mustHistInt(
+		"s3store.fanout.items",
+		"Items dispatched per fan-out call",
+		"{item}")
+
+	// S3 op level.
+	m.s3Duration = mustHist(
+		"s3store.s3.request.duration",
+		"Wall-clock duration of one outer S3 wrapper call (acquire + retry + release)",
+		"s")
+	m.s3Count = mustCounter(
+		"s3store.s3.request.count",
+		"Total S3 wrapper calls, labelled by operation and outcome",
+		"{request}")
+	m.s3Attempts = mustHistInt(
+		"s3store.s3.request.attempts",
+		"Outer retry() attempts per S3 wrapper call (1..retryMaxAttempts)",
+		"{attempt}")
+	m.s3ReqBytes = mustHistInt(
+		"s3store.s3.request.body.size",
+		"Request body size for outbound S3 PUTs",
+		"By")
+	m.s3RespBytes = mustHistInt(
+		"s3store.s3.response.body.size",
+		"Response body size for inbound S3 GETs",
+		"By")
+
+	// Library method level.
+	m.methodDuration = mustHist(
+		"s3store.method.duration",
+		"Wall-clock duration of one public library method call",
+		"s")
+	m.methodCalls = mustCounter(
+		"s3store.method.calls",
+		"Total library method calls, labelled by method and outcome",
+		"{call}")
+	m.writeRecords = mustHistInt(
+		"s3store.write.records",
+		"Records per Write/WriteWithKey call",
+		"{record}")
+	m.writePartitions = mustHistInt(
+		"s3store.write.partitions",
+		"Distinct partition keys per Write call (always 1 for WriteWithKey)",
+		"{partition}")
+	m.writeBytes = mustHistInt(
+		"s3store.write.bytes",
+		"Total parquet body bytes uploaded per Write/WriteWithKey call",
+		"By")
+	m.readRecords = mustHistInt(
+		"s3store.read.records",
+		"Records returned per read-side method call",
+		"{record}")
+	m.readBytes = mustHistInt(
+		"s3store.read.bytes",
+		"Total parquet body bytes downloaded per read-side method call",
+		"By")
+	m.readFiles = mustHistInt(
+		"s3store.read.files",
+		"Data files materialised per read-side method call",
+		"{file}")
+
+	// Iter pipeline internals.
+	m.iterBodySlotWait = mustHist(
+		"s3store.read.iter.body_slot.wait.duration",
+		"Time downloaders spent blocked acquiring a body-slot in the iter pipeline (recorded only when a wait actually occurred)",
+		"s")
+	m.iterBodySlotExhausted = mustCounter(
+		"s3store.read.iter.body_slot.exhausted",
+		"Times the iter pipeline's body-slot pool was full and a downloader had to wait",
+		"{event}")
+	m.iterByteBudgetWait = mustHist(
+		"s3store.read.iter.byte_budget.wait.duration",
+		"Time the decoder spent blocked reserving uncompressed bytes against ReadAheadBytes (recorded only when a wait actually occurred)",
+		"s")
+	m.iterByteBudgetExhausted = mustCounter(
+		"s3store.read.iter.byte_budget.exhausted",
+		"Times the iter pipeline's byte budget was full and the decoder had to wait",
+		"{event}")
+	m.iterDecodeDuration = mustHist(
+		"s3store.read.iter.partition.decode.duration",
+		"Wall-clock parquet decode time per partition (excludes byte-budget wait)",
+		"s")
+
+	return m
+}
+
+// callOpts builds the [constSet, perCall] MeasurementOption pair
+// every record/add call passes. constSetOpt is pre-built once at
+// construction; the per-call opt only carries the small variable
+// set (operation/method/outcome/error.type), so no slice allocation
+// is needed for the constants on the hot path.
+//
+// extras is passed through metric.WithAttributes which calls
+// attribute.NewSet internally — unavoidable for the variable bit,
+// but it's now a small set (≤ 3 entries) instead of constants+vars.
+func (m *metrics) callOpts(extras ...attribute.KeyValue) (metric.MeasurementOption, metric.MeasurementOption) {
+	return m.constSetOpt, metric.WithAttributes(extras...)
+}
+
+// semaphoreScope tracks one acquire-side observation cycle: from
+// the moment a goroutine starts waiting on the semaphore through
+// its terminal outcome (acquired or canceled). On creation it
+// increments the waiting gauge and captures start time; the
+// terminal call (acquired/canceled) decrements the gauge, records
+// wait duration, and increments the per-outcome counter.
+//
+// Release stays separate as metrics.semaphoreReleased — release
+// happens after the work is done and far away from the acquire
+// site, so a scope object would have to be threaded through every
+// S3 wrapper. Keeping release as a standalone method matches that
+// reality without inventing a side-channel.
+type semaphoreScope struct {
+	m         *metrics
+	ctx       context.Context
+	start     time.Time
+	waitEnded bool // true once acquired/canceled/cleanup recorded the wait phase
+}
+
+// semaphoreScope begins observing one acquire attempt. Returns a
+// scope; the caller invokes acquired() or canceled() in the
+// matching select arm. Always pair with `defer sc.cleanup()` so a
+// panic between scope creation and the select arm doesn't leak the
+// waiting gauge.
+func (m *metrics) semaphoreScope(ctx context.Context) *semaphoreScope {
+	if m == nil {
+		return &semaphoreScope{}
+	}
+	m.semWaiting.Add(ctx, 1, m.constSetOpt)
+	return &semaphoreScope{m: m, ctx: ctx, start: time.Now()}
+}
+
+// endWait decrements the waiting gauge and records wait duration.
+// Idempotent — subsequent calls are no-ops, so cleanup() can run
+// as a defer safety-net even when acquired/canceled already fired.
+func (s *semaphoreScope) endWait() {
+	if s.m == nil || s.waitEnded {
+		return
+	}
+	s.waitEnded = true
+	s.m.semWaiting.Add(s.ctx, -1, s.m.constSetOpt)
+	s.m.semWaitDuration.Record(s.ctx, time.Since(s.start).Seconds(), s.m.constSetOpt)
+}
+
+// recordAcquired reports a successful acquire: waiting--, wait
+// duration, inflight++, acquires{outcome=success}.
+func (s *semaphoreScope) recordAcquired() {
+	if s.m == nil {
+		return
+	}
+	s.endWait()
+	s.m.semInflight.Add(s.ctx, 1, s.m.constSetOpt)
+	cs, vs := s.m.callOpts(attribute.String(attrKeyOutcome, outcomeSuccess))
+	s.m.semAcquires.Add(s.ctx, 1, cs, vs)
+}
+
+// recordCanceled reports a cancelled acquire: waiting--, wait
+// duration, acquires{outcome=canceled}. Inflight is NOT bumped —
+// no slot was held.
+func (s *semaphoreScope) recordCanceled() {
+	if s.m == nil {
+		return
+	}
+	s.endWait()
+	cs, vs := s.m.callOpts(attribute.String(attrKeyOutcome, outcomeCanceled))
+	s.m.semAcquires.Add(s.ctx, 1, cs, vs)
+}
+
+// cleanup is the panic-safety defer pair for semaphoreScope. It
+// undoes the waiting++ that semaphoreScope() did, in case neither
+// acquired() nor canceled() ran (a panic between scope creation
+// and the select arm). Idempotent — no-op when endWait already
+// fired.
+func (s *semaphoreScope) cleanup() {
+	if s.m == nil || s.waitEnded {
+		return
+	}
+	s.waitEnded = true
+	s.m.semWaiting.Add(s.ctx, -1, s.m.constSetOpt)
+}
+
+// recordReleased decrements the inflight gauge. Called from
+// S3Target.release, which has no caller ctx — uses
+// context.Background() (release is not cancellable; OTel
+// UpDownCounter.Add requires a ctx).
+func (m *metrics) recordReleased() {
+	if m == nil {
+		return
+	}
+	m.semInflight.Add(context.Background(), -1, m.constSetOpt)
+}
+
+// recordFanout records one fan-out dispatch's items + worker
+// counts. Called from inside fanOut once it knows the actual
+// worker count, and from the iter pipeline (which spawns workers
+// directly with a known statically-bounded worker count).
+//
+// Skipped when items == 0 — that's a no-work path, not a fan-out
+// dispatch, and recording (0, 0) would clutter the histograms with
+// non-fanout events.
+func (m *metrics) recordFanout(ctx context.Context, items, workers int) {
+	if m == nil || items == 0 {
+		return
+	}
+	m.fanoutItems.Record(ctx, int64(items), m.constSetOpt)
+	m.fanoutWorkers.Record(ctx, int64(workers), m.constSetOpt)
+}
+
+// recordIterBodySlotWait reports one acquireBodySlot call that
+// blocked and ended in a successful acquire. Records wait duration
+// and increments the exhausted counter.
+//
+// Cancel-during-wait is intentionally NOT recorded — that path
+// fires only during shutdown races, where a near-zero duration
+// would drown out the saturation signal callers actually want to
+// see. Caller must only invoke this when the wait actually fired
+// (cond.Wait at least once) AND the acquire succeeded.
+func (m *metrics) recordIterBodySlotWait(
+	ctx context.Context, dur time.Duration,
+) {
+	if m == nil {
+		return
+	}
+	m.iterBodySlotWait.Record(ctx, dur.Seconds(), m.constSetOpt)
+	m.iterBodySlotExhausted.Add(ctx, 1, m.constSetOpt)
+}
+
+// recordIterByteBudgetWait reports one reserveBytes call that
+// blocked and ended in a successful reservation. Same shape as
+// recordIterBodySlotWait — cancel path is not recorded.
+func (m *metrics) recordIterByteBudgetWait(
+	ctx context.Context, dur time.Duration,
+) {
+	if m == nil {
+		return
+	}
+	m.iterByteBudgetWait.Record(ctx, dur.Seconds(), m.constSetOpt)
+	m.iterByteBudgetExhausted.Add(ctx, 1, m.constSetOpt)
+}
+
+// recordIterDecodeDuration reports one partition's parquet decode
+// wall-clock time. Recorded regardless of decode outcome — decode
+// time is meaningful even on the error path so operators see how
+// much time the decoder spent before failing.
+func (m *metrics) recordIterDecodeDuration(ctx context.Context, dur time.Duration) {
+	if m == nil {
+		return
+	}
+	m.iterDecodeDuration.Record(ctx, dur.Seconds(), m.constSetOpt)
+}
+
+// s3OpScope tracks one outer S3 wrapper call. Created via
+// s3OpStart, finalised via end in a defer. Captures duration,
+// outcome, attempts, and (for put/get) request/response body
+// sizes. Holding the scope as a pointer lets the deferred end
+// read the eventual error via &err.
+//
+// end is idempotent — call it manually when you need the duration
+// to stop before the function returns (e.g. putIfAbsent ending the
+// PUT scope before running the disambiguation HEAD), and the
+// matching defer becomes a no-op.
+type s3OpScope struct {
+	m         *metrics
+	ctx       context.Context
+	op        s3OpKind
+	start     time.Time
+	attempts  int
+	reqBytes  int64
+	respBytes int64
+	done      bool
+}
+
+// s3OpScope begins observing one outer S3 wrapper call (one
+// S3Target.put / get / del / listPage / existsLocked). Returns a
+// scope; defer scope.end(&err) at the call site so duration +
+// outcome are recorded on every exit path.
+func (m *metrics) s3OpScope(ctx context.Context, op s3OpKind) *s3OpScope {
+	if m == nil {
+		return &s3OpScope{}
+	}
+	return &s3OpScope{m: m, ctx: ctx, op: op, start: time.Now()}
+}
+
+// incAttempts increments the per-attempt counter. Invoked from
+// inside the caller's retry loop so the s3.request.attempts
+// histogram captures the actual attempt count, not just
+// success/fail.
+func (s *s3OpScope) incAttempts() {
+	if s.m == nil {
+		return
+	}
+	s.attempts++
+}
+
+// setReqBytes records the size of the outgoing request body.
+// PUT-only — GET / HEAD / DELETE / LIST callers don't invoke it.
+// Set semantics: called exactly once per scope.
+func (s *s3OpScope) setReqBytes(n int64) {
+	if s.m == nil {
+		return
+	}
+	s.reqBytes = n
+}
+
+// setRespBytes records the size of the inbound response body.
+// GET-only — other operations don't invoke it. Set semantics:
+// called exactly once per scope.
+func (s *s3OpScope) setRespBytes(n int64) {
+	if s.m == nil {
+		return
+	}
+	s.respBytes = n
+}
+
+// end records the scope's terminal observations: duration, per-op
+// count, attempt count, and (when set) request/response body
+// sizes. errPtr is read at call time so the surrounding function's
+// named return error drives outcome classification.
+//
+// Idempotent: subsequent calls are no-ops. This lets callers end
+// early (excluding follow-up work from the duration metric) while
+// keeping the standard `defer scope.end(&err)` as a safety net.
+func (s *s3OpScope) end(errPtr *error) {
+	if s.m == nil || s.done {
+		return
+	}
+	s.done = true
+	var err error
+	if errPtr != nil {
+		err = *errPtr
+	}
+	outcome, errType := classifyError(err)
+	opAttr := attribute.String(attrKeyOperation, string(s.op))
+	outcomeAttr := attribute.String(attrKeyOutcome, outcome)
+	var cs, vs metric.MeasurementOption
+	if errType != "" {
+		cs, vs = s.m.callOpts(opAttr, outcomeAttr,
+			attribute.String(attrKeyErrorType, errType))
+	} else {
+		cs, vs = s.m.callOpts(opAttr, outcomeAttr)
+	}
+	s.m.s3Duration.Record(s.ctx, time.Since(s.start).Seconds(), cs, vs)
+	s.m.s3Count.Add(s.ctx, 1, cs, vs)
+	if s.attempts > 0 {
+		// Attempts measures retry behavior, not terminal outcome —
+		// drop error.type so the histogram stays low-cardinality
+		// (operation × outcome only, no per-error-type explosion).
+		acs, avs := s.m.callOpts(opAttr, outcomeAttr)
+		s.m.s3Attempts.Record(s.ctx, int64(s.attempts), acs, avs)
+	}
+	if s.reqBytes > 0 {
+		// Body-size histograms are tagged only by operation — they
+		// describe payload distribution per op, not per-outcome.
+		bcs, bvs := s.m.callOpts(opAttr)
+		s.m.s3ReqBytes.Record(s.ctx, s.reqBytes, bcs, bvs)
+	}
+	if s.respBytes > 0 {
+		bcs, bvs := s.m.callOpts(opAttr)
+		s.m.s3RespBytes.Record(s.ctx, s.respBytes, bcs, bvs)
+	}
+}
+
+// methodScope tracks one public library method call. Records
+// duration, outcome, and method-specific aggregates (records,
+// partitions, bytes, files) accumulated through the call.
+//
+// Streaming methods (ReadIter / ReadRangeIter) park the scope on
+// the iterator and call end in the iter's deferred cancel block —
+// the totals reflect everything actually drained, not just what
+// fit in the first batch.
+//
+// Aggregates fire on every outcome (success and error alike) — but
+// callers must only addX(n) for work that actually committed
+// (records pushed to S3 / yielded to the consumer / files visited).
+// Partial-success paths thus record what genuinely happened, while
+// total-failure paths record zeros (which the >0 guard skips).
+//
+// Counters are atomic.Int64 because Write fans partitions out
+// concurrently and each successful partition increments the scope.
+//
+// end is idempotent.
+type methodScope struct {
+	m          *metrics
+	ctx        context.Context
+	method     methodKind
+	start      time.Time
+	records    atomic.Int64
+	partitions atomic.Int64
+	bytes      atomic.Int64
+	files      atomic.Int64
+	done       bool
+}
+
+// methodScope begins observing one library method call. Returns a
+// scope; defer scope.end(&err) at the call site.
+func (m *metrics) methodScope(ctx context.Context, method methodKind) *methodScope {
+	if m == nil {
+		return &methodScope{}
+	}
+	return &methodScope{m: m, ctx: ctx, method: method, start: time.Now()}
+}
+
+// addRecords increments the count of records that the method
+// committed (pushed for writes, yielded for reads). Safe for
+// concurrent use — Write's per-partition fan-out goroutines call
+// it after each successful partition. Only call on commit; the
+// total-failure path then records zero, and partial-success
+// records what actually landed.
+func (s *methodScope) addRecords(n int64) {
+	if s.m == nil || n <= 0 {
+		return
+	}
+	s.records.Add(n)
+}
+
+// addPartitions increments the count of distinct partition keys
+// touched by a Write call. WriteWithKey adds 1 on commit; Write
+// adds 1 per successful partition.
+func (s *methodScope) addPartitions(n int64) {
+	if s.m == nil || n <= 0 {
+		return
+	}
+	s.partitions.Add(n)
+}
+
+// addBytes increments the parquet body byte total for the method
+// (uploaded for writes, downloaded for reads). Safe for
+// concurrent use.
+func (s *methodScope) addBytes(n int64) {
+	if s.m == nil || n <= 0 {
+		return
+	}
+	s.bytes.Add(n)
+}
+
+// addFiles increments the count of data files materialised by a
+// read-side method. Safe for concurrent use — read pipelines
+// fan downloads out to multiple goroutines.
+func (s *methodScope) addFiles(n int64) {
+	if s.m == nil || n <= 0 {
+		return
+	}
+	s.files.Add(n)
+}
+
+// end records the scope's terminal observations: duration,
+// per-method count, and any non-zero aggregates. errPtr is read
+// at call time so the surrounding function's named return error
+// drives outcome classification.
+//
+// Aggregates record on every outcome — the values reflect what
+// actually committed (callers only addX for committed work), so
+// partial-success error paths still surface their progress. The
+// >0 guard prevents zero-valued samples from polluting
+// histograms on total-failure paths.
+//
+// Idempotent: subsequent calls are no-ops.
+func (s *methodScope) end(errPtr *error) {
+	if s.m == nil || s.done {
+		return
+	}
+	s.done = true
+	var err error
+	if errPtr != nil {
+		err = *errPtr
+	}
+	outcome, errType := classifyError(err)
+	methodAttr := attribute.String(attrKeyMethod, string(s.method))
+	outcomeAttr := attribute.String(attrKeyOutcome, outcome)
+	var cs, vs metric.MeasurementOption
+	if errType != "" {
+		cs, vs = s.m.callOpts(methodAttr, outcomeAttr,
+			attribute.String(attrKeyErrorType, errType))
+	} else {
+		cs, vs = s.m.callOpts(methodAttr, outcomeAttr)
+	}
+	s.m.methodDuration.Record(s.ctx, time.Since(s.start).Seconds(), cs, vs)
+	s.m.methodCalls.Add(s.ctx, 1, cs, vs)
+
+	mcs, mvs := s.m.callOpts(methodAttr)
+	records := s.records.Load()
+	partitions := s.partitions.Load()
+	bytesN := s.bytes.Load()
+	files := s.files.Load()
+	switch s.method {
+	case methodWrite, methodWriteWithKey:
+		if records > 0 {
+			s.m.writeRecords.Record(s.ctx, records, mcs, mvs)
+		}
+		if partitions > 0 {
+			s.m.writePartitions.Record(s.ctx, partitions, mcs, mvs)
+		}
+		if bytesN > 0 {
+			s.m.writeBytes.Record(s.ctx, bytesN, mcs, mvs)
+		}
+	case methodRead, methodReadIter, methodReadRangeIter,
+		methodPollRecords, methodPoll, methodLookup, methodBackfill:
+		if records > 0 {
+			s.m.readRecords.Record(s.ctx, records, mcs, mvs)
+		}
+		if bytesN > 0 {
+			s.m.readBytes.Record(s.ctx, bytesN, mcs, mvs)
+		}
+		if files > 0 {
+			s.m.readFiles.Record(s.ctx, files, mcs, mvs)
+		}
+	}
+}
+
+// classifyError maps an error into (outcome, error.type) for the
+// outcome / error.type attributes. Buckets HTTP and SDK errors
+// into a fixed enumeration so cardinality stays bounded.
+//
+// Returns ("", "") for a nil err so the success path emits
+// outcome=success without an error.type label.
+func classifyError(err error) (outcome, errType string) {
+	if err == nil {
+		return outcomeSuccess, ""
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return outcomeCanceled, errTypeCanceled
+	}
+	if errors.Is(err, ErrAlreadyExists) {
+		return outcomeError, errTypePreconditionFail
+	}
+	if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
+		return outcomeError, errTypeNotFound
+	}
+	if _, ok := errors.AsType[*s3types.NotFound](err); ok {
+		return outcomeError, errTypeNotFound
+	}
+	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
+		status := respErr.HTTPStatusCode()
+		switch {
+		case status == 412:
+			return outcomeError, errTypePreconditionFail
+		case status == 429:
+			return outcomeError, errTypeSlowDown
+		case status >= 500:
+			return outcomeError, errTypeServer
+		case status >= 400:
+			return outcomeError, errTypeClient
+		default:
+			return outcomeError, errTypeOther
+		}
+	}
+	// No HTTP response attached and not a known sentinel —
+	// transport-level (DNS / TCP / TLS / connection reset).
+	return outcomeError, errTypeTransport
+}

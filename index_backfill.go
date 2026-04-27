@@ -58,8 +58,13 @@ func BackfillIndex[T any](
 	keyPatterns []string,
 	until time.Time,
 	onMissingData func(dataPath string),
-) (BackfillStats, error) {
-	var stats BackfillStats
+) (stats BackfillStats, err error) {
+	scope := target.metrics.methodScope(ctx, methodBackfill)
+	defer func() {
+		scope.addRecords(int64(stats.Records))
+		scope.addFiles(int64(stats.DataObjects))
+		scope.end(&err)
+	}()
 
 	keyPatterns = dedupePatterns(keyPatterns)
 	if len(keyPatterns) == 0 {
@@ -112,7 +117,9 @@ func BackfillIndex[T any](
 	stats.DataObjects = len(keys)
 
 	var recordsTotal, markersTotal atomic.Int64
-	err = fanOut(ctx, keys, target.EffectiveMaxInflightRequests(),
+	err = fanOut(ctx, keys,
+		target.EffectiveMaxInflightRequests(),
+		target.metrics,
 		func(ctx context.Context, _ int, km KeyMeta) error {
 			key := km.Key
 			paths, nRecs, err := backfillMarkersForObject(

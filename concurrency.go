@@ -38,6 +38,12 @@ import (
 // a goroutine, avoiding scheduler overhead for the sugar-wrapper
 // single-item case.
 //
+// Self-instrumentation: when m is non-nil, fanOut records exactly
+// one observation pair (s3store.fanout.items, s3store.fanout.workers)
+// per call, with the actual worker count it computed. Call sites
+// don't recompute the formula — fanOut owns the truth so internal
+// logic changes can't drift apart from the metric.
+//
 // Used as the single fan-out primitive across the package —
 // partition writes, parallel data-file downloads, multi-pattern
 // LISTs, BackfillIndex, etc. all funnel through here so the
@@ -47,16 +53,24 @@ func fanOut[I any](
 	ctx context.Context,
 	items []I,
 	concurrency int,
+	m *metrics,
 	work func(ctx context.Context, i int, item I) error,
 ) error {
 	if len(items) == 0 {
+		// No-work path: don't record a fan-out observation. The
+		// histograms only hold real dispatches, not "we were called
+		// with nothing." recordFanout's own items==0 guard would
+		// skip this anyway — short-circuiting here keeps the intent
+		// explicit at the call site.
 		return nil
 	}
 	if len(items) == 1 {
+		m.recordFanout(ctx, 1, 1)
 		return work(ctx, 0, items[0])
 	}
 
 	workers := max(1, min(concurrency, len(items)))
+	m.recordFanout(ctx, len(items), workers)
 
 	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
@@ -104,9 +118,9 @@ func fanOut[I any](
 // fanOutMapReduce runs mapFn across items in parallel via fanOut,
 // then folds the per-item slices through reduceFn. The map step
 // reuses every guarantee of fanOut (worker pool, first-error wins,
-// cancellation propagation); the reduce step runs once on the main
-// goroutine after all workers finish, so reduceFn does not need to
-// be safe for concurrent use.
+// cancellation propagation, fan-out metric); the reduce step runs
+// once on the main goroutine after all workers finish, so reduceFn
+// does not need to be safe for concurrent use.
 //
 // Per-item results are stored in a preallocated [][]O slot so
 // workers never share state. On any map error the reduce step is
@@ -118,11 +132,12 @@ func fanOutMapReduce[I, O, R any](
 	ctx context.Context,
 	items []I,
 	concurrency int,
+	m *metrics,
 	mapFn func(ctx context.Context, item I) ([]O, error),
 	reduceFn func([][]O) R,
 ) (R, error) {
 	results := make([][]O, len(items))
-	err := fanOut(ctx, items, concurrency,
+	err := fanOut(ctx, items, concurrency, m,
 		func(ctx context.Context, i int, item I) error {
 			r, err := mapFn(ctx, item)
 			if err != nil {
