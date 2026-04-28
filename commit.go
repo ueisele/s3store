@@ -59,6 +59,14 @@ const dataLMMetaKey = "datalm"
 // post-data HEAD (so refTsMicros is server-stamped), and markerLM
 // is read from the marker HEAD or LIST response.
 //
+// **Assumption:** the gap between two server-stamped LMs reflects
+// the gap between when the two objects first became *observable*
+// to any reader. See CLAUDE.md "Backend assumptions" — the
+// library is correct only on backends where
+// `LastModified ≈ first-observable-time` (AWS S3, MinIO, and
+// StorageGRID at `strong-*` all qualify; weaker levels and
+// non-S3-compliant backends may not).
+//
 // A zero dataLM or markerLM trips the false branch — caller's
 // responsibility to feed populated values.
 func isCommitValid(dataLM, markerLM time.Time, commitTimeout time.Duration) bool {

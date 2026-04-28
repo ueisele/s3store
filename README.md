@@ -62,6 +62,24 @@ without breaking read stability**. Cleanup of orphans is an
 operator decision (S3 lifecycle rules, or a manual prune with
 readers quiesced), not a library feature.
 
+**Backend requirement: `LastModified ≈ first-observable-time`.**
+The commit-marker timing model — the post-marker timeliness
+check (`marker.LM - data.LM < CommitTimeout`) and `Poll`'s
+`refCutoff = now - SettleWindow` — assumes that a server-stamped
+`LastModified` value approximately equals when the object first
+became *observable* (readable via subsequent HEAD / GET / LIST)
+to any reader. AWS S3, MinIO, and StorageGRID at `strong-*` all
+satisfy this for new-key writes via their read-after-new-write
+guarantee, and the library never overwrites under
+`WithIdempotencyToken` (per-attempt-paths), so every PUT is a
+new-key write. Backends where the LM stamp can predate
+observability — eventual-consistency-only setups, cross-replica
+replicated stores without strong consistency, or non-S3-compliant
+storage with different LM semantics — are out of scope for the
+library's correctness guarantees. See [CLAUDE.md "Backend
+assumptions"](CLAUDE.md#backend-assumptions) for the full
+treatment.
+
 Detailed contract and configuration in
 [Durability guarantees](#durability-guarantees).
 

@@ -58,6 +58,36 @@ the full rationale and trade-offs.
 
 ## Decided design choices
 
+- **Foundational backend assumption:
+  `LastModified ≈ first-observable-time`.** A server-stamped
+  `LastModified` value `L` on an object reflects approximately
+  when that object first became *observable* (readable via
+  subsequent HEAD / GET / LIST) to any reader. The whole
+  commit-marker timing model rests on this:
+  
+  - The post-marker timeliness check
+    (`marker.LM - data.LM < CommitTimeout`) treats the gap
+    between two server-LMs as the gap between when the data and
+    marker became visible.
+  - `Poll`'s `refCutoff = now - SettleWindow` assumes any ref
+    with `dataLM ≤ now - SettleWindow` is LIST-visible.
+  
+  If LM were divorced from observability — e.g., LM is set at
+  request arrival but cross-replica propagation takes seconds —
+  the timeliness check could pass while the data is still
+  invisible to a reader who can already see the marker, and
+  refs could silently drop out of the reader's view past the
+  cutoff. AWS S3, MinIO, and StorageGRID at `strong-*` all
+  satisfy the assumption via their read-after-new-write
+  guarantee for new-key writes; per-attempt-paths ensure every
+  PUT in the write path is a new-key write. Backends that don't
+  satisfy the assumption are out of scope for the library's
+  correctness guarantees. CLAUDE.md "Backend assumptions" is
+  the canonical statement; STORAGEGRID.md's appendix explains
+  how the specific consistency levels satisfy or fail it.
+  Refactors must not swap LM for a different timestamp source
+  (e.g., `x-amz-date` request time, a client-stamped value)
+  that has different semantics.
 - **`DisableRefStream` is removed; ref stream + marker are always
   written.** Pre-v1 cleanup that comes along with the marker
   work. One mode for everyone — no `DisableRefStream` branching

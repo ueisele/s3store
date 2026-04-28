@@ -519,6 +519,36 @@ clearly, but cannot distinguish *`read-after-new-write`* from
 indistinguishable medians, consistent with several of the
 candidate models.
 
+#### `LastModified ≈ first-observable-time` — the foundational assumption
+
+The commit-marker timing model rests on one property of the
+backend the docs never explicitly state but which the
+read-after-new-write contract operationally implies: a
+server-stamped `LastModified` value `L` reflects approximately
+when the object first became *observable* (readable via
+subsequent HEAD / GET / LIST) by any reader.
+
+The post-marker timeliness check
+(`marker.LM - data.LM < CommitTimeout`) and `Poll`'s
+`refCutoff = now - SettleWindow` both treat `LastModified` as a
+proxy for first-observable-time. If a backend stamped `LM` at
+request arrival but propagation to read replicas took seconds,
+the timeliness check could pass while the data is still
+invisible to a reader who can already see the marker — atomic
+visibility breaks. StorageGRID at `strong-global` (every site
+acks before the PUT returns) gives every site the metadata
+before the LM-stamped timestamp is observed by any reader,
+which satisfies the assumption. `strong-site` satisfies it
+within a single site; cross-site reads against
+`strong-site`-stamped LMs are out of scope. Under
+`read-after-new-write` (default) and `available`, the docs
+don't commit to the property in any form — those levels are
+not safe for the library's commit-marker mechanism.
+
+[CLAUDE.md "Backend assumptions"](CLAUDE.md#backend-assumptions)
+states this assumption canonically; this section just documents
+how StorageGRID's specific levels satisfy or fail it.
+
 #### Inferences specific to s3store's correctness reasoning
 
 The library's only structural dependency on a docs-stated fact

@@ -24,10 +24,14 @@ must preserve them — even when the change appears unrelated.
 - **Exactly-once at the consumer layer is opt-in via reader
   dedup** — `EntityKeyOf` + `VersionOf` collapse duplicates by
   (entity, version). `WithIdempotencyToken` makes retries
-  deterministic via a token-derived data path + always-
-  conditional `If-None-Match: *` on the data PUT, routing
-  retries into the retry-dedup branch. Refactors must not drop
-  the conditional flag.
+  recover automatically: every attempt writes to a per-attempt
+  path (id = `{token}-{tsMicros}-{shortID}`) and the writer's
+  upfront LIST under `{partition}/{token}-` finds any prior
+  valid commit and returns its `WriteResult` unchanged.
+  Refactors must not reintroduce overwrite-based retry
+  detection — per-attempt-paths are what makes the design
+  correct on multi-site StorageGRID, where read-after-overwrite
+  is eventually consistent.
 - **Deterministic parquet encoding** — same records + same codec
   produce byte-identical bytes. `WithIdempotencyToken` retries
   depend on this; refactors must not introduce non-determinism
@@ -41,6 +45,55 @@ must preserve them — even when the change appears unrelated.
   partition at a time, so `EntityKeyOf` must be fully determined
   by the partition key. `Read` does global dedup and pays the
   memory cost.
+
+# Backend assumptions
+
+Properties of the underlying object-storage backend that the
+library's correctness reasoning depends on. The library *assumes*
+them — it does not detect or test for them at runtime. Backends
+where these don't hold are out of scope for the library's
+correctness guarantees, even when the wire-level S3 API is
+honoured.
+
+- **`LastModified` ≈ first-observable-time, for every reader.**
+  A server-stamped `LastModified` value `L` on an object
+  reflects approximately when the object first became
+  *observable* (readable via subsequent HEAD / GET / LIST) by
+  any reader. Equivalently: when a reader's HEAD or LIST
+  returns an object with `LastModified = L`, that object became
+  visible to all readers somewhere around time `L`. This is the
+  operational shape of the **read-after-new-write** guarantee
+  that AWS S3 (since 2020), MinIO, and StorageGRID at
+  `strong-*` all provide for new-key writes; the library never
+  overwrites under `WithIdempotencyToken` (per-attempt-paths),
+  so every PUT in the write path is a new-key write — well
+  inside that guarantee on every supported backend.
+
+  Where this assumption is load-bearing:
+
+  - The **post-marker timeliness check**
+    (`marker.LM - data.LM < CommitTimeout`) treats the gap
+    between two server-stamped LMs as the gap between when the
+    data became visible and when the marker became visible. If
+    LM were divorced from observability (e.g., LM is set at
+    request arrival but cross-replica propagation takes
+    seconds), the check could pass while the data is still
+    invisible to a reader who can already see the marker —
+    breaking atomic visibility.
+  - **`Poll`'s `refCutoff = now - SettleWindow`** assumes that
+    any ref whose `dataLM` ≤ `now - SettleWindow` is
+    LIST-visible to the reader. If LM were set significantly
+    before the ref became LIST-visible, refs would silently
+    drop out of the reader's view and never reappear — the
+    cutoff advances past them. `MaxClockSkew` bounds
+    reader↔server clock skew, not server-LM-stamp ↔
+    server-visibility skew, which is what this assumption
+    constrains.
+
+  Refactors that swap LM for a different timestamp source
+  (e.g., `x-amz-date` request time, a client-stamped value, or
+  a header that some backends emit ahead of replication) break
+  this assumption and must not be introduced.
 
 # Verification
 

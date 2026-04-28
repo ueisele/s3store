@@ -268,6 +268,15 @@ func parseRefKey(refKey string) (
 // greater than this cutoff falls within the settle window and
 // should not yet be emitted. Lex compatibility with encodeRefKey
 // is guaranteed by the shared refTsKey helper.
+//
+// **Assumption:** any ref whose dataLM ≤ now-SettleWindow is
+// LIST-visible to the reader. This holds on every supported
+// backend by the read-after-new-write guarantee that satisfies
+// `LastModified ≈ first-observable-time` — refs (a new key per
+// attempt) become observable at or before the LM stamped on
+// them. See CLAUDE.md "Backend assumptions"; backends where the
+// LM-stamp can predate observability would silently drop refs
+// from the reader's view past this cutoff.
 func refCutoff(refPath string, now time.Time, settleWindow time.Duration) string {
 	return refTsKey(refPath, now.Add(-settleWindow).UnixMicro())
 }
