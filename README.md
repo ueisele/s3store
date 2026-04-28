@@ -1700,6 +1700,29 @@ against `CommitTimeout` enforces the write-path budget,
 returning a wrapped error if the commit landed too late so the
 caller retries.
 
+#### Context cancellation boundary
+
+`Write` honours `ctx` cancellation through the data PUT (Step 5
+of the write sequence). A cancel before the data PUT lands
+returns `ctx.Err()` and leaves either nothing on S3 or an
+orphan parquet — invisible to readers via the commit gate, dead
+weight on S3 until an operator-driven prune.
+
+Once the data PUT lands successfully, the ref PUT and the
+`<token>.commit` PUT issue under `context.WithoutCancel(ctx)` —
+they run to completion regardless of caller cancellation.
+Without this boundary, a cancel between the data PUT and the
+commit PUT would leave the most expensive form of orphan: a
+multi-megabyte parquet that's invisible-but-durable when the
+work to make it visible was two zero-byte PUTs away. Both PUTs
+are bounded by the library's retry policy
+(`retryMaxAttempts = 4` with cumulative ~1.4s backoff per call)
+plus the AWS SDK's per-request timeouts; in practice they
+complete in milliseconds. A caller that genuinely needs to
+abort must do so before the data PUT returns; once `Write`
+returns success, the cancellation that may have arrived during
+the no-cancel window is moot — the records are committed.
+
 ### Read
 
 A data-file GET that returns S3 `NoSuchKey` is operator-driven

@@ -321,11 +321,17 @@ func (s *Writer[T]) writeWithKeyResolved(
 //     refMicroTs is captured immediately before this PUT so the
 //     encoded value tracks ref-LIST-visibility as tightly as
 //     possible — bounds the writer↔reader skew SettleWindow has
-//     to absorb.
+//     to absorb. Issued under a context.WithoutCancel of the
+//     caller's ctx (see step 6+7 note below).
 //  7. Token-commit PUT at `<dataPath>/<partition>/<token>.commit`,
 //     zero-byte body, with user-metadata `attemptid` + `refmicrots`
 //     so reads can reconstruct the WriteResult on retry without a
 //     LIST. Single atomic event flipping read-side visibility.
+//     Same detached context as step 6: once the data PUT lands,
+//     these two zero-byte PUTs run to completion regardless of
+//     caller cancellation, so a cancel-after-data doesn't leave
+//     an orphan parquet that's invisible-but-durable. Bounded by
+//     retryMaxAttempts plus the AWS SDK's per-request timeouts.
 //  8. Sanity check (writer-local). When the elapsed time from
 //     refMicroTs (step 6) to now exceeds CommitTimeout, increment
 //     s3store.write.commit_after_timeout and return an error. The
@@ -425,6 +431,17 @@ func (s *Writer[T]) writeEncodedPayload(
 		return nil, fmt.Errorf("s3store: put data: %w", err)
 	}
 
+	// Step 6 + 7: ref PUT and token-commit PUT issue under a
+	// detached context that ignores caller cancellation. Once the
+	// data PUT has landed, a cancellation here would leave an
+	// orphan parquet (invisible to readers via the commit gate,
+	// but dead weight on S3) when the work to make it visible is
+	// two zero-byte PUTs away. Bounded by retryMaxAttempts (4)
+	// per call plus the AWS SDK's per-request timeouts; no extra
+	// deadline needed. A caller that genuinely needs to abort
+	// must do so before the data PUT (Step 5) returns.
+	commitCtx := context.WithoutCancel(ctx)
+
 	// Step 6: ref PUT. Capture refMicroTs immediately before the
 	// PUT so the encoded value tracks ref-LIST-visibility as
 	// tightly as possible. Writer wall-clock is now in the
@@ -432,7 +449,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// skew (see CLAUDE.md "Backend assumptions").
 	refMicroTs := time.Now().UnixMicro()
 	refKey := encodeRefKey(s.refPath, refMicroTs, token, attemptID, key)
-	if err := s.cfg.Target.put(ctx, refKey, []byte{},
+	if err := s.cfg.Target.put(commitCtx, refKey, []byte{},
 		"application/octet-stream"); err != nil {
 		return nil, fmt.Errorf("s3store: put ref: %w", err)
 	}
@@ -441,7 +458,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// writeStartTime (for InsertedAt round-tripping on retry).
 	// The single atomic event that flips visibility for both
 	// read paths.
-	if err := putTokenCommit(ctx, s.cfg.Target,
+	if err := putTokenCommit(commitCtx, s.cfg.Target,
 		s.dataPath, key, token, attemptID,
 		refMicroTs, writeStartTime.UnixMicro()); err != nil {
 		return nil, fmt.Errorf(
