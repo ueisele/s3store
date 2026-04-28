@@ -14,6 +14,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Rec is the record type used across this file's integration
@@ -230,6 +232,130 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 	if len(got) != 1 {
 		t.Errorf("read-after-write: got %d entries, want 1", len(got))
 	}
+}
+
+// TestWrite_MarkersFirst guards the Phase 3 ordering invariant:
+// projection markers PUT *before* the data PUT, so a forced
+// data-PUT failure cannot leave a data file behind without its
+// markers. The contract is "any data file on S3 implies all R1
+// markers landed" — verifying the contrapositive (markers can
+// land without data) confirms the order, since the reverse order
+// would fail the data PUT *after* the data file already existed.
+//
+// Mechanism: a smithy middleware on the S3 client returns an
+// error for any PutObject whose key contains "/data/" and ends
+// with ".parquet". Marker PUTs (under "/_projection/") and the
+// timing-config GETs flow through unaffected.
+func TestWrite_MarkersFirst(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+
+	failClient := newDataPUTFailingClient(t, f)
+
+	store, err := New(ctx, Config[Rec]{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          failClient,
+		PartitionKeyParts: []string{"period", "customer"},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		ConsistencyControl: ConsistencyStrongGlobal,
+		Projections: []ProjectionDef[Rec]{{
+			Name:    "sku_idx",
+			Columns: []string{"sku", "customer"},
+			Of: func(r Rec) ([]string, error) {
+				return []string{r.SKU, r.Customer}, nil
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = store.Write(ctx, []Rec{
+		{Period: "2026-04-22", Customer: "abc", SKU: "s1"},
+	})
+	if err == nil {
+		t.Fatal("Write: want error from data-PUT failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "put data") {
+		t.Errorf("error %q: want 'put data' phase to be the failure, "+
+			"got something else (markers-first ordering broken)", err)
+	}
+
+	// Marker exists: confirms markers PUT ran before data PUT.
+	markerPrefix := "store/_projection/sku_idx/"
+	mkOut, err := f.S3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(f.Bucket),
+		Prefix: aws.String(markerPrefix),
+	})
+	if err != nil {
+		t.Fatalf("list markers: %v", err)
+	}
+	if len(mkOut.Contents) == 0 {
+		t.Errorf("no markers under %s — markers-first ordering "+
+			"broken (markers should land before data PUT)",
+			markerPrefix)
+	}
+
+	// No data file: confirms the failed data PUT left no parquet.
+	dataPrefix := "store/data/"
+	dOut, err := f.S3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(f.Bucket),
+		Prefix: aws.String(dataPrefix),
+	})
+	if err != nil {
+		t.Fatalf("list data: %v", err)
+	}
+	for _, obj := range dOut.Contents {
+		if strings.HasSuffix(aws.ToString(obj.Key), ".parquet") {
+			t.Errorf("unexpected data file %q after failed PUT",
+				aws.ToString(obj.Key))
+		}
+	}
+}
+
+// newDataPUTFailingClient returns an *s3.Client wired against the
+// same MinIO endpoint as f.S3Client but with a smithy middleware
+// that errors on any PutObject whose key contains "/data/" and
+// ends with ".parquet". Used by markers-first tests to assert
+// the projection markers PUT completes before the data PUT — a
+// data-PUT failure must leave projection markers visible (no
+// orphan data files), proving the order.
+func newDataPUTFailingClient(t *testing.T, f *fixture) *s3.Client {
+	t.Helper()
+	return s3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: f.S3Client.Options().Credentials,
+	}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String("http://" + f.HostPort)
+		o.UsePathStyle = true
+		o.APIOptions = append(o.APIOptions,
+			func(stack *middleware.Stack) error {
+				return stack.Build.Add(
+					middleware.BuildMiddlewareFunc(
+						"s3store-test.failDataPUTs",
+						func(
+							ctx context.Context,
+							in middleware.BuildInput,
+							next middleware.BuildHandler,
+						) (middleware.BuildOutput, middleware.Metadata, error) {
+							req, ok := in.Request.(*smithyhttp.Request)
+							if ok && req.Method == "PUT" &&
+								strings.Contains(req.URL.Path, "/data/") &&
+								strings.HasSuffix(req.URL.Path, ".parquet") {
+								return middleware.BuildOutput{},
+									middleware.Metadata{},
+									fmt.Errorf("test: forced data-PUT failure")
+							}
+							return next.HandleBuild(ctx, in)
+						}),
+					middleware.After)
+			})
+	})
 }
 
 // TestBackfillProjection covers the relief-valve path: records

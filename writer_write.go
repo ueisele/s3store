@@ -226,11 +226,21 @@ func (s *Writer[T]) writeWithKeyResolved(
 
 // writeEncodedPayload is the post-encode orchestration for
 // WriteWithKey. The body is a four-phase commit sequence —
-// data → retry-dedup → markers →
-// ref — so the at-least-once contract can be checked phase by
-// phase. Phase 4 still lives in commitRefOrRecover because it
-// owns the SettleWindow/2 budget logic and the budget-exceeded
-// recovery branch (non-trivial state machine of its own).
+// markers → data → retry-dedup → ref — so the at-least-once
+// contract can be checked phase by phase. Phase 4 still lives in
+// commitRefOrRecover because it owns the SettleWindow/2 budget
+// logic and the budget-exceeded recovery branch (non-trivial
+// state machine of its own).
+//
+// Markers are PUT *before* the data file so any data file on S3
+// implies all R1 projection markers have already landed. A retry
+// after a markers-PUT failure produces no data file, so neither
+// snapshot reads (which gate on the data file) nor projection
+// readers (which see the partial markers as benign orphans) can
+// observe a record that was supposed to have markers but doesn't.
+// Orphan markers from R1 ≠ R2 retries are tolerated per
+// [projection_write.go:108](projection_write.go#L108) — marker
+// dedup is by path, not by reference count.
 //
 // writeStartTime is the wall clock captured by the caller just
 // before parquet encoding — used to stamp the data filename
@@ -270,7 +280,18 @@ func (s *Writer[T]) writeEncodedPayload(
 	}
 	dataKey := buildDataFilePath(s.dataPath, key, id)
 
-	// Phase 1: data PUT (always conditional via If-None-Match: *).
+	// Phase 1: projection markers. Sequenced before data so any data
+	// file on S3 implies all R1 markers landed. A marker-PUT failure
+	// leaves nothing in S3 from this attempt's data side, so a retry
+	// converges on the same logical write without any orphan data
+	// file to clean up. Orphan markers from R1 ≠ R2 retries are
+	// tolerated by ProjectionReader.Lookup.
+	if err := s.putMarkers(ctx, markerPaths); err != nil {
+		return nil, fmt.Errorf(
+			"s3store: put projection markers: %w", err)
+	}
+
+	// Phase 2: data PUT (always conditional via If-None-Match: *).
 	// Auto-generated dataKeys are unique per attempt so the check
 	// trivially passes; token-derived dataKeys collide with prior
 	// attempts and surface ErrAlreadyExists, which we route to the
@@ -286,7 +307,7 @@ func (s *Writer[T]) writeEncodedPayload(
 		return nil, fmt.Errorf("s3store: put data: %w", putErr)
 	}
 
-	// Phase 2: on retry, scoped-LIST the ref stream for a still-
+	// Phase 3: on retry, scoped-LIST the ref stream for a still-
 	// fresh ref this token already published. Found → prior attempt
 	// already made the write consumable; return its ref as the
 	// result. findExistingRef filters stale refs (past the settle
@@ -307,16 +328,6 @@ func (s *Writer[T]) writeEncodedPayload(
 				InsertedAt: writeStartTime,
 			}, nil
 		}
-	}
-
-	// Phase 3: markers. Sequenced after data so a landed marker
-	// implies the backing file exists, and before ref so Poll's
-	// commit semantics are unchanged. A marker-PUT failure leaves
-	// the data file in S3 as an orphan — at-least-once on storage
-	// means the library never deletes data it has written.
-	if err := s.putMarkers(ctx, markerPaths); err != nil {
-		return nil, fmt.Errorf(
-			"s3store: put projection markers: %w", err)
 	}
 
 	// Phase 4: ref PUT under a SettleWindow/2 client-side timeout.
