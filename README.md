@@ -102,8 +102,12 @@ is missing.
 Each body is a Go `time.Duration` string. The library has no
 fallback — a missing or unparseable object fails construction
 with a hint at the seeding step. Floors:
-`commit-timeout ≥ 50ms` (below the floor the writer's PUT budget
-can't fit a real round-trip; sanity check, not correctness),
+`commit-timeout ≥ 1s` (S3 server-stamps `LastModified` at second
+precision; a data PUT and a marker PUT that straddle a wall-clock
+second boundary appear 1s apart even when both completed in
+milliseconds, so any value below 1s would reject those writes
+outright — most operators should pick 2s or higher to leave
+headroom),
 `max-clock-skew ≥ 0` (zero is valid on tightly-clocked
 deployments, negative is incoherent). The boto3 snippet below
 ships `5s` / `1s` as sensible starting values for a typical

@@ -39,45 +39,6 @@ func TestIsCommitValid(t *testing.T) {
 	}
 }
 
-// TestTsMicrosFromID covers the shapes of id strings the Phase 4
-// writer emits and the upfront-LIST dedup gate parses back. Both
-// the tokened and token-less forms must round-trip; tokens
-// containing dashes must not confuse the auto-id portion.
-func TestTsMicrosFromID(t *testing.T) {
-	cases := []struct {
-		id      string
-		want    int64
-		wantErr bool
-	}{
-		// Token-less auto-id: {tsMicros}-{shortID}.
-		{"1700000000000000-deadbeef", 1_700_000_000_000_000, false},
-		// Idempotency token + auto-id.
-		{"tok42-1700000000000000-deadbeef", 1_700_000_000_000_000, false},
-		// Token containing dashes.
-		{"2026-04-22T10:15:00Z-batch42-1700000000000000-deadbeef",
-			1_700_000_000_000_000, false},
-		// Malformed: no separators.
-		{"deadbeef", 0, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.id, func(t *testing.T) {
-			got, err := tsMicrosFromID(tc.id)
-			if tc.wantErr {
-				if err == nil {
-					t.Errorf("want error, got %d", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got != tc.want {
-				t.Errorf("got %d, want %d", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestParseDataOrCommitKey verifies the tiny shape parser the
 // LIST-pair primitive uses to bucket entries by id + extension.
 func TestParseDataOrCommitKey(t *testing.T) {
@@ -143,7 +104,8 @@ func TestReconstructWriteResult(t *testing.T) {
 		t.Errorf("InsertedAt = %v, want %v",
 			wr.InsertedAt, time.UnixMicro(tsMicros))
 	}
-	wantRef := encodeRefKey("p/_ref", dataLM.UnixMicro(), id, tsMicros, "period=A")
+	wantRef := encodeRefKey("p/_ref", dataLM.UnixMicro(),
+		tsMicros, "deadbeef", "tok42", "period=A")
 	if wr.RefPath != wantRef {
 		t.Errorf("RefPath = %q, want %q", wr.RefPath, wantRef)
 	}

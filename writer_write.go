@@ -324,11 +324,8 @@ func (s *Writer[T]) writeEncodedPayload(
 
 	// Step 2: generate fresh per-attempt id.
 	tsMicros := writeStartTime.UnixMicro()
-	autoID := makeAutoID(tsMicros, uuid.New().String()[:8])
-	id := autoID
-	if opts.IdempotencyToken != "" {
-		id = opts.IdempotencyToken + "-" + autoID
-	}
+	shortID := uuid.New().String()[:8]
+	id := makeID(opts.IdempotencyToken, tsMicros, shortID)
 	dataKey := buildDataFilePath(s.dataPath, key, id)
 
 	// Step 3: projection markers, before data (Phase 3 ordering).
@@ -352,9 +349,13 @@ func (s *Writer[T]) writeEncodedPayload(
 	}
 	dataLMMicros := dataLM.UnixMicro()
 
-	// Step 6: ref PUT. refTsMicros = server-stamped data.LM, so
-	// the reader's refCutoff comparison is reader↔server only.
-	refKey := encodeRefKey(s.refPath, dataLMMicros, id, tsMicros, key)
+	// Step 6: ref PUT. dataLM (server-stamped, second-precision)
+	// is the primary lex sort key — keeps the reader's refCutoff
+	// comparison reader↔server only. tsMicros (writer wall-clock,
+	// microsecond precision) is the within-second tiebreaker so
+	// refs from same-second writes have stable sub-second order.
+	refKey := encodeRefKey(s.refPath, dataLMMicros, tsMicros,
+		shortID, opts.IdempotencyToken, key)
 	if err := s.cfg.Target.put(ctx, refKey, []byte{},
 		"application/octet-stream"); err != nil {
 		return nil, fmt.Errorf("s3store: put ref: %w", err)

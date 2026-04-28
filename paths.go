@@ -47,6 +47,78 @@ func makeAutoID(tsMicros int64, shortID string) string {
 	return fmt.Sprintf("%d-%s", tsMicros, shortID)
 }
 
+// makeID composes a per-attempt id from its parts. token may be
+// empty; the result is "{tsMicros}-{shortID}" in that case
+// (auto-id form, today's makeAutoID shape) or
+// "{token}-{tsMicros}-{shortID}" when a token is provided. The
+// id is used as the data file's basename (with ".parquet" / ".commit"
+// suffixes) and as the embedded id field in ref filenames.
+func makeID(token string, tsMicros int64, shortID string) string {
+	auto := makeAutoID(tsMicros, shortID)
+	if token == "" {
+		return auto
+	}
+	return token + "-" + auto
+}
+
+// parseID is the inverse of makeID: given an id of either
+// {tsMicros}-{shortID} or {token}-{tsMicros}-{shortID}, return
+// the components. Anchors on the trailing fixed-width fields
+// (16-digit tsMicros + dash + 8-hex shortID = 25 chars), so a
+// token containing arbitrary printable ASCII (including dashes)
+// parses unambiguously. tsMicros is fixed-width 16 digits across
+// the realistic operating range — same assumption refTsKey relies
+// on; shortID is fixed-width 8 hex chars (the makeAutoID shape).
+//
+// Used by the upfront-LIST dedup gate's reconstruction of
+// WriteResult: the LIST entry's basename is parsed back into the
+// (token, tsMicros, shortID) triple needed to rebuild the ref key.
+func parseID(id string) (token string, tsMicros int64, shortID string, _ error) {
+	const tail = 16 + 1 + 8 // "{tsMicros}-{shortID}"
+	if len(id) < tail {
+		return "", 0, "", fmt.Errorf(
+			"s3store: id %q: too short for {tsMicros}-{shortID} suffix",
+			id)
+	}
+	suffix := id[len(id)-tail:]
+	if suffix[16] != '-' {
+		return "", 0, "", fmt.Errorf(
+			"s3store: id %q: missing - between tsMicros and shortID",
+			id)
+	}
+	tsStr := suffix[:16]
+	for i := 0; i < 16; i++ {
+		if tsStr[i] < '0' || tsStr[i] > '9' {
+			return "", 0, "", fmt.Errorf(
+				"s3store: id %q: tsMicros field has non-digit", id)
+		}
+	}
+	shortID = suffix[17:]
+	for i := 0; i < 8; i++ {
+		c := shortID[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", 0, "", fmt.Errorf(
+				"s3store: id %q: shortID has non-hex char", id)
+		}
+	}
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return "", 0, "", fmt.Errorf(
+			"s3store: id %q: parse tsMicros: %w", id, err)
+	}
+	if len(id) == tail {
+		return "", ts, shortID, nil
+	}
+	// More chars before the auto-id portion → token + "-" prefix.
+	if id[len(id)-tail-1] != '-' {
+		return "", 0, "", fmt.Errorf(
+			"s3store: id %q: missing - between token and tsMicros",
+			id)
+	}
+	token = id[:len(id)-tail-1]
+	return token, ts, shortID, nil
+}
+
 // Ref-file encoding.
 //
 // refSeparator splits the fixed-width "{ts}-{id}" header from
@@ -77,43 +149,61 @@ func refTsKey(refPath string, tsMicros int64) string {
 	return fmt.Sprintf("%s/%d", refPath, tsMicros)
 }
 
-// encodeRefKey builds the full ref-object key from its components.
-// The returned key:
+// encodeRefKey builds the full ref-object key from its
+// components. The returned key:
 //
-//   - sorts lexicographically by refTsMicros (Poll relies on
-//     this) — the publication timestamp captured just before
-//     the ref PUT, so SettleWindow only needs to cover ref-PUT
-//     latency + LIST propagation,
-//   - carries the shortID that identifies the data file,
-//   - carries dataTsMicros — the writer's wall-clock at write-
-//     start, i.e. the timestamp embedded in the data filename —
-//     so consumers can reconstruct the data path from the ref
-//     without a separate LIST,
+//   - sorts lexicographically by dataLM first (Poll relies on
+//     this) — the data file's server-stamped LastModified at
+//     second precision, so the reader's refCutoff = now -
+//     SettleWindow comparison is reader↔server only (the
+//     writer's clock is not in the protocol),
+//   - carries tsMicros (writer's wall-clock at write-start)
+//     as the within-second tiebreaker so refs from same-second
+//     writes have stable sub-second order,
+//   - carries shortID for further uniqueness,
+//   - carries the optional idempotency token (omitted when
+//     empty — no trailing dash) so consumers can reconstruct
+//     the data file's id without a separate LIST,
 //   - carries the PathEscape'd Hive key via a refSeparator-split
 //     tail.
 //
-// Format: "{refTsMicros}-{shortID}-{dataTsMicros}<RefSep>{hive}.ref"
-// The three pre-sep fields are dash-separated; refTsMicros is
-// leftmost so it dominates lex ordering. See refTsKey for the
-// lex-compatibility constraint.
+// Format with token:
+//
+//	"{dataLM}-{tsMicros}-{shortID}-{token}<RefSep>{hive}.ref"
+//
+// Format without token:
+//
+//	"{dataLM}-{tsMicros}-{shortID}<RefSep>{hive}.ref"
+//
+// dataLM and tsMicros are 16-digit fixed-width decimals (the
+// realistic operating range — see refTsKey); shortID is 8
+// fixed-width hex chars (the makeAutoID format). Position-parsed
+// in parseRefKey; the token (which may itself contain dashes)
+// is everything after the third '-' in the pre-sep portion.
+// validateIdempotencyToken forbids ';' so a token can never
+// confuse the refSeparator split.
 func encodeRefKey(
-	refPath string, refTsMicros int64, shortID string,
-	dataTsMicros int64, hiveKey string,
+	refPath string, dataLM int64, tsMicros int64,
+	shortID, token, hiveKey string,
 ) string {
-	return fmt.Sprintf("%s-%s-%d%s%s.ref",
-		refTsKey(refPath, refTsMicros), shortID, dataTsMicros,
+	if token == "" {
+		return fmt.Sprintf("%s-%d-%s%s%s.ref",
+			refTsKey(refPath, dataLM), tsMicros, shortID,
+			refSeparator, url.PathEscape(hiveKey))
+	}
+	return fmt.Sprintf("%s-%d-%s-%s%s%s.ref",
+		refTsKey(refPath, dataLM), tsMicros, shortID, token,
 		refSeparator, url.PathEscape(hiveKey))
 }
 
 // parseRefKey is the inverse of encodeRefKey. It accepts any
 // S3-style key (with or without a path prefix) ending in the
-// encoded ref filename and returns the decoded Hive key, the
-// ref-publication timestamp (µs since epoch), the shortID, and
-// the data-file timestamp (µs since epoch) used to reconstruct
-// the data path.
+// encoded ref filename and returns the decoded Hive key plus
+// the embedded fields. token is "" when the ref was written
+// without WithIdempotencyToken (auto-id form).
 func parseRefKey(refKey string) (
-	hiveKey string, refTsMicros int64, shortID string,
-	dataTsMicros int64, err error,
+	hiveKey string, dataLM int64, tsMicros int64,
+	shortID, token string, err error,
 ) {
 	name := refKey
 	if idx := strings.LastIndex(name, "/"); idx >= 0 {
@@ -123,41 +213,54 @@ func parseRefKey(refKey string) (
 
 	parts := strings.SplitN(name, refSeparator, 2)
 	if len(parts) != 2 {
-		return "", 0, "", 0, fmt.Errorf(
+		return "", 0, 0, "", "", fmt.Errorf(
 			"s3store: invalid ref key: %s", refKey)
 	}
+	pre, hiveEsc := parts[0], parts[1]
 
-	// pre-sep is "{refTsMicros}-{id}-{dataTsMicros}". The id may
-	// itself contain '-' (e.g. an idempotency token formatted as
-	// "{ISO-timestamp}-{suffix}"), so anchor on the numeric
-	// timestamps at both ends: first '-' splits refTs from the
-	// rest; last '-' splits the id from dataTs.
-	firstDash := strings.IndexByte(parts[0], '-')
-	lastDash := strings.LastIndexByte(parts[0], '-')
-	if firstDash <= 0 || lastDash <= firstDash {
-		return "", 0, "", 0, fmt.Errorf(
-			"s3store: invalid ref key: %s", refKey)
+	// pre = "{dataLM:16}-{tsMicros:16}-{shortID:8}" or
+	//       "{dataLM:16}-{tsMicros:16}-{shortID:8}-{token}".
+	// Position-parse the three fixed-width fields anchored at the
+	// front; everything past them (if any) is the token.
+	const headLen = 16 + 1 + 16 + 1 + 8 // "{dataLM}-{tsMicros}-{shortID}"
+	if len(pre) < headLen {
+		return "", 0, 0, "", "", fmt.Errorf(
+			"s3store: invalid ref key %q: pre-separator too short",
+			refKey)
 	}
-	refTsStr := parts[0][:firstDash]
-	shortID = parts[0][firstDash+1 : lastDash]
-	dataTsStr := parts[0][lastDash+1:]
-	refTsMicros, err = strconv.ParseInt(refTsStr, 10, 64)
-	if err != nil {
-		return "", 0, "", 0, fmt.Errorf(
-			"s3store: invalid ref ts in ref key %q: %w", refKey, err)
+	if pre[16] != '-' || pre[33] != '-' {
+		return "", 0, 0, "", "", fmt.Errorf(
+			"s3store: invalid ref key %q: malformed fixed-width header",
+			refKey)
 	}
-	dataTsMicros, err = strconv.ParseInt(dataTsStr, 10, 64)
+	dataLM, err = strconv.ParseInt(pre[:16], 10, 64)
 	if err != nil {
-		return "", 0, "", 0, fmt.Errorf(
-			"s3store: invalid data ts in ref key %q: %w", refKey, err)
+		return "", 0, 0, "", "", fmt.Errorf(
+			"s3store: invalid dataLM in ref key %q: %w", refKey, err)
+	}
+	tsMicros, err = strconv.ParseInt(pre[17:33], 10, 64)
+	if err != nil {
+		return "", 0, 0, "", "", fmt.Errorf(
+			"s3store: invalid tsMicros in ref key %q: %w", refKey, err)
+	}
+	shortID = pre[34:headLen]
+
+	if len(pre) > headLen {
+		// More chars → must start with '-' followed by token.
+		if pre[headLen] != '-' {
+			return "", 0, 0, "", "", fmt.Errorf(
+				"s3store: invalid ref key %q: missing - before token",
+				refKey)
+		}
+		token = pre[headLen+1:]
 	}
 
-	hiveKey, err = url.PathUnescape(parts[1])
+	hiveKey, err = url.PathUnescape(hiveEsc)
 	if err != nil {
-		return "", 0, "", 0, fmt.Errorf(
+		return "", 0, 0, "", "", fmt.Errorf(
 			"s3store: invalid ref key %q: %w", refKey, err)
 	}
-	return hiveKey, refTsMicros, shortID, dataTsMicros, nil
+	return hiveKey, dataLM, tsMicros, shortID, token, nil
 }
 
 // refCutoff returns the upper-bound refs-prefix for a given

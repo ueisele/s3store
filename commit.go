@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
@@ -238,60 +237,23 @@ func findValidCommitForToken(
 //
 //	DataPath   = ci.dataKey (full .parquet key from LIST)
 //	InsertedAt = time.UnixMicro(tsMicros) parsed from the id
-//	RefPath    = encodeRefKey(refPath, ci.dataLM, ci.id, tsMicros, hiveKey)
+//	RefPath    = encodeRefKey(refPath, ci.dataLM, tsMicros, shortID, token, hiveKey)
 //	Offset     = Offset(RefPath)
 //
 // All inputs are derivable without a single HEAD or GET.
 func reconstructWriteResult(
 	refPath string, ci commitInfo, hiveKey string,
 ) (WriteResult, error) {
-	tsMicros, err := tsMicrosFromID(ci.id)
+	token, tsMicros, shortID, err := parseID(ci.id)
 	if err != nil {
 		return WriteResult{}, err
 	}
 	refKey := encodeRefKey(refPath, ci.dataLM.UnixMicro(),
-		ci.id, tsMicros, hiveKey)
+		tsMicros, shortID, token, hiveKey)
 	return WriteResult{
 		Offset:     Offset(refKey),
 		DataPath:   ci.dataKey,
 		RefPath:    refKey,
 		InsertedAt: time.UnixMicro(tsMicros),
 	}, nil
-}
-
-// tsMicrosFromID extracts the writer's wall-clock-at-write-start
-// (in microseconds since the Unix epoch) from an id of shape
-// {token}-{tsMicros}-{shortID} or {tsMicros}-{shortID}. The id
-// is unambiguously parseable because the trailing
-// {tsMicros}-{shortID} has fixed widths in the realistic
-// operating range (16-digit tsMicros from 2002-01-09 through
-// 2286-11-20; 8-hex-char shortID).
-//
-// The token itself may contain dashes (an idempotency token is
-// "printable ASCII without /" per validateIdempotencyToken), so
-// we anchor on the last two dashes: the last splits shortID off,
-// the second-to-last splits tsMicros off.
-func tsMicrosFromID(id string) (int64, error) {
-	lastDash := strings.LastIndexByte(id, '-')
-	if lastDash <= 0 {
-		return 0, fmt.Errorf(
-			"s3store: id %q: missing - separator", id)
-	}
-	prefix := id[:lastDash]
-	secondLastDash := strings.LastIndexByte(prefix, '-')
-	var tsStr string
-	if secondLastDash < 0 {
-		// {tsMicros}-{shortID} (token-less auto-id).
-		tsStr = prefix
-	} else {
-		// {token}-{tsMicros}-{shortID}; extract tsMicros.
-		tsStr = prefix[secondLastDash+1:]
-	}
-	ts, err := strconv.ParseInt(tsStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf(
-			"s3store: id %q: parse tsMicros %q: %w",
-			id, tsStr, err)
-	}
-	return ts, nil
 }

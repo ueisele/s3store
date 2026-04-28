@@ -20,6 +20,7 @@ func TestValidateIdempotencyToken(t *testing.T) {
 		{"empty", "", true},
 		{"too long", strings.Repeat("a", 201), true},
 		{"contains slash", "ns/job42", true},
+		{"contains semicolon", "job;42", true},
 		{"contains dotdot", "job..42", true},
 		{"contains space", "job 42", true},
 		{"contains tab", "job\t42", true},

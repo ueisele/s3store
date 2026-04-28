@@ -16,6 +16,9 @@ import (
 // Rules:
 //   - non-empty
 //   - no "/" (would split the S3 key into unintended segments)
+//   - no ";" (the ref filename uses ';' as a header/hive
+//     separator; a token containing ';' would split the ref
+//     filename at the wrong position)
 //   - no ".." (collides with the key-pattern grammar's range
 //     separator; tokens with ".." would be unaddressable on read)
 //   - no whitespace, no control characters — printable ASCII
@@ -36,6 +39,12 @@ func validateIdempotencyToken(token string) error {
 		return fmt.Errorf(
 			"s3store: IdempotencyToken %q must not contain '/'",
 			token)
+	}
+	if strings.Contains(token, ";") {
+		return fmt.Errorf(
+			"s3store: IdempotencyToken %q must not contain "+
+				"';' (reserved as the ref-filename header/hive "+
+				"separator)", token)
 	}
 	if strings.Contains(token, "..") {
 		return fmt.Errorf(

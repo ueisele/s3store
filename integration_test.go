@@ -3433,13 +3433,17 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 }
 
 // TestCommitTimeout_BelowFloorRejected guards that NewS3Target
-// rejects a persisted CommitTimeout value below CommitTimeoutFloor.
-// Below the floor, the writer's PUT budget can't fit a real
-// round-trip — sanity check, not correctness.
+// rejects a persisted CommitTimeout below CommitTimeoutFloor.
+// The floor is 1s — below that, the timeliness check
+// (marker.LM - data.LM < CommitTimeout) would reject every
+// write that straddles a wall-clock second boundary even when
+// the PUTs completed in milliseconds (HEAD's RFC 1123
+// LastModified is second-precision; the cross-source
+// truncation in truncLMToSecond aligns LIST values to match).
 func TestCommitTimeout_BelowFloorRejected(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
-	f.seedDurationConfig(t, "store/_config/commit-timeout", 10*time.Millisecond)
+	f.seedDurationConfig(t, "store/_config/commit-timeout", 100*time.Millisecond)
 	f.seedDurationConfig(t, "store/_config/max-clock-skew", testMaxClockSkew)
 
 	_, err := NewS3Target(ctx, S3TargetConfig{

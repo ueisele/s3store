@@ -116,7 +116,7 @@ the full rationale and trade-offs.
     the data filename's `{token}-{tsMicros}-{shortID}`
     suffix.
   - `RefPath` / `Offset` = computed via the existing
-    `encodeRefKey(refPath, data.LM, id, tsMicros, hiveKey)`
+    `encodeRefKey(refPath, data.LM, tsMicros, shortID, token, hiveKey)`
     formula — all inputs derivable from LIST + the
     `_ref/` prefix constant.
 
@@ -301,8 +301,12 @@ the full rationale and trade-offs.
   Removed from `S3TargetConfig` entirely — users can't pass
   them.
 
-  **Floors:** `CommitTimeout ≥ 50ms` (sanity check; a few ×
-  typical PUT latency on any backend). `MaxClockSkew ≥ 0`
+  **Floors:** `CommitTimeout ≥ 1s` (S3 server-stamps
+  `LastModified` at second precision — see Phase 4 fix-up
+  below; a write straddling a wall-clock second boundary
+  shows a 1s gap even when both PUTs completed in
+  milliseconds, so any value below 1s would fail the
+  timeliness check on those writes). `MaxClockSkew ≥ 0`
   (zero is a valid claim on tightly-clocked deployments).
   No upper bound — operators size for their environment.
 
@@ -1040,6 +1044,76 @@ strings.
 per-attempt-paths semantics, post-PUT verification,
 same-token-retries-forever guarantee, reader-side dedup
 recommendation under `WithIdempotencyToken`).
+
+### Phase 4 fix-up — server-LM precision + ref-format restructure
+
+Three issues surfaced when Phase 4's integration suite ran on
+MinIO. Root causes were always present in the design; unit tests
+didn't catch them. All resolved in-place after Phase 4 shipped.
+
+- **HEAD vs LIST `LastModified` precision mismatch.** S3's HEAD
+  carries `Last-Modified` as an HTTP-date (RFC 1123, second
+  precision); MinIO's LIST returns it at millisecond precision
+  in the XML body. Same object, different values via different
+  APIs. The upfront-LIST dedup gate's reconstructed
+  `refTsMicros` disagreed with the original write's HEAD-derived
+  `refTsMicros` — same logical commit, different ref-key bytes,
+  surfaced as "drifted RefPath" on retry.
+  
+  **Fix:** new `truncLMToSecond` helper, applied where
+  `listCommitsAtPrefix` reads LIST entries, normalizes
+  everything to second precision (which is what HEAD already
+  gives us *and* what AWS S3 stores natively — MinIO's
+  millisecond LIST output is non-standard). Cross-source
+  agreement restored.
+
+- **`CommitTimeoutFloor` bumped from 50ms to 1s.** With
+  second-precision LMs everywhere, two PUTs straddling a
+  wall-clock second boundary appear 1s apart even when both
+  completed in milliseconds. The post-marker timeliness check
+  (`marker.LM - data.LM < CommitTimeout`) would reject those
+  writes outright at any value below 1s. README and the
+  per-CommitTimeout-knob `_config/commit-timeout` documentation
+  recommend 2s or higher to leave headroom for slow PUTs on top
+  of the second-boundary effect.
+
+- **Ref filename restructured** from
+  `{refTsMicros}-{id}-{dataTsMicros};{hive}.ref` to
+  `{dataLM}-{tsMicros}-{shortID}-{token};{hive}.ref` (token
+  omitted when empty). Two motivations:
+
+  1. **Stable sub-second ordering for same-second writes.**
+     `dataLM` is the lex-primary key (Poll's `refCutoff` only
+     inspects the first 16 chars — second-precision is fine
+     there); `tsMicros` (writer wall-clock at write-start,
+     microsecond precision) becomes the within-second
+     tiebreaker so refs from same-second writes stream in
+     stable sub-second order. Stream consumers don't need
+     server-completion order within a second — atomic
+     visibility comes from the marker, not the ref's lex
+     position.
+  2. **Position-parseable layout.** Three fixed-width fields
+     (16-digit dataLM + 16-digit tsMicros + 8-hex shortID = 42
+     chars + dashes) followed by an optional `-{token}` tail.
+     The `validateIdempotencyToken` rule "no `;`" closes the
+     last way a token could break the parse.
+
+  Data file format **unchanged** at
+  `{token}-{tsMicros}-{shortID}.parquet` so the upfront LIST
+  under `{partition}/{token}-` keeps its prefix-scope.
+
+- **`validateIdempotencyToken` rejects `;`** (in addition to
+  the existing `/` and `..` rejections). The ref filename's
+  `;` separator splits the header from the PathEscape'd Hive
+  key; a token containing `;` would split the ref filename at
+  the wrong position.
+
+**What this fix-up doesn't touch:** the writer's clock stays
+out of the protocol's *correctness* contract — `dataLM` (server-
+stamped, second-precision) is still the timeliness anchor and
+the lex-primary sort key. `tsMicros` (writer wall-clock) only
+affects within-second sort order, which has no correctness
+implications.
 
 ### Phase 5 — Read path: snapshot gating
 

@@ -98,7 +98,7 @@ func (s *Reader[T]) Poll(
 			if o.until != "" && objKey >= string(o.until) {
 				return false, nil
 			}
-			key, _, id, dataTsMicros, err := parseRefKey(objKey)
+			key, _, tsMicros, shortID, token, err := parseRefKey(objKey)
 			if err != nil {
 				// Malformed refs (externally written, or a future
 				// schema this binary doesn't understand) shouldn't
@@ -106,19 +106,18 @@ func (s *Reader[T]) Poll(
 				// — applications inherit their configured handler —
 				// and bump the s3store.read.malformed_refs counter
 				// so silent drift stays observable, then skip.
-				// Mirrors findExistingRef's tolerance on the write
-				// side, just visible.
 				slog.Warn("s3store: skipping malformed ref",
 					"key", objKey, "err", err)
 				scope.recordMalformedRefs()
 				return true, nil
 			}
+			id := makeID(token, tsMicros, shortID)
 			out = append(out, StreamEntry{
 				Offset:     Offset(objKey),
 				Key:        key,
 				DataPath:   buildDataFilePath(s.dataPath, key, id),
 				RefPath:    objKey,
-				InsertedAt: time.UnixMicro(dataTsMicros),
+				InsertedAt: time.UnixMicro(tsMicros),
 			})
 			lastKey = objKey
 			return true, nil

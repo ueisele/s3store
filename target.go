@@ -221,29 +221,37 @@ type S3TargetConfig struct {
 // commitTimeoutConfigKey is the object key under which the
 // dataset's CommitTimeout is persisted, relative to the target's
 // Prefix. NewS3Target GETs this object once at construction; the
-// body is a Go time.Duration string ("100ms", "1s", ...). It bounds
+// body is a Go time.Duration string ("2s", "5s", ...). It bounds
 // the server-time gap between data PUT and commit-marker arrival
-// — the reader's timeliness check and the writer's collective
-// ref+marker PUT budget both consume this value, so writer and
+// — the reader's timeliness check and the writer's post-marker
+// HEAD verification both consume this value, so writer and
 // reader agree by construction.
 const commitTimeoutConfigKey = "_config/commit-timeout"
 
 // maxClockSkewConfigKey is the object key under which the
 // dataset's MaxClockSkew is persisted, relative to the target's
 // Prefix. NewS3Target GETs this object once at construction; the
-// body is a Go time.Duration string ("0s", "50ms", "5s", ...). It
-// encodes the operator's assumed bound on writer↔reader wall-clock
+// body is a Go time.Duration string ("0s", "500ms", "5s", ...). It
+// encodes the operator's assumed bound on reader↔server wall-clock
 // divergence and is consumed by the reader's refCutoff (via the
 // derived SettleWindow). The writer doesn't read it.
 const maxClockSkewConfigKey = "_config/max-clock-skew"
 
 // CommitTimeoutFloor is the minimum CommitTimeout value the
-// library accepts. 50ms is several × typical PUT latency on any
-// realistic S3 backend; below it, the writer's PUT budget can't
-// fit a real round-trip and every write fails its budget. Sanity
-// check, not correctness: anything below the floor is operator
-// confusion.
-const CommitTimeoutFloor = 50 * time.Millisecond
+// library accepts. 1s is the smallest value that's *meaningful*
+// given S3's second-precision LastModified — the timeliness check
+// (marker.LM - data.LM < CommitTimeout) compares two
+// server-stamped LMs that the wire protocol carries at second
+// precision (HEAD's RFC 1123 Last-Modified header is HTTP-date
+// format, second-precision; the cross-source truncation in
+// truncLMToSecond aligns LIST values to the same precision). A
+// data PUT and a marker PUT that straddle a wall-clock second
+// boundary appear 1s apart even when both completed in
+// milliseconds, so any CommitTimeout below 1s would reject those
+// writes outright. Most operators should pick 2s or higher to
+// leave headroom for slow PUTs on top of the second-boundary
+// effect.
+const CommitTimeoutFloor = 1 * time.Second
 
 // MaxClockSkewFloor is the minimum MaxClockSkew value the library
 // accepts. Zero is a valid claim on tightly-clocked deployments

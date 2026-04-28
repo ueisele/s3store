@@ -234,26 +234,22 @@ func TestOffsetAt(t *testing.T) {
 	anchor := time.UnixMicro(2_000_000_000_000_000)
 	off := s.OffsetAt(anchor)
 
-	earlier := encodeRefKey(
-		s.refPath, anchor.Add(-time.Millisecond).UnixMicro(),
-		"abcd1234", anchor.Add(-time.Millisecond).UnixMicro(),
-		"period=X/customer=y")
+	earlierTs := anchor.Add(-time.Millisecond).UnixMicro()
+	earlier := encodeRefKey(s.refPath, earlierTs, earlierTs,
+		"abcd1234", "", "period=X/customer=y")
 	if earlier >= string(off) {
 		t.Errorf("earlier ref %q should sort before offset %q",
 			earlier, off)
 	}
-	same := encodeRefKey(
-		s.refPath, anchor.UnixMicro(),
-		"abcd1234", anchor.UnixMicro(),
-		"period=X/customer=y")
+	same := encodeRefKey(s.refPath, anchor.UnixMicro(),
+		anchor.UnixMicro(), "abcd1234", "", "period=X/customer=y")
 	if same < string(off) {
 		t.Errorf("same-time ref %q should sort >= offset %q",
 			same, off)
 	}
-	later := encodeRefKey(
-		s.refPath, anchor.Add(time.Second).UnixMicro(),
-		"abcd1234", anchor.Add(time.Second).UnixMicro(),
-		"period=X/customer=y")
+	laterTs := anchor.Add(time.Second).UnixMicro()
+	later := encodeRefKey(s.refPath, laterTs, laterTs,
+		"abcd1234", "", "period=X/customer=y")
 	if later <= string(off) {
 		t.Errorf("later ref %q should sort after offset %q",
 			later, off)
