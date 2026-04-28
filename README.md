@@ -76,6 +76,73 @@ API changes**. Pin an exact version in your `go.mod` (or commit your
 `go.sum`) to control when you pick them up. Requires Go 1.26.2+ (declared
 in [go.mod](go.mod)).
 
+## Initializing a new dataset
+
+Each dataset's timing config is persisted as **two** objects so
+writer and reader agree on the values by construction:
+
+- `<Prefix>/_config/commit-timeout` — the maximum server-time gap
+  between data PUT and commit-marker arrival. Bounds the writer's
+  PUT budget and the reader's marker timeliness check (both ends
+  consume the same value).
+- `<Prefix>/_config/max-clock-skew` — the operator's assumed
+  bound on writer↔reader wall-clock divergence. Read by the
+  reader's poll cutoff; the writer doesn't read it.
+
+`SettleWindow = CommitTimeout + MaxClockSkew` is **derived**, not
+persisted; it's the cutoff `Poll` / `PollRecords` / `ReadRangeIter`
+apply to the live tip.
+
+Operators seed both objects once when provisioning a new prefix;
+`NewS3Target` (and `New(Config)`) GET them at construction time
+and stamp the resolved values (plus the derived `SettleWindow`)
+on the Target. Construction fails with a hint when either object
+is missing.
+
+Each body is a Go `time.Duration` string. The library has no
+fallback — a missing or unparseable object fails construction
+with a hint at the seeding step. Floors:
+`commit-timeout ≥ 50ms` (below the floor the writer's PUT budget
+can't fit a real round-trip; sanity check, not correctness),
+`max-clock-skew ≥ 0` (zero is valid on tightly-clocked
+deployments, negative is incoherent). The boto3 snippet below
+ships `5s` / `1s` as sensible starting values for a typical
+deployment with NTP-synced nodes; tune higher when you can't rule
+out larger skew.
+
+Once seeded, both values are **immutable** — changing either
+silently rewrites history (decreasing `commit-timeout` makes valid
+markers fail; increasing it resurrects timed-out writes;
+decreasing `max-clock-skew` may shift the cutoff so stream
+consumers temporarily skip refs they used to include). An operator
+who genuinely needs different values re-creates the store at a
+new prefix and migrates.
+
+Seed both with the Python `boto3` snippet below (one-time, before
+any process constructs a Target):
+
+```python
+import boto3
+
+s3 = boto3.client("s3", endpoint_url="https://s3.example.com")
+s3.put_object(
+    Bucket="my-bucket",
+    Key="my-prefix/_config/commit-timeout",
+    Body=b"5s",
+    ContentType="text/plain",
+)
+s3.put_object(
+    Bucket="my-bucket",
+    Key="my-prefix/_config/max-clock-skew",
+    Body=b"1s",
+    ContentType="text/plain",
+)
+```
+
+The integration-test fixture (`fixture_test.go`) provides a
+`SeedTimingConfig` helper that does the same thing, called once
+per test.
+
 ## Quick start
 
 ```go
@@ -88,7 +155,11 @@ type CostRecord struct {
     CalculatedAt time.Time `parquet:"calculated_at,timestamp(millisecond)"`
 }
 
-store, err := s3store.New[CostRecord](s3store.Config[CostRecord]{
+// New does two S3 GETs on the persisted timing-config objects at
+// <Prefix>/_config/commit-timeout and <Prefix>/_config/max-clock-skew
+// — seed both once via the snippet in "Initializing a new dataset"
+// before this call.
+store, err := s3store.New[CostRecord](ctx, s3store.Config[CostRecord]{
     Bucket:            "warehouse",
     Prefix:            "billing",
     S3Client:          s3Client,
@@ -1298,14 +1369,21 @@ per Write doesn't require any read-side config. External engines
 Refs on S3 (chronological):
 ... 1000 1001 1002 1003 1004 1005 1006 1007
                                  ↑
-                              now - 5s
+                          now - SettleWindow
                               ──────→ don't read yet
 ```
 
 S3 PUTs aren't globally ordered, so `Poll` reads up to `now - SettleWindow`
-(default 5s) to guarantee no newer-than-cutoff ref "sneaks in" behind an
-already-read one. This gives you a single monotonic offset with no seen-set
-or dedup bookkeeping.
+to guarantee no newer-than-cutoff ref "sneaks in" behind an already-read
+one. `SettleWindow = CommitTimeout + MaxClockSkew` is **derived** from
+the two persisted timing knobs (see
+[Initializing a new dataset](#initializing-a-new-dataset) for seeding).
+The two-knob shape decomposes what the cutoff actually has to cover:
+`CommitTimeout` for server-time PUT latency, `MaxClockSkew` for the
+reader's wall-clock divergence from the writer. Together they bound
+the cutoff so it can't overtake a ref whose marker might still be
+landing server-side, even at the worst-case skew. This gives you a
+single monotonic offset with no seen-set or dedup bookkeeping.
 
 ### Enforcement: the ref PUT is budgeted against SettleWindow
 
@@ -1490,8 +1568,13 @@ type Config[T any] struct {
     EntityKeyOf func(T) string  // identifies a unique entity
     VersionOf   func(T) int64   // monotonic version per entity
 
-    // Stream
-    SettleWindow time.Duration  // default: 5s
+    // CommitTimeout / MaxClockSkew are NOT Config fields. They're
+    // persisted at <Prefix>/_config/commit-timeout and
+    // <Prefix>/_config/max-clock-skew so writer and reader agree
+    // by construction. Seed once via the boto3 snippet in
+    // "Initializing a new dataset"; New(Config) GETs both values
+    // at construction time and stamps them (plus the derived
+    // SettleWindow = CommitTimeout + MaxClockSkew) on the Target.
 
     // Optional write-time column: if set, the writer populates
     // this field on T (must be `time.Time` with a non-empty,

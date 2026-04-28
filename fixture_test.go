@@ -5,6 +5,7 @@ package s3store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -139,5 +140,40 @@ func newFixture(t *testing.T) *fixture {
 		S3Client: s.client,
 		HostPort: s.hostPort,
 		Bucket:   bucket,
+	}
+}
+
+// SeedTimingConfig PUTs the persisted timing-config objects at
+// <prefix>/_config/commit-timeout and <prefix>/_config/max-clock-skew
+// with the given values, so a subsequent NewS3Target / New(Config)
+// call against this prefix finds them and stamps the resolved
+// values (plus the derived SettleWindow) on the Target. Mirrors
+// the boto3 snippet operators run once per dataset (see README's
+// "Initializing a new dataset"). Tests pass values >= the floors
+// (CommitTimeoutFloor = 50ms, MaxClockSkewFloor = 0); the parser
+// rejects anything below.
+func (f *fixture) SeedTimingConfig(
+	t *testing.T, prefix string,
+	commitTimeout, maxClockSkew time.Duration,
+) {
+	t.Helper()
+	f.seedDurationConfig(t, prefix+"/_config/commit-timeout", commitTimeout)
+	f.seedDurationConfig(t, prefix+"/_config/max-clock-skew", maxClockSkew)
+}
+
+// seedDurationConfig PUTs a single duration-valued config object.
+// Used by SeedTimingConfig and by tests that need to seed only one
+// of the two timing knobs (e.g. "missing the other" rejection
+// tests).
+func (f *fixture) seedDurationConfig(
+	t *testing.T, key string, value time.Duration,
+) {
+	t.Helper()
+	if _, err := f.S3Client.PutObject(t.Context(), &s3.PutObjectInput{
+		Bucket: aws.String(f.Bucket),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(value.String()),
+	}); err != nil {
+		t.Fatalf("seed timing config %s/%s: %v", f.Bucket, key, err)
 	}
 }

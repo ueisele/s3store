@@ -14,7 +14,7 @@ import (
 // PartitionKeyOf and preserves every record in its group.
 func TestGroupByKey(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		Target: NewS3Target(S3TargetConfig{
+		Target: newS3TargetSkipConfig(S3TargetConfig{
 			PartitionKeyParts: []string{"period", "customer"},
 		}),
 		PartitionKeyOf: func(r testRec) string {
@@ -135,14 +135,16 @@ func TestEncodeParquet_Compression(t *testing.T) {
 // TestNew_CompressionValidation guards that New() rejects an
 // unknown Compression value before any S3 work.
 func TestNew_CompressionValidation(t *testing.T) {
-	_, err := New(Config[testRec]{
+	cfg := Config[testRec]{
 		Bucket:            "b",
 		Prefix:            "p",
 		PartitionKeyParts: []string{"period", "customer"},
 		S3Client:          &s3.Client{},
 		PartitionKeyOf:    func(r testRec) string { return "" },
 		Compression:       "brotli", // not supported
-	})
+	}
+	_, err := newStoreFromTarget(cfg,
+		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

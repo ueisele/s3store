@@ -62,7 +62,7 @@ func newTestReader(
 ) *Reader[int] {
 	t.Helper()
 	r, err := NewReader[int](ReaderConfig[int]{
-		Target: NewS3Target(S3TargetConfig{
+		Target: newS3TargetSkipConfig(S3TargetConfig{
 			Bucket:             "bucket",
 			Prefix:             "p",
 			S3Client:           newTestS3Client(endpoint),

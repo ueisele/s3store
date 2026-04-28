@@ -80,7 +80,7 @@ func (s *Reader[T]) Poll(
 	}
 
 	cutoffPrefix := refCutoff(s.refPath, time.Now(),
-		s.cfg.Target.EffectiveSettleWindow())
+		s.cfg.Target.SettleWindow())
 
 	var lastKey string
 

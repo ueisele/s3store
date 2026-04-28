@@ -104,7 +104,7 @@ func (s *Reader[T]) ReadRangeIter(
 	var untilOffset Offset
 	if until.IsZero() {
 		settleAt := time.Now().Add(
-			-s.cfg.Target.EffectiveSettleWindow())
+			-s.cfg.Target.SettleWindow())
 		untilOffset = s.OffsetAt(settleAt)
 	} else {
 		untilOffset = s.OffsetAt(until)

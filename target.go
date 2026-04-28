@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -151,25 +152,6 @@ type S3TargetConfig struct {
 	// patterns are validated against this order.
 	PartitionKeyParts []string
 
-	// SettleWindow is how far behind the live tip Poll and
-	// PollRecords read, and the total budget the ref PUT must fit
-	// inside (the ref-PUT timeout is SettleWindow / 2). Keeps
-	// readers consistent with near-tip writers whose refs may not
-	// yet be visible in S3 LIST.
-	//
-	// Does not apply to ProjectionReader.Lookup: marker visibility
-	// is delegated to the storage layer via ConsistencyControl, so
-	// a read-after-write Lookup works without any settle delay on
-	// strong-consistent backends.
-	//
-	// Default (zero value): 5s. Zero is treated as "use library
-	// default", not "disable settle" — Poll correctness and
-	// ref-PUT budgeting both depend on a non-zero value, so there
-	// is no disabled mode. Set explicitly if you want a different
-	// window (e.g. 30s on a slow backend, 500ms for low-latency
-	// testing).
-	SettleWindow time.Duration
-
 	// MaxInflightRequests caps the number of S3 requests a single
 	// constructed S3Target may have outstanding at once. Enforced
 	// by a semaphore inside S3Target — every PUT/GET/HEAD/LIST
@@ -231,18 +213,38 @@ type S3TargetConfig struct {
 	MeterProvider metric.MeterProvider
 }
 
-// EffectiveSettleWindow returns the configured SettleWindow, or
-// 5s when it's unset (zero value). Zero is deliberately mapped
-// to the default rather than "disabled" — a zero window would
-// collapse both Poll's cutoff and the ref-PUT budget, which has
-// no valid use case (consumers and writers would both skip
-// their consistency safeguards).
-func (c S3TargetConfig) EffectiveSettleWindow() time.Duration {
-	if c.SettleWindow > 0 {
-		return c.SettleWindow
-	}
-	return 5 * time.Second
-}
+// commitTimeoutConfigKey is the object key under which the
+// dataset's CommitTimeout is persisted, relative to the target's
+// Prefix. NewS3Target GETs this object once at construction; the
+// body is a Go time.Duration string ("100ms", "1s", ...). It bounds
+// the server-time gap between data PUT and commit-marker arrival
+// — the reader's timeliness check and the writer's collective
+// ref+marker PUT budget both consume this value, so writer and
+// reader agree by construction.
+const commitTimeoutConfigKey = "_config/commit-timeout"
+
+// maxClockSkewConfigKey is the object key under which the
+// dataset's MaxClockSkew is persisted, relative to the target's
+// Prefix. NewS3Target GETs this object once at construction; the
+// body is a Go time.Duration string ("0s", "50ms", "5s", ...). It
+// encodes the operator's assumed bound on writer↔reader wall-clock
+// divergence and is consumed by the reader's refCutoff (via the
+// derived SettleWindow). The writer doesn't read it.
+const maxClockSkewConfigKey = "_config/max-clock-skew"
+
+// CommitTimeoutFloor is the minimum CommitTimeout value the
+// library accepts. 50ms is several × typical PUT latency on any
+// realistic S3 backend; below it, the writer's PUT budget can't
+// fit a real round-trip and every write fails its budget. Sanity
+// check, not correctness: anything below the floor is operator
+// confusion.
+const CommitTimeoutFloor = 50 * time.Millisecond
+
+// MaxClockSkewFloor is the minimum MaxClockSkew value the library
+// accepts. Zero is a valid claim on tightly-clocked deployments
+// (NTP-synced nodes typically run within milliseconds of each
+// other); negative would be incoherent.
+const MaxClockSkewFloor = time.Duration(0)
 
 // EffectiveMaxInflightRequests returns the configured
 // MaxInflightRequests, or 32 when unset. 32 utilises typical S3
@@ -308,28 +310,122 @@ func (c S3TargetConfig) ValidateLookup() error {
 // fresh NewS3Target if you need to change MaxInflightRequests
 // or any other field.
 type S3Target struct {
-	cfg     S3TargetConfig
-	sem     chan struct{}
-	metrics *metrics
+	cfg           S3TargetConfig
+	commitTimeout time.Duration
+	maxClockSkew  time.Duration
+	sem           chan struct{}
+	metrics       *metrics
 }
 
-// NewS3Target constructs a live S3Target from config, allocating
-// the shared in-flight semaphore. Performs no field validation —
-// downstream constructors (NewWriter, NewReader, NewProjectionReader,
-// BackfillProjection) call Validate / ValidateLookup as appropriate.
+// NewS3Target constructs a live S3Target from config. Calls
+// cfg.ValidateLookup (Bucket, Prefix, S3Client) up-front so the
+// GETs that follow have the wiring they need, then GETs the
+// persisted timing-config objects at <Prefix>/_config/commit-timeout
+// and <Prefix>/_config/max-clock-skew, parses each as a Go
+// time.Duration string, and validates against CommitTimeoutFloor /
+// MaxClockSkewFloor before stamping the values (and the derived
+// SettleWindow) on the Target. Construction fails when
+// ValidateLookup fails, when either object is missing, unparseable,
+// or below its floor — operators must seed the dataset's prefix
+// before any process can construct a Target against it (see
+// README's "Initializing a new dataset").
+//
+// Does not call Validate (PartitionKeyParts) — that's a Writer /
+// Reader concern and is checked by NewWriter / NewReader, not by
+// every Target consumer (NewProjectionReader is read-only and
+// doesn't need PartitionKeyParts).
 //
 // Logs a warning when ConsistencyControl is non-empty but doesn't
 // match a named ConsistencyLevel constant — typo guard with no
 // effect on behaviour (the value is still sent verbatim).
-func NewS3Target(cfg S3TargetConfig) S3Target {
+func NewS3Target(ctx context.Context, cfg S3TargetConfig) (S3Target, error) {
+	if err := cfg.ValidateLookup(); err != nil {
+		return S3Target{}, err
+	}
+	t := newS3TargetSkipConfig(cfg)
+	commitTimeout, maxClockSkew, err := loadTimingConfig(ctx, t)
+	if err != nil {
+		return S3Target{}, err
+	}
+	t.commitTimeout = commitTimeout
+	t.maxClockSkew = maxClockSkew
+	return t, nil
+}
+
+// newS3TargetSkipConfig allocates an S3Target without GETing the
+// persisted timing-config objects. Used internally by NewS3Target
+// (which then loads the values) and by tests that don't want a
+// live S3 dependency. Stamps CommitTimeoutFloor / MaxClockSkewFloor
+// as the resolved values so any code reading them gets a non-zero,
+// non-negative result.
+func newS3TargetSkipConfig(cfg S3TargetConfig) S3Target {
 	warnIfUnknownConsistency(cfg.ConsistencyControl, "S3TargetConfig")
 	return S3Target{
-		cfg: cfg,
-		sem: make(chan struct{}, cfg.EffectiveMaxInflightRequests()),
+		cfg:           cfg,
+		commitTimeout: CommitTimeoutFloor,
+		maxClockSkew:  MaxClockSkewFloor,
+		sem:           make(chan struct{}, cfg.EffectiveMaxInflightRequests()),
 		metrics: newMetrics(
 			cfg.MeterProvider, cfg.Bucket, cfg.Prefix,
 			cfg.ConsistencyControl),
 	}
+}
+
+// loadTimingConfig GETs <Prefix>/_config/commit-timeout and
+// <Prefix>/_config/max-clock-skew, parses each body as a Go
+// time.Duration string, and rejects values below their floors.
+// Surfaces a hint at the operator's seeding step when either
+// object is missing.
+func loadTimingConfig(
+	ctx context.Context, t S3Target,
+) (commitTimeout, maxClockSkew time.Duration, _ error) {
+	commitTimeout, err := loadDurationConfig(
+		ctx, t, commitTimeoutConfigKey, CommitTimeoutFloor)
+	if err != nil {
+		return 0, 0, err
+	}
+	maxClockSkew, err = loadDurationConfig(
+		ctx, t, maxClockSkewConfigKey, MaxClockSkewFloor)
+	if err != nil {
+		return 0, 0, err
+	}
+	return commitTimeout, maxClockSkew, nil
+}
+
+// loadDurationConfig GETs <Prefix>/<key>, parses the body as a Go
+// time.Duration string, and rejects values below floor. Returns a
+// hint at the seeding step when the object is missing.
+func loadDurationConfig(
+	ctx context.Context, t S3Target,
+	relKey string, floor time.Duration,
+) (time.Duration, error) {
+	key := t.cfg.Prefix + "/" + relKey
+	body, err := t.get(ctx, key)
+	if err != nil {
+		if _, notFound := errors.AsType[*s3types.NoSuchKey](err); notFound {
+			return 0, fmt.Errorf(
+				"s3store: %s/%s missing — seed the dataset's "+
+					"timing config before constructing a Target "+
+					"(see README \"Initializing a new dataset\")",
+				t.cfg.Bucket, key)
+		}
+		return 0, fmt.Errorf(
+			"s3store: get %s/%s: %w", t.cfg.Bucket, key, err)
+	}
+	raw := strings.TrimSpace(string(body))
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"s3store: %s/%s body %q: parse as time.Duration: %w",
+			t.cfg.Bucket, key, raw, err)
+	}
+	if value < floor {
+		return 0, fmt.Errorf(
+			"s3store: %s/%s body %q resolves to %s, below the "+
+				"%s floor",
+			t.cfg.Bucket, key, raw, value, floor)
+	}
+	return value, nil
 }
 
 // Config returns a copy of the S3TargetConfig the target was
@@ -355,9 +451,32 @@ func (t S3Target) ConsistencyControl() ConsistencyLevel {
 	return t.cfg.ConsistencyControl
 }
 
-// EffectiveSettleWindow forwards to S3TargetConfig.EffectiveSettleWindow.
-func (t S3Target) EffectiveSettleWindow() time.Duration {
-	return t.cfg.EffectiveSettleWindow()
+// CommitTimeout returns the value resolved at construction time
+// from <Prefix>/_config/commit-timeout. Pure accessor — no I/O.
+// Bounds the server-time gap between data PUT and commit-marker
+// arrival; consumed by the writer's PUT budget and the reader's
+// timeliness check.
+func (t S3Target) CommitTimeout() time.Duration {
+	return t.commitTimeout
+}
+
+// MaxClockSkew returns the value resolved at construction time
+// from <Prefix>/_config/max-clock-skew. Pure accessor — no I/O.
+// Operator's assumed bound on writer↔reader wall-clock divergence;
+// consumed by the reader's refCutoff via SettleWindow.
+func (t S3Target) MaxClockSkew() time.Duration {
+	return t.maxClockSkew
+}
+
+// SettleWindow returns the derived sum CommitTimeout + MaxClockSkew.
+// Used in one place: Poll's refCutoff = now - SettleWindow. Pure
+// optimization once the marker timeliness check is the actual
+// visibility gate — refCutoff just bounds which refs to HEAD-check.
+// Sized so even at the worst-case skew, the refCutoff cannot
+// overtake refs whose markers might still be valid server-side.
+// Pure accessor — no I/O.
+func (t S3Target) SettleWindow() time.Duration {
+	return t.commitTimeout + t.maxClockSkew
 }
 
 // EffectiveMaxInflightRequests forwards to

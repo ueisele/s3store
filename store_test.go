@@ -41,7 +41,7 @@ func TestNew_Validation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
 			tc.mutate(&cfg)
-			_, err := New(cfg)
+			_, err := New(t.Context(), cfg)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -55,7 +55,7 @@ func TestNew_Validation(t *testing.T) {
 
 func TestValidateKey(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		Target: NewS3Target(S3TargetConfig{
+		Target: newS3TargetSkipConfig(S3TargetConfig{
 			PartitionKeyParts: []string{"period", "customer"},
 		}),
 	}}
@@ -110,17 +110,6 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSettleWindowDefault(t *testing.T) {
-	var cfg S3TargetConfig
-	if got := cfg.EffectiveSettleWindow(); got.String() != "5s" {
-		t.Errorf("S3TargetConfig default: got %v, want 5s", got)
-	}
-	cfg.SettleWindow = 2 * time.Second
-	if got := cfg.EffectiveSettleWindow(); got != 2*time.Second {
-		t.Errorf("S3TargetConfig explicit: got %v, want 2s", got)
-	}
-}
-
 // TestWriteEmptyRecords guards that Write and WriteWithKey
 // return (nil, nil) for empty input instead of erroring. This
 // lets callers forward their batch pipelines without a manual
@@ -129,7 +118,7 @@ func TestSettleWindowDefault(t *testing.T) {
 // method touches s.s3.
 func TestWriteEmptyRecords(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
-		Target: NewS3Target(S3TargetConfig{
+		Target: newS3TargetSkipConfig(S3TargetConfig{
 			PartitionKeyParts: []string{"period", "customer"},
 		}),
 		PartitionKeyOf: func(r testRec) string {
@@ -204,7 +193,8 @@ func TestNewRejectsPartialDedupConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
 			tc.mutate(&cfg)
-			if _, err := New(cfg); err == nil {
+			if _, err := newStoreFromTarget(cfg,
+				newS3TargetSkipConfig(s3TargetConfigFrom(cfg))); err == nil {
 				t.Error("expected error, got nil")
 			}
 		})
@@ -218,9 +208,10 @@ func TestNewKeepsUserVersionOf(t *testing.T) {
 	cfg.EntityKeyOf = func(r testRec) string { return r.Customer }
 	cfg.VersionOf = func(r testRec) int64 { return r.Value * 2 }
 
-	s, err := New(cfg)
+	s, err := newStoreFromTarget(cfg,
+		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("newStoreFromTarget: %v", err)
 	}
 	got := s.Reader.cfg.VersionOf(testRec{Value: 21})
 	if got != 42 {
@@ -234,8 +225,10 @@ func TestNewKeepsUserVersionOf(t *testing.T) {
 // are the invariants Poll+WithUntilOffset relies on to turn a
 // time window into the correct half-open offset range.
 func TestOffsetAt(t *testing.T) {
+	cfg := validConfig()
+	target := newS3TargetSkipConfig(s3TargetConfigFrom(cfg))
 	s := &Reader[testRec]{
-		cfg:     readerConfigFrom(validConfig()),
+		cfg:     readerConfigFrom(cfg, target),
 		refPath: "p/_ref",
 	}
 	anchor := time.UnixMicro(2_000_000_000_000_000)
@@ -305,9 +298,10 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 	cfg := validConfig()
 	// both EntityKeyOf and VersionOf left nil
 
-	s, err := New(cfg)
+	s, err := newStoreFromTarget(cfg,
+		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("newStoreFromTarget: %v", err)
 	}
 	if s.Reader.cfg.VersionOf != nil {
 		t.Error("VersionOf set despite no EntityKeyOf")

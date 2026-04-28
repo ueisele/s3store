@@ -1,6 +1,7 @@
 package s3store
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -65,10 +66,6 @@ type Config[T any] struct {
 	// record. Required for Write(). The returned string must
 	// conform to the PartitionKeyParts layout ("part=value/part=value").
 	PartitionKeyOf func(T) string
-
-	// SettleWindow is how far behind the stream tip Poll and
-	// PollRecords read. Default: 5s.
-	SettleWindow time.Duration
 
 	// EntityKeyOf returns the logical entity identifier for a
 	// record. When non-nil, Read and PollRecords deduplicate to
@@ -166,42 +163,61 @@ func (s *Store[T]) Target() S3Target {
 // new code that only writes or only reads should prefer
 // NewWriter / NewReader directly.
 //
-// Performs no S3 I/O at construction time.
-func New[T any](cfg Config[T]) (*Store[T], error) {
-	w, err := NewWriter(writerConfigFrom(cfg))
+// Performs two S3 GETs at construction time — the persisted
+// timing-config objects at <Prefix>/_config/commit-timeout and
+// <Prefix>/_config/max-clock-skew — via NewS3Target. Construction
+// fails when either object is missing, unparseable, or below its
+// floor (CommitTimeoutFloor / MaxClockSkewFloor).
+func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
+	s3cfg := s3TargetConfigFrom(cfg)
+	if err := s3cfg.Validate(); err != nil {
+		return nil, err
+	}
+	target, err := NewS3Target(ctx, s3cfg)
 	if err != nil {
 		return nil, err
 	}
-	r, err := NewReader(readerConfigFrom(cfg))
+	return newStoreFromTarget(cfg, target)
+}
+
+// newStoreFromTarget wires Writer + Reader from cfg + a pre-built
+// target. Shared between New (production path, GETs the persisted
+// config) and unit-test helpers that bypass the GET.
+func newStoreFromTarget[T any](cfg Config[T], target S3Target) (*Store[T], error) {
+	w, err := NewWriter(writerConfigFrom(cfg, target))
+	if err != nil {
+		return nil, err
+	}
+	r, err := NewReader(readerConfigFrom(cfg, target))
 	if err != nil {
 		return nil, err
 	}
 	return &Store[T]{Writer: w, Reader: r}, nil
 }
 
-// targetFrom lifts the S3-wiring fields off a unified Config[T]
-// into a constructed S3Target. Called once inside New() so the
-// Writer and Reader projections share one S3Target instance —
-// and therefore one MaxInflightRequests semaphore + one
-// ConsistencyControl value — automatically.
-func targetFrom[T any](c Config[T]) S3Target {
-	return NewS3Target(S3TargetConfig{
+// s3TargetConfigFrom lifts the S3-wiring fields off a unified
+// Config[T] into an S3TargetConfig. Called by New so the Writer
+// and Reader projections share one S3Target instance — and
+// therefore one MaxInflightRequests semaphore, one
+// ConsistencyControl value, and one resolved CommitTimeout +
+// MaxClockSkew pair — automatically.
+func s3TargetConfigFrom[T any](c Config[T]) S3TargetConfig {
+	return S3TargetConfig{
 		Bucket:              c.Bucket,
 		Prefix:              c.Prefix,
 		S3Client:            c.S3Client,
 		PartitionKeyParts:   c.PartitionKeyParts,
-		SettleWindow:        c.SettleWindow,
 		MaxInflightRequests: c.MaxInflightRequests,
 		ConsistencyControl:  c.ConsistencyControl,
-	})
+	}
 }
 
 // writerConfigFrom projects a unified Config[T] onto the narrower
 // WriterConfig[T]. Central place so drift between the two types
 // is easy to spot.
-func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
+func writerConfigFrom[T any](c Config[T], target S3Target) WriterConfig[T] {
 	return WriterConfig[T]{
-		Target:          targetFrom(c),
+		Target:          target,
 		PartitionKeyOf:  c.PartitionKeyOf,
 		Compression:     c.Compression,
 		InsertedAtField: c.InsertedAtField,
@@ -213,9 +229,9 @@ func writerConfigFrom[T any](c Config[T]) WriterConfig[T] {
 // ReaderConfig[T]. InsertedAtField is writer-only — the reader
 // sees that column like any other parquet field, decoded
 // natively into T by parquet-go.
-func readerConfigFrom[T any](c Config[T]) ReaderConfig[T] {
+func readerConfigFrom[T any](c Config[T], target S3Target) ReaderConfig[T] {
 	return ReaderConfig[T]{
-		Target:      targetFrom(c),
+		Target:      target,
 		EntityKeyOf: c.EntityKeyOf,
 		VersionOf:   c.VersionOf,
 	}

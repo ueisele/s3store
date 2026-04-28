@@ -411,7 +411,7 @@ func newTestTarget(
 	if len(consistency) > 0 {
 		cfg.ConsistencyControl = consistency[0]
 	}
-	return NewS3Target(cfg)
+	return newS3TargetSkipConfig(cfg)
 }
 
 // statusServer returns an httptest server that responds with

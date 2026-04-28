@@ -36,13 +36,34 @@ type storeOpts struct {
 	projections []ProjectionDef[Rec]
 }
 
+// testCommitTimeout is the CommitTimeout integration tests seed
+// before constructing a Store. Tight enough to keep settle-window
+// sleeps short on localhost MinIO (millisecond PUT latency, sub-
+// millisecond clock skew between writer and reader processes
+// running on the same host); the writer's PUT budget on the
+// existing single-knob path is testCommitTimeout/2 + (skew share),
+// well above realistic localhost latencies.
+const testCommitTimeout = 200 * time.Millisecond
+
+// testMaxClockSkew is the MaxClockSkew integration tests seed.
+// Localhost has ~microsecond skew between processes; 100ms is
+// generous headroom so a slightly contended scheduler tick
+// doesn't trip refCutoff.
+const testMaxClockSkew = 100 * time.Millisecond
+
+// testSettleWindow is the derived sum testCommitTimeout +
+// testMaxClockSkew. Used by the sleep-past-settle-window call
+// sites; same role as the value the Target stamps via SettleWindow().
+const testSettleWindow = testCommitTimeout + testMaxClockSkew
+
 // newStore builds a fresh Store against a freshly
 // created bucket on the shared MinIO fixture. PartitionKeyParts are
 // (period, customer) across every test.
 func newStore(t *testing.T, opts storeOpts) *Store[Rec] {
 	t.Helper()
 	f := newFixture(t)
-	store, err := New[Rec](Config[Rec]{
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+	store, err := New[Rec](t.Context(), Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -51,7 +72,6 @@ func newStore(t *testing.T, opts storeOpts) *Store[Rec] {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 		EntityKeyOf:        opts.entityKeyOf,
 		VersionOf:          opts.versionOf,
@@ -171,7 +191,8 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 			return []string{r.SKU, r.Customer}, nil
 		},
 	}
-	store, err := New(Config[Rec]{
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+	store, err := New(ctx, Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -180,10 +201,6 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		// 5s picks up the library default; Lookup no longer uses it,
-		// so the magnitude doesn't matter — the point of this test
-		// is that Lookup ignores SettleWindow entirely.
-		SettleWindow:       5 * time.Second,
 		ConsistencyControl: ConsistencyStrongGlobal,
 		Projections:        []ProjectionDef[Rec]{projectionDef},
 	})
@@ -289,7 +306,7 @@ func TestBackfillProjection(t *testing.T) {
 		t.Fatalf("post-registration Write: %v", err)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Before BackfillProjection: only the post-registration record is
 	// visible.
@@ -324,7 +341,7 @@ func TestBackfillProjection(t *testing.T) {
 			stats.Markers)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// After BackfillProjection: every distinct (sku, customer) is
 	// visible.
@@ -523,8 +540,9 @@ func TestBackfillProjection_MissingDataTolerant(t *testing.T) {
 func TestMissingData_PollSkipsReadIsLISTConsistent(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
-	store, err := New(Config[Rec]{
+	store, err := New(ctx, Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -533,7 +551,6 @@ func TestMissingData_PollSkipsReadIsLISTConsistent(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -566,7 +583,7 @@ func TestMissingData_PollSkipsReadIsLISTConsistent(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Read is LIST-based and MinIO LIST reflects the delete,
 	// so Read never tries to GET the missing file.
@@ -635,7 +652,7 @@ func TestPoll_SkipsMalformedRefs(t *testing.T) {
 		}); err != nil {
 		t.Fatalf("PutObject malformed ref: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// 3. Poll: succeeds and returns only the valid entry. The
 	// malformed ref is logged + metric'd + skipped.
@@ -673,6 +690,7 @@ func TestPoll_SkipsMalformedRefs(t *testing.T) {
 func TestInsertedAtField_Populate(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
 	type RecWithMeta struct {
 		Period     string    `parquet:"period"`
@@ -682,7 +700,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := New[RecWithMeta](Config[RecWithMeta]{
+	store, err := New[RecWithMeta](ctx, Config[RecWithMeta]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -691,7 +709,6 @@ func TestInsertedAtField_Populate(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 		InsertedAtField:    "InsertedAt",
 	})
@@ -707,7 +724,7 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	after := time.Now()
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
@@ -751,6 +768,8 @@ func TestInsertedAtField_Populate(t *testing.T) {
 // non-empty, non-"-" tag).
 func TestInsertedAtField_Validation(t *testing.T) {
 	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+	ctx := t.Context()
 
 	type RecIgnoredMeta struct {
 		Period   string    `parquet:"period"`
@@ -787,14 +806,14 @@ func TestInsertedAtField_Validation(t *testing.T) {
 	}
 
 	t.Run("no such field", func(t *testing.T) {
-		_, err := New[Rec](mkCfgRec("Nonexistent"))
+		_, err := New[Rec](ctx, mkCfgRec("Nonexistent"))
 		if err == nil || !strings.Contains(err.Error(), "no such field") {
 			t.Fatalf("want %q error, got %v", "no such field", err)
 		}
 	})
 	t.Run("wrong type", func(t *testing.T) {
 		// Period is string, not time.Time.
-		_, err := New[Rec](mkCfgRec("Period"))
+		_, err := New[Rec](ctx, mkCfgRec("Period"))
 		if err == nil || !strings.Contains(err.Error(), "must be time.Time") {
 			t.Fatalf("want %q error, got %v", "must be time.Time", err)
 		}
@@ -802,7 +821,7 @@ func TestInsertedAtField_Validation(t *testing.T) {
 	t.Run("parquet dash tag rejected", func(t *testing.T) {
 		// Ignored is time.Time but tagged parquet:"-" — rejected
 		// because the value must be persisted as a real column.
-		_, err := New[RecIgnoredMeta](mkCfgIgnored("Ignored"))
+		_, err := New[RecIgnoredMeta](ctx, mkCfgIgnored("Ignored"))
 		if err == nil || !strings.Contains(err.Error(), "non-empty, non-\"-\" parquet tag") {
 			t.Fatalf("want non-empty/non-\"-\" error, got %v", err)
 		}
@@ -837,7 +856,8 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 	}
 
 	f := newFixture(t)
-	store, err := New[FullRec](Config[FullRec]{
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+	store, err := New[FullRec](ctx, Config[FullRec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -846,7 +866,6 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -1152,7 +1171,7 @@ func TestLookup_NonCartesian(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	got, err := idx.Lookup(ctx, []string{
 		"sku=s1/customer=abc",
@@ -1249,7 +1268,7 @@ func TestBackfillProjection_NonCartesian(t *testing.T) {
 			"March-18; April skipped)", stats.DataObjects)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Sanity: Lookup sees the March markers, NOT April.
 	got, err := idx.Lookup(ctx, []string{"sku=*/customer=*"})
@@ -1603,7 +1622,7 @@ func TestPoll(t *testing.T) {
 		lastOffset = append(lastOffset, string(r.Offset))
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	entries, newOffset, err := store.Poll(ctx, "", 100)
 	if err != nil {
@@ -1652,8 +1671,9 @@ type RecNarrow struct {
 func TestRead_MissingColumnZeroFills(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
-	wNarrow, err := New[RecNarrow](Config[RecNarrow]{
+	wNarrow, err := New[RecNarrow](ctx, Config[RecNarrow]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -1662,7 +1682,6 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -1675,7 +1694,7 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	rWide, err := New[Rec](Config[Rec]{
+	rWide, err := New[Rec](ctx, Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -1684,7 +1703,6 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -1737,7 +1755,7 @@ func TestPollRecords(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("second Write: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Default: both versions of the same entity flow through.
 	got, off, err := store.PollRecords(ctx, "", 100)
@@ -1806,7 +1824,7 @@ func TestPollTimeWindow(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Write 3: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Full stream: three entries.
 	all, _, err := store.Poll(ctx, "", 100)
@@ -1869,7 +1887,7 @@ func TestReadRangeIter(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 	after := time.Now()
 
 	// Bounded window: all 5 records.
@@ -1930,7 +1948,7 @@ func TestReadRangeIter_EarlyBreak(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Break after first record. The closure must observe yield
 	// returning false and stop — no further work, no error.
@@ -1972,7 +1990,7 @@ func TestReadRangeIter_SnapshotsLiveTipCutoff(t *testing.T) {
 		}
 	}
 	// Wait past the settle window so the pre-writes are visible.
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Phase 2: start the iter, then write more concurrently. The
 	// concurrent writes are timed AFTER iter entry — the snapshot
@@ -2061,8 +2079,9 @@ type ParquetRec struct {
 func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
-	store, err := New[ParquetRec](Config[ParquetRec]{
+	store, err := New[ParquetRec](ctx, Config[ParquetRec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2071,7 +2090,6 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
@@ -2459,6 +2477,7 @@ func TestReadIter_MultiPartition(t *testing.T) {
 func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
 	type RecWithMeta struct {
 		Period     string    `parquet:"period"`
@@ -2467,7 +2486,7 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := New[RecWithMeta](Config[RecWithMeta]{
+	store, err := New[RecWithMeta](ctx, Config[RecWithMeta]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2476,7 +2495,6 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 		InsertedAtField:    "InsertedAt",
 	})
@@ -2491,7 +2509,7 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	after := time.Now()
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
@@ -2521,6 +2539,7 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
 	type RecWithMeta struct {
 		Period     string    `parquet:"period"`
@@ -2529,7 +2548,7 @@ func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := New[RecWithMeta](Config[RecWithMeta]{
+	store, err := New[RecWithMeta](ctx, Config[RecWithMeta]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2538,7 +2557,6 @@ func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow:       300 * time.Millisecond,
 		ConsistencyControl: ConsistencyStrongGlobal,
 		InsertedAtField:    "InsertedAt",
 	})
@@ -2616,7 +2634,7 @@ func TestSort_ByEntityKeyAndVersion(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// WithHistory so sort can be observed without dedup folding.
 	got, err := store.Read(ctx, []string{"*"}, WithHistory())
@@ -2664,7 +2682,7 @@ func TestSort_LastModifiedFallback(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	got, err := store.Read(ctx, []string{"*"})
 	if err != nil {
@@ -2705,7 +2723,7 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	readGot, err := store.Read(ctx, []string{"*"}, WithHistory())
 	if err != nil {
@@ -2753,7 +2771,8 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 func newIdempotentStore(t *testing.T) *Store[Rec] {
 	t.Helper()
 	f := newFixture(t)
-	store, err := New[Rec](Config[Rec]{
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+	store, err := New[Rec](t.Context(), Config[Rec]{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
@@ -2762,7 +2781,6 @@ func newIdempotentStore(t *testing.T) *Store[Rec] {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		SettleWindow: 300 * time.Millisecond,
 		// MinIO is in fact strongly consistent; the claim keeps
 		// idempotent writes on the conditional-PUT path and lets
 		// the scoped retry LIST linearize against prior writes.
@@ -2837,7 +2855,7 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	// Read should see exactly one record — the idempotent retry
 	// didn't land a duplicate. Wait past SettleWindow first so
 	// Read can observe the ref in full.
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -2886,7 +2904,7 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 			first.RefPath, second.RefPath)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -2957,7 +2975,7 @@ func TestWriteWithIdempotencyToken_SameTokenAcrossPartitions(t *testing.T) {
 	}
 
 	// End-to-end: both records visible, exactly one per partition.
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 	got, err := store.Read(ctx, []string{keyA, keyB})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -3055,7 +3073,7 @@ func TestIdempotentRead_ReadModifyWriteRetrySafe(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("zombie write: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// 5. Attempt-2 retries the same Read with the same token. The
 	// barrier excludes both the attempt-1 file (self-exclusion) and
@@ -3129,7 +3147,7 @@ func TestIdempotentRead_PerPartitionIsolation(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("zombie B: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// Read across both partitions with the barrier. A is filtered
 	// (only baseline survives); B has no token file so its barrier
@@ -3257,7 +3275,7 @@ func TestIdempotency_FullCycle_ScenarioBRefMissing(t *testing.T) {
 		}); err != nil {
 		t.Fatalf("DeleteObject ref: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
 	// 5. Attempt-2 retries with the same token. The writer must
 	// detect existing data, scope-LIST for the ref, find none,
@@ -3286,7 +3304,7 @@ func TestIdempotency_FullCycle_ScenarioBRefMissing(t *testing.T) {
 
 	// 6. PollRecords sees both refs (baseline + reconstructed
 	// attempt-1). Wait past SettleWindow first.
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
 	polled, _, err := store.PollRecords(ctx, "", 100)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
@@ -3321,53 +3339,96 @@ func TestIdempotency_FullCycle_ScenarioBRefMissing(t *testing.T) {
 	}
 }
 
-// TestWrite_RefSettleBudgetEnforced guards that a write whose
-// initial ref PUT exceeds SettleWindow is handled correctly — the
-// library never silently returns success with a stale ref.
-//
-// Two outcomes are correct under the simplified budget contract:
-//
-//   - Success: the PUT happened to land inside the SettleWindow/2
-//     deadline despite the tight budget (rare on MinIO at 1ms but
-//     not impossible).
-//   - Wrapped put-ref error (typically ctx.DeadlineExceeded): the
-//     PUT was cancelled by the client-side timeout. The data file
-//     stays in S3 as an orphan; the caller retries.
-//
-// Strong consistency is declared via ConsistencyControl so the
-// idempotent data-PUT and retry LIST take the strong path. The
-// ref-PUT budget is SettleWindow/2 regardless of this flag, so
-// 1ms SettleWindow → 500µs PUT budget — guaranteed to blow on
-// MinIO, which is exactly what this test wants to exercise.
-func TestWrite_RefSettleBudgetEnforced(t *testing.T) {
+// TestCommitTimeout_BelowFloorRejected guards that NewS3Target
+// rejects a persisted CommitTimeout value below CommitTimeoutFloor.
+// Below the floor, the writer's PUT budget can't fit a real
+// round-trip — sanity check, not correctness.
+func TestCommitTimeout_BelowFloorRejected(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
-	store, err := New[Rec](Config[Rec]{
+	f.seedDurationConfig(t, "store/_config/commit-timeout", 10*time.Millisecond)
+	f.seedDurationConfig(t, "store/_config/max-clock-skew", testMaxClockSkew)
+
+	_, err := NewS3Target(ctx, S3TargetConfig{
 		Bucket:            f.Bucket,
 		Prefix:            "store",
 		S3Client:          f.S3Client,
 		PartitionKeyParts: []string{"period", "customer"},
-		PartitionKeyOf: func(r Rec) string {
-			return fmt.Sprintf("period=%s/customer=%s",
-				r.Period, r.Customer)
-		},
-		// 1ms SettleWindow: real MinIO PUT is a few ms, so every
-		// ref write exceeds the budget one way or another.
-		SettleWindow:       1 * time.Millisecond,
-		ConsistencyControl: ConsistencyStrongGlobal,
 	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	if err == nil {
+		t.Fatal("expected error for below-floor CommitTimeout, got nil")
 	}
+	if !strings.Contains(err.Error(), "floor") {
+		t.Errorf("error %q should mention the floor", err)
+	}
+}
 
-	_, writeErr := store.Write(ctx, []Rec{{
-		Period: "2026-04-22", Customer: "x",
-		SKU: "s1", Value: 1, Ts: time.UnixMilli(1),
-	}})
-	// Any of the three outcomes above is correct. The previous
-	// guard ("writeErr must be non-nil") regressed once internal
-	// recovery landed — a recovery PUT that happens to finish
-	// inside budget (rare at 1ms but not impossible) is the new
-	// correct-success path, not a silent miss.
-	t.Logf("budget-enforcement outcome: %v", writeErr)
+// TestMaxClockSkew_BelowFloorRejected guards that NewS3Target
+// rejects a negative MaxClockSkew (the floor is zero). A negative
+// skew is incoherent — refCutoff would round-trip into the future.
+func TestMaxClockSkew_BelowFloorRejected(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.seedDurationConfig(t, "store/_config/commit-timeout", testCommitTimeout)
+	f.seedDurationConfig(t, "store/_config/max-clock-skew", -1*time.Second)
+
+	_, err := NewS3Target(ctx, S3TargetConfig{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+	})
+	if err == nil {
+		t.Fatal("expected error for negative MaxClockSkew, got nil")
+	}
+	if !strings.Contains(err.Error(), "floor") {
+		t.Errorf("error %q should mention the floor", err)
+	}
+}
+
+// TestCommitTimeout_MissingRejected guards that NewS3Target fails
+// fast when only max-clock-skew is seeded. Production callers seed
+// via the boto3 snippet (see README); the error surfaces with a
+// hint pointing at that step and names the missing key.
+func TestCommitTimeout_MissingRejected(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	// Only seed max-clock-skew; commit-timeout is missing.
+	f.seedDurationConfig(t, "store/_config/max-clock-skew", testMaxClockSkew)
+
+	_, err := NewS3Target(ctx, S3TargetConfig{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+	})
+	if err == nil {
+		t.Fatal("expected error for missing commit-timeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "commit-timeout") {
+		t.Errorf("error %q should name the missing config key", err)
+	}
+}
+
+// TestMaxClockSkew_MissingRejected guards that NewS3Target fails
+// fast when only commit-timeout is seeded. Mirrors
+// TestCommitTimeout_MissingRejected for the second knob.
+func TestMaxClockSkew_MissingRejected(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	// Only seed commit-timeout; max-clock-skew is missing.
+	f.seedDurationConfig(t, "store/_config/commit-timeout", testCommitTimeout)
+
+	_, err := NewS3Target(ctx, S3TargetConfig{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+	})
+	if err == nil {
+		t.Fatal("expected error for missing max-clock-skew, got nil")
+	}
+	if !strings.Contains(err.Error(), "max-clock-skew") {
+		t.Errorf("error %q should name the missing config key", err)
+	}
 }

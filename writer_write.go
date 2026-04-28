@@ -356,7 +356,7 @@ func (s *Writer[T]) commitRef(
 	refKey := encodeRefKey(
 		s.refPath, refTsMicros, id, dataTsMicros, hiveKey)
 
-	settle := s.cfg.Target.EffectiveSettleWindow()
+	settle := s.cfg.Target.SettleWindow()
 	putCtx, cancel := context.WithTimeout(ctx, settle/2)
 	defer cancel()
 
@@ -446,7 +446,7 @@ func (s *Writer[T]) findExistingRef(
 	lo := refTsKey(s.refPath, createdAt.UnixMicro())
 	hi := refTsKey(s.refPath, now.UnixMicro())
 	settleCutoffUs := now.Add(
-		-s.cfg.Target.EffectiveSettleWindow()).UnixMicro()
+		-s.cfg.Target.SettleWindow()).UnixMicro()
 	var found string
 	err = s.cfg.Target.listEach(ctx, s.refPath+"/", lo, 0,
 		func(obj s3types.Object) (bool, error) {
