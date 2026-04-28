@@ -1,115 +1,185 @@
 package s3store
 
 import (
-	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
-// TestIsCommitValid pins down the timeliness check at the
-// boundaries: equal LMs are valid (zero-gap commit), gap ==
-// CommitTimeout is invalid (strict <), and either zero LM is
-// invalid. Both inputs are S3-server-stamped so a negative gap
-// (marker-before-data) is impossible by construction — not
-// covered.
-func TestIsCommitValid(t *testing.T) {
-	base := time.UnixMicro(1_700_000_000_000_000)
-	cases := []struct {
-		name          string
-		dataLM        time.Time
-		markerLM      time.Time
-		commitTimeout time.Duration
-		want          bool
-	}{
-		{"zero gap", base, base, time.Second, true},
-		{"sub-timeout gap", base, base.Add(500 * time.Millisecond), time.Second, true},
-		{"exactly-at-timeout invalid", base, base.Add(time.Second), time.Second, false},
-		{"over-timeout invalid", base, base.Add(2 * time.Second), time.Second, false},
-		{"zero dataLM invalid", time.Time{}, base, time.Second, false},
-		{"zero markerLM invalid", base, time.Time{}, time.Second, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := isCommitValid(tc.dataLM, tc.markerLM, tc.commitTimeout)
-			if got != tc.want {
-				t.Errorf("isCommitValid(%v, %v, %v) = %v, want %v",
-					tc.dataLM, tc.markerLM, tc.commitTimeout, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestParseDataOrCommitKey verifies the tiny shape parser the
-// LIST-pair primitive uses to bucket entries by id + extension.
-func TestParseDataOrCommitKey(t *testing.T) {
-	cases := []struct {
-		key         string
-		wantID      string
-		wantParquet bool
-		wantCommit  bool
-	}{
-		{"prefix/data/period=A/id1.parquet", "id1", true, false},
-		{"prefix/data/period=A/id1.commit", "id1", false, true},
-		{"prefix/data/period=A/something.txt", "", false, false},
-		{"id-with-dashes-1700000000000000-deadbeef.parquet",
-			"id-with-dashes-1700000000000000-deadbeef", true, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.key, func(t *testing.T) {
-			id, p, c := parseDataOrCommitKey(tc.key)
-			if id != tc.wantID || p != tc.wantParquet || c != tc.wantCommit {
-				t.Errorf("got (%q, %v, %v), want (%q, %v, %v)",
-					id, p, c, tc.wantID, tc.wantParquet, tc.wantCommit)
-			}
-		})
-	}
-}
-
-// TestCommitMarkerKey verifies the sibling-of-parquet shape.
-func TestCommitMarkerKey(t *testing.T) {
-	got := commitMarkerKey("p/data", "period=A/customer=B", "id1")
-	want := "p/data/period=A/customer=B/id1.commit"
+// TestTokenCommitKey verifies the path shape:
+// `<dataPath>/<partition>/<token>.commit`.
+func TestTokenCommitKey(t *testing.T) {
+	got := tokenCommitKey("p/data", "period=A/customer=B", "tok42")
+	want := "p/data/period=A/customer=B/tok42.commit"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
-// TestReconstructWriteResult guards that the upfront-LIST dedup
-// gate's reconstruction produces exactly the WriteResult the
-// original write would have returned. Drives the same id /
-// dataLM / partition through encodeRefKey so any drift in the
-// formula breaks here.
-func TestReconstructWriteResult(t *testing.T) {
-	dataLM := time.UnixMicro(1_700_000_000_500_000)
-	tsMicros := int64(1_700_000_000_000_000)
-	id := fmt.Sprintf("tok42-%d-deadbeef", tsMicros)
-	dataKey := "p/data/period=A/" + id + ".parquet"
-
-	ci := commitInfo{
-		id:        id,
-		dataKey:   dataKey,
-		dataLM:    dataLM,
-		markerKey: "p/data/period=A/" + id + ".commit",
-		markerLM:  dataLM.Add(50 * time.Millisecond),
+// TestReadTokenCommitMeta_HappyPath confirms that the parser
+// extracts all three fields from a well-formed metadata map.
+func TestReadTokenCommitMeta_HappyPath(t *testing.T) {
+	meta := map[string]string{
+		attemptIDMetaKey:  testAttemptIDA,
+		refMicroTsMetaKey: "1710684000000000",
+		insertedAtMetaKey: "1710683999500000",
 	}
-
-	wr, err := reconstructWriteResult("p/_ref", ci, "period=A")
+	got, err := readTokenCommitMeta(meta)
 	if err != nil {
-		t.Fatalf("reconstructWriteResult: %v", err)
+		t.Fatalf("readTokenCommitMeta: %v", err)
 	}
-	if wr.DataPath != dataKey {
-		t.Errorf("DataPath = %q, want %q", wr.DataPath, dataKey)
+	if got.attemptID != testAttemptIDA {
+		t.Errorf("attemptID = %q, want %q", got.attemptID, testAttemptIDA)
 	}
-	if wr.InsertedAt != time.UnixMicro(tsMicros) {
-		t.Errorf("InsertedAt = %v, want %v",
-			wr.InsertedAt, time.UnixMicro(tsMicros))
+	if got.refMicroTs != 1710684000000000 {
+		t.Errorf("refMicroTs = %d, want %d",
+			got.refMicroTs, int64(1710684000000000))
 	}
-	wantRef := encodeRefKey("p/_ref", dataLM.UnixMicro(),
-		tsMicros, "deadbeef", "tok42", "period=A")
+	if got.insertedAtUs != 1710683999500000 {
+		t.Errorf("insertedAtUs = %d, want %d",
+			got.insertedAtUs, int64(1710683999500000))
+	}
+}
+
+// TestReadTokenCommitMeta_Invalid pins the failure modes: a
+// committed marker with malformed metadata is a hard error,
+// not "missing" — silent acceptance would let a corrupted
+// commit cause redundant retries.
+func TestReadTokenCommitMeta_Invalid(t *testing.T) {
+	cases := []struct {
+		name string
+		meta map[string]string
+	}{
+		{
+			name: "missing attemptid",
+			meta: map[string]string{
+				refMicroTsMetaKey: "1710684000000000",
+				insertedAtMetaKey: "1710683999500000",
+			},
+		},
+		{
+			name: "missing refmicrots",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA,
+				insertedAtMetaKey: "1710683999500000",
+			},
+		},
+		{
+			name: "missing insertedat",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA,
+				refMicroTsMetaKey: "1710684000000000",
+			},
+		},
+		{
+			name: "attemptid too short",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA[:31],
+				refMicroTsMetaKey: "1710684000000000",
+				insertedAtMetaKey: "1710683999500000",
+			},
+		},
+		{
+			name: "attemptid uppercase hex",
+			meta: map[string]string{
+				attemptIDMetaKey:  strings.ToUpper(testAttemptIDA),
+				refMicroTsMetaKey: "1710684000000000",
+				insertedAtMetaKey: "1710683999500000",
+			},
+		},
+		{
+			name: "attemptid non-hex char",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA[:31] + "z",
+				refMicroTsMetaKey: "1710684000000000",
+				insertedAtMetaKey: "1710683999500000",
+			},
+		},
+		{
+			name: "refmicrots not a number",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA,
+				refMicroTsMetaKey: "notanumber",
+				insertedAtMetaKey: "1710683999500000",
+			},
+		},
+		{
+			name: "insertedat not a number",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA,
+				refMicroTsMetaKey: "1710684000000000",
+				insertedAtMetaKey: "notanumber",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := readTokenCommitMeta(tc.meta); err == nil {
+				t.Errorf("want error for %v", tc.meta)
+			}
+		})
+	}
+}
+
+// TestReconstructWriteResult guards that the upfront-HEAD dedup
+// gate's reconstruction produces the same WriteResult shape the
+// original write would have returned. Drives the same
+// (token, attemptID, refMicroTs, partition) through encodeRefKey
+// so any drift in the formula breaks here. InsertedAt is sourced
+// from the token-commit's `insertedat` metadata (= the original
+// write's pre-encode wall-clock = the parquet column value), so
+// the assertion is against insertedAtUs, not refMicroTs.
+func TestReconstructWriteResult(t *testing.T) {
+	const refMicroTs int64 = 1_700_000_000_500_000
+	const insertedAtUs int64 = 1_700_000_000_000_000
+	meta := tokenCommitMeta{
+		attemptID:    testAttemptIDA,
+		refMicroTs:   refMicroTs,
+		insertedAtUs: insertedAtUs,
+	}
+	wr := reconstructWriteResult(
+		"p/data", "p/_ref", "period=A", "tok42", meta)
+
+	wantData := "p/data/period=A/" + makeID("tok42", testAttemptIDA) + ".parquet"
+	if wr.DataPath != wantData {
+		t.Errorf("DataPath = %q, want %q", wr.DataPath, wantData)
+	}
+	wantRef := encodeRefKey("p/_ref", refMicroTs,
+		"tok42", testAttemptIDA, "period=A")
 	if wr.RefPath != wantRef {
 		t.Errorf("RefPath = %q, want %q", wr.RefPath, wantRef)
 	}
 	if string(wr.Offset) != wantRef {
 		t.Errorf("Offset = %q, want %q", string(wr.Offset), wantRef)
+	}
+	if wr.InsertedAt != time.UnixMicro(insertedAtUs) {
+		t.Errorf("InsertedAt = %v, want %v (from insertedat metadata)",
+			wr.InsertedAt, time.UnixMicro(insertedAtUs))
+	}
+}
+
+// TestPutTokenCommit_MetaShape confirms the writer's PUT helper
+// assembles the metadata fields the reader's parser expects.
+// Round-trips through readTokenCommitMeta so future renames of
+// the metadata keys break here.
+func TestPutTokenCommit_MetaShape(t *testing.T) {
+	const refMicroTs int64 = 1_710_684_000_000_000
+	const insertedAtUs int64 = 1_710_683_999_500_000
+	meta := map[string]string{
+		attemptIDMetaKey:  testAttemptIDA,
+		refMicroTsMetaKey: strconv.FormatInt(refMicroTs, 10),
+		insertedAtMetaKey: strconv.FormatInt(insertedAtUs, 10),
+	}
+	got, err := readTokenCommitMeta(meta)
+	if err != nil {
+		t.Fatalf("readTokenCommitMeta(produced metadata): %v", err)
+	}
+	if got.attemptID != testAttemptIDA ||
+		got.refMicroTs != refMicroTs ||
+		got.insertedAtUs != insertedAtUs {
+		t.Errorf("round-trip drift: got (%q, %d, %d), want (%q, %d, %d)",
+			got.attemptID, got.refMicroTs, got.insertedAtUs,
+			testAttemptIDA, refMicroTs, insertedAtUs)
 	}
 }

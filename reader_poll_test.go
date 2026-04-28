@@ -97,11 +97,13 @@ func TestPoll_ConsistencyControlHeaderSent(t *testing.T) {
 	}
 }
 
-// TestPoll_EmptyConsistencyOmitsHeader guards the fast-path: no
-// ConsistencyControl wired in means no header sent. Correct on
-// AWS S3 / MinIO; relies on bucket-default consistency on
-// StorageGRID.
-func TestPoll_EmptyConsistencyOmitsHeader(t *testing.T) {
+// TestPoll_EmptyConsistencyDefaultsToStrongGlobal guards that an
+// unset ConsistencyControl on the config is substituted with the
+// library's safe-multi-site default (strong-global) at target
+// construction. AWS S3 / MinIO ignore the header so this is a
+// no-op for those backends; on StorageGRID it ensures
+// list-after-write converges across sites.
+func TestPoll_EmptyConsistencyDefaultsToStrongGlobal(t *testing.T) {
 	var sawHeader atomic.Value
 	srv := listServer(t, &sawHeader)
 	r := newTestReader(t, srv.URL, ConsistencyDefault)
@@ -111,7 +113,8 @@ func TestPoll_EmptyConsistencyOmitsHeader(t *testing.T) {
 		t.Fatalf("Poll: %v", err)
 	}
 	got, _ := sawHeader.Load().(string)
-	if got != "" {
-		t.Errorf("Consistency-Control header = %q, want empty", got)
+	if got != string(ConsistencyStrongGlobal) {
+		t.Errorf("Consistency-Control header = %q, want %q",
+			got, ConsistencyStrongGlobal)
 	}
 }

@@ -179,27 +179,28 @@ type S3TargetConfig struct {
 	// ConsistencyControl sets the Consistency-Control HTTP header
 	// applied to every correctness-critical S3 operation routed
 	// through this target — data PUTs (per-attempt-path, never
-	// overwriting), ref PUTs, commit-marker PUTs, projection
-	// marker PUTs, data / config GETs, post-data and post-marker
-	// HEADs, and every LIST (partition LIST on the read path,
-	// projection-marker LIST in ProjectionReader.Lookup,
-	// ref-stream LIST in Poll/PollRecords/ReadRangeIter, and the
-	// upfront-LIST dedup gate under {partition}/{token}- on
-	// idempotent writes).
+	// overwriting), ref PUTs, token-commit PUTs, projection
+	// marker PUTs, data / config GETs, the upfront-dedup HEAD on
+	// `<token>.commit`, and every LIST (partition LIST on the
+	// read path, projection-marker LIST in ProjectionReader.Lookup,
+	// ref-stream LIST in Poll/PollRecords/ReadRangeIter).
 	//
-	// Zero value (ConsistencyDefault) sends no header — bucket
-	// default applies. Correct on AWS S3 and MinIO (strongly
-	// consistent out of the box). On NetApp StorageGRID the bucket
-	// default is read-after-new-write, which is insufficient for
-	// list-after-write — set ConsistencyStrongGlobal (multi-site)
-	// or ConsistencyStrongSite (single-site) explicitly. See the
-	// README's "Consistency levels × S3 operations" section for
-	// the full matrix.
+	// Zero value (ConsistencyDefault) is substituted at
+	// construction with ConsistencyStrongGlobal — the safe
+	// multi-site choice that lets sequential same-token
+	// retries observe a prior token-commit overwrite without
+	// surfacing as a redundant PUT. Single-site deployments can
+	// downgrade to ConsistencyStrongSite explicitly when the
+	// per-call cost matters. AWS S3 and MinIO ignore the header
+	// entirely; the substitution is a no-op for those backends.
+	// See the README's "Consistency levels × S3 operations"
+	// section for the full matrix.
 	//
 	// Setting the level on the target rather than on the Writer /
-	// Reader / Projection configs enforces NetApp's "same consistency
-	// for paired operations" rule by construction: every operation
-	// routed through this target uses one and the same value.
+	// Reader / Projection configs enforces NetApp's "same
+	// consistency for paired operations" rule by construction:
+	// every operation routed through this target uses one and the
+	// same value.
 	ConsistencyControl ConsistencyLevel
 
 	// MeterProvider, when set, supplies the OTel meter used to
@@ -221,37 +222,40 @@ type S3TargetConfig struct {
 // commitTimeoutConfigKey is the object key under which the
 // dataset's CommitTimeout is persisted, relative to the target's
 // Prefix. NewS3Target GETs this object once at construction; the
-// body is a Go time.Duration string ("2s", "5s", ...). It bounds
-// the server-time gap between data PUT and commit-marker arrival
-// — the reader's timeliness check and the writer's post-marker
-// HEAD verification both consume this value, so writer and
-// reader agree by construction.
+// body is a Go time.Duration string ("2s", "5s", ...). With the
+// timeliness check dropped, CommitTimeout is now a writer-local
+// elapsed bound: writes whose end-to-end wall-clock exceeds it
+// increment s3store.write.commit_after_timeout (the commit still
+// lands; the metric flags that the SettleWindow tuned for this
+// value may not yet have included the write in the stream
+// window). The reader's SettleWindow remains derived from
+// CommitTimeout + MaxClockSkew so the writer's expected envelope
+// and the reader's emit cutoff stay paired by construction.
 const commitTimeoutConfigKey = "_config/commit-timeout"
 
 // maxClockSkewConfigKey is the object key under which the
 // dataset's MaxClockSkew is persisted, relative to the target's
 // Prefix. NewS3Target GETs this object once at construction; the
 // body is a Go time.Duration string ("0s", "500ms", "5s", ...). It
-// encodes the operator's assumed bound on reader↔server wall-clock
-// divergence and is consumed by the reader's refCutoff (via the
-// derived SettleWindow). The writer doesn't read it.
+// encodes the operator's assumed bound on writer↔reader
+// wall-clock divergence (refMicroTs in the ref filename is now
+// writer-stamped, so this skew is the one the reader's refCutoff
+// has to absorb via the derived SettleWindow). The writer doesn't
+// read it.
 const maxClockSkewConfigKey = "_config/max-clock-skew"
 
-// CommitTimeoutFloor is the minimum CommitTimeout value the
-// library accepts. 1s is the smallest value that's *meaningful*
-// given S3's second-precision LastModified — the timeliness check
-// (marker.LM - data.LM < CommitTimeout) compares two
-// server-stamped LMs that the wire protocol carries at second
-// precision (HEAD's RFC 1123 Last-Modified header is HTTP-date
-// format, second-precision; the cross-source truncation in
-// truncLMToSecond aligns LIST values to the same precision). A
-// data PUT and a marker PUT that straddle a wall-clock second
-// boundary appear 1s apart even when both completed in
-// milliseconds, so any CommitTimeout below 1s would reject those
-// writes outright. Most operators should pick 2s or higher to
-// leave headroom for slow PUTs on top of the second-boundary
-// effect.
-const CommitTimeoutFloor = 1 * time.Second
+// CommitTimeoutFloor is the lower bound enforced by
+// loadDurationConfig: values strictly less than this are rejected
+// with a "below the floor" error. Set to 0 — negatives are
+// rejected here; CommitTimeout = 0s itself is rejected by
+// loadTimingConfig with a more specific error explaining that
+// zero is not "unlimited" and would cause every write to exceed
+// the timeout. The historical 1 s floor existed because HTTP-date
+// `Last-Modified` is second-precision and the dropped timeliness
+// check could not resolve sub-second gaps; with LastModified out
+// of the protocol, the writer's local elapsed bound is honest at
+// any strictly positive value.
+const CommitTimeoutFloor = time.Duration(0)
 
 // MaxClockSkewFloor is the minimum MaxClockSkew value the library
 // accepts. Zero is a valid claim on tightly-clocked deployments
@@ -335,13 +339,14 @@ type S3Target struct {
 // GETs that follow have the wiring they need, then GETs the
 // persisted timing-config objects at <Prefix>/_config/commit-timeout
 // and <Prefix>/_config/max-clock-skew, parses each as a Go
-// time.Duration string, and validates against CommitTimeoutFloor /
-// MaxClockSkewFloor before stamping the values (and the derived
-// SettleWindow) on the Target. Construction fails when
-// ValidateLookup fails, when either object is missing, unparseable,
-// or below its floor — operators must seed the dataset's prefix
-// before any process can construct a Target against it (see
-// README's "Initializing a new dataset").
+// time.Duration string, and rejects values below the configured
+// floors (CommitTimeoutFloor = 0, MaxClockSkewFloor = 0 — only
+// negatives are nonsensical) before stamping the values (and the
+// derived SettleWindow) on the Target. Construction fails when
+// ValidateLookup fails or when either object is missing,
+// unparseable, or negative — operators must seed the dataset's
+// prefix before any process can construct a Target against it
+// (see README's "Initializing a new dataset").
 //
 // Does not call Validate (PartitionKeyParts) — that's a Writer /
 // Reader concern and is checked by NewWriter / NewReader, not by
@@ -368,10 +373,19 @@ func NewS3Target(ctx context.Context, cfg S3TargetConfig) (S3Target, error) {
 // newS3TargetSkipConfig allocates an S3Target without GETing the
 // persisted timing-config objects. Used internally by NewS3Target
 // (which then loads the values) and by tests that don't want a
-// live S3 dependency. Stamps CommitTimeoutFloor / MaxClockSkewFloor
-// as the resolved values so any code reading them gets a non-zero,
-// non-negative result.
+// live S3 dependency. Stamps the configured floors as the
+// resolved timing values so code reading them gets a non-negative
+// result before timing config is loaded.
+//
+// Substitutes the zero ConsistencyControl with the library's
+// safe-multi-site default (strong-global) so token-commit
+// overwrites converge under sequential same-token retries
+// without operator intervention. Single-site deployments can
+// pick strong-site explicitly when per-call cost matters.
 func newS3TargetSkipConfig(cfg S3TargetConfig) S3Target {
+	if cfg.ConsistencyControl == "" {
+		cfg.ConsistencyControl = ConsistencyStrongGlobal
+	}
 	warnIfUnknownConsistency(cfg.ConsistencyControl, "S3TargetConfig")
 	return S3Target{
 		cfg:           cfg,
@@ -387,6 +401,10 @@ func newS3TargetSkipConfig(cfg S3TargetConfig) S3Target {
 // loadTimingConfig GETs <Prefix>/_config/commit-timeout and
 // <Prefix>/_config/max-clock-skew, parses each body as a Go
 // time.Duration string, and rejects values below their floors.
+// CommitTimeout additionally must be strictly positive: zero
+// would cause every write to exceed the timeout and return an
+// error (the writer's elapsed wall-clock between write-start
+// and token-commit completion is always strictly positive).
 // Surfaces a hint at the operator's seeding step when either
 // object is missing.
 func loadTimingConfig(
@@ -396,6 +414,17 @@ func loadTimingConfig(
 		ctx, t, commitTimeoutConfigKey, CommitTimeoutFloor)
 	if err != nil {
 		return 0, 0, err
+	}
+	if commitTimeout == 0 {
+		return 0, 0, fmt.Errorf(
+			"s3store: %s/%s/%s resolves to 0s — CommitTimeout "+
+				"must be strictly positive (zero is not "+
+				"\"unlimited\"; it would cause every write to "+
+				"exceed the timeout and return an error); "+
+				"operators typically pick a value tuned to "+
+				"their max expected upload duration, on the "+
+				"order of seconds",
+			t.cfg.Bucket, t.cfg.Prefix, commitTimeoutConfigKey)
 	}
 	maxClockSkew, err = loadDurationConfig(
 		ctx, t, maxClockSkewConfigKey, MaxClockSkewFloor)
@@ -466,28 +495,32 @@ func (t S3Target) ConsistencyControl() ConsistencyLevel {
 
 // CommitTimeout returns the value resolved at construction time
 // from <Prefix>/_config/commit-timeout. Pure accessor — no I/O.
-// Bounds the server-time gap between data PUT and commit-marker
-// arrival; consumed by the writer's PUT budget and the reader's
-// timeliness check.
+// Bounds the writer's end-to-end wall-clock budget for one Write:
+// past CommitTimeout, the s3store.write.commit_after_timeout
+// counter increments (the commit still lands; the metric flags
+// that the reader's SettleWindow tuned for this CommitTimeout may
+// not yet have included this write in the stream window).
 func (t S3Target) CommitTimeout() time.Duration {
 	return t.commitTimeout
 }
 
 // MaxClockSkew returns the value resolved at construction time
 // from <Prefix>/_config/max-clock-skew. Pure accessor — no I/O.
-// Operator's assumed bound on writer↔reader wall-clock divergence;
-// consumed by the reader's refCutoff via SettleWindow.
+// Operator's assumed bound on writer↔reader wall-clock divergence
+// (refMicroTs in the ref filename is writer-stamped, so this is
+// the skew SettleWindow has to absorb). Consumed by the reader's
+// refCutoff via SettleWindow.
 func (t S3Target) MaxClockSkew() time.Duration {
 	return t.maxClockSkew
 }
 
 // SettleWindow returns the derived sum CommitTimeout + MaxClockSkew.
-// Used in one place: Poll's refCutoff = now - SettleWindow. Pure
-// optimization once the marker timeliness check is the actual
-// visibility gate — refCutoff just bounds which refs to HEAD-check.
-// Sized so even at the worst-case skew, the refCutoff cannot
-// overtake refs whose markers might still be valid server-side.
-// Pure accessor — no I/O.
+// Used by Poll's `refCutoff = now - SettleWindow`. Sized so the
+// cutoff cannot overtake refs whose token-commit is still being
+// written: CommitTimeout bounds the writer's full ref-PUT +
+// token-commit-PUT envelope, MaxClockSkew bounds the
+// writer↔reader wall-clock divergence applied to the
+// writer-stamped refMicroTs. Pure accessor — no I/O.
 func (t S3Target) SettleWindow() time.Duration {
 	return t.commitTimeout + t.maxClockSkew
 }

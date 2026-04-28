@@ -1,120 +1,134 @@
 package s3store
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
 
+const (
+	testAttemptIDA = "0190a1b23c4d7e5f8a9bcdef01234567"
+	testAttemptIDB = "0190a1b23c4d7e5f8a9bcdef01234568"
+)
+
 func TestRefKeyRoundTrip(t *testing.T) {
 	const refPath = "test-prefix/_ref"
-	const dataLM int64 = 1710684000000000
-	const tsMicros int64 = 1710683999500000
-	const shortID = "a3f2e1b4"
+	const refMicroTs int64 = 1710684000000000
 
 	cases := []struct {
-		name  string
-		key   string
-		token string
+		name      string
+		token     string
+		attemptID string
+		hiveKey   string
 	}{
-		{"simple, no token", "period=2026-03-17/customer=abc", ""},
-		{"simple, with token", "period=2026-03-17/customer=abc", "tok42"},
-		{"hyphen in value", "period=2026-03-17/customer=foo-bar", "tok42"},
-		{"hyphen in token", "period=X/customer=y", "2026-04-22T10:15:00Z-batch42"},
-		{"semicolon in value", "period=X/customer=a;b", ""},
-		{"percent in value", "period=X/customer=50%off", "tok42"},
-		{"slash in value", "period=X/customer=a/b", ""},
-		{"question mark in value", "period=X/customer=who?", "tok42"},
-		{"unicode", "period=X/customer=日本", ""},
-		{"space in value", "period=X/customer=hello world", "tok42"},
+		{"idempotent simple", "tok42", testAttemptIDA,
+			"period=2026-03-17/customer=abc"},
+		{"idempotent, hyphen in value", "tok42", testAttemptIDA,
+			"period=2026-03-17/customer=foo-bar"},
+		{"idempotent, hyphen in token", "2026-04-22T10:15:00Z-batch42",
+			testAttemptIDA, "period=X/customer=y"},
+		{"idempotent, semicolon in value (escaped)", "tok42", testAttemptIDA,
+			"period=X/customer=a;b"},
+		{"idempotent, percent in value", "tok42", testAttemptIDA,
+			"period=X/customer=50%off"},
+		{"idempotent, slash in value", "tok42", testAttemptIDA,
+			"period=X/customer=a/b"},
+		{"idempotent, question mark in value", "tok42", testAttemptIDA,
+			"period=X/customer=who?"},
+		{"idempotent, unicode in value", "tok42", testAttemptIDA,
+			"period=X/customer=日本"},
+		{"idempotent, space in value", "tok42", testAttemptIDA,
+			"period=X/customer=hello world"},
+		// Auto-token (token == attemptID, same UUIDv7 used for both)
+		// — the path stays uniform, parser still has one case.
+		{"auto-token (token == attemptID)", testAttemptIDA, testAttemptIDA,
+			"period=2026-03-17/customer=abc"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			encoded := encodeRefKey(refPath, dataLM, tsMicros,
-				shortID, tc.token, tc.key)
+			encoded := encodeRefKey(refPath, refMicroTs,
+				tc.token, tc.attemptID, tc.hiveKey)
 
-			gotKey, gotDataLM, gotTs, gotShort, gotTok, err := parseRefKey(encoded)
+			gotHive, gotTs, gotTok, gotAtt, err := parseRefKey(encoded)
 			if err != nil {
 				t.Fatalf("parseRefKey(%q): %v", encoded, err)
 			}
-			if gotKey != tc.key {
-				t.Errorf("key: got %q want %q", gotKey, tc.key)
+			if gotHive != tc.hiveKey {
+				t.Errorf("hiveKey: got %q want %q", gotHive, tc.hiveKey)
 			}
-			if gotDataLM != dataLM {
-				t.Errorf("dataLM: got %d want %d", gotDataLM, dataLM)
-			}
-			if gotTs != tsMicros {
-				t.Errorf("tsMicros: got %d want %d", gotTs, tsMicros)
-			}
-			if gotShort != shortID {
-				t.Errorf("shortID: got %q want %q", gotShort, shortID)
+			if gotTs != refMicroTs {
+				t.Errorf("refMicroTs: got %d want %d", gotTs, refMicroTs)
 			}
 			if gotTok != tc.token {
 				t.Errorf("token: got %q want %q", gotTok, tc.token)
+			}
+			if gotAtt != tc.attemptID {
+				t.Errorf("attemptID: got %q want %q", gotAtt, tc.attemptID)
 			}
 		})
 	}
 }
 
 // TestRefKeyLexicalOrdering guards that ref filenames sort in
-// timestamp order via plain byte comparison: dataLM is the
-// primary lex key (Poll's refCutoff relies on this), and tsMicros
-// is the within-second tiebreaker so refs from same-second
-// writes have stable sub-second order.
+// timestamp order via plain byte comparison: refMicroTs is the
+// primary lex key, and Poll's refCutoff relies on this for the
+// settle-window cutoff to be a clean prefix bound.
 func TestRefKeyLexicalOrdering(t *testing.T) {
 	const refPath = "test-prefix/_ref"
-	const key = "period=2026-03-17/customer=abc"
+	const hiveKey = "period=2026-03-17/customer=abc"
 
-	// Primary axis: dataLM. Different dataLMs sort by dataLM
-	// regardless of tsMicros.
-	dataLMs := []int64{
+	timestamps := []int64{
 		1_000_000_000_000_000,
 		1_710_684_000_000_000,
 		9_000_000_000_000_000,
 	}
-	var byLM []string
-	for _, lm := range dataLMs {
-		byLM = append(byLM,
-			encodeRefKey(refPath, lm, lm-1, "abcd1234", "", key))
+	var byTs []string
+	for _, ts := range timestamps {
+		byTs = append(byTs,
+			encodeRefKey(refPath, ts, "tok42", testAttemptIDA, hiveKey))
 	}
-	for i := 0; i < len(byLM)-1; i++ {
-		if byLM[i] >= byLM[i+1] {
-			t.Errorf("lexical order violated by dataLM:\n %q\n !< %q",
-				byLM[i], byLM[i+1])
+	for i := 0; i < len(byTs)-1; i++ {
+		if byTs[i] >= byTs[i+1] {
+			t.Errorf("lexical order violated by refMicroTs:\n %q\n !< %q",
+				byTs[i], byTs[i+1])
 		}
 	}
 
-	// Secondary axis: tsMicros tiebreaker within same dataLM.
-	const sameLM int64 = 1_710_684_000_000_000
-	a := encodeRefKey(refPath, sameLM, 1_710_684_000_000_111,
-		"aaaaaaaa", "", key)
-	b := encodeRefKey(refPath, sameLM, 1_710_684_000_000_999,
-		"bbbbbbbb", "", key)
-	if a >= b {
-		t.Errorf("same-dataLM tsMicros ordering: %q !< %q", a, b)
+	// Within the same refMicroTs, ordering between concurrent
+	// writers' refs is implementation-defined (depends on
+	// alphanumeric collation of token + attemptID); the change-
+	// stream contract already tolerates this via SettleWindow.
+	// Refs at the same refMicroTs must at least be distinct keys
+	// when token or attemptID differs.
+	const sameTs int64 = 1_710_684_000_000_000
+	a := encodeRefKey(refPath, sameTs, "tok42", testAttemptIDA, hiveKey)
+	b := encodeRefKey(refPath, sameTs, "tok42", testAttemptIDB, hiveKey)
+	if a == b {
+		t.Errorf("distinct attemptIDs produced identical ref keys: %q", a)
 	}
-
-	// Token writes and auto writes share the same lex-relevant
-	// dataLM-tsMicros-shortID prefix. Within-prefix ordering
-	// (auto vs token) is implementation-defined and not part of
-	// the Poll contract — Poll's refCutoff only inspects the
-	// 16-digit dataLM portion.
 }
 
 func TestParseRefKeyInvalid(t *testing.T) {
 	cases := []string{
 		"not-a-ref-key",
 		"refs/garbage.ref",
-		"refs/1710684000000000.ref",                                          // no separator
-		"refs/1710684000000000;period=X.ref",                                 // pre-sep too short
-		"refs/1710684000000000-1710683999500000;period=X.ref",                // missing shortID
-		"refs/notanumber-1710683999500000-abcd1234;period=X.ref",             // non-numeric dataLM
-		"refs/1710684000000000-notanumber-abcd1234;period=X.ref",             // non-numeric tsMicros
-		"refs/1710684000000000-1710683999500000-abcd1234;period=X%ZZabc.ref", // invalid percent escape
+		"refs/1710684000000000.ref",          // no separator
+		"refs/1710684000000000;period=X.ref", // pre-sep too short
+		"refs/1710684000000000-tok-" + testAttemptIDA[:30] + // attemptID too short
+			";period=X.ref",
+		"refs/1710684000000000-tok-" + testAttemptIDA + "Z" + // attemptID has non-hex
+			";period=X.ref",
+		"refs/notanumber0000000-tok-" + testAttemptIDA + // refMicroTs non-digit
+			";period=X.ref",
+		// missing token segment between refMicroTs and attemptID
+		"refs/1710684000000000-" + testAttemptIDA + ";period=X.ref",
+		// invalid percent escape in hiveKey
+		"refs/1710684000000000-tok-" + testAttemptIDA + ";period=X%ZZabc.ref",
 	}
 	for _, raw := range cases {
 		t.Run(raw, func(t *testing.T) {
-			if _, _, _, _, _, err := parseRefKey(raw); err == nil {
+			if _, _, _, _, err := parseRefKey(raw); err == nil {
 				t.Errorf("parseRefKey(%q): expected error", raw)
 			}
 		})
@@ -133,76 +147,89 @@ func TestRefCutoff(t *testing.T) {
 	cutoff := refCutoff(refPath, now, settle)
 
 	earlierTs := now.Add(-settle).Add(-time.Second).UnixMicro()
-	earlier := encodeRefKey(refPath, earlierTs, earlierTs,
-		"abcd1234", "", "period=X/customer=y")
+	earlier := encodeRefKey(refPath, earlierTs,
+		"tok42", testAttemptIDA, "period=X/customer=y")
 	if earlier >= cutoff {
 		t.Errorf("earlier ref %q should sort before cutoff %q",
 			earlier, cutoff)
 	}
 
-	later := encodeRefKey(refPath, now.UnixMicro(), now.UnixMicro(),
-		"abcd1234", "", "period=X/customer=y")
+	later := encodeRefKey(refPath, now.UnixMicro(),
+		"tok42", testAttemptIDA, "period=X/customer=y")
 	if later <= cutoff {
 		t.Errorf("later ref %q should sort after cutoff %q",
 			later, cutoff)
 	}
 }
 
-// TestParseID covers the round-trip and corner cases of the
-// data-file id helpers shared by the writer, the reader, and
-// the upfront-LIST dedup gate.
-func TestParseID(t *testing.T) {
+// TestParseAttemptID covers the round-trip and corner cases of
+// the data-file id helpers shared by the writer, the reader, and
+// the upfront-HEAD dedup gate.
+func TestParseAttemptID(t *testing.T) {
 	cases := []struct {
 		name      string
 		token     string
-		tsMicros  int64
-		shortID   string
-		wantParse bool // true = should round-trip
+		attemptID string
 	}{
-		{"auto-id (no token)", "", 1_700_000_000_000_000, "deadbeef", true},
-		{"with token", "tok42", 1_700_000_000_000_000, "deadbeef", true},
-		{"token with dashes", "2026-04-22T10:15:00Z-batch42",
-			1_700_000_000_000_000, "abcdef01", true},
+		{"idempotent token", "tok42", testAttemptIDA},
+		{"token with dashes", "2026-04-22T10:15:00Z-batch42", testAttemptIDA},
+		{"auto-token (same UUIDv7 in both halves)", testAttemptIDA, testAttemptIDA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			id := makeID(tc.token, tc.tsMicros, tc.shortID)
-			gotTok, gotTs, gotShort, err := parseID(id)
-			if !tc.wantParse {
-				if err == nil {
-					t.Errorf("parseID(%q): want error", id)
-				}
-				return
-			}
+			id := makeID(tc.token, tc.attemptID)
+			gotTok, gotAtt, err := parseAttemptID(id)
 			if err != nil {
-				t.Fatalf("parseID(%q): %v", id, err)
+				t.Fatalf("parseAttemptID(%q): %v", id, err)
 			}
-			if gotTok != tc.token || gotTs != tc.tsMicros ||
-				gotShort != tc.shortID {
-				t.Errorf("round-trip drift: id=%q parsed=(%q, %d, %q), want (%q, %d, %q)",
-					id, gotTok, gotTs, gotShort,
-					tc.token, tc.tsMicros, tc.shortID)
+			if gotTok != tc.token || gotAtt != tc.attemptID {
+				t.Errorf("round-trip drift: id=%q parsed=(%q, %q), want (%q, %q)",
+					id, gotTok, gotAtt, tc.token, tc.attemptID)
 			}
 		})
 	}
 }
 
-func TestParseIDInvalid(t *testing.T) {
+func TestParseAttemptIDInvalid(t *testing.T) {
 	cases := []string{
-		"deadbeef",                     // too short, no separator
-		"1234-deadbeef",                // tsMicros wrong width
-		"17000000000000-deadbeef",      // tsMicros 14 digits
-		"1700000000000000-deadbe",      // shortID 6 chars
-		"1700000000000000-DEADBEEF",    // shortID uppercase (we require lowercase)
-		"foo1700000000000000-deadbeef", // missing - between token and tsMicros
-		"170000000000000a-deadbeef",    // non-digit in tsMicros
-		"1700000000000000-deadbeeg",    // non-hex in shortID
+		"deadbeef",                               // way too short
+		"tok-deadbeef",                           // attemptID too short
+		"tok-" + testAttemptIDA[:31],             // attemptID 31 chars
+		"tok-" + strings.ToUpper(testAttemptIDA), // uppercase hex
+		"tok-" + testAttemptIDA + "z",            // 33 chars including non-hex
+		"tok" + testAttemptIDA,                   // missing - between token and attemptID
 	}
 	for _, raw := range cases {
 		t.Run(raw, func(t *testing.T) {
-			if _, _, _, err := parseID(raw); err == nil {
-				t.Errorf("parseID(%q): want error", raw)
+			if _, _, err := parseAttemptID(raw); err == nil {
+				t.Errorf("parseAttemptID(%q): want error", raw)
 			}
 		})
+	}
+}
+
+// TestNewAttemptID confirms the writer-side generator produces a
+// 32-char lowercase-hex string (the round-trip-able shape
+// parseAttemptID expects). UUIDv7's 48-bit timestamp prefix is
+// time-sortable; we don't assert on the value beyond shape.
+func TestNewAttemptID(t *testing.T) {
+	a, err := newAttemptID()
+	if err != nil {
+		t.Fatalf("newAttemptID: %v", err)
+	}
+	if len(a) != attemptIDHexLen {
+		t.Errorf("len = %d, want %d", len(a), attemptIDHexLen)
+	}
+	if !isLowerHex(a) {
+		t.Errorf("%q is not lowercase hex", a)
+	}
+	// Two consecutive calls must produce distinct ids — the random
+	// suffix is 74 bits; collisions are practically impossible.
+	b, err := newAttemptID()
+	if err != nil {
+		t.Fatalf("newAttemptID: %v", err)
+	}
+	if a == b {
+		t.Errorf("two newAttemptID calls returned identical %q", a)
 	}
 }

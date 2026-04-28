@@ -179,10 +179,14 @@ func TestConsistencyControl_HeaderSentOnPUT(t *testing.T) {
 	}
 }
 
-// TestConsistencyControl_EmptyOmitsHeader: when the level is
-// ConsistencyDefault (empty), no header is sent — preserves the
-// "AWS / MinIO sees no surprise header" contract.
-func TestConsistencyControl_EmptyOmitsHeader(t *testing.T) {
+// TestConsistencyControl_DefaultsToStrongGlobal: when the level
+// is ConsistencyDefault (empty) at config time, NewS3Target
+// substitutes ConsistencyStrongGlobal so token-commit overwrites
+// converge under sequential same-token retries on multi-site
+// StorageGRID without operator intervention. AWS S3 and MinIO
+// ignore the header so the substitution is a no-op for those
+// backends.
+func TestConsistencyControl_DefaultsToStrongGlobal(t *testing.T) {
 	stubBackoff(t)
 	var sawHeader atomic.Value
 	srv, _ := headServer(t,
@@ -199,8 +203,9 @@ func TestConsistencyControl_EmptyOmitsHeader(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 	got, _ := sawHeader.Load().(string)
-	if got != "" {
-		t.Errorf("Consistency-Control header = %q, want empty", got)
+	if got != string(ConsistencyStrongGlobal) {
+		t.Errorf("Consistency-Control header = %q, want %q",
+			got, ConsistencyStrongGlobal)
 	}
 }
 

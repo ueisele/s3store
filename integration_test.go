@@ -3024,14 +3024,15 @@ func TestWriteWithIdempotencyToken_FreshAndRetry(t *testing.T) {
 }
 
 // TestWriteWithIdempotencyToken_RetryAfterFailedAttempt simulates
-// a failed prior attempt (data + ref landed but the commit marker
-// got externally deleted, mimicking "marker PUT failed" or
+// a failed prior attempt (data + ref landed but the token-commit
+// got externally deleted, mimicking "token-commit PUT failed" or
 // "operator-driven sweeper reclaimed an orphan"). The retry's
-// upfront LIST sees no valid commit and creates a fresh
-// per-attempt path with a fresh server-stamped data.LM.
+// upfront HEAD on `<token>.commit` sees 404 and creates a fresh
+// per-attempt path with a fresh attempt-id.
 //
 // Asserts the per-attempt-path uniqueness invariant: two attempts
-// of the same token land at *different* data files.
+// of the same token land at *different* data files (no overwrite
+// of the prior attempt's parquet).
 func TestWriteWithIdempotencyToken_RetryAfterFailedAttempt(t *testing.T) {
 	ctx := context.Background()
 	store := newIdempotentStore(t)
@@ -3049,19 +3050,18 @@ func TestWriteWithIdempotencyToken_RetryAfterFailedAttempt(t *testing.T) {
 		t.Fatalf("fresh write: %v", err)
 	}
 
-	// Simulate a failed prior attempt: delete the commit marker
-	// out-of-band so the upfront LIST sees a .parquet without a
-	// timely .commit sibling. Under Phase 4 a missing or stale
-	// marker means "no valid commit"; the retry must take the
-	// fresh-attempt path.
+	// Simulate a failed prior attempt: delete the token-commit
+	// out-of-band so the upfront HEAD on <token>.commit returns
+	// 404. The retry must take the fresh-attempt path.
 	firstID := strings.TrimSuffix(path.Base(first.DataPath), ".parquet")
-	markerKey := strings.TrimSuffix(first.DataPath, ".parquet") + ".commit"
+	commitKey := tokenCommitKey(
+		store.Target().Prefix()+"/data", key, token)
 	if _, err := store.Target().S3Client().DeleteObject(ctx,
 		&s3.DeleteObjectInput{
 			Bucket: aws.String(store.Target().Bucket()),
-			Key:    aws.String(markerKey),
+			Key:    aws.String(commitKey),
 		}); err != nil {
-		t.Fatalf("DeleteObject marker: %v", err)
+		t.Fatalf("DeleteObject token-commit: %v", err)
 	}
 
 	second, err := store.WriteWithKey(ctx, key, rec,
@@ -3099,10 +3099,12 @@ func TestWriteWithIdempotencyToken_RetryAfterFailedAttempt(t *testing.T) {
 
 // TestWriteWithIdempotencyToken_PerAttemptTriple verifies that a
 // successful Write under WithIdempotencyToken lands all three
-// per-attempt objects: data (.parquet), commit marker (.commit),
-// and ref. The .parquet and .commit are siblings in the partition
-// directory under the same id; the ref is in _ref/. Plain Write
-// (no token) lands the same triple, just with a token-less id.
+// objects that make up the commit: the per-attempt data file
+// (.parquet at the partition under {token}-{attemptID}), the ref
+// (in _ref/), and the token-commit marker (.commit at the
+// partition under {token}). Unlike the per-attempt commit of the
+// earlier design, the token-commit is shared across retries —
+// it's the single atomic event that flips read visibility.
 func TestWriteWithIdempotencyToken_PerAttemptTriple(t *testing.T) {
 	ctx := context.Background()
 	store := newIdempotentStore(t)
@@ -3124,33 +3126,36 @@ func TestWriteWithIdempotencyToken_PerAttemptTriple(t *testing.T) {
 	if !strings.HasPrefix(id, token+"-") {
 		t.Errorf("id %q does not carry token prefix", id)
 	}
-	wantMarker := strings.TrimSuffix(wr.DataPath, ".parquet") + ".commit"
+	wantCommit := tokenCommitKey(
+		store.Target().Prefix()+"/data", key, token)
 
 	// Confirm all three objects exist on S3.
-	for _, key := range []string{wr.DataPath, wantMarker, wr.RefPath} {
+	for _, key := range []string{wr.DataPath, wantCommit, wr.RefPath} {
 		_, err := store.Target().S3Client().HeadObject(ctx,
 			&s3.HeadObjectInput{
 				Bucket: aws.String(store.Target().Bucket()),
 				Key:    aws.String(key),
 			})
 		if err != nil {
-			t.Errorf("HeadObject(%q): %v (per-attempt triple "+
-				"must include data + ref + commit marker)", key, err)
+			t.Errorf("HeadObject(%q): %v (commit triple must "+
+				"include data + ref + token-commit)", key, err)
 		}
 	}
 
-	// Confirm the marker carries the dataLM user metadata that
-	// the change-stream read path will consume in Phase 6.
+	// Confirm the token-commit carries the user metadata that
+	// reads consume to identify the canonical attempt and
+	// reconstruct WriteResult on retry.
 	hd, err := store.Target().S3Client().HeadObject(ctx,
 		&s3.HeadObjectInput{
 			Bucket: aws.String(store.Target().Bucket()),
-			Key:    aws.String(wantMarker),
+			Key:    aws.String(wantCommit),
 		})
 	if err != nil {
-		t.Fatalf("HeadObject(marker): %v", err)
+		t.Fatalf("HeadObject(token-commit): %v", err)
 	}
-	if _, ok := hd.Metadata["datalm"]; !ok {
-		t.Errorf("marker metadata missing datalm: %v", hd.Metadata)
+	if _, err := readTokenCommitMeta(hd.Metadata); err != nil {
+		t.Errorf("token-commit metadata invalid: %v (got %v)",
+			err, hd.Metadata)
 	}
 }
 
@@ -3432,18 +3437,16 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 	}
 }
 
-// TestCommitTimeout_BelowFloorRejected guards that NewS3Target
+// TestCommitTimeout_NegativeRejected guards that NewS3Target
 // rejects a persisted CommitTimeout below CommitTimeoutFloor.
-// The floor is 1s — below that, the timeliness check
-// (marker.LM - data.LM < CommitTimeout) would reject every
-// write that straddles a wall-clock second boundary even when
-// the PUTs completed in milliseconds (HEAD's RFC 1123
-// LastModified is second-precision; the cross-source
-// truncation in truncLMToSecond aligns LIST values to match).
-func TestCommitTimeout_BelowFloorRejected(t *testing.T) {
+// The floor is zero — the historical 1s minimum existed because
+// HTTP-date `Last-Modified` is second-precision and the dropped
+// timeliness check could not resolve sub-second gaps. With the
+// timeliness check gone, only negative values are nonsensical.
+func TestCommitTimeout_NegativeRejected(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
-	f.seedDurationConfig(t, "store/_config/commit-timeout", 100*time.Millisecond)
+	f.seedDurationConfig(t, "store/_config/commit-timeout", -100*time.Millisecond)
 	f.seedDurationConfig(t, "store/_config/max-clock-skew", testMaxClockSkew)
 
 	_, err := NewS3Target(ctx, S3TargetConfig{
@@ -3453,10 +3456,36 @@ func TestCommitTimeout_BelowFloorRejected(t *testing.T) {
 		PartitionKeyParts: []string{"period", "customer"},
 	})
 	if err == nil {
-		t.Fatal("expected error for below-floor CommitTimeout, got nil")
+		t.Fatal("expected error for negative CommitTimeout, got nil")
 	}
 	if !strings.Contains(err.Error(), "floor") {
 		t.Errorf("error %q should mention the floor", err)
+	}
+}
+
+// TestCommitTimeout_ZeroRejected guards that CommitTimeout = 0s
+// is rejected with a clear "must be strictly positive" error
+// (zero is not "unlimited" — the writer's elapsed wall-clock is
+// always strictly positive, so a zero CommitTimeout would cause
+// every write to surface the "committed after CommitTimeout"
+// error).
+func TestCommitTimeout_ZeroRejected(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.seedDurationConfig(t, "store/_config/commit-timeout", 0)
+	f.seedDurationConfig(t, "store/_config/max-clock-skew", testMaxClockSkew)
+
+	_, err := NewS3Target(ctx, S3TargetConfig{
+		Bucket:            f.Bucket,
+		Prefix:            "store",
+		S3Client:          f.S3Client,
+		PartitionKeyParts: []string{"period", "customer"},
+	})
+	if err == nil {
+		t.Fatal("expected error for zero CommitTimeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "strictly positive") {
+		t.Errorf("error %q should mention 'strictly positive'", err)
 	}
 }
 

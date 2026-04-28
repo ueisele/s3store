@@ -150,8 +150,8 @@ func newFixture(t *testing.T) *fixture {
 // values (plus the derived SettleWindow) on the Target. Mirrors
 // the boto3 snippet operators run once per dataset (see README's
 // "Initializing a new dataset"). Tests pass values >= the floors
-// (CommitTimeoutFloor = 50ms, MaxClockSkewFloor = 0); the parser
-// rejects anything below.
+// (CommitTimeoutFloor = 0, MaxClockSkewFloor = 0); the parser
+// rejects negative values.
 func (f *fixture) SeedTimingConfig(
 	t *testing.T, prefix string,
 	commitTimeout, maxClockSkew time.Duration,

@@ -2,266 +2,197 @@ package s3store
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"path"
-	"strings"
+	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// Commit-marker primitives shared by the write path's upfront-LIST
-// dedup gate, the post-marker timeliness check, the snapshot
-// reader's pairing, and (Phase 7) LookupCommit.
+// Token-commit primitives.
 //
-// A commit marker is a zero-byte sibling of the data file at
-// {dataPath}/{partition}/{id}.commit. The marker existing alone
-// is not enough — its server-stamped LastModified must satisfy
-// `marker.LM - data.LM < CommitTimeout` for the commit to be
-// considered valid. Both timestamps come from S3's response
-// headers, so the comparison is free of client/server clock skew.
+// The token-commit is a zero-byte object at
+// `<dataPath>/<partition>/<token>.commit` with three pieces of
+// user-metadata encoding the canonical attempt:
 //
-// Per-attempt-paths under WithIdempotencyToken: every retry of
-// the same logical write lands at a fresh per-attempt id
-// ({token}-{tsMicros}-{shortID}), so the write path never
-// overwrites — sidesteps multi-site StorageGRID's eventual-
-// consistency exposure on overwrites. The upfront LIST under
-// {partition}/{token}- is the dedup gate.
+//   - attemptIDMetaKey ("attemptid"): the UUIDv7 hex string
+//     (32 lowercase hex chars) identifying the canonical
+//     data-file basename `<token>-<attemptID>` for this commit.
+//   - refMicroTsMetaKey ("refmicrots"): the decimal microseconds
+//     refMicroTs the canonical ref filename is anchored on.
+//   - insertedAtMetaKey ("insertedat"): the writer's pre-encode
+//     wall-clock at write-start, decimal microseconds. Identical
+//     to the value stamped into the parquet's InsertedAtField
+//     column. Stored on the marker so a same-token retry's
+//     reconstructed WriteResult.InsertedAt matches the original
+//     attempt's column value (without it, retries would surface
+//     `refMicroTs` — a slightly later wall-clock).
+//
+// Together with the partition Hive key (known from the lookup
+// path) and the dataset's data / ref prefixes (known from the
+// target), the metadata fully reconstructs the WriteResult of
+// the original write — no second round trip, no LIST needed.
+//
+// The token-commit is the single atomic event that flips
+// visibility for both read paths: snapshot reads pair it with
+// `<token>-*.parquet` siblings via partition LIST; stream reads
+// HEAD it per ref. Crash before the token-commit PUT → invisible
+// to both; crash after → visible to both.
 
-// commitMarkerKey returns the S3 object key of the commit marker
-// for a data file. Format: {dataPath}/{partition}/{id}.commit
-// (sibling of the .parquet under the same partition).
-func commitMarkerKey(dataPath, partition, id string) string {
-	return fmt.Sprintf("%s/%s/%s.commit", dataPath, partition, id)
+// attemptIDMetaKey is the user-metadata header carrying the
+// canonical attempt's UUIDv7 hex (32 lowercase hex chars).
+//
+// Lowercase, no separator: AWS SDK v2 surfaces user-metadata keys
+// lowercased on the response side; matching on the produce side
+// keeps the round-trip consistent across SDK versions.
+const attemptIDMetaKey = "attemptid"
+
+// refMicroTsMetaKey is the user-metadata header carrying the
+// canonical ref's refMicroTs (decimal microseconds).
+const refMicroTsMetaKey = "refmicrots"
+
+// insertedAtMetaKey is the user-metadata header carrying the
+// writer's pre-encode wall-clock (decimal microseconds) — the same
+// value stamped into the parquet's InsertedAtField column, so
+// WriteResult.InsertedAt agrees with the in-file column on every
+// path (fresh write, retry-found-commit, LookupCommit).
+const insertedAtMetaKey = "insertedat"
+
+// tokenCommitKey returns the S3 object key of the token-level
+// commit marker. Format:
+// `{dataPath}/{partition}/{token}.commit`.
+func tokenCommitKey(dataPath, partition, token string) string {
+	return fmt.Sprintf("%s/%s/%s.commit", dataPath, partition, token)
 }
 
-// dataLMMetaKey is the user-metadata header that the writer
-// stamps on the commit marker carrying the data file's server-
-// stamped LastModified, in microseconds since the Unix epoch
-// encoded as decimal. The change-stream read path consumes it
-// to apply isCommitValid with a single per-ref HEAD on the
-// marker — no second HEAD on the data file. Snapshot reads,
-// the upfront-LIST dedup gate, and LookupCommit get
-// data.LastModified directly from their LIST response and
-// don't need the marker's metadata.
-//
-// Lowercase: AWS SDK v2 surfaces user-metadata keys lowercased.
-const dataLMMetaKey = "datalm"
+// tokenCommitMeta is the parsed user-metadata of a token-commit:
+// the canonical attempt-id (UUIDv7 hex), the canonical ref's
+// refMicroTs, and the writer's pre-encode wall-clock at
+// write-start (= InsertedAtField column value).
+type tokenCommitMeta struct {
+	attemptID    string
+	refMicroTs   int64
+	insertedAtUs int64
+}
 
-// isCommitValid reports whether a commit marker is timely enough
-// to count as committed. Both timestamps are S3-server-stamped, so
-// the comparison is free of client/server clock skew and produces
-// the same answer for every reader regardless of clock state.
-//
-// The contract is server-time-only: the writer's wall clock is
-// not in the protocol. dataLM is captured by the writer's
-// post-data HEAD (so refTsMicros is server-stamped), and markerLM
-// is read from the marker HEAD or LIST response.
-//
-// **Assumption:** the gap between two server-stamped LMs reflects
-// the gap between when the two objects first became *observable*
-// to any reader. See CLAUDE.md "Backend assumptions" — the
-// library is correct only on backends where
-// `LastModified ≈ first-observable-time` (AWS S3, MinIO, and
-// StorageGRID at `strong-*` all qualify; weaker levels and
-// non-S3-compliant backends may not).
-//
-// A zero dataLM or markerLM trips the false branch — caller's
-// responsibility to feed populated values.
-func isCommitValid(dataLM, markerLM time.Time, commitTimeout time.Duration) bool {
-	if dataLM.IsZero() || markerLM.IsZero() {
-		return false
+// readTokenCommitMeta extracts the structured metadata from a
+// token-commit's response headers. Validates that all three
+// fields are present and well-formed; an existing commit with
+// malformed metadata is a hard error, not a "missing" — silently
+// ignoring it would let a corrupted commit surface as "no commit
+// yet" and cause a redundant retry.
+func readTokenCommitMeta(meta map[string]string) (tokenCommitMeta, error) {
+	attemptID, ok := meta[attemptIDMetaKey]
+	if !ok {
+		return tokenCommitMeta{}, fmt.Errorf(
+			"s3store: token-commit missing %s metadata",
+			attemptIDMetaKey)
 	}
-	return markerLM.Sub(dataLM) < commitTimeout
+	if len(attemptID) != attemptIDHexLen || !isLowerHex(attemptID) {
+		return tokenCommitMeta{}, fmt.Errorf(
+			"s3store: token-commit %s = %q (want %d lowercase hex chars)",
+			attemptIDMetaKey, attemptID, attemptIDHexLen)
+	}
+	refMicroTs, err := readMicrosMeta(meta, refMicroTsMetaKey)
+	if err != nil {
+		return tokenCommitMeta{}, err
+	}
+	insertedAtUs, err := readMicrosMeta(meta, insertedAtMetaKey)
+	if err != nil {
+		return tokenCommitMeta{}, err
+	}
+	return tokenCommitMeta{
+		attemptID:    attemptID,
+		refMicroTs:   refMicroTs,
+		insertedAtUs: insertedAtUs,
+	}, nil
 }
 
-// truncLMToSecond normalizes an S3-server-stamped LastModified to
-// second precision. Required because the same object's LM comes
-// back at *different* precisions depending on how we read it:
-//
-//   - HEAD's Last-Modified header is HTTP-date (RFC 1123) format,
-//     which only carries second precision — anything sub-second
-//     is silently truncated by the protocol.
-//   - LIST's LastModified is an ISO 8601 timestamp, and MinIO
-//     emits it at millisecond precision; AWS S3 emits it at
-//     second precision (matching what the bucket persists).
-//
-// Without normalization, a HEAD and a LIST against the same
-// object return values differing by up to 999 ms — the upfront-
-// LIST dedup gate's reconstructed refTsMicros (from LIST) would
-// not match the original write's refTsMicros (from HEAD), and
-// retries would surface "drifted RefPath" even when the
-// reconstruction is logically correct. Truncation to seconds
-// produces the same value via either path on every backend.
-//
-// The cost is granularity: refs from two writes within the same
-// wall-clock second can collide on refTsMicros. The id portion
-// of the ref filename keeps them distinct (every per-attempt id
-// embeds tsMicros + an 8-hex shortID, so collisions are
-// vanishingly improbable), and lex ordering by (refTsMicros, id)
-// remains stable.
-func truncLMToSecond(t time.Time) time.Time {
-	return t.Truncate(time.Second)
+// readMicrosMeta extracts a decimal-microsecond field from a
+// token-commit's user-metadata. Centralised so the missing /
+// unparseable error messages are uniform across fields.
+func readMicrosMeta(meta map[string]string, key string) (int64, error) {
+	raw, ok := meta[key]
+	if !ok {
+		return 0, fmt.Errorf(
+			"s3store: token-commit missing %s metadata", key)
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"s3store: token-commit %s = %q: %w", key, raw, err)
+	}
+	return v, nil
 }
 
-// commitInfo bundles a data file and its commit-marker sibling —
-// the unit the upfront-LIST dedup gate, snapshot reads, and
-// LookupCommit work in. Both LMs come from a LIST page so the
-// helper does no HEADs.
+// headTokenCommit HEADs `<dataPath>/<partition>/<token>.commit`
+// and returns its parsed metadata when present. ok=false signals
+// 404 (no prior commit for this token) and is the dedup gate's
+// "proceed with a fresh attempt" branch. Any other failure
+// surfaces as a non-nil err.
 //
-// The .commit may be missing on a freshly-LISTed pair: a
-// concurrent attempt that PUT its data but hasn't reached the
-// marker PUT yet, or a failed attempt that died after data PUT.
-// markerLM is zero in that case; isCommitValid returns false; the
-// pair is treated as uncommitted (and is invisible to every read
-// path with marker gating).
-type commitInfo struct {
-	id        string
-	dataKey   string
-	dataLM    time.Time
-	markerKey string
-	markerLM  time.Time // zero if the .commit sibling is absent
-}
-
-// valid reports whether ci passes the timeliness check.
-func (ci commitInfo) valid(commitTimeout time.Duration) bool {
-	return isCommitValid(ci.dataLM, ci.markerLM, commitTimeout)
-}
-
-// listCommitsForToken LISTs sibling .parquet/.commit pairs under
-// {dataPath}/{partition}/{token}- and pairs them by id. Both LMs
-// come from the LIST response — no HEADs.
-//
-// The trailing "-" anchors the LIST to per-attempt entries of
-// this exact token (the per-attempt id format is
-// {token}-{tsMicros}-{shortID}). Without the trailing "-", a
-// LIST under "{partition}/{token}" would also pick up
-// "{token}foo-..." paths if such existed.
-func listCommitsForToken(
+// One round trip; powers the writer's upfront-dedup HEAD, the
+// public LookupCommit API (Phase 2/5), and the stream-read
+// commit-existence gate (Phase 2).
+func headTokenCommit(
 	ctx context.Context, target S3Target,
 	dataPath, partition, token string,
-) ([]commitInfo, error) {
-	prefix := fmt.Sprintf("%s/%s/%s-", dataPath, partition, token)
-	return listCommitsAtPrefix(ctx, target, prefix)
-}
-
-// listCommitsAtPrefix is the LIST-pair primitive: groups .parquet
-// and .commit entries under prefix into commitInfo records keyed
-// by id. Returns the pairs in arbitrary order — callers that need
-// a specific ordering (e.g., return-the-first-valid) must impose
-// it themselves.
-//
-// LIST-page LastModified values are truncated to second precision
-// via truncLMToSecond so they match what target.head returns on
-// the HEAD path (HEAD's Last-Modified is HTTP-date format, second
-// precision only). Without normalization, the upfront-LIST dedup
-// gate would reconstruct a refTsMicros that disagrees with the
-// original write's HEAD-derived refTsMicros — same logical commit,
-// different ref-key bytes — and retries would surface as
-// "drifted RefPath" even when correct. See truncLMToSecond.
-func listCommitsAtPrefix(
-	ctx context.Context, target S3Target, prefix string,
-) ([]commitInfo, error) {
-	pairs := make(map[string]*commitInfo)
-	err := target.listEach(ctx, prefix, "", 0,
-		func(obj s3types.Object) (bool, error) {
-			key := aws.ToString(obj.Key)
-			id, isParquet, isCommit := parseDataOrCommitKey(key)
-			if !isParquet && !isCommit {
-				return true, nil
-			}
-			ci := pairs[id]
-			if ci == nil {
-				ci = &commitInfo{id: id}
-				pairs[id] = ci
-			}
-			lm := truncLMToSecond(aws.ToTime(obj.LastModified))
-			if isParquet {
-				ci.dataKey = key
-				ci.dataLM = lm
-			} else {
-				ci.markerKey = key
-				ci.markerLM = lm
-			}
-			return true, nil
-		})
+) (meta tokenCommitMeta, ok bool, err error) {
+	key := tokenCommitKey(dataPath, partition, token)
+	_, raw, err := target.head(ctx, key)
 	if err != nil {
-		return nil, err
-	}
-	out := make([]commitInfo, 0, len(pairs))
-	for _, ci := range pairs {
-		out = append(out, *ci)
-	}
-	return out, nil
-}
-
-// parseDataOrCommitKey returns the id (basename without
-// extension) of a data file or commit marker, plus which type.
-// Returns (_, false, false) for keys that match neither shape —
-// callers skip such entries silently.
-func parseDataOrCommitKey(s3Key string) (id string, isParquet, isCommit bool) {
-	base := path.Base(s3Key)
-	switch {
-	case strings.HasSuffix(base, ".parquet"):
-		return strings.TrimSuffix(base, ".parquet"), true, false
-	case strings.HasSuffix(base, ".commit"):
-		return strings.TrimSuffix(base, ".commit"), false, true
-	}
-	return "", false, false
-}
-
-// findValidCommitForToken runs the upfront-LIST under
-// {partition}/{token}- and returns the first valid commit
-// (a pair whose timeliness check passes). Both LMs come from the
-// LIST response — no HEADs. Returns ok=false when no valid commit
-// exists, including when the token has no entries at all (first
-// attempt of this logical write).
-//
-// Used by the write path's upfront-dedup gate; Phase 7's
-// LookupCommit shares the same primitive.
-func findValidCommitForToken(
-	ctx context.Context, target S3Target,
-	dataPath, partition, token string,
-	commitTimeout time.Duration,
-) (commitInfo, bool, error) {
-	pairs, err := listCommitsForToken(ctx, target, dataPath, partition, token)
-	if err != nil {
-		return commitInfo{}, false, err
-	}
-	for _, ci := range pairs {
-		if ci.valid(commitTimeout) {
-			return ci, true, nil
+		if _, notFound := errors.AsType[*s3types.NotFound](err); notFound {
+			return tokenCommitMeta{}, false, nil
 		}
+		return tokenCommitMeta{}, false, err
 	}
-	return commitInfo{}, false, nil
+	meta, err = readTokenCommitMeta(raw)
+	if err != nil {
+		return tokenCommitMeta{}, true, fmt.Errorf("%w (key %q)", err, key)
+	}
+	return meta, true, nil
 }
 
-// reconstructWriteResult builds a WriteResult from a valid
-// commitInfo using the existing encodeRefKey formula. The writer
-// never recorded the WriteResult locally for prior attempts, so
-// the upfront-LIST dedup gate (and Phase 7's LookupCommit) have
-// to reconstruct it from LIST data + filename parsing:
+// reconstructWriteResult builds a WriteResult from a token-commit's
+// metadata plus the dataset's known prefixes and the caller's
+// partition. Used by the writer's upfront-dedup return path and
+// (in Phase 2) by LookupCommit.
 //
-//	DataPath   = ci.dataKey (full .parquet key from LIST)
-//	InsertedAt = time.UnixMicro(tsMicros) parsed from the id
-//	RefPath    = encodeRefKey(refPath, ci.dataLM, tsMicros, shortID, token, hiveKey)
-//	Offset     = Offset(RefPath)
-//
-// All inputs are derivable without a single HEAD or GET.
+// InsertedAt comes from the token-commit's `insertedat` metadata
+// (= the original write's pre-encode wall-clock, = the parquet
+// InsertedAtField column value), so a same-token retry returns
+// the original column value unchanged.
 func reconstructWriteResult(
-	refPath string, ci commitInfo, hiveKey string,
-) (WriteResult, error) {
-	token, tsMicros, shortID, err := parseID(ci.id)
-	if err != nil {
-		return WriteResult{}, err
-	}
-	refKey := encodeRefKey(refPath, ci.dataLM.UnixMicro(),
-		tsMicros, shortID, token, hiveKey)
+	dataPath, refPath, partition, token string, meta tokenCommitMeta,
+) WriteResult {
+	id := makeID(token, meta.attemptID)
+	refKey := encodeRefKey(refPath, meta.refMicroTs, token,
+		meta.attemptID, partition)
 	return WriteResult{
 		Offset:     Offset(refKey),
-		DataPath:   ci.dataKey,
+		DataPath:   buildDataFilePath(dataPath, partition, id),
 		RefPath:    refKey,
-		InsertedAt: time.UnixMicro(tsMicros),
-	}, nil
+		InsertedAt: time.UnixMicro(meta.insertedAtUs),
+	}
+}
+
+// putTokenCommit writes the zero-byte token-commit marker with
+// the canonical attempt's metadata (attempt-id, ref's
+// refMicroTs, and the writer's pre-encode wall-clock for
+// InsertedAt round-tripping). Single point of metadata shape so
+// writer and any future test fixture build the same headers.
+func putTokenCommit(
+	ctx context.Context, target S3Target,
+	dataPath, partition, token, attemptID string,
+	refMicroTs, insertedAtUs int64,
+) error {
+	key := tokenCommitKey(dataPath, partition, token)
+	return target.putWithMeta(ctx, key, []byte{},
+		"application/octet-stream",
+		map[string]string{
+			attemptIDMetaKey:  attemptID,
+			refMicroTsMetaKey: strconv.FormatInt(refMicroTs, 10),
+			insertedAtMetaKey: strconv.FormatInt(insertedAtUs, 10),
+		})
 }

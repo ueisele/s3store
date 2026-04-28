@@ -35,11 +35,14 @@ type Offset string
 //     DataPath.
 //   - DataPath is the S3 object key of the data file this ref
 //     points at; GET it to fetch the parquet payload.
-//   - InsertedAt is the writer's wall-clock capture at write-start,
-//     decoded from the dataTsMicros embedded in the ref filename.
-//     Identical to what the writer stamped into the InsertedAtField
-//     parquet column, so consumers see the write time without
-//     reading the data file.
+//   - InsertedAt is the writer's wall-clock capture immediately
+//     before the ref PUT (microsecond precision; same value
+//     embedded as `refMicroTs` in the ref filename). It approximates
+//     ref-LIST-visibility time. Slightly later than the
+//     InsertedAtField parquet column (stamped at pre-encode
+//     write-start so the column reflects logical record time, not
+//     commit-finalize time); the two values can drift by the
+//     encode + data-PUT duration.
 type StreamEntry struct {
 	Offset     Offset
 	Key        string
@@ -98,7 +101,7 @@ func (s *Reader[T]) Poll(
 			if o.until != "" && objKey >= string(o.until) {
 				return false, nil
 			}
-			key, _, tsMicros, shortID, token, err := parseRefKey(objKey)
+			hiveKey, refMicroTs, token, attemptID, err := parseRefKey(objKey)
 			if err != nil {
 				// Malformed refs (externally written, or a future
 				// schema this binary doesn't understand) shouldn't
@@ -111,13 +114,13 @@ func (s *Reader[T]) Poll(
 				scope.recordMalformedRefs()
 				return true, nil
 			}
-			id := makeID(token, tsMicros, shortID)
+			id := makeID(token, attemptID)
 			out = append(out, StreamEntry{
 				Offset:     Offset(objKey),
-				Key:        key,
-				DataPath:   buildDataFilePath(s.dataPath, key, id),
+				Key:        hiveKey,
+				DataPath:   buildDataFilePath(s.dataPath, hiveKey, id),
 				RefPath:    objKey,
-				InsertedAt: time.UnixMicro(tsMicros),
+				InsertedAt: time.UnixMicro(refMicroTs),
 			})
 			lastKey = objKey
 			return true, nil

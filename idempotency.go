@@ -92,12 +92,11 @@ func applyIdempotentReadOpts(
 // use-case).
 //
 // The token is a raw idempotency token as passed to
-// WithIdempotencyToken on the write side. Under per-attempt-paths
-// (Phase 4), every successful attempt of the token lands at a
-// fresh data file whose basename has shape
-// "{token}-{tsMicros}-{shortID}.parquet" — so the matcher here
-// has to recognize that shape rather than a single canonical
-// filename.
+// WithIdempotencyToken on the write side. Every successful
+// attempt of the token lands at a fresh data file whose basename
+// has shape "{token}-{attemptID}.parquet" where attemptID is a
+// UUIDv7 (32 lowercase hex chars) — so the matcher here has to
+// recognize that shape rather than a single canonical filename.
 //
 // Two filters apply per partition:
 //
@@ -172,15 +171,15 @@ func applyIdempotentRead(
 
 // dataFileBasenameMatchesToken reports whether base (a parquet
 // data-file basename) has the per-attempt shape
-// "{token}-{tsMicros}-{shortID}.parquet". tsMicros is exactly 16
-// decimal digits (the realistic operating range — see refTsKey)
-// and shortID is exactly 8 lowercase hex characters (the
-// makeAutoID format), so a token that itself contains dashes can
-// be matched unambiguously: only the trailing 25 characters
-// "-{16 digits}-{8 hex}" form the auto-id, anything before is
-// the token verbatim.
+// "{token}-{attemptID}.parquet" where attemptID is a UUIDv7
+// rendered as 32 lowercase hex characters (canonical form with
+// internal dashes stripped — see paths.go). The trailing
+// fixed-width 32-hex anchor lets a token containing dashes match
+// unambiguously: only the last 32 hex chars before ".parquet"
+// form the attempt-id, anything before (after stripping the
+// separating dash) is the token verbatim.
 func dataFileBasenameMatchesToken(base, token string) bool {
-	const wantSuffixLen = 1 + 16 + 1 + 8 + len(".parquet") // -ts-short.parquet
+	const wantSuffixLen = 1 + attemptIDHexLen + len(".parquet") // -uuidv7hex.parquet
 	if len(base) != len(token)+wantSuffixLen {
 		return false
 	}
@@ -191,20 +190,5 @@ func dataFileBasenameMatchesToken(base, token string) bool {
 		return false
 	}
 	rest := base[len(token)+1 : len(base)-len(".parquet")]
-	// rest = "{16 digits}-{8 hex}" = 25 chars total.
-	if rest[16] != '-' {
-		return false
-	}
-	for i := 0; i < 16; i++ {
-		if rest[i] < '0' || rest[i] > '9' {
-			return false
-		}
-	}
-	for i := 17; i < 25; i++ {
-		c := rest[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
+	return len(rest) == attemptIDHexLen && isLowerHex(rest)
 }

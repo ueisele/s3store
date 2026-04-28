@@ -117,16 +117,17 @@ type metrics struct {
 	s3RespBytes metric.Int64Histogram
 
 	// Library method level.
-	methodDuration    metric.Float64Histogram
-	methodCalls       metric.Int64Counter
-	writeRecords      metric.Int64Histogram
-	writePartitions   metric.Int64Histogram
-	writeBytes        metric.Int64Histogram
-	readRecords       metric.Int64Histogram
-	readBytes         metric.Int64Histogram
-	readFiles         metric.Int64Histogram
-	readMissingData   metric.Int64Counter
-	readMalformedRefs metric.Int64Counter
+	methodDuration     metric.Float64Histogram
+	methodCalls        metric.Int64Counter
+	writeRecords       metric.Int64Histogram
+	writePartitions    metric.Int64Histogram
+	writeBytes         metric.Int64Histogram
+	readRecords        metric.Int64Histogram
+	readBytes          metric.Int64Histogram
+	readFiles          metric.Int64Histogram
+	readMissingData    metric.Int64Counter
+	readMalformedRefs  metric.Int64Counter
+	writeCommitAfterTO metric.Int64Counter
 
 	// Iter pipeline internals (downloadAndDecodeIter): bottleneck
 	// signals for the streamState's body-slot pool and byte-budget
@@ -285,6 +286,10 @@ func newMetrics(
 	m.readMalformedRefs = mustCounter(
 		"s3store.read.malformed_refs",
 		"Ref objects whose filename failed to parse during a LIST on the ref stream (Poll / PollRecords / ReadRangeIter). Skipped after a slog.Warn — symmetric with read.missing_data on the data side.",
+		"{event}")
+	m.writeCommitAfterTO = mustCounter(
+		"s3store.write.commit_after_timeout",
+		"Writes whose end-to-end wall-clock elapsed exceeded CommitTimeout by the time the token-commit PUT completed. Not a failure — the commit landed; signals that a SettleWindow tuned for this CommitTimeout may not yet have included this write in the stream window.",
 		"{event}")
 
 	// Iter pipeline internals.
@@ -695,6 +700,20 @@ func (s *methodScope) recordMalformedRefs() {
 	}
 	cs, vs := s.m.callOpts(attribute.String(attrKeyMethod, string(s.method)))
 	s.m.readMalformedRefs.Add(s.ctx, 1, cs, vs)
+}
+
+// recordCommitAfterTimeout increments the commit_after_timeout
+// counter for one Write whose end-to-end wall-clock elapsed
+// exceeded CommitTimeout by the time the token-commit PUT
+// completed. The commit landed (the write returns success); this
+// is an observability signal that a SettleWindow tuned to the
+// CommitTimeout may not yet have included this write in the
+// stream window. No scope dimension — Write is the only emitter.
+func (m *metrics) recordCommitAfterTimeout(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.writeCommitAfterTO.Add(ctx, 1, m.constSetOpt)
 }
 
 // end records the scope's terminal observations: duration,

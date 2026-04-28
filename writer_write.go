@@ -7,30 +7,30 @@ import (
 	"maps"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
 )
 
 // WriteResult contains metadata about a completed write.
-// InsertedAt is the writer's wall-clock capture at write-start —
-// the same value that populates the configured InsertedAtField
-// column and the dataTsMicros component of the ref filename.
-// Exposed on the result so callers can log / persist it (e.g.,
-// into an outbox table) without parsing the data path or issuing
-// a HEAD.
+//
+// InsertedAt is the writer's wall-clock capture at write-start
+// (pre-encode), microsecond precision — the same value stamped
+// into the parquet's InsertedAtField column. Surfaced on the
+// result so callers can log / persist it (e.g., into an outbox
+// table) without parsing the data path or issuing a HEAD.
 //
 // Under WithIdempotencyToken, a same-token retry whose upfront
-// LIST finds a prior valid commit returns *that* commit's
-// WriteResult (DataPath, RefPath, InsertedAt all reflect the
-// prior attempt). Callers comparing two results from the same
-// token across retries will see identical values when the prior
-// attempt landed within CommitTimeout, and different per-attempt
-// values when an earlier attempt aged out.
+// HEAD on `<token>.commit` finds a prior commit returns *that*
+// commit's WriteResult (DataPath, RefPath, InsertedAt all
+// reflect the prior attempt — InsertedAt is recovered from the
+// token-commit's `insertedat` user-metadata, so it agrees with
+// the prior attempt's column value byte-for-byte). Callers
+// comparing two results from the same token across retries will
+// therefore see identical values whenever a prior attempt's
+// token-commit is still in place.
 type WriteResult struct {
 	Offset     Offset
 	DataPath   string
@@ -141,32 +141,35 @@ func (s *Writer[T]) writeGroupedFanOut(
 }
 
 // WriteWithKey encodes records as Parquet, uploads to S3, writes
-// the ref file, and lands the commit marker that flips visibility
-// for both the snapshot and stream read paths atomically.
+// the ref file, and lands the token-commit marker that flips
+// visibility for both the snapshot and stream read paths
+// atomically.
 //
-// Each attempt writes to a per-attempt path (id =
-// {token}-{tsMicros}-{shortID} under WithIdempotencyToken,
-// {tsMicros}-{shortID} otherwise), so no PUT in this method ever
-// overwrites — sidesteps multi-site StorageGRID's eventual-
-// consistency exposure on overwrites. The trade is a per-attempt
-// orphan triple (data + ref + possibly marker) on failure; the
-// reader's timeliness check filters them out and the operator-
-// driven sweeper reclaims them.
+// Each attempt writes to a per-attempt data path
+// (`{partition}/{token}-{attemptID}.parquet`), so no data PUT
+// ever overwrites — sidesteps multi-site StorageGRID's
+// eventual-consistency exposure on data-file overwrites. token
+// is the caller's WithIdempotencyToken value, or a
+// writer-generated UUIDv7 (used as both token and attemptID) for
+// non-idempotent writes. The trade is a per-attempt orphan triple
+// (data + ref + possibly token-commit) on failure; the reader's
+// commit-marker gate filters them out, and the operator-driven
+// sweeper reclaims them.
 //
 // On any failure mid-sequence the returned error is wrapped and
 // nothing is deleted. This is the at-least-once contract: a
 // failed Write may leave per-attempt orphans, never deletes one.
-// Snapshot and stream reads ignore the orphans because their
-// commit markers either didn't land or fail the timeliness check.
+// Reads ignore the orphans because their token-commits either
+// didn't land or name a different attempt-id.
 //
 // Passing WithIdempotencyToken makes this call retry-safe across
-// arbitrary outages: an upfront LIST under
-// {partition}/{token}- finds any prior valid commit and returns
-// its WriteResult unchanged (no body re-upload, no new PUTs).
-// If no valid prior commit exists, the retry proceeds with a
-// fresh attempt-id and a fresh server-stamped data.LM —
-// recovery is automatic regardless of how long ago the original
-// landed. See WithIdempotencyToken for the full contract.
+// arbitrary outages: an upfront HEAD on `<token>.commit` returns
+// any prior commit's WriteResult reconstructed from metadata
+// (no body re-upload, no new PUTs). If no prior commit exists,
+// the retry proceeds with a fresh attempt-id; recovery is
+// automatic regardless of how long ago the original landed.
+// **Concurrent writes that share the same token are out of
+// contract** — see README's Concurrency contract section.
 func (s *Writer[T]) WriteWithKey(
 	ctx context.Context, key string, records []T, opts ...WriteOption,
 ) (result *WriteResult, err error) {
@@ -241,51 +244,57 @@ func (s *Writer[T]) writeWithKeyResolved(
 }
 
 // writeEncodedPayload is the post-encode orchestration for
-// WriteWithKey. The eight-step sequence is the heart of the
-// commit-marker design:
+// WriteWithKey. The new sequence (3 PUTs, 0 HEADs in the
+// happy-path-without-idempotency-token, 1 HEAD on idempotent
+// retries) is the heart of the token-commit redesign:
 //
-//  1. Upfront LIST under {partition}/{token}- (only when
-//     WithIdempotencyToken is set). Pair .parquet with .commit
-//     by id, apply isCommitValid using LIST-page LMs. Any valid
-//     pair → reconstruct WriteResult and return success without
-//     re-issuing PUTs.
-//  2. Generate fresh attempt-id. id = {token}-{tsMicros}-{shortID}
-//     under WithIdempotencyToken, or {tsMicros}-{shortID} for
-//     token-less writes. tsMicros is the writer's wall clock at
-//     write-start; shortID is a UUID-derived 8 hex-char fragment.
-//  3. Projection markers PUT (Phase 3 ordering: before data, so
+//  1. Token resolution. Use the caller's WithIdempotencyToken
+//     verbatim; otherwise generate a fresh UUIDv7 and use it as
+//     both the token and the attempt-id (the path layout stays
+//     uniform, parsing is one-case).
+//  2. Upfront commit check (idempotent path only). HEAD
+//     `<dataPath>/<partition>/<token>.commit`. 200 → reconstruct
+//     WriteResult from the metadata and return without re-issuing
+//     any PUT. 404 → proceed with a fresh attempt. Skipped on the
+//     auto-token path: the UUIDv7 was just generated, so the HEAD
+//     is guaranteed to 404 by construction.
+//  3. Generate attempt-id. UUIDv7 hex (32 lowercase hex chars).
+//     For non-idempotent writes the auto-token doubles as the
+//     attempt-id; for idempotent writes it's freshly generated.
+//  4. Projection markers PUT (Phase 3 ordering: before data, so
 //     any data file on S3 implies its R1 markers landed).
-//  4. Data PUT to fresh path. Unconditional — but the per-attempt
-//     id makes the path unique by construction, so nothing to
-//     overwrite. Server stamps data.LM.
-//  5. HEAD data file → server-stamped data.LastModified. This
-//     value becomes the ref filename's refTsMicros and is stamped
-//     into the marker's dataLM user metadata (consumed by stream
-//     reads only).
-//  6. Ref PUT at the path computed from
-//     (refPath, data.LM, id, dataTsMicros, hiveKey) — refTsMicros
-//     is server-stamped, so the reader's refCutoff comparison is
-//     reader↔server only (writer's clock is not in the protocol).
-//  7. Commit-marker PUT at {partition}/{id}.commit with user
-//     metadata {dataLM}. Sibling of the .parquet, single source
-//     of atomic visibility for Phases 5–6 read paths.
-//  8. HEAD marker → server-stamped marker.LastModified. Verify
-//     marker.LM - data.LM < CommitTimeout (same check the reader
-//     runs, same server-stamped values). On violation: explicit
-//     error; the per-attempt orphan stays on S3, filtered by
-//     every read path's timeliness check.
+//  5. Data PUT to `<dataPath>/<partition>/<token>-<attemptID>.parquet`.
+//     Unconditional; path is unique per attempt by construction.
+//  6. Ref PUT to
+//     `<refPath>/<refMicroTs>-<token>-<attemptID>;<hiveEsc>.ref`.
+//     refMicroTs is captured immediately before this PUT so the
+//     encoded value tracks ref-LIST-visibility as tightly as
+//     possible — bounds the writer↔reader skew SettleWindow has
+//     to absorb.
+//  7. Token-commit PUT at `<dataPath>/<partition>/<token>.commit`,
+//     zero-byte body, with user-metadata `attemptid` + `refmicrots`
+//     so reads can reconstruct the WriteResult on retry without a
+//     LIST. Single atomic event flipping read-side visibility.
+//  8. Sanity check (writer-local). When the writer's local
+//     elapsed exceeds CommitTimeout, increment
+//     s3store.write.commit_after_timeout and warn. Not a failure
+//     — the commit landed; this just signals that a SettleWindow
+//     tuned to this CommitTimeout may not yet have included this
+//     write in the stream window.
 //
-// Per-attempt-paths sidestep multi-site StorageGRID's eventual-
-// consistency exposure on overwrites: read-after-new-write is
-// strongly consistent on every supported backend at any
-// consistency level, so the post-PUT HEADs on data and marker
-// always observe the values they just wrote. No If-None-Match,
-// no s3:PutOverwriteObject deny policy — uniform behaviour
-// across AWS S3, MinIO, and StorageGRID.
+// Per-attempt data paths sidestep multi-site StorageGRID's
+// eventual-consistency exposure on data-file overwrites. The
+// token-commit IS overwriteable across concurrent retries of the
+// same token, but **concurrent writes per (partition, token) are
+// out of contract** (see README's Concurrency contract section);
+// under sequential retries the upfront HEAD short-circuits before
+// any second token-commit PUT lands.
 //
 // writeStartTime is the wall clock captured by the caller just
-// before parquet encoding — used to stamp the data filename
-// tsMicros and the InsertedAtField column.
+// before parquet encoding — used for the InsertedAtField column
+// only. The WriteResult's InsertedAt comes from refMicroTs (so
+// retries that find a prior commit return the original commit's
+// InsertedAt unchanged via the token-commit metadata).
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
 	writeStartTime time.Time, opts WriteOpts,
@@ -298,94 +307,110 @@ func (s *Writer[T]) writeEncodedPayload(
 		return nil, err
 	}
 
-	commitTimeout := s.cfg.Target.CommitTimeout()
-
-	// Step 1 (token-only): upfront LIST for a prior valid commit.
-	// LIST returns both .parquet and .commit siblings with
-	// LastModified — enough to run the timeliness check and
-	// reconstruct WriteResult. No HEADs at this stage; same
-	// primitive Phase 7's LookupCommit will use.
-	if opts.IdempotencyToken != "" {
-		ci, ok, err := findValidCommitForToken(ctx, s.cfg.Target,
-			s.dataPath, key, opts.IdempotencyToken, commitTimeout)
+	// Step 1: token resolution. Auto-generate a UUIDv7 for the
+	// no-token path and use it as both the token and the
+	// attempt-id (path shape is uniform: <token>-<attemptID>).
+	token := opts.IdempotencyToken
+	autoToken := false
+	if token == "" {
+		auto, err := newAttemptID()
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3store: upfront LIST for token: %w", err)
+				"s3store: generate auto-token: %w", err)
 		}
-		if ok {
-			wr, err := reconstructWriteResult(s.refPath, ci, key)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"s3store: reconstruct prior commit: %w", err)
-			}
+		token = auto
+		autoToken = true
+	}
+
+	// Step 2: upfront HEAD on <token>.commit. Skipped on the
+	// auto-token path (HEAD would always 404 — we just generated
+	// the token).
+	if !autoToken {
+		meta, exists, err := headTokenCommit(ctx, s.cfg.Target,
+			s.dataPath, key, token)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"s3store: head token-commit: %w", err)
+		}
+		if exists {
+			wr := reconstructWriteResult(s.dataPath, s.refPath,
+				key, token, meta)
 			return &wr, nil
 		}
 	}
 
-	// Step 2: generate fresh per-attempt id.
-	tsMicros := writeStartTime.UnixMicro()
-	shortID := uuid.New().String()[:8]
-	id := makeID(opts.IdempotencyToken, tsMicros, shortID)
+	// Step 3: attempt-id. The auto-token path reuses the token
+	// (same UUIDv7) so id == "<UUIDv7>-<UUIDv7>"; the idempotent
+	// path generates a fresh UUIDv7 distinct from the token.
+	var attemptID string
+	if autoToken {
+		attemptID = token
+	} else {
+		fresh, err := newAttemptID()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"s3store: generate attempt-id: %w", err)
+		}
+		attemptID = fresh
+	}
+	id := makeID(token, attemptID)
 	dataKey := buildDataFilePath(s.dataPath, key, id)
 
-	// Step 3: projection markers, before data (Phase 3 ordering).
+	// Step 4: projection markers, before data (Phase 3 ordering).
 	if err := s.putMarkers(ctx, markerPaths); err != nil {
 		return nil, fmt.Errorf(
 			"s3store: put projection markers: %w", err)
 	}
 
-	// Step 4: data PUT to fresh path. Unconditional (path is
+	// Step 5: data PUT to fresh path. Unconditional (path is
 	// unique per attempt by construction).
 	if err := s.cfg.Target.put(ctx, dataKey, parquetBytes,
 		"application/octet-stream"); err != nil {
 		return nil, fmt.Errorf("s3store: put data: %w", err)
 	}
 
-	// Step 5: HEAD data file to read server-stamped data.LM.
-	dataLM, _, err := s.cfg.Target.head(ctx, dataKey)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"s3store: head data file: %w", err)
-	}
-	dataLMMicros := dataLM.UnixMicro()
-
-	// Step 6: ref PUT. dataLM (server-stamped, second-precision)
-	// is the primary lex sort key — keeps the reader's refCutoff
-	// comparison reader↔server only. tsMicros (writer wall-clock,
-	// microsecond precision) is the within-second tiebreaker so
-	// refs from same-second writes have stable sub-second order.
-	refKey := encodeRefKey(s.refPath, dataLMMicros, tsMicros,
-		shortID, opts.IdempotencyToken, key)
+	// Step 6: ref PUT. Capture refMicroTs immediately before the
+	// PUT so the encoded value tracks ref-LIST-visibility as
+	// tightly as possible. Writer wall-clock is now in the
+	// protocol via this field — MaxClockSkew bounds writer↔reader
+	// skew (see CLAUDE.md "Backend assumptions").
+	refMicroTs := time.Now().UnixMicro()
+	refKey := encodeRefKey(s.refPath, refMicroTs, token, attemptID, key)
 	if err := s.cfg.Target.put(ctx, refKey, []byte{},
 		"application/octet-stream"); err != nil {
 		return nil, fmt.Errorf("s3store: put ref: %w", err)
 	}
 
-	// Step 7: commit-marker PUT with dataLM metadata. The single
-	// atomic event that flips visibility for both read paths.
-	markerKey := commitMarkerKey(s.dataPath, key, id)
-	if err := s.cfg.Target.putWithMeta(ctx, markerKey, []byte{},
-		"application/octet-stream",
-		map[string]string{
-			dataLMMetaKey: strconv.FormatInt(dataLMMicros, 10),
-		}); err != nil {
+	// Step 7: token-commit PUT with attempt-id, refMicroTs, and
+	// writeStartTime (for InsertedAt round-tripping on retry).
+	// The single atomic event that flips visibility for both
+	// read paths.
+	if err := putTokenCommit(ctx, s.cfg.Target,
+		s.dataPath, key, token, attemptID,
+		refMicroTs, writeStartTime.UnixMicro()); err != nil {
 		return nil, fmt.Errorf(
-			"s3store: put commit marker: %w", err)
+			"s3store: put token-commit: %w", err)
 	}
 
-	// Step 8: HEAD marker, verify timeliness (same check the
-	// reader runs, same server-stamped values, no clock-skew
-	// sensitivity).
-	markerLM, _, err := s.cfg.Target.head(ctx, markerKey)
-	if err != nil {
+	// Step 8: writer-local contract enforcement. Past
+	// CommitTimeout, the reader's SettleWindow (= CommitTimeout +
+	// MaxClockSkew) may have already advanced past this write's
+	// `refMicroTs` and emitted the ref before the token-commit
+	// became visible — i.e., a stream reader could miss it. The
+	// writer surfaces this as an error so the caller knows their
+	// write is at risk; the token-commit IS in place (the data is
+	// durable + committed for snapshot reads), so an idempotent
+	// retry recovers automatically via the upfront-HEAD path.
+	commitTimeout := s.cfg.Target.CommitTimeout()
+	if elapsed := time.Since(writeStartTime); elapsed > commitTimeout {
+		s.cfg.Target.metrics.recordCommitAfterTimeout(ctx)
 		return nil, fmt.Errorf(
-			"s3store: head commit marker: %w", err)
-	}
-	if !isCommitValid(dataLM, markerLM, commitTimeout) {
-		return nil, fmt.Errorf(
-			"s3store: commit marker %q stale: marker.LM - data.LM "+
-				"= %v, want < CommitTimeout %v",
-			markerKey, markerLM.Sub(dataLM), commitTimeout)
+			"s3store: write committed after CommitTimeout "+
+				"(elapsed %v > %v) — stream reader's SettleWindow "+
+				"may not include this write; data is durable at "+
+				"%s, retry with the same WithIdempotencyToken "+
+				"recovers via upfront-HEAD",
+			elapsed, commitTimeout, dataKey)
 	}
 
 	return &WriteResult{
