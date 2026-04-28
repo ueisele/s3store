@@ -48,7 +48,7 @@ func (s *Reader[T]) ReadIter(
 		defer cancel()
 
 		keys, err := ResolvePatterns(
-			ctx, s.cfg.Target, keyPatterns, &o)
+			ctx, s.cfg.Target, keyPatterns, &o, methodReadIter)
 		if err != nil {
 			iterErr = fmt.Errorf("s3store: ReadIter %w", err)
 			yield(*new(T), iterErr)

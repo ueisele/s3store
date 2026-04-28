@@ -55,12 +55,26 @@ type StreamEntry struct {
 
 // Poll returns up to maxEntries stream entries (refs only) after
 // the given offset, capped at now - SettleWindow to avoid races
-// with in-flight writes. One or more S3 LIST calls, no GETs.
+// with in-flight writes. One LIST call against the ref stream
+// plus one HEAD per ref against `<token>.commit` (collapsed by a
+// per-poll cache when refs share a token); no parquet GETs.
 // Returns (entries, nextOffset, error); checkpoint nextOffset and
 // pass it as `since` on the next call.
 //
+// Refs whose `<token>.commit` is missing (404) are skipped: by
+// the time the ref clears the SettleWindow cutoff, the writer
+// has either committed (200) or returned an error to its caller
+// (no commit will land). Refs whose commit's `attemptid` doesn't
+// match the ref's attempt-id are also skipped — they're orphans
+// from a failed-mid-write retry under the same token.
+//
 // Pass WithUntilOffset to bound the walk from above so long
 // streams aren't scanned past the window of interest.
+//
+// nextOffset advances over every ref the LIST visits, including
+// ones the gate skips. Once a ref's refMicroTs is past the
+// SettleWindow cutoff, its commit outcome is final — re-walking
+// it on the next poll wouldn't surface anything new.
 func (s *Reader[T]) Poll(
 	ctx context.Context,
 	since Offset,
@@ -85,9 +99,15 @@ func (s *Reader[T]) Poll(
 	cutoffPrefix := refCutoff(s.refPath, time.Now(),
 		s.cfg.Target.SettleWindow())
 
+	cache := newCommitCache()
 	var lastKey string
 
-	err = s.cfg.Target.listEach(ctx,
+	// listErr is the LIST/iteration error; gateErr is the first
+	// commit-gate failure. We separate them so a gate failure
+	// surfaces a wrapped error rather than a "list refs" prefix.
+	var gateErr error
+
+	listErr := s.cfg.Target.listEach(ctx,
 		s.refPath+"/", string(since),
 		min(maxEntries, s3ListMaxKeys),
 		func(obj s3types.Object) (bool, error) {
@@ -109,9 +129,31 @@ func (s *Reader[T]) Poll(
 				// — applications inherit their configured handler —
 				// and bump the s3store.read.malformed_refs counter
 				// so silent drift stays observable, then skip.
+				// Advance lastKey so the consumer's nextOffset moves
+				// past the malformed entry rather than re-walking it.
 				slog.Warn("s3store: skipping malformed ref",
 					"key", objKey, "err", err)
 				scope.recordMalformedRefs()
+				lastKey = objKey
+				return true, nil
+			}
+
+			entry, err := cache.lookupOrFetch(ctx, s.cfg.Target,
+				s.dataPath, hiveKey, token, methodPoll)
+			if err != nil {
+				gateErr = err
+				return false, err
+			}
+			// Always advance lastKey: refs past the cutoff have a
+			// final commit outcome, so re-walking them on the next
+			// poll would just re-issue the same HEADs.
+			lastKey = objKey
+			if !entry.exists {
+				return true, nil
+			}
+			if entry.attemptID != attemptID {
+				// Orphan from a failed-mid-write retry; canonical
+				// attempt won the token-commit race.
 				return true, nil
 			}
 			id := makeID(token, attemptID)
@@ -122,11 +164,13 @@ func (s *Reader[T]) Poll(
 				RefPath:    objKey,
 				InsertedAt: time.UnixMicro(refMicroTs),
 			})
-			lastKey = objKey
 			return true, nil
 		})
-	if err != nil {
-		return nil, since, fmt.Errorf("s3store: list refs: %w", err)
+	if gateErr != nil {
+		return nil, since, fmt.Errorf("s3store: gate ref by commit: %w", gateErr)
+	}
+	if listErr != nil {
+		return nil, since, fmt.Errorf("s3store: list refs: %w", listErr)
 	}
 
 	if lastKey != "" {

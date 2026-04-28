@@ -360,6 +360,69 @@ golangci-lint run ./...
 **Verification gates:** none (pure docs change). The four-gate
 checklist in CLAUDE.md says docs-only changes don't need them.
 
+### Phase 4 — Error-message convention cleanup
+
+Independent of the redesign, but surfaced during Phase 2 review.
+The package's error chain currently produces strings of the shape
+`"s3store: outer: s3store: inner"` because both leaf errors and
+wrap layers prefix the package name. Two examples in the current
+tree:
+
+- Leaf prefixed: `validateIdempotencyToken` returns
+  `"s3store: IdempotencyToken must not be empty"`.
+- Wrap layer also prefixed:
+  `fmt.Errorf("s3store: head token-commit: %w", err)` in
+  `writer_write.go`'s upfront-HEAD step.
+
+The chain reads `"s3store: head token-commit: s3store: ..."` —
+functional but visually noisy and easy to misread in logs.
+
+**Choose one direction across the package:**
+
+- **(a) Leaves keep `s3store:`, wrap layers drop it.** New wrap
+  shape: `fmt.Errorf("head token-commit: %w", err)`. Matches the
+  existing `"WithIdempotentRead: %w"` site (option-validation
+  wrap in `idempotency.go`) — that one already follows the
+  convention, so picking this direction means most leaves are
+  already correct and most wrap sites need a touch.
+- **(b) Wrap layers keep `s3store:`, leaves drop it.** New leaf
+  shape: `errors.New("IdempotencyToken must not be empty")`.
+  Touches every leaf — `validateIdempotencyToken`,
+  `headTokenCommit`, `readTokenCommitMeta`,
+  `loadDurationConfig`, `validatePartitionKeyParts`, every
+  `validateProjectionDef*`, etc. Larger blast radius.
+
+(a) is cheaper (most leaves are already in shape) and keeps the
+package name visible at the deepest point of the chain (where it
+identifies the source most usefully). Recommend (a).
+
+**Files touched (option a):**
+
+- Every `fmt.Errorf("s3store: <op>: %w", err)` site in
+  `writer_write.go`, `writer.go`, `reader_*.go`, `target.go`,
+  `commit.go`, `paths.go`, `listing.go`, `idempotency.go`,
+  `projection_*.go`, `concurrency.go`. Replace with
+  `fmt.Errorf("<op>: %w", err)` only when the wrapped error
+  already starts with `"s3store: "`. Wraps of foreign errors
+  (parquet-go decode, AWS SDK, `time.ParseDuration`) keep their
+  `s3store:` prefix because the inner doesn't have it.
+- Every test that asserts on an error string (`strings.Contains(err.Error(), "s3store: ...")`).
+  Spot check: `target_test.go`, `idempotency_test.go`,
+  `commit_test.go`, `paths_test.go`, `integration_test.go`'s
+  CommitTimeout / MaxClockSkew rejection tests.
+
+Estimate ~30–50 sites in source + a similar count in test
+assertions. Mechanical edit; no semantics change.
+
+**Out of scope:** changing how errors are surfaced (still
+`fmt.Errorf("…: %w", err)`); introducing typed error sentinels
+beyond `ErrAlreadyExists`; restructuring the contract around
+`errors.Is` / `errors.As`. This phase is purely cosmetic
+deduplication.
+
+**Verification gates:** all four. Test-string assertions catch
+drift; lint stays clean if tests are updated in the same PR.
+
 ---
 
 ## Risk notes

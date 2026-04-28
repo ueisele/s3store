@@ -417,3 +417,23 @@ func hiveKeyOfDataFile(s3Key, dataPath string) (string, bool) {
 	}
 	return rest[:slash], true
 }
+
+// hiveKeyOfPartitionFile is the suffix-agnostic counterpart of
+// hiveKeyOfDataFile: returns the Hive-key portion of any file
+// under dataPath (parquet, commit marker, anything else
+// operators may park alongside the data tree). Used by the
+// commit-gate's LIST callback, which needs to recognise both
+// `.parquet` and `.commit` keys without two suffix-specific
+// helpers.
+func hiveKeyOfPartitionFile(s3Key, dataPath string) (string, bool) {
+	prefix := dataPath + "/"
+	if !strings.HasPrefix(s3Key, prefix) {
+		return "", false
+	}
+	rest := s3Key[len(prefix):]
+	slash := strings.LastIndex(rest, "/")
+	if slash < 0 {
+		return "", false
+	}
+	return rest[:slash], true
+}

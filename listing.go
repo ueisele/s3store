@@ -86,11 +86,12 @@ func dedupePatterns(patterns []string) []string {
 }
 
 // ResolvePatterns chains the standard pattern→keys pipeline:
-// dedupe → buildReadPlans → listDataFiles →
+// dedupe → buildReadPlans → listDataFiles → gateByCommit →
 // applyIdempotentReadOpts. Returns the deduplicated KeyMetas
-// matching any pattern, with IdempotentRead filtering applied
-// when opts.IdempotentReadToken is set. Empty patterns slice or
-// no matches → (nil, nil).
+// matching any pattern, gated against `<token>.commit` markers so
+// uncommitted parquets are invisible, with IdempotentRead
+// filtering applied when opts.IdempotentReadToken is set. Empty
+// patterns slice or no matches → (nil, nil).
 //
 // Used by every snapshot-style read entry point (Read / ReadIter /
 // ReadRangeIter) so the chain lives in exactly one place. Pattern
@@ -101,9 +102,12 @@ func dedupePatterns(patterns []string) []string {
 // The partition LIST inherits the target's ConsistencyControl
 // from t — every t.listEach call does — so callers don't need
 // to thread the level explicitly.
+//
+// method is the caller's methodKind used as the metric label for
+// commit-gate HEADs (s3store.read.commit_head{method=...}).
 func ResolvePatterns(
 	ctx context.Context, t S3Target, patterns []string,
-	opts *QueryOpts,
+	opts *QueryOpts, method methodKind,
 ) ([]KeyMeta, error) {
 	patterns = dedupePatterns(patterns)
 	if len(patterns) == 0 {
@@ -114,7 +118,11 @@ func ResolvePatterns(
 	if err != nil {
 		return nil, err
 	}
-	keys, err := listDataFiles(ctx, t, plans)
+	keys, commits, err := listDataFiles(ctx, t, plans)
+	if err != nil {
+		return nil, err
+	}
+	keys, err = gateByCommit(ctx, t, dataPath, keys, commits, method)
 	if err != nil {
 		return nil, err
 	}
@@ -123,11 +131,20 @@ func ResolvePatterns(
 
 // listDataFiles returns the deduplicated union of parquet objects
 // under each plan's ListPrefix whose Hive key matches the plan's
-// predicate. Each KeyMeta carries S3 LastModified so downstream
-// filters (WithIdempotentRead, sort fallbacks) can reason about
-// write time without a second round-trip. Overlapping plans (e.g.
-// "period=*" and "period=2026-03-*") are deduped on key so
-// downstream GET / scan work is not duplicated.
+// predicate, plus the set of `<token>.commit` markers visible in
+// the same LIST iteration. Each parquet KeyMeta carries S3
+// LastModified so downstream filters (WithIdempotentRead, sort
+// fallbacks) can reason about write time without a second round-
+// trip. Overlapping plans (e.g. "period=*" and "period=2026-03-*")
+// are deduped on key so downstream GET / scan work is not
+// duplicated.
+//
+// commits is keyed by `<partition>:<token>` and records every
+// `<token>.commit` whose containing partition matched its plan's
+// predicate. Returned alongside the parquet KeyMetas because both
+// kinds of object live under the same partition prefix — capturing
+// them in one LIST iteration is one round-trip cheaper than a
+// separate scan.
 //
 // Plans run with bounded concurrency capped at MaxInflightRequests;
 // each page-fetch additionally acquires the target's semaphore (via
@@ -137,38 +154,92 @@ func ResolvePatterns(
 func listDataFiles(
 	ctx context.Context, t S3Target,
 	plans []*readPlan,
-) ([]KeyMeta, error) {
+) (parquets []KeyMeta, commits map[string]struct{}, err error) {
 	dataPath := dataPath(t.Prefix())
-	return fanOutMapReduce(ctx, plans,
+
+	type planResult struct {
+		Parquets []KeyMeta
+		Commits  []string // composite "partition:token"
+	}
+
+	merged, err := fanOutMapReduce(ctx, plans,
 		t.EffectiveMaxInflightRequests(),
 		t.metrics,
-		func(ctx context.Context, plan *readPlan) ([]KeyMeta, error) {
-			var out []KeyMeta
+		func(ctx context.Context, plan *readPlan) ([]planResult, error) {
+			var pr planResult
 			err := t.listEach(ctx, plan.listPrefix, "", 0,
 				func(obj s3types.Object) (bool, error) {
 					objKey := aws.ToString(obj.Key)
-					if !strings.HasSuffix(objKey, ".parquet") {
-						return true, nil
-					}
-					hiveKey, ok := hiveKeyOfDataFile(objKey, dataPath)
+					hiveKey, ok := hiveKeyOfPartitionFile(objKey, dataPath)
 					if !ok {
 						return true, nil
 					}
-					if plan.match(hiveKey) {
-						out = append(out, KeyMeta{
+					if !plan.match(hiveKey) {
+						return true, nil
+					}
+					base := objKey[strings.LastIndex(objKey, "/")+1:]
+					if strings.HasSuffix(objKey, ".parquet") {
+						if _, _, ok := dataFileTokenAndID(base); !ok {
+							// Parquet under partition prefix but not
+							// shaped like a data file (externally
+							// written / stale layout) — skip.
+							return true, nil
+						}
+						pr.Parquets = append(pr.Parquets, KeyMeta{
 							Key:        objKey,
 							InsertedAt: aws.ToTime(obj.LastModified),
 							Size:       aws.ToInt64(obj.Size),
 						})
+						return true, nil
+					}
+					if strings.HasSuffix(objKey, commitMarkerSuffix) {
+						token, ok := commitTokenFromBasename(base)
+						if !ok {
+							return true, nil
+						}
+						pr.Commits = append(pr.Commits, hiveKey+":"+token)
 					}
 					return true, nil
 				})
 			if err != nil {
 				return nil, fmt.Errorf("list data files: %w", err)
 			}
-			return out, nil
+			return []planResult{pr}, nil
 		},
-		func(per [][]KeyMeta) []KeyMeta {
-			return unionKeys(per, func(k KeyMeta) string { return k.Key })
+		func(per [][]planResult) []planResult {
+			var flat []planResult
+			for _, slice := range per {
+				flat = append(flat, slice...)
+			}
+			return flat
 		})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Union per-plan results: dedupe parquet keys (overlapping
+	// plans), and merge commit sets.
+	commits = make(map[string]struct{})
+	totalParquets := 0
+	for _, pr := range merged {
+		totalParquets += len(pr.Parquets)
+		for _, c := range pr.Commits {
+			commits[c] = struct{}{}
+		}
+	}
+	if totalParquets == 0 {
+		return nil, commits, nil
+	}
+	seen := make(map[string]struct{}, totalParquets)
+	parquets = make([]KeyMeta, 0, totalParquets)
+	for _, pr := range merged {
+		for _, k := range pr.Parquets {
+			if _, dup := seen[k.Key]; dup {
+				continue
+			}
+			seen[k.Key] = struct{}{}
+			parquets = append(parquets, k)
+		}
+	}
+	return parquets, commits, nil
 }

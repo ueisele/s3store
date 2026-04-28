@@ -100,7 +100,11 @@ func BackfillProjection[T any](
 			"s3store: BackfillProjection %w", err)
 	}
 
-	keys, err := listDataFiles(ctx, target, plans)
+	keys, commits, err := listDataFiles(ctx, target, plans)
+	if err != nil {
+		return stats, err
+	}
+	keys, err = gateByCommit(ctx, target, dataPath, keys, commits, methodBackfill)
 	if err != nil {
 		return stats, err
 	}

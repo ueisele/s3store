@@ -43,6 +43,12 @@ const attemptIDHexLen = 32
 // range are zero-padded into the same width.
 const refMicroTsLen = 16
 
+// commitMarkerSuffix is the trailing ".commit" suffix shared by
+// every token-commit marker key. Pulled out of the LIST callbacks
+// so the suffix lives next to the .parquet suffix and the two are
+// easy to scan side-by-side.
+const commitMarkerSuffix = ".commit"
+
 // dataPath returns the prefix under which data parquet files and
 // commit markers are stored, relative to the store's top-level
 // Prefix.
@@ -92,6 +98,25 @@ func newAttemptID() (string, error) {
 		return "", fmt.Errorf("s3store: generate UUIDv7: %w", err)
 	}
 	return hex.EncodeToString(u[:]), nil
+}
+
+// dataFileTokenAndID extracts the token and full id
+// (`<token>-<attemptID>`) from a data-file basename of shape
+// `<token>-<attemptID>.parquet`. Returns ok=false on any other
+// shape (caller-side filter for LIST entries that share a
+// partition prefix but aren't data files). Used by the read-side
+// commit gate to bucket parquets by token before pairing with
+// `<token>.commit` markers.
+func dataFileTokenAndID(basename string) (token, id string, ok bool) {
+	id, found := strings.CutSuffix(basename, ".parquet")
+	if !found {
+		return "", "", false
+	}
+	t, _, err := parseAttemptID(id)
+	if err != nil {
+		return "", "", false
+	}
+	return t, id, true
 }
 
 // parseAttemptID is the inverse of makeID: given an id of shape

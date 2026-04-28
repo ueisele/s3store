@@ -38,6 +38,57 @@ type WriteResult struct {
 	InsertedAt time.Time
 }
 
+// LookupCommit returns the WriteResult of the canonical write
+// committed under (partition, token), if any. One HEAD against
+// `<dataPath>/<partition>/<token>.commit`; no LIST, no parquet
+// re-encode, no parquet GET.
+//
+// Sits on Writer because the use case is write-side: a service
+// that stores the (partition, token) pair alongside its outbox
+// row and, on retry, wants to know "did the prior attempt
+// commit?" before re-fetching records and re-encoding parquet.
+// WriteWithKey under the same token would do the same upfront
+// HEAD internally, but only after re-encoding parquet — calling
+// LookupCommit first lets retries skip the encode entirely on
+// the recovery path. The HEAD + reconstruction primitives
+// (headTokenCommit / reconstructWriteResult) are exactly the
+// ones writeEncodedPayload's Step 2 calls; this method is the
+// externalized form of that step.
+//
+// On a hit, the returned WriteResult is byte-identical to what
+// the original Write returned (DataPath / RefPath / Offset
+// reconstructed from the path scheme + the marker's metadata;
+// InsertedAt sourced from the `insertedat` user-metadata so it
+// matches the parquet's InsertedAtField column value).
+//
+// ok=false signals 404: no commit exists for that (partition,
+// token). If the caller knows a Write was attempted for this
+// token and ok=false, the write either crashed or returned an
+// error to its original caller.
+//
+// Validates token via validateIdempotencyToken so callers fail
+// loudly on garbage rather than HEADing nonsensical keys.
+func (w *Writer[T]) LookupCommit(
+	ctx context.Context, partition, token string,
+) (wr WriteResult, ok bool, err error) {
+	scope := w.cfg.Target.metrics.methodScope(ctx, methodLookupCommit)
+	defer scope.end(&err)
+	if err := validateIdempotencyToken(token); err != nil {
+		return WriteResult{}, false, fmt.Errorf("LookupCommit: %w", err)
+	}
+	w.cfg.Target.metrics.recordReadCommitHead(ctx, methodLookupCommit)
+	meta, exists, err := headTokenCommit(ctx, w.cfg.Target,
+		w.dataPath, partition, token)
+	if err != nil {
+		return WriteResult{}, false, fmt.Errorf("LookupCommit: %w", err)
+	}
+	if !exists {
+		return WriteResult{}, false, nil
+	}
+	return reconstructWriteResult(w.dataPath, w.refPath,
+		partition, token, meta), true, nil
+}
+
 // Write extracts the key from each record via PartitionKeyOf,
 // groups by key, and writes one Parquet file + stream ref per
 // key in parallel (bounded by Target.MaxInflightRequests,

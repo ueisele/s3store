@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -63,7 +65,20 @@ const insertedAtMetaKey = "insertedat"
 // commit marker. Format:
 // `{dataPath}/{partition}/{token}.commit`.
 func tokenCommitKey(dataPath, partition, token string) string {
-	return fmt.Sprintf("%s/%s/%s.commit", dataPath, partition, token)
+	return fmt.Sprintf("%s/%s/%s%s",
+		dataPath, partition, token, commitMarkerSuffix)
+}
+
+// commitTokenFromBasename extracts the token from a `<token>.commit`
+// basename. Returns ok=false on any other shape; callers feed every
+// LIST entry that ends in `.commit` through here without further
+// pre-filtering.
+func commitTokenFromBasename(basename string) (token string, ok bool) {
+	t, found := strings.CutSuffix(basename, commitMarkerSuffix)
+	if !found || t == "" {
+		return "", false
+	}
+	return t, true
 }
 
 // tokenCommitMeta is the parsed user-metadata of a token-commit:
@@ -175,6 +190,212 @@ func reconstructWriteResult(
 		RefPath:    refKey,
 		InsertedAt: time.UnixMicro(meta.insertedAtUs),
 	}
+}
+
+// gateByCommit applies the snapshot-read commit gate to a flat
+// LIST result of data-file KeyMetas, dropping uncommitted parquets
+// and resolving multi-attempt tokens to their canonical attempt:
+//
+//   - parquet whose token has no `<token>.commit` marker visible
+//     in the same LIST → drop. The write either crashed before
+//     the token-commit PUT or never finished; reads must not see
+//     it (read stability invariant: two consecutive snapshot reads
+//     return the same records, so we cannot depend on a future
+//     commit landing).
+//   - token has 1 parquet + commit → keep parquet. The parquet is
+//     canonical by uniqueness — no HEAD needed, since any other
+//     attempt-id would also be in the LIST.
+//   - token has ≥2 parquets + commit → HEAD `<token>.commit` once
+//     per token, read the canonical `attemptid` from metadata, and
+//     keep only the parquet whose attempt-id matches. The other
+//     parquets are orphans from failed-mid-write retries (the
+//     library never deletes them; cleanup is operator-driven).
+//
+// Per-token HEADs run in parallel (bounded by
+// MaxInflightRequests) so a partition with many multi-attempt
+// tokens doesn't serialise. observabilityMethod is the caller's
+// methodKind so the s3store.read.commit_head metric carries the
+// right entry-point label.
+//
+// commits maps `<partition>:<token>` → struct{} for every
+// `<token>.commit` observed in the same LIST as dataFiles.
+// Callers populate it during the LIST iteration so the gate
+// doesn't re-LIST.
+func gateByCommit(
+	ctx context.Context, target S3Target, dataPath string,
+	dataFiles []KeyMeta, commits map[string]struct{},
+	observabilityMethod methodKind,
+) ([]KeyMeta, error) {
+	if len(dataFiles) == 0 {
+		return dataFiles, nil
+	}
+
+	// Bucket data files by (partition, token). Files whose path
+	// doesn't parse as a data file flow through unchanged — higher
+	// layers (hiveKeyOfDataFile callers) already validate, so a
+	// non-parsing path here is genuinely outside our concern.
+	type bucketKey struct{ partition, token string }
+	type bucket struct {
+		token     string
+		partition string
+		files     []KeyMeta
+	}
+	buckets := make(map[bucketKey]*bucket, len(dataFiles))
+	var passthrough []KeyMeta
+	for _, k := range dataFiles {
+		partition, ok := hiveKeyOfDataFile(k.Key, dataPath)
+		if !ok {
+			passthrough = append(passthrough, k)
+			continue
+		}
+		base := k.Key[strings.LastIndex(k.Key, "/")+1:]
+		token, _, ok := dataFileTokenAndID(base)
+		if !ok {
+			passthrough = append(passthrough, k)
+			continue
+		}
+		bk := bucketKey{partition: partition, token: token}
+		b, ok := buckets[bk]
+		if !ok {
+			b = &bucket{token: token, partition: partition}
+			buckets[bk] = b
+		}
+		b.files = append(b.files, k)
+	}
+
+	// Resolve buckets in two passes: trivial ones synchronously
+	// (drop / keep) and ambiguous ones (≥ 2 attempts under a single
+	// commit) via a fan-out HEAD. Single-pass over the bucket map
+	// would force us to spawn a goroutine for the trivial branches
+	// too, which is most buckets in steady state.
+	type ambiguous struct {
+		bucket *bucket
+	}
+	out := make([]KeyMeta, 0, len(dataFiles))
+	out = append(out, passthrough...)
+	var pending []ambiguous
+	for bk, b := range buckets {
+		if _, committed := commits[bk.partition+":"+bk.token]; !committed {
+			continue
+		}
+		if len(b.files) == 1 {
+			out = append(out, b.files[0])
+			continue
+		}
+		pending = append(pending, ambiguous{bucket: b})
+	}
+	if len(pending) == 0 {
+		return out, nil
+	}
+
+	resolved := make([][]KeyMeta, len(pending))
+	err := fanOut(ctx, pending,
+		target.EffectiveMaxInflightRequests(),
+		target.metrics,
+		func(ctx context.Context, i int, item ambiguous) error {
+			b := item.bucket
+			target.metrics.recordReadCommitHead(ctx, observabilityMethod)
+			meta, ok, err := headTokenCommit(ctx, target,
+				dataPath, b.partition, b.token)
+			if err != nil {
+				return fmt.Errorf(
+					"s3store: head token-commit %s/%s: %w",
+					b.partition, b.token, err)
+			}
+			if !ok {
+				// Vanished between LIST and HEAD — nothing committed.
+				// Read stability invariant: never include uncommitted
+				// data, and operator-driven cleanup is the only
+				// deletion path.
+				return nil
+			}
+			canonicalBase := makeID(b.token, meta.attemptID) + ".parquet"
+			for _, k := range b.files {
+				base := k.Key[strings.LastIndex(k.Key, "/")+1:]
+				if base == canonicalBase {
+					resolved[i] = []KeyMeta{k}
+					return nil
+				}
+			}
+			// Canonical attempt is named in metadata but its
+			// parquet wasn't in the LIST — unusual, but possible
+			// if the LIST happened mid-write (data PUT not yet
+			// visible) or if a sweep raced. Drop everything for
+			// this token rather than emit a non-canonical attempt.
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range resolved {
+		out = append(out, r...)
+	}
+	return out, nil
+}
+
+// commitCache memoises per-poll `<token>.commit` HEAD results
+// keyed by (partition, token). The stream-read gate consults it
+// per ref so refs that share a token within one Poll cycle issue
+// at most one HEAD against the marker. Reset between polls — a
+// stale cache across cycles would let a failed-write zombie ref
+// escape the gate after its commit was confirmed missing once.
+//
+// Concurrent safety: future poll fan-outs may parallelise this
+// gate; the mutex keeps the contract correct. Today's Poll is
+// serial, so contention is zero in steady state.
+type commitCache struct {
+	mu      sync.Mutex
+	entries map[string]commitCacheEntry
+}
+
+// commitCacheEntry is a single cached HEAD outcome plus the
+// metadata needed to compare against a ref's attempt-id.
+type commitCacheEntry struct {
+	exists    bool
+	attemptID string
+}
+
+// newCommitCache returns an empty cache ready for one poll cycle.
+func newCommitCache() *commitCache {
+	return &commitCache{entries: map[string]commitCacheEntry{}}
+}
+
+// lookupOrFetch returns the cached commit-presence + attempt-id
+// for (partition, token), HEADing the token-commit marker on a
+// miss. Records s3store.read.commit_head_cache_hit on a cache hit
+// and s3store.read.commit_head on a miss (via headTokenCommit's
+// caller side, here). 404 is cached as ok=false so a partition
+// hammered with refs from a failed write doesn't HEAD per ref.
+func (c *commitCache) lookupOrFetch(
+	ctx context.Context, target S3Target,
+	dataPath, partition, token string,
+	method methodKind,
+) (commitCacheEntry, error) {
+	cacheKey := partition + ":" + token
+
+	c.mu.Lock()
+	if e, ok := c.entries[cacheKey]; ok {
+		c.mu.Unlock()
+		target.metrics.recordReadCommitHeadCacheHit(ctx, method)
+		return e, nil
+	}
+	c.mu.Unlock()
+
+	target.metrics.recordReadCommitHead(ctx, method)
+	meta, exists, err := headTokenCommit(ctx, target,
+		dataPath, partition, token)
+	if err != nil {
+		return commitCacheEntry{}, err
+	}
+	entry := commitCacheEntry{exists: exists}
+	if exists {
+		entry.attemptID = meta.attemptID
+	}
+
+	c.mu.Lock()
+	c.entries[cacheKey] = entry
+	c.mu.Unlock()
+	return entry, nil
 }
 
 // putTokenCommit writes the zero-byte token-commit marker with

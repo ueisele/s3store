@@ -3537,6 +3537,243 @@ func TestCommitTimeout_MissingRejected(t *testing.T) {
 }
 
 // TestMaxClockSkew_MissingRejected guards that NewS3Target fails
+// TestSnapshotRead_UncommittedDataInvisible guards Phase 2's
+// snapshot-read commit gate: a parquet whose `<token>.commit`
+// marker is missing must not appear in any snapshot read path,
+// even though the file itself is present in the partition LIST.
+//
+// Simulates the failed-mid-write shape by deleting the
+// token-commit out-of-band after a successful Write. The data
+// file persists (the library never deletes it) but every
+// snapshot entry point — Read, ReadIter, ReadRangeIter,
+// LookupCommit — must agree it is invisible.
+func TestSnapshotRead_UncommittedDataInvisible(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	key := "period=2026-04-22/customer=ghost"
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "ghost",
+		SKU: "vanish", Value: 1, Ts: time.UnixMilli(1),
+	}}
+	const token = "job-uncommitted-ghost"
+
+	wr, err := store.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token))
+	if err != nil {
+		t.Fatalf("WriteWithKey: %v", err)
+	}
+
+	// Sanity: the write was visible before the simulated outage.
+	got, err := store.Read(ctx, []string{key})
+	if err != nil {
+		t.Fatalf("pre-delete Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("pre-delete Read: got %d, want 1", len(got))
+	}
+
+	// Simulate a failed-mid-write attempt: delete the token-commit
+	// while leaving the data file. The orphan parquet now mimics
+	// a writer that crashed between data PUT and token-commit PUT.
+	commitKey := tokenCommitKey(
+		store.Target().Prefix()+"/data", key, token)
+	if _, err := store.Target().S3Client().DeleteObject(ctx,
+		&s3.DeleteObjectInput{
+			Bucket: aws.String(store.Target().Bucket()),
+			Key:    aws.String(commitKey),
+		}); err != nil {
+		t.Fatalf("DeleteObject token-commit: %v", err)
+	}
+
+	// Read: gate must drop the parquet.
+	got, err = store.Read(ctx, []string{key})
+	if err != nil {
+		t.Fatalf("post-delete Read: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("post-delete Read: got %d records, want 0 "+
+			"(uncommitted parquet must be invisible): %+v",
+			len(got), got)
+	}
+
+	// ReadIter: same gate, streaming path.
+	var iterOut []Rec
+	for r, err := range store.ReadIter(ctx, []string{key}) {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		iterOut = append(iterOut, r)
+	}
+	if len(iterOut) != 0 {
+		t.Errorf("post-delete ReadIter: got %d records, want 0",
+			len(iterOut))
+	}
+
+	// LookupCommit: must report ok=false now that the marker is gone.
+	_, ok, err := store.LookupCommit(ctx, key, token)
+	if err != nil {
+		t.Fatalf("LookupCommit: %v", err)
+	}
+	if ok {
+		t.Errorf("LookupCommit: ok=true, want false (token-commit deleted)")
+	}
+
+	// Reference data path stayed in place (the library never
+	// deletes data); the LIST sees it but the gate hides it.
+	_, err = store.Target().S3Client().HeadObject(ctx,
+		&s3.HeadObjectInput{
+			Bucket: aws.String(store.Target().Bucket()),
+			Key:    aws.String(wr.DataPath),
+		})
+	if err != nil {
+		t.Fatalf("data file unexpectedly absent: %v", err)
+	}
+}
+
+// TestStreamPoll_UncommittedRefSkipped guards the stream-side
+// commit gate: a ref whose `<token>.commit` is missing is
+// transparently skipped by Poll, the consumer's offset still
+// advances past it (no re-walking), and the next ref's commit
+// is observed normally.
+func TestStreamPoll_UncommittedRefSkipped(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	key := "period=2026-04-22/customer=stream"
+	rec := func(value int64) Rec {
+		return Rec{
+			Period: "2026-04-22", Customer: "stream",
+			SKU: "k", Value: value, Ts: time.UnixMilli(value),
+		}
+	}
+
+	// Write A — token-commit will be deleted.
+	const tokA = "job-stream-A"
+	wrA, err := store.WriteWithKey(ctx, key, []Rec{rec(1)},
+		WithIdempotencyToken(tokA))
+	if err != nil {
+		t.Fatalf("WriteWithKey A: %v", err)
+	}
+	// Write B — fully committed.
+	const tokB = "job-stream-B"
+	if _, err := store.WriteWithKey(ctx, key, []Rec{rec(2)},
+		WithIdempotencyToken(tokB)); err != nil {
+		t.Fatalf("WriteWithKey B: %v", err)
+	}
+
+	// Knock out A's token-commit so the corresponding ref
+	// becomes a "failed write" the gate must skip.
+	commitKeyA := tokenCommitKey(
+		store.Target().Prefix()+"/data", key, tokA)
+	if _, err := store.Target().S3Client().DeleteObject(ctx,
+		&s3.DeleteObjectInput{
+			Bucket: aws.String(store.Target().Bucket()),
+			Key:    aws.String(commitKeyA),
+		}); err != nil {
+		t.Fatalf("DeleteObject token-commit A: %v", err)
+	}
+
+	// Wait past SettleWindow so the cutoff has passed both refs
+	// (Poll only emits refs whose refMicroTs is past the cutoff).
+	time.Sleep(testSettleWindow + 200*time.Millisecond)
+
+	entries, _, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	// Only the committed ref (write B) should surface; A's
+	// uncommitted ref must be skipped.
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1 (A skipped, B kept):\n %+v",
+			len(entries), entries)
+	}
+	if entries[0].RefPath == string(wrA.Offset) {
+		t.Errorf("uncommitted ref %q surfaced — gate failed",
+			entries[0].RefPath)
+	}
+}
+
+// TestLookupCommit_RoundTrip asserts that LookupCommit returns a
+// WriteResult identical to the original Write's. Same DataPath,
+// same RefPath, same Offset, and an InsertedAt that matches
+// (the field is sourced from the token-commit's `insertedat`
+// metadata = the original write's pre-encode wall-clock).
+func TestLookupCommit_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	key := "period=2026-04-22/customer=lookup"
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "lookup",
+		SKU: "k", Value: 5, Ts: time.UnixMilli(5),
+	}}
+	const token = "job-lookup-A"
+
+	wr, err := store.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token))
+	if err != nil {
+		t.Fatalf("WriteWithKey: %v", err)
+	}
+
+	got, ok, err := store.LookupCommit(ctx, key, token)
+	if err != nil {
+		t.Fatalf("LookupCommit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("LookupCommit: ok=false, want true")
+	}
+	if got.DataPath != wr.DataPath {
+		t.Errorf("DataPath = %q, want %q", got.DataPath, wr.DataPath)
+	}
+	if got.RefPath != wr.RefPath {
+		t.Errorf("RefPath = %q, want %q", got.RefPath, wr.RefPath)
+	}
+	if got.Offset != wr.Offset {
+		t.Errorf("Offset = %q, want %q", got.Offset, wr.Offset)
+	}
+	if !got.InsertedAt.Equal(wr.InsertedAt) {
+		t.Errorf("InsertedAt = %v, want %v", got.InsertedAt, wr.InsertedAt)
+	}
+}
+
+// TestLookupCommit_MissingReturnsOK_False guards the not-found
+// branch: a token that was never written returns (zero-value, false, nil)
+// — distinct from a real error.
+func TestLookupCommit_MissingReturnsOK_False(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	got, ok, err := store.LookupCommit(ctx,
+		"period=2026-04-22/customer=ghost", "never-written")
+	if err != nil {
+		t.Fatalf("LookupCommit: %v", err)
+	}
+	if ok {
+		t.Errorf("ok=true for unknown token, want false")
+	}
+	if got != (WriteResult{}) {
+		t.Errorf("got %+v, want zero-value WriteResult", got)
+	}
+}
+
+// TestLookupCommit_RejectsBadToken guards that LookupCommit
+// runs the token validation up-front so callers fail loudly on
+// garbage input instead of HEADing nonsensical keys.
+func TestLookupCommit_RejectsBadToken(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	for _, bad := range []string{"", "tok/with/slash", "tok;semi"} {
+		_, _, err := store.LookupCommit(ctx,
+			"period=2026-04-22/customer=ghost", bad)
+		if err == nil {
+			t.Errorf("LookupCommit(%q) returned nil err, want validation error", bad)
+		}
+	}
+}
+
 // fast when only commit-timeout is seeded. Mirrors
 // TestCommitTimeout_MissingRejected for the second knob.
 func TestMaxClockSkew_MissingRejected(t *testing.T) {

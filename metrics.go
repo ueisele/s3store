@@ -49,6 +49,7 @@ const (
 	methodPoll          methodKind = "poll"
 	methodPollRecords   methodKind = "poll_records"
 	methodLookup        methodKind = "lookup"
+	methodLookupCommit  methodKind = "lookup_commit"
 	methodBackfill      methodKind = "backfill"
 )
 
@@ -127,6 +128,8 @@ type metrics struct {
 	readFiles          metric.Int64Histogram
 	readMissingData    metric.Int64Counter
 	readMalformedRefs  metric.Int64Counter
+	readCommitHead     metric.Int64Counter
+	readCommitHeadHit  metric.Int64Counter
 	writeCommitAfterTO metric.Int64Counter
 
 	// Iter pipeline internals (downloadAndDecodeIter): bottleneck
@@ -290,6 +293,14 @@ func newMetrics(
 	m.writeCommitAfterTO = mustCounter(
 		"s3store.write.commit_after_timeout",
 		"Writes whose end-to-end wall-clock elapsed exceeded CommitTimeout by the time the token-commit PUT completed. Not a failure — the commit landed; signals that a SettleWindow tuned for this CommitTimeout may not yet have included this write in the stream window.",
+		"{event}")
+	m.readCommitHead = mustCounter(
+		"s3store.read.commit_head",
+		"HEAD requests issued by the read paths against `<token>.commit` to gate visibility (snapshot reads on multi-attempt tokens; one per ref on stream reads after per-poll cache misses).",
+		"{request}")
+	m.readCommitHeadHit = mustCounter(
+		"s3store.read.commit_head_cache_hit",
+		"Stream-read commit-gate lookups satisfied by the per-poll (partition, token) → committed cache, collapsing repeat HEADs across refs that share a token within one Poll cycle.",
 		"{event}")
 
 	// Iter pipeline internals.
@@ -702,6 +713,30 @@ func (s *methodScope) recordMalformedRefs() {
 	s.m.readMalformedRefs.Add(s.ctx, 1, cs, vs)
 }
 
+// recordReadCommitHead increments the commit_head counter for one
+// HEAD on a `<token>.commit` issued by a read-path gate. Carries
+// the caller's method (snapshot read vs stream poll) so dashboards
+// can split by entry point.
+func (m *metrics) recordReadCommitHead(ctx context.Context, method methodKind) {
+	if m == nil {
+		return
+	}
+	cs, vs := m.callOpts(attribute.String(attrKeyMethod, string(method)))
+	m.readCommitHead.Add(ctx, 1, cs, vs)
+}
+
+// recordReadCommitHeadCacheHit increments the
+// commit_head_cache_hit counter for one stream-poll gate lookup
+// satisfied by the per-poll cache. Carries the caller's method so
+// dashboards see hit-rate per entry point.
+func (m *metrics) recordReadCommitHeadCacheHit(ctx context.Context, method methodKind) {
+	if m == nil {
+		return
+	}
+	cs, vs := m.callOpts(attribute.String(attrKeyMethod, string(method)))
+	m.readCommitHeadHit.Add(ctx, 1, cs, vs)
+}
+
 // recordCommitAfterTimeout increments the commit_after_timeout
 // counter for one Write whose end-to-end wall-clock elapsed
 // exceeded CommitTimeout by the time the token-commit PUT
@@ -767,7 +802,8 @@ func (s *methodScope) end(errPtr *error) {
 			s.m.writeBytes.Record(s.ctx, bytesN, mcs, mvs)
 		}
 	case methodRead, methodReadIter, methodReadRangeIter,
-		methodPollRecords, methodPoll, methodLookup, methodBackfill:
+		methodPollRecords, methodPoll, methodLookup,
+		methodLookupCommit, methodBackfill:
 		if records > 0 {
 			s.m.readRecords.Record(s.ctx, records, mcs, mvs)
 		}

@@ -37,7 +37,7 @@ func (s *Reader[T]) Read(
 	o.Apply(opts...)
 
 	keys, err := ResolvePatterns(
-		ctx, s.cfg.Target, keyPatterns, &o)
+		ctx, s.cfg.Target, keyPatterns, &o, methodRead)
 	if err != nil {
 		return nil, fmt.Errorf("s3store: Read %w", err)
 	}
