@@ -69,6 +69,35 @@ func isCommitValid(dataLM, markerLM time.Time, commitTimeout time.Duration) bool
 	return markerLM.Sub(dataLM) < commitTimeout
 }
 
+// truncLMToSecond normalizes an S3-server-stamped LastModified to
+// second precision. Required because the same object's LM comes
+// back at *different* precisions depending on how we read it:
+//
+//   - HEAD's Last-Modified header is HTTP-date (RFC 1123) format,
+//     which only carries second precision — anything sub-second
+//     is silently truncated by the protocol.
+//   - LIST's LastModified is an ISO 8601 timestamp, and MinIO
+//     emits it at millisecond precision; AWS S3 emits it at
+//     second precision (matching what the bucket persists).
+//
+// Without normalization, a HEAD and a LIST against the same
+// object return values differing by up to 999 ms — the upfront-
+// LIST dedup gate's reconstructed refTsMicros (from LIST) would
+// not match the original write's refTsMicros (from HEAD), and
+// retries would surface "drifted RefPath" even when the
+// reconstruction is logically correct. Truncation to seconds
+// produces the same value via either path on every backend.
+//
+// The cost is granularity: refs from two writes within the same
+// wall-clock second can collide on refTsMicros. The id portion
+// of the ref filename keeps them distinct (every per-attempt id
+// embeds tsMicros + an 8-hex shortID, so collisions are
+// vanishingly improbable), and lex ordering by (refTsMicros, id)
+// remains stable.
+func truncLMToSecond(t time.Time) time.Time {
+	return t.Truncate(time.Second)
+}
+
 // commitInfo bundles a data file and its commit-marker sibling —
 // the unit the upfront-LIST dedup gate, snapshot reads, and
 // LookupCommit work in. Both LMs come from a LIST page so the
@@ -115,6 +144,15 @@ func listCommitsForToken(
 // by id. Returns the pairs in arbitrary order — callers that need
 // a specific ordering (e.g., return-the-first-valid) must impose
 // it themselves.
+//
+// LIST-page LastModified values are truncated to second precision
+// via truncLMToSecond so they match what target.head returns on
+// the HEAD path (HEAD's Last-Modified is HTTP-date format, second
+// precision only). Without normalization, the upfront-LIST dedup
+// gate would reconstruct a refTsMicros that disagrees with the
+// original write's HEAD-derived refTsMicros — same logical commit,
+// different ref-key bytes — and retries would surface as
+// "drifted RefPath" even when correct. See truncLMToSecond.
 func listCommitsAtPrefix(
 	ctx context.Context, target S3Target, prefix string,
 ) ([]commitInfo, error) {
@@ -131,12 +169,13 @@ func listCommitsAtPrefix(
 				ci = &commitInfo{id: id}
 				pairs[id] = ci
 			}
+			lm := truncLMToSecond(aws.ToTime(obj.LastModified))
 			if isParquet {
 				ci.dataKey = key
-				ci.dataLM = aws.ToTime(obj.LastModified)
+				ci.dataLM = lm
 			} else {
 				ci.markerKey = key
-				ci.markerLM = aws.ToTime(obj.LastModified)
+				ci.markerLM = lm
 			}
 			return true, nil
 		})

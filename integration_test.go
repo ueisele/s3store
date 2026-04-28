@@ -40,13 +40,16 @@ type storeOpts struct {
 }
 
 // testCommitTimeout is the CommitTimeout integration tests seed
-// before constructing a Store. Tight enough to keep settle-window
-// sleeps short on localhost MinIO (millisecond PUT latency, sub-
-// millisecond clock skew between writer and reader processes
-// running on the same host); the writer's PUT budget on the
-// existing single-knob path is testCommitTimeout/2 + (skew share),
-// well above realistic localhost latencies.
-const testCommitTimeout = 200 * time.Millisecond
+// before constructing a Store. Has to clear MinIO's per-second
+// LastModified granularity (HEAD returns RFC 1123 second-precision
+// values; LIST is truncated to seconds at the commit-marker layer
+// for cross-source consistency — see truncLMToSecond), so two
+// PUTs straddling a wall-clock second boundary appear 1s apart
+// even when they completed in milliseconds. 2s leaves headroom
+// for the post-marker timeliness check (marker.LM - data.LM <
+// CommitTimeout) on the worst-case spanning case while still
+// keeping settle-window sleeps short.
+const testCommitTimeout = 2 * time.Second
 
 // testMaxClockSkew is the MaxClockSkew integration tests seed.
 // Localhost has ~microsecond skew between processes; 100ms is
@@ -1919,13 +1922,19 @@ func TestPollRecords(t *testing.T) {
 // from both sides pulls only the middle window. Also verifies
 // the paginator stops early and the returned offset lands
 // inside the window.
+//
+// Writes are spaced by 1.1s because under Phase 4 the ref
+// filename's refTsMicros is the data file's server-stamped
+// LastModified at *second* precision (HEAD's RFC 1123 format
+// + the cross-source truncation in truncLMToSecond). Two writes
+// landing in the same wall-clock second are indistinguishable
+// at the offset level — the time window can't separate them.
+// The 1.1s spacing guarantees each write lands in its own
+// second.
 func TestPollTimeWindow(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	// Three writes separated by small pauses; OffsetAt uses
-	// microsecond precision so 5ms is enough to give each ref a
-	// distinctly-orderable timestamp even on fast hosts.
 	beforeFirst := time.Now()
 	if _, err := store.WriteWithKey(ctx,
 		"period=2026-03-17/customer=a",
@@ -1933,18 +1942,18 @@ func TestPollTimeWindow(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Write 1: %v", err)
 	}
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	afterFirst := time.Now()
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	if _, err := store.WriteWithKey(ctx,
 		"period=2026-03-17/customer=b",
 		[]Rec{{Period: "2026-03-17", Customer: "b", SKU: "s2"}},
 	); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	beforeThird := time.Now()
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	if _, err := store.WriteWithKey(ctx,
 		"period=2026-03-17/customer=c",
 		[]Rec{{Period: "2026-03-17", Customer: "c", SKU: "s3"}},
@@ -2000,11 +2009,18 @@ func TestPollTimeWindow(t *testing.T) {
 // via range. Also checks that zero time.Time bounds mean
 // "stream head → live tip" and that an empty window terminates
 // without error or yielded records.
+//
+// `before` is taken from the previous wall-clock second so it
+// sorts strictly before any write's server-stamped refTsMicros
+// (which is second-precision under Phase 4 — see truncLMToSecond).
+// A `before` taken from the same second as the writes would
+// land mid-second and the second-truncated refKeys would lex
+// less than it, excluding every write from the window.
 func TestReadRangeIter(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	before := time.Now()
+	before := time.Now().Add(-1 * time.Second).Truncate(time.Second)
 	for i := range 5 {
 		if _, err := store.WriteWithKey(ctx,
 			fmt.Sprintf("period=2026-03-17/customer=c%d", i),
