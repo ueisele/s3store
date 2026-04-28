@@ -24,14 +24,28 @@ must preserve them — even when the change appears unrelated.
 - **Exactly-once at the consumer layer is opt-in via reader
   dedup** — `EntityKeyOf` + `VersionOf` collapse duplicates by
   (entity, version). `WithIdempotencyToken` makes retries
-  recover automatically: every attempt writes to a per-attempt
-  path (id = `{token}-{tsMicros}-{shortID}`) and the writer's
-  upfront LIST under `{partition}/{token}-` finds any prior
-  valid commit and returns its `WriteResult` unchanged.
-  Refactors must not reintroduce overwrite-based retry
-  detection — per-attempt-paths are what makes the design
+  recover automatically: every attempt writes its data and ref
+  to per-attempt paths (id = `{token}-{UUIDv7}`), and the
+  writer's upfront HEAD on `<dataPath>/<partition>/<token>.commit`
+  finds any prior commit and returns its `WriteResult` unchanged.
+  Refactors must not reintroduce overwrite-based retry detection
+  on data or refs — per-attempt-paths are what keep the design
   correct on multi-site StorageGRID, where read-after-overwrite
-  is eventually consistent.
+  on those keys is eventually consistent. The `<token>.commit`
+  marker itself overwrites only under declared-out-of-contract
+  concurrent same-token writes (see "One in-flight write per
+  token" below); under sequential retries the upfront HEAD
+  short-circuits before any second commit PUT lands.
+- **Atomic per-file visibility via `<token>.commit`** — both
+  read paths gate on the marker. Snapshot reads
+  (`Read` / `ReadIter` / `ProjectionReader.Lookup` /
+  `BackfillProjection`) drop parquets without a paired commit;
+  the change-stream APIs (`Poll` / `PollRecords` /
+  `ReadRangeIter`) HEAD `<token>.commit` per ref before yielding
+  (per-poll cache collapses repeat tokens). A writer that
+  crashes mid-sequence leaves an orphan parquet/ref pair
+  invisible to every read path. Refactors must not introduce
+  read paths that bypass the gate.
 - **Deterministic parquet encoding** — same records + same codec
   produce byte-identical bytes. `WithIdempotencyToken` retries
   depend on this; refactors must not introduce non-determinism
@@ -55,45 +69,67 @@ where these don't hold are out of scope for the library's
 correctness guarantees, even when the wire-level S3 API is
 honoured.
 
-- **`LastModified` ≈ first-observable-time, for every reader.**
-  A server-stamped `LastModified` value `L` on an object
-  reflects approximately when the object first became
-  *observable* (readable via subsequent HEAD / GET / LIST) by
-  any reader. Equivalently: when a reader's HEAD or LIST
-  returns an object with `LastModified = L`, that object became
-  visible to all readers somewhere around time `L`. This is the
-  operational shape of the **read-after-new-write** guarantee
-  that AWS S3 (since 2020), MinIO, and StorageGRID at
-  `strong-*` all provide for new-key writes; the library never
-  overwrites under `WithIdempotencyToken` (per-attempt-paths),
-  so every PUT in the write path is a new-key write — well
-  inside that guarantee on every supported backend.
+- **One in-flight write per `(partition, token)`.** Concurrent
+  writes that share the same `WithIdempotencyToken` are
+  out of contract. The library guarantees correctness only
+  when at most one write is in flight per `(partition, token)`
+  at any given moment. Sequential retries (a failed write
+  followed by a same-token retry) remain fully supported —
+  that is the design's primary use case. The constraint buys
+  back enough determinism that the writer's `<token>.commit`
+  PUT can be tolerated as a no-overwrite write under
+  sequential retries: the upfront HEAD short-circuits before
+  any second commit lands. Refactors must not weaken this
+  contract or remove the upfront-HEAD short-circuit.
 
-  Where this assumption is load-bearing:
+- **Read-after-new-write on every PUT key.** Data files, refs,
+  projection markers, and `<token>.commit` markers all rely on
+  read-after-new-write at the configured consistency level.
+  AWS S3 (since 2020), MinIO, and StorageGRID at `strong-*`
+  all guarantee this for new-key writes. Data and ref PUTs use
+  per-attempt paths (`<token>-<UUIDv7>`) and never overwrite,
+  so they always live inside the new-key guarantee.
+  `<token>.commit` PUTs may overwrite only under declared-out-
+  of-contract concurrent same-token writes; record-wise
+  byte-equivalence (deterministic parquet encoding) bounds the
+  blast radius even then.
 
-  - The **post-marker timeliness check**
-    (`marker.LM - data.LM < CommitTimeout`) treats the gap
-    between two server-stamped LMs as the gap between when the
-    data became visible and when the marker became visible. If
-    LM were divorced from observability (e.g., LM is set at
-    request arrival but cross-replica propagation takes
-    seconds), the check could pass while the data is still
-    invisible to a reader who can already see the marker —
-    breaking atomic visibility.
-  - **`Poll`'s `refCutoff = now - SettleWindow`** assumes that
-    any ref whose `dataLM` ≤ `now - SettleWindow` is
-    LIST-visible to the reader. If LM were set significantly
-    before the ref became LIST-visible, refs would silently
-    drop out of the reader's view and never reappear — the
-    cutoff advances past them. `MaxClockSkew` bounds
-    reader↔server clock skew, not server-LM-stamp ↔
-    server-visibility skew, which is what this assumption
-    constrains.
+- **`ConsistencyControl: strong-global` is required on
+  multi-site StorageGRID for the token-commit-overwrite
+  convergence path.** When two attempts of the same token race
+  through the upfront HEAD (out of contract, but possible) and
+  both PUT `<token>.commit`, multi-site grids at `strong-site`
+  or `read-after-new-write` propagate the overwrite eventually.
+  At `strong-global` the overwrite resolves under the same
+  EACH_QUORUM mechanism that backs every-site PUT
+  acknowledgement, so subsequent HEADs converge on the
+  latest-wins metadata. Single-site grids where every
+  reader/writer pair lives in one site can downgrade to
+  `strong-site` — there's no cross-site overwrite-propagation
+  exposure to absorb. AWS S3 and MinIO ignore the header
+  entirely.
 
-  Refactors that swap LM for a different timestamp source
-  (e.g., `x-amz-date` request time, a client-stamped value, or
-  a header that some backends emit ahead of replication) break
-  this assumption and must not be introduced.
+- **Writer wall-clock is in the protocol.** Refs encode
+  `refMicroTs` — the writer's microsecond wall-clock captured
+  immediately before the ref PUT. The reader's
+  `refCutoff = now - SettleWindow` therefore compares writer-
+  stamped time against reader wall-clock; `MaxClockSkew` bounds
+  writer↔reader skew. There is no `LastModified` dependency in
+  the cutoff math (the earlier design's
+  `LM ≈ first-observable-time` assumption was dropped on the
+  empirical finding that StorageGRID stamps `LastModified` at
+  request-receipt time, not observability). Refactors that
+  reintroduce a server-`LastModified` dependency on the
+  ordering path break this contract and must not be introduced.
+
+  The `WithIdempotentRead` barrier (per-partition
+  `min(LastModified)` over token-matching parquets) and
+  `BackfillProjection`'s `until time.Time` bound do still rely
+  on `LastModified`, but only as a *relative* ordering signal
+  across files written through the library — not as an
+  observability proxy. Both compare LMs that the same backend
+  stamped at PUT time on new keys, which is monotonic enough
+  for those use cases on every supported backend.
 
 # Verification
 

@@ -33,23 +33,24 @@ contract follows from that:
 - **Read stability.** Two consecutive snapshot reads with no
   intervening writes return the same records — the library never
   deletes or rewrites data on its own.
-- **No atomic write visibility.** `Write` PUTs the data file
-  before its ref. Snapshot reads (`Read` / `ReadIter` /
-  `ProjectionReader.Lookup`) LIST the data path directly, so they can
-  observe a data file before its ref has committed — including
-  orphans from a writer that crashed between the two PUTs. The
-  change-stream APIs (`Poll` / `PollRecords` / `ReadRangeIter`)
-  LIST the ref stream and filter those out: a ref only appears
-  once its data file is durable. A multi-partition `Write` is
-  also not atomic across partitions — refs become visible one at
-  a time. For workloads where each write is a self-contained
-  record version (typical CDC), partial visibility is benign:
-  at-least-once dedup on `EntityKeyOf` / `VersionOf` collapses
-  the duplicate. **For workloads that compute deltas against a
-  previously-read snapshot, partial visibility is a correctness
-  hazard** — read the base state via `PollRecords` /
-  `ReadRangeIter` so the read boundary lines up with committed
-  refs, and checkpoint by offset rather than wall-clock.
+- **Atomic per-file visibility via the token-commit marker.**
+  Every `Write` lands a single `<token>.commit` zero-byte object
+  *after* the data and ref PUTs. Both read paths gate on its
+  presence: snapshot reads (`Read` / `ReadIter` /
+  `ProjectionReader.Lookup`) drop parquets without a sibling
+  commit; the change-stream APIs (`Poll` / `PollRecords` /
+  `ReadRangeIter`) HEAD `<token>.commit` for each ref before
+  yielding. A writer that crashes mid-sequence leaves an orphan
+  parquet/ref pair that stays invisible to every read path — no
+  in-flight states leak. A multi-partition `Write` is still not
+  atomic *across* partitions; partition commits become visible one
+  at a time. For per-partition workloads (typical CDC,
+  read-modify-write under `WithIdempotencyToken`) that's
+  sufficient. **For workloads that compute deltas across
+  partitions in one logical step**, treat each partition's commit
+  independently — read each via `PollRecords` / `ReadRangeIter` so
+  the read boundary lines up with committed refs, and checkpoint
+  by offset rather than wall-clock.
 
 **Corollary: once a data file is in S3, it stays forever — even if
 the `Write` call returned an error.** A crashed write can leave an
@@ -62,23 +63,26 @@ without breaking read stability**. Cleanup of orphans is an
 operator decision (S3 lifecycle rules, or a manual prune with
 readers quiesced), not a library feature.
 
-**Backend requirement: `LastModified ≈ first-observable-time`.**
-The commit-marker timing model — the post-marker timeliness
-check (`marker.LM - data.LM < CommitTimeout`) and `Poll`'s
-`refCutoff = now - SettleWindow` — assumes that a server-stamped
-`LastModified` value approximately equals when the object first
-became *observable* (readable via subsequent HEAD / GET / LIST)
-to any reader. AWS S3, MinIO, and StorageGRID at `strong-*` all
-satisfy this for new-key writes via their read-after-new-write
-guarantee, and the library never overwrites under
-`WithIdempotencyToken` (per-attempt-paths), so every PUT is a
-new-key write. Backends where the LM stamp can predate
-observability — eventual-consistency-only setups, cross-replica
-replicated stores without strong consistency, or non-S3-compliant
-storage with different LM semantics — are out of scope for the
-library's correctness guarantees. See [CLAUDE.md "Backend
-assumptions"](CLAUDE.md#backend-assumptions) for the full
-treatment.
+**Concurrency contract: one in-flight write per token.**
+Concurrent writes that share the same `WithIdempotencyToken` —
+or auto-token writes that happen to share an attempt-id, a
+non-occurrence under UUIDv7 — are **out of contract**.
+Sequential retries (a failed write followed by a same-token
+retry) are the design's primary use case and remain fully
+supported. The constraint buys back enough determinism that
+the writer's `<token>.commit` PUT can be tolerated as a
+no-overwrite write under sequential retries: the upfront HEAD
+short-circuits a same-token retry before any second commit
+PUT lands.
+
+**Writer wall-clock is in the protocol.** Refs encode
+`refMicroTs` — the writer's microsecond wall-clock captured
+immediately before the ref PUT. The reader's `refCutoff = now
+- SettleWindow` therefore compares writer-stamped time against
+reader wall-clock; `MaxClockSkew` bounds writer↔reader skew.
+No backend-`LastModified` dependency. See
+[CLAUDE.md "Backend assumptions"](CLAUDE.md#backend-assumptions)
+for the full treatment.
 
 Detailed contract and configuration in
 [Durability guarantees](#durability-guarantees).
@@ -99,13 +103,19 @@ in [go.mod](go.mod)).
 Each dataset's timing config is persisted as **two** objects so
 writer and reader agree on the values by construction:
 
-- `<Prefix>/_config/commit-timeout` — the maximum server-time gap
-  between data PUT and commit-marker arrival. Bounds the writer's
-  PUT budget and the reader's marker timeliness check (both ends
-  consume the same value).
+- `<Prefix>/_config/commit-timeout` — the writer's elapsed
+  wall-clock budget for the full write sequence (encode → marker
+  PUT → data PUT → ref PUT → token-commit PUT). A write that
+  exceeds this budget returns an error to the caller — the
+  token-commit still lands, so a same-token retry recovers via
+  the upfront HEAD; the error surfaces that the stream reader's
+  `SettleWindow` (derived from this same value) may already have
+  advanced past the write's `refMicroTs`.
 - `<Prefix>/_config/max-clock-skew` — the operator's assumed
-  bound on writer↔reader wall-clock divergence. Read by the
-  reader's poll cutoff; the writer doesn't read it.
+  bound on writer↔reader wall-clock divergence. Refs encode
+  the writer's `refMicroTs` directly, so this skew is what the
+  reader's `refCutoff` has to absorb. Read by the reader's poll
+  cutoff; the writer doesn't read it.
 
 `SettleWindow = CommitTimeout + MaxClockSkew` is **derived**, not
 persisted; it's the cutoff `Poll` / `PollRecords` / `ReadRangeIter`
@@ -120,17 +130,15 @@ is missing.
 Each body is a Go `time.Duration` string. The library has no
 fallback — a missing or unparseable object fails construction
 with a hint at the seeding step. Floors:
-`commit-timeout ≥ 1s` (S3 server-stamps `LastModified` at second
-precision; a data PUT and a marker PUT that straddle a wall-clock
-second boundary appear 1s apart even when both completed in
-milliseconds, so any value below 1s would reject those writes
-outright — most operators should pick 2s or higher to leave
-headroom),
+`commit-timeout > 0s` (zero is rejected because writer elapsed is
+always strictly positive, so a zero-budget write would always
+surface the timeout error; most operators pick something on the
+order of seconds — 5–30s, tuned to expected upload duration),
 `max-clock-skew ≥ 0` (zero is valid on tightly-clocked
 deployments, negative is incoherent). The boto3 snippet below
 ships `5s` / `1s` as sensible starting values for a typical
 deployment with NTP-synced nodes; tune higher when you can't rule
-out larger skew.
+out larger skew or longer uploads.
 
 Once seeded, both values are **immutable** — changing either
 silently rewrites history (decreasing `commit-timeout` makes valid
@@ -384,17 +392,26 @@ s3://warehouse/billing/
   data/
     charge_period=2026-03-17/
       customer=abc/
-        1710684000000000-a3f2e1b4.parquet
-        1710770400000000-c7d9f0e2.parquet   ← recalculation (sorts after the first)
+        job-2026-03-17-batch01-0190a8b4d3a87f4ab1c2d3e4f5a6b7c8.parquet
+        job-2026-03-17-batch01.commit                                              ← atomic-visibility marker
   _ref/
-    1710684000000000-a3f2e1b4;charge_period=2026-03-17%2Fcustomer=abc.ref
-    1710770400000000-c7d9f0e2;charge_period=2026-03-17%2Fcustomer=abc.ref
+    1710684000123456-job-2026-03-17-batch01-0190a8b4d3a87f4ab1c2d3e4f5a6b7c8;charge_period=2026-03-17%2Fcustomer=abc.ref
 ```
 
-- `data/` holds the actual Parquet files, partitioned Hive-style.
-- `_ref/` holds one **empty** file per write. The filename encodes
-  the timestamp, a short UUID, and the partition key. `Poll` is a single
-  S3 LIST over this prefix — no GETs.
+- `data/` holds Parquet files, partitioned Hive-style. Filenames
+  are `<token>-<UUIDv7>.parquet` — under
+  `WithIdempotencyToken("job-…batch01")` the token prefixes the
+  basename; without a token, an auto-generated UUIDv7 stands in
+  as the token (so the basename becomes `<UUIDv7>-<UUIDv7>`).
+  Every attempt of a write lands on its own per-attempt path; no
+  PUT in the write path overwrites.
+- `<token>.commit` siblings are zero-byte commit markers. A
+  parquet without a paired commit is invisible to every read path.
+- `_ref/` holds one **empty** file per ref. The filename encodes
+  `refMicroTs` (writer wall-clock), the data file's
+  `<token>-<UUIDv7>` id, and the URL-escaped partition key. `Poll`
+  is a single S3 LIST over this prefix; per-ref HEAD on
+  `<token>.commit` gates visibility.
 
 ### Partition naming: column or path-only
 
@@ -499,9 +516,15 @@ results, err := store.Write(ctx, records)
 result, err := store.WriteWithKey(ctx, "charge_period=X/customer=Y", recs)
 ```
 
-Writes are atomic at the file level: if the ref PUT fails after the data
-PUT succeeded, s3store best-effort deletes the orphan parquet (with a HEAD
-check to detect lost-ack).
+Writes are **atomic at the file level**: every attempt PUTs
+`<token>.commit` last, and both read paths gate on its presence.
+A writer that fails or crashes before the commit lands leaves an
+orphan `<token>-<UUIDv7>.parquet` on S3, but every read path
+filters it out — no in-flight states leak to readers. The library
+never deletes the orphan; operators clean up via lifecycle rule
+or manual prune (see
+[Read stability](#guarantees) and
+[Idempotent writes](#idempotent-writes)).
 
 For retry-safe writes (orchestrator failover, crash-and-resume), see
 [Idempotent writes](#idempotent-writes).
@@ -571,14 +594,15 @@ ties; files feed in lex order, so within a tied group the lex-
 later file's record is the last one and dedupLatestSeq's
 `pending` advances onto it.
 
-For the auto-generated `{tsMicros}-{shortID}` id, lex-later =
-wrote-later, so this is "wrote-later wins" in practice. With
-`WithIdempotencyToken` the filename is the caller's token; the
-tie-break follows the token's lex order rather than wall-clock
-order. Use a time-sortable token format
-(e.g. `{ISO-timestamp}-{suffix}`) if you rely on chronological
-tie-breaking. Stable across repeated reads either way. To make
-ties impossible, ensure `VersionOf` strictly increases per write.
+For the auto-token path the basename is `<UUIDv7>-<UUIDv7>` —
+UUIDv7 sorts by embedded millisecond time, so lex-later =
+wrote-later in practice. With `WithIdempotencyToken` the
+filename starts with the caller's token; the tie-break follows
+the token's lex order rather than wall-clock order. Use a
+time-sortable token format (e.g. `{ISO-timestamp}-{suffix}`) if
+you rely on chronological tie-breaking. Stable across repeated
+reads either way. To make ties impossible, ensure `VersionOf`
+strictly increases per write.
 
 **Replicas under `WithHistory`.** Records that share
 `(entity, version)` describe the same logical write — a retry,
@@ -854,18 +878,20 @@ _, err := store.WriteWithKey(ctx, key, records,
 On retry with the same token:
 
 - **Per-attempt data path** — every attempt lands at a fresh
-  `{token}-{tsMicros}-{shortID}.parquet`. No PUT in the write
-  path ever overwrites — sidesteps multi-site StorageGRID's
-  eventual-consistency exposure on overwrites; uniform behaviour
-  across AWS S3, MinIO, and StorageGRID at any consistency level.
-- **Upfront-LIST dedup gate** — before generating a fresh
-  attempt-id, the writer LISTs under `{partition}/{token}-` and
-  pairs `.parquet` siblings with their `.commit` siblings by id.
-  If any pair passes the timeliness check (`marker.LM - data.LM
-  < CommitTimeout`), the retry returns that prior commit's
-  `WriteResult` unchanged — no body re-upload, no new PUTs. If
-  no valid commit exists, the retry proceeds with a fresh
-  attempt-id and a fresh server-stamped `data.LM`.
+  `{token}-{UUIDv7}.parquet`. Data and ref PUTs never overwrite
+  by construction — sidesteps multi-site StorageGRID's
+  eventual-consistency exposure on data-key overwrites; uniform
+  behaviour across AWS S3, MinIO, and StorageGRID at any
+  consistency level.
+- **Upfront-HEAD dedup gate** — before generating a fresh
+  attempt-id, the writer issues a single HEAD on
+  `<dataPath>/<partition>/<token>.commit`. 200 → reconstruct the
+  prior `WriteResult` from the marker's user-metadata
+  (`attemptid`, `refmicrots`, `insertedat`) and return without
+  re-uploading anything. 404 → proceed with a fresh attempt-id
+  end-to-end. The auto-token (no `WithIdempotencyToken`) path
+  skips the HEAD: a freshly generated UUIDv7 is guaranteed to
+  404 by construction.
 - **Recovery from arbitrarily long outages.** Same token works
   forever: retries across S3 outages, orchestrator restarts,
   process crashes — all converge automatically. There's no
@@ -873,9 +899,10 @@ On retry with the same token:
   the orchestrator side.
 
 **Cost: per-attempt orphans on failure.** Every failed attempt
-under `WithIdempotencyToken` leaves data + ref + (possibly)
-marker on S3 as orphans. Reader paths filter them out via the
-commit-marker timeliness check; the deferred operator-driven
+under `WithIdempotencyToken` may leave a data file + ref on S3
+as orphans (any attempt that crashed before the commit PUT).
+Reader paths filter them out — both snapshot and stream reads
+gate on the `<token>.commit` marker. The deferred operator-driven
 sweeper reclaims them. A retry storm with sane orchestrator
 backoff produces orphans bounded by `(retry rate) × (parquet
 size)` per token.
@@ -886,13 +913,16 @@ Tokens recover the same `WriteResult` for sequential retries
 once the prior commit has landed and is still timely. They do
 **not** absorb every form of duplication on their own:
 
-- **Near-concurrent retry overlap** — two attempts of the same
-  token whose upfront LISTs both miss the prior commit (slow
-  original + fast retry). Both write their own per-attempt
-  triple; both commit; the partition has two valid commits for
-  the token, both with bit-identical records (deterministic
-  parquet encoding). Without reader-side dedup, the application
-  sees doubled rows.
+- **Near-concurrent retry overlap (out of contract).** Two
+  in-flight attempts of the same token are explicitly out of
+  contract (see [Concurrency contract](#guarantees)). If the
+  invariant is violated by accident, both upfront HEADs miss the
+  prior commit (slow original + fast retry); both write their
+  own per-attempt data + ref; both PUT `<token>.commit` (latest-
+  wins arbitrates the metadata, but both attempts' records are
+  byte-identical thanks to deterministic parquet encoding).
+  Without reader-side dedup, the application sees doubled rows
+  via two distinct refs.
 - **Different tokens for the same logical write** — two distinct
   per-attempt triples; reader dedup is the only collapse point.
 
@@ -912,21 +942,49 @@ matters. Under `WithIdempotencyToken`, reader dedup is
 
 ### Cross-backend uniformity
 
-Per-attempt-paths plus the upfront-LIST dedup gate produce the
-same retry semantics on every supported backend:
+Per-attempt-paths for data+refs plus the upfront-HEAD on
+`<token>.commit` produce the same retry semantics on every
+supported backend:
 
 - **AWS S3 / MinIO** — read-after-new-write is strongly
-  consistent out of the box. The writer's post-PUT HEADs always
-  observe what was just written; the upfront-LIST always sees
-  any prior commit.
-- **NetApp StorageGRID** — set `ConsistencyControl` to
-  `strong-site` or `strong-global` (per topology — see
-  [STORAGEGRID.md](STORAGEGRID.md)) so the LIST half of the
-  upfront-dedup gate gets list-after-write across the relevant
-  scope. **No `s3:PutOverwriteObject` bucket policy required**
-  — Phase 4 of the commit-marker design replaced that mechanism
-  with per-attempt paths. Earlier versions of the library
-  required this policy; operators upgrading can drop it.
+  consistent out of the box. The upfront HEAD always observes
+  any prior commit; data and ref PUTs always observe what was
+  just written.
+- **NetApp StorageGRID** — `ConsistencyControl` defaults to
+  `strong-global` (the safe multi-site choice). Single-site
+  deployments can downgrade to `strong-site` explicitly when the
+  per-call cost matters; see
+  [STORAGEGRID.md](STORAGEGRID.md) for the topology decision
+  matrix. **No `s3:PutOverwriteObject` bucket policy required**
+  — data and ref PUTs use per-attempt paths; the
+  `<token>.commit` overwrite that arises only on declared-out-
+  of-contract concurrent same-token retries is byte-equivalent
+  record-wise (deterministic parquet encoding) regardless of
+  which attempt's metadata wins.
+
+### Probing a token without writing (`LookupCommit`)
+
+`Writer.LookupCommit(ctx, partition, token)` returns the prior
+`WriteResult` if `<token>.commit` already exists in the
+partition, or `(WriteResult{}, false, nil)` when it doesn't. A
+single HEAD against the marker — same primitive the write path
+uses for upfront-dedup, exposed for orchestrators that need to
+ask "did this logical step already commit?" without going
+through `Write`:
+
+```go
+wr, ok, err := store.LookupCommit(ctx, partitionKey, token)
+if err != nil { return err }
+if ok {
+    // the prior attempt of this token committed; skip the work
+    return wr, nil
+}
+// proceed with the write…
+```
+
+Useful when retries are driven by an external orchestrator that
+already knows the partition key and the token, and wants to
+short-circuit before re-encoding parquet.
 
 ### Zombie writers and orchestrators
 
@@ -934,10 +992,11 @@ The library does not enforce single-writer-per-partition —
 that's a caller invariant. Two cases:
 
 - **Same token.** Sequential retries collapse via the
-  upfront-LIST gate. Truly concurrent writers' upfront LISTs
-  may both miss the prior commit (the partition has two valid
-  commits for the token after both finish); reader dedup via
-  `(entity, version)` collapses the duplicate records on read.
+  upfront HEAD on `<token>.commit`. Concurrent writers
+  (out of contract per [Concurrency contract](#guarantees)) both
+  miss the prior commit on their upfront HEAD and both write
+  their own per-attempt data + ref + commit; reader dedup via
+  `(entity, version)` collapses the duplicate records.
 - **Different tokens.** Two distinct per-attempt triples
   (different paths, different refs); reader dedup via
   `(entity, version)` collapses them at read time.
@@ -959,8 +1018,10 @@ an outbox pattern often composes better than s3store's ref stream:
    constraint violations — Postgres is the authoritative dedup.
 
 This moves the dedup primitive off S3, so on StorageGRID you can
-leave `ConsistencyControl` at the empty default and still get
-exactly-once at the consumer layer. Any rare storage-layer
+downgrade `ConsistencyControl` from the default `strong-global`
+to `read-after-new-write` (`ConsistencyDefault`) and still get
+exactly-once at the consumer layer — the outbox absorbs every
+storage-layer race. Any rare storage-layer
 duplicate from a weak-consistency race becomes a "ghost" file that
 isn't referenced by an outbox row — wasted bytes, not a visible
 duplicate. The s3store ref stream still gets written alongside the
@@ -1399,84 +1460,88 @@ one. `SettleWindow = CommitTimeout + MaxClockSkew` is **derived** from
 the two persisted timing knobs (see
 [Initializing a new dataset](#initializing-a-new-dataset) for seeding).
 The two-knob shape decomposes what the cutoff actually has to cover:
-`CommitTimeout` for server-time PUT latency, `MaxClockSkew` for the
-reader's wall-clock divergence from the writer. Together they bound
-the cutoff so it can't overtake a ref whose marker might still be
-landing server-side, even at the worst-case skew. This gives you a
-single monotonic offset with no seen-set or dedup bookkeeping.
+`CommitTimeout` covers the writer's elapsed wall-clock budget from
+ref PUT to commit visibility (the window during which a ref exists
+but its `<token>.commit` may not yet be HEAD-visible to the reader);
+`MaxClockSkew` covers writer↔reader wall-clock divergence (refs
+encode the writer's `refMicroTs` directly, so the reader's
+`refCutoff` is a writer↔reader comparison). Together they bound
+the cutoff so it can't overtake a ref whose token-commit might
+still be landing server-side. This gives you a single monotonic
+offset with no seen-set or dedup bookkeeping.
 
-### Enforcement: the post-marker HEAD verifies the timeliness check
+### Enforcement: the writer's elapsed-time check
 
 The whole `SettleWindow` contract rests on one assumption: by
 the time `Poll`'s cutoff (`now - SettleWindow`) advances past a
-ref's `refTsMicros`, either the ref's commit marker has landed
-server-side or the marker is permanently invalid (took longer
-than `CommitTimeout` to land, so it fails the timeliness check
-on every read path).
+ref's `refMicroTs`, either the ref's `<token>.commit` is
+HEAD-visible or the ref is permanently invisible (its writer
+exceeded `CommitTimeout`, so a same-token retry has to land a
+fresh commit before the ref appears in any stream window).
 
-The write path enforces this directly. After the marker PUT,
-the writer issues an HEAD on the marker, reads its server-stamped
-`LastModified`, and verifies `marker.LM - data.LM <
-CommitTimeout` — the same check the reader runs, with the same
-S3-server-stamped values, so the answer is identical regardless
-of the writer's or reader's clock state. On violation the writer
-returns an explicit error; the per-attempt orphan triple
-(data + ref + marker) stays on S3, filtered out by every read
-path's timeliness check, and the caller retries.
+The write path enforces this directly. After the token-commit
+PUT, the writer compares its own elapsed wall-clock against
+`CommitTimeout`. If exceeded, it returns an error to the caller
+— the commit IS in place (data is durable; snapshot reads see
+the new records immediately), but a stream reader whose
+`SettleWindow` already advanced past `refMicroTs` may have
+emitted past the ref. The error tells the caller their write is
+at risk; a same-token retry recovers via the upfront HEAD with
+the original `WriteResult`.
 
-If any PUT in the sequence fails (data, ref, or marker), the
-call returns a wrapped error. The library never deletes anything
-it has written; per-attempt-paths mean the failed attempt's
-files don't conflict with a retry. Under `WithIdempotencyToken`
-the retry runs the upfront-LIST gate first — if the failed
-attempt happened to land its full triple, the retry returns its
-`WriteResult` unchanged; otherwise the retry generates a fresh
-attempt-id and proceeds end-to-end with a fresh server-stamped
-`data.LM`.
+If any PUT in the sequence fails (markers, data, ref, or
+token-commit), the call returns a wrapped error. The library
+never deletes anything it has written; per-attempt paths mean a
+failed attempt's data and ref don't conflict with a retry, and
+both read paths gate on `<token>.commit` so an orphan parquet
+remains invisible until an operator-driven prune removes it.
+Under `WithIdempotencyToken` the retry runs the upfront HEAD
+first — if the failed attempt happened to land its commit, the
+retry returns its `WriteResult` unchanged; otherwise the retry
+generates a fresh attempt-id and proceeds end-to-end.
 
 ```go
 if _, err := store.Write(ctx, recs,
     s3store.WithIdempotencyToken(token),
 ); err != nil {
-    // The post-marker timeliness check failed, or some PUT in the
-    // sequence didn't land. Retry with the same token — the
-    // upfront-LIST gate dedups the prior attempt if it secretly
-    // succeeded; otherwise the retry writes a fresh attempt.
+    // Some PUT didn't land, or the writer's elapsed exceeded
+    // CommitTimeout. Retry with the same token — the upfront
+    // HEAD on <token>.commit dedups the prior attempt if it
+    // secretly succeeded; otherwise the retry writes a fresh
+    // attempt end-to-end.
     return retry(...)
 }
 ```
 
 For **exactly-once at the consumer**, configure reader dedup
-(`EntityKeyOf + VersionOf`). Near-concurrent retry overlap can
-produce two valid commits whose records share
-`(entity, version)`; dedup collapses them.
-
-**AWS S3 / MinIO users**: `ConsistencyControl` is a no-op (both
-backends ignore the header). The write-path budget is the
-persisted `CommitTimeout`, set per-prefix at dataset
-initialization — see
-[Initializing a new dataset](#initializing-a-new-dataset).
+(`EntityKeyOf + VersionOf`). Near-concurrent retry overlap (out
+of contract per the
+[Concurrency contract](#guarantees) but still bounded if it
+arises by accident) can leave two committed attempts whose
+records share `(entity, version)`; dedup collapses them.
 
 ## StorageGRID
 
 s3store works on AWS S3, MinIO, and NetApp StorageGRID. AWS and
 MinIO need no configuration — both are strongly consistent on
 LIST and GET by default and ignore the `Consistency-Control`
-header. **StorageGRID needs explicit setup:**
+header. **StorageGRID setup:**
 
-- `ConsistencyControl: ConsistencyStrongGlobal` (multi-site
-  grid with cross-cutting traffic) or `ConsistencyStrongSite`
-  (single-site grid, or co-located reader/writer pairs) on
-  the `S3Target`.
+- `ConsistencyControl` defaults to `ConsistencyStrongGlobal` —
+  the safe multi-site choice. Single-site grids (or multi-site
+  grids with strictly co-located reader/writer pairs) can
+  downgrade explicitly to `ConsistencyStrongSite` to avoid the
+  cross-site PUT cost.
 
-No bucket policy required: per-attempt-paths under
-`WithIdempotencyToken` make every PUT a first write to a new
-key, so the `s3:PutOverwriteObject` deny earlier versions
-required is no longer used. See
-[STORAGEGRID.md](STORAGEGRID.md) for the full topology decision
-matrix, operational notes on the 11.9 availability cliff, and
-the consistency-model reasoning that motivates the
-`ConsistencyControl` requirement.
+No bucket policy required: data and ref PUTs use per-attempt
+paths, and the `<token>.commit` overwrite that arises only on
+out-of-contract concurrent same-token retries is record-wise
+byte-equivalent (deterministic parquet encoding). The
+`s3:PutOverwriteObject` deny earlier versions required is no
+longer used. See [STORAGEGRID.md](STORAGEGRID.md) for the full
+topology decision matrix, operational notes on the 11.9
+availability cliff, and the consistency-model reasoning that
+motivates the `ConsistencyControl` default.
 
 ## Durability guarantees
 
@@ -1506,42 +1571,46 @@ subsequent poll issued after one `SettleWindow` has elapsed.
 #### What you need to configure
 
 - **AWS S3 / MinIO.** Nothing. Both backends give strong
-  read-after-write on LIST and GET by default. Leave
-  `ConsistencyControl` unset.
-- **StorageGRID (NetApp).** Set `ConsistencyControl:
-  ConsistencyStrongGlobal` (multi-site) or
-  `ConsistencyStrongSite` (single-site) on the target — and
-  apply the bucket policy. Both are documented in
-  [STORAGEGRID.md](STORAGEGRID.md), which also explains why a
-  weaker level (or asymmetric writer/reader levels) breaks the
-  read-after-write contract.
+  read-after-write on LIST and GET by default and ignore the
+  `Consistency-Control` header — the default
+  `ConsistencyStrongGlobal` is a no-op there.
+- **StorageGRID (NetApp).** The default
+  `ConsistencyStrongGlobal` is the safe multi-site choice and
+  needs no further configuration. Single-site grids can
+  downgrade to `ConsistencyStrongSite` explicitly to save the
+  cross-site PUT cost. No bucket policy required; both options
+  are documented in [STORAGEGRID.md](STORAGEGRID.md), which also
+  explains why a weaker level (or asymmetric writer/reader
+  levels) breaks the read-after-write contract.
 
 ### Write
 
 If `Write` (or `WriteWithKey`) returns `nil`, every record in
 the batch is durably stored in S3 and will be returned by
-subsequent `Read`, `Poll`, `PollRecords`, and `ProjectionReader.Lookup` for
-the lifetime of the data. The write path commits in order: data
-PUT → marker PUTs → ref PUT, returning success only after the
-final step lands (or, on a lost PUT ack, after a HEAD confirms
-the object is there).
+subsequent `Read`, `Poll`, `PollRecords`, and
+`ProjectionReader.Lookup` for the lifetime of the data. The write
+path commits in order: marker PUTs → data PUT → ref PUT →
+`<token>.commit` PUT, returning success only after the
+token-commit lands and the writer's elapsed wall-clock check
+against `CommitTimeout` passes.
 
 If `Write` returns an **error**, state is indeterminate — the
-records may or may not be durable. The caller must retry. A
-retry after partial success writes some records twice; dedupe
-those on read via `EntityKeyOf` + `VersionOf`. Multi-group
-`Write` returns `([]WriteResult, error)` — consult the slice for
-records that *did* commit before the error so a retry can skip
-them if needed.
+records may or may not be durable, and the commit may or may
+not have landed. The caller must retry. A retry after partial
+success may write some records twice; dedupe those on read via
+`EntityKeyOf` + `VersionOf`. Multi-group `Write` returns
+`([]WriteResult, error)` — consult the slice for records that
+*did* commit before the error so a retry can skip them if needed.
 
 To make retries dedup against prior successful attempts, pass
 `WithIdempotencyToken` — see
 [Idempotent writes](#idempotent-writes). Each attempt writes
-to its own per-attempt path; the upfront-LIST gate dedups
-sequential retries; the post-marker timeliness check
-(`marker.LM - data.LM < CommitTimeout`) verifies the commit
-landed within budget, returning a wrapped error otherwise so
-the caller retries.
+its data and ref to per-attempt paths; the upfront HEAD on
+`<token>.commit` dedups sequential retries (returning the prior
+`WriteResult` unchanged); the writer's elapsed-time check
+against `CommitTimeout` enforces the write-path budget,
+returning a wrapped error if the commit landed too late so the
+caller retries.
 
 ### Read
 
@@ -1611,9 +1680,13 @@ type Config[T any] struct {
 
     // Consistency-Control HTTP header value applied to every
     // correctness-critical S3 operation (one knob, target-wide).
-    // Empty on AWS / MinIO; set to ConsistencyStrongGlobal /
-    // ConsistencyStrongSite on StorageGRID. See "Consistency
-    // levels × S3 operations" for the full contract.
+    // Zero value substitutes ConsistencyStrongGlobal at
+    // construction — the safe multi-site StorageGRID choice
+    // and a no-op on AWS / MinIO (those backends ignore the
+    // header). Single-site StorageGRID grids can downgrade
+    // explicitly to ConsistencyStrongSite to save the cross-
+    // site PUT cost. See STORAGEGRID.md for the topology
+    // decision matrix.
     ConsistencyControl ConsistencyLevel
 
     // Optional tuning knobs.
@@ -1681,8 +1754,9 @@ on non-success. `s3store.s3.request.attempts` carries only
 not terminal error class — keeping cardinality bounded).
 
 **Library methods** (recorded at the public entry point of `Write`,
-`WriteWithKey`, `Read`, `ReadIter`, `ReadRangeIter`, `Poll`,
-`PollRecords`, `ProjectionReader.Lookup`, `BackfillProjection`):
+`WriteWithKey`, `LookupCommit`, `Read`, `ReadIter`, `ReadRangeIter`,
+`Poll`, `PollRecords`, `ProjectionReader.Lookup`,
+`BackfillProjection`):
 
 | Name | Kind | Unit |
 |---|---|---|
@@ -1691,11 +1765,31 @@ not terminal error class — keeping cardinality bounded).
 | `s3store.write.records` | histogram | 1 |
 | `s3store.write.partitions` | histogram | 1 |
 | `s3store.write.bytes` | histogram | By |
+| `s3store.write.commit_after_timeout` | counter | 1 |
 | `s3store.read.records` | histogram | 1 |
 | `s3store.read.bytes` | histogram | By |
 | `s3store.read.files` | histogram | 1 |
 | `s3store.read.missing_data` | counter | 1 |
 | `s3store.read.malformed_refs` | counter | 1 |
+| `s3store.read.commit_head` | counter | 1 |
+| `s3store.read.commit_head_cache_hit` | counter | 1 |
+
+`s3store.write.commit_after_timeout` increments when the writer's
+end-to-end elapsed wall-clock exceeded `CommitTimeout` after the
+token-commit landed. The write surfaces an error to the caller
+(commit is durable; the stream reader's `SettleWindow` may
+already have advanced past `refMicroTs` — a same-token retry
+recovers via the upfront HEAD).
+
+`s3store.read.commit_head` increments on every commit-marker
+HEAD that the read paths issue: snapshot reads HEAD only when
+≥2 parquets share a token in one partition; stream reads HEAD
+once per uncached `(partition, token)` per poll;
+`Writer.LookupCommit` HEADs unconditionally. Carries
+`s3store.method` so dashboards can split by which path issued
+the HEAD. `s3store.read.commit_head_cache_hit` is the
+companion: increments when a stream-read HEAD was satisfied
+from the per-poll cache instead.
 
 `s3store.read.missing_data` increments on `NoSuchKey` skips along
 the tolerant read paths (`PollRecords`, `ReadRangeIter`,
