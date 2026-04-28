@@ -3437,13 +3437,13 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 	}
 }
 
-// TestCommitTimeout_NegativeRejected guards that NewS3Target
-// rejects a persisted CommitTimeout below CommitTimeoutFloor.
-// The floor is zero — the historical 1s minimum existed because
-// HTTP-date `Last-Modified` is second-precision and the dropped
-// timeliness check could not resolve sub-second gaps. With the
-// timeliness check gone, only negative values are nonsensical.
-func TestCommitTimeout_NegativeRejected(t *testing.T) {
+// TestCommitTimeout_BelowFloorRejected guards that NewS3Target
+// rejects a persisted CommitTimeout below CommitTimeoutFloor
+// (1 ms — strictly positive; zero would cause every write to
+// exceed the timeout). Both negatives and zero hit the same
+// "below the floor" path; this test covers a negative — see
+// TestCommitTimeout_ZeroRejected for the zero case.
+func TestCommitTimeout_BelowFloorRejected(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	f.seedDurationConfig(t, "store/_config/commit-timeout", -100*time.Millisecond)
@@ -3464,11 +3464,12 @@ func TestCommitTimeout_NegativeRejected(t *testing.T) {
 }
 
 // TestCommitTimeout_ZeroRejected guards that CommitTimeout = 0s
-// is rejected with a clear "must be strictly positive" error
-// (zero is not "unlimited" — the writer's elapsed wall-clock is
-// always strictly positive, so a zero CommitTimeout would cause
-// every write to surface the "committed after CommitTimeout"
-// error).
+// is rejected via the CommitTimeoutFloor (1 ms — strictly
+// positive). Zero is not "unlimited" — it would cause every
+// write to exceed the timeout (the elapsed wall-clock from
+// refMicroTs to token-commit completion is always strictly
+// positive). Now flows through the same "below the floor" path
+// as negatives.
 func TestCommitTimeout_ZeroRejected(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
@@ -3484,8 +3485,8 @@ func TestCommitTimeout_ZeroRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for zero CommitTimeout, got nil")
 	}
-	if !strings.Contains(err.Error(), "strictly positive") {
-		t.Errorf("error %q should mention 'strictly positive'", err)
+	if !strings.Contains(err.Error(), "floor") {
+		t.Errorf("error %q should mention the floor", err)
 	}
 }
 

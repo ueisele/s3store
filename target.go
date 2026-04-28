@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -224,13 +225,18 @@ type S3TargetConfig struct {
 // Prefix. NewS3Target GETs this object once at construction; the
 // body is a Go time.Duration string ("2s", "5s", ...). With the
 // timeliness check dropped, CommitTimeout is now a writer-local
-// elapsed bound: writes whose end-to-end wall-clock exceeds it
-// increment s3store.write.commit_after_timeout (the commit still
-// lands; the metric flags that the SettleWindow tuned for this
-// value may not yet have included the write in the stream
-// window). The reader's SettleWindow remains derived from
-// CommitTimeout + MaxClockSkew so the writer's expected envelope
-// and the reader's emit cutoff stay paired by construction.
+// elapsed bound: writes whose elapsed time from refMicroTs
+// (captured just before the ref PUT) to token-commit completion
+// exceeds it increment s3store.write.commit_after_timeout (the
+// commit still lands; the metric flags that the SettleWindow
+// tuned for this value may not yet have included the write in
+// the stream window). The reader's SettleWindow remains derived
+// from CommitTimeout + MaxClockSkew so the writer's expected
+// envelope and the reader's emit cutoff stay paired by
+// construction. Pre-ref work (parquet encoding, marker PUTs,
+// data PUT — the last scaling with payload size) is excluded
+// from the budget: only the ref-LIST-visible → token-commit-
+// visible interval can put the SettleWindow contract at risk.
 const commitTimeoutConfigKey = "_config/commit-timeout"
 
 // maxClockSkewConfigKey is the object key under which the
@@ -246,16 +252,35 @@ const maxClockSkewConfigKey = "_config/max-clock-skew"
 
 // CommitTimeoutFloor is the lower bound enforced by
 // loadDurationConfig: values strictly less than this are rejected
-// with a "below the floor" error. Set to 0 — negatives are
-// rejected here; CommitTimeout = 0s itself is rejected by
-// loadTimingConfig with a more specific error explaining that
-// zero is not "unlimited" and would cause every write to exceed
-// the timeout. The historical 1 s floor existed because HTTP-date
+// with a "below the floor" error. Set to 1 ms — strictly positive
+// (zero is rejected as "would cause every write to exceed the
+// timeout") and small enough that test deployments can pick
+// sub-second values without further plumbing. Production
+// deployments should pick a value well above
+// CommitTimeoutAdvisory: loadTimingConfig emits a slog.Warn
+// when the configured value is below the advisory floor (the
+// retry envelope of the ref-PUT + token-commit-PUT pair).
+//
+// The historical 1 s floor existed because HTTP-date
 // `Last-Modified` is second-precision and the dropped timeliness
 // check could not resolve sub-second gaps; with LastModified out
 // of the protocol, the writer's local elapsed bound is honest at
 // any strictly positive value.
-const CommitTimeoutFloor = time.Duration(0)
+const CommitTimeoutFloor = time.Millisecond
+
+// CommitTimeoutAdvisory is the soft floor below which
+// loadTimingConfig emits a slog.Warn at construction. It bounds
+// the retry envelope for the two PUTs that participate in the
+// SettleWindow contract (ref + token-commit): each PUT can retry
+// up to retryMaxAttempts (4) with backoffs 200ms / 400ms / 800ms
+// (sum 1.4 s sleep per call), so two PUTs in worst case spend
+// ~2.8 s in retry sleep alone, plus actual request time. 6 s
+// gives ~2× safety on that retry envelope. Operators on
+// tightly-clocked dev/test deployments can set CommitTimeout
+// below this and ignore the warning; production deployments
+// should size CommitTimeout above the advisory so transient S3
+// retries cannot cause the SettleWindow contract to be missed.
+const CommitTimeoutAdvisory = 6 * time.Second
 
 // MaxClockSkewFloor is the minimum MaxClockSkew value the library
 // accepts. Zero is a valid claim on tightly-clocked deployments
@@ -401,12 +426,13 @@ func newS3TargetSkipConfig(cfg S3TargetConfig) S3Target {
 // loadTimingConfig GETs <Prefix>/_config/commit-timeout and
 // <Prefix>/_config/max-clock-skew, parses each body as a Go
 // time.Duration string, and rejects values below their floors.
-// CommitTimeout additionally must be strictly positive: zero
-// would cause every write to exceed the timeout and return an
-// error (the writer's elapsed wall-clock between write-start
-// and token-commit completion is always strictly positive).
-// Surfaces a hint at the operator's seeding step when either
-// object is missing.
+// CommitTimeoutFloor (1 ms) is the strict-positive floor that
+// keeps zero out of the protocol; CommitTimeoutAdvisory (6 s) is
+// a soft floor — values below it pass construction but emit a
+// slog.Warn so operators see when a configured CommitTimeout is
+// below the retry envelope of the two SettleWindow-relevant PUTs
+// (ref + token-commit). Surfaces a hint at the operator's
+// seeding step when either object is missing.
 func loadTimingConfig(
 	ctx context.Context, t S3Target,
 ) (commitTimeout, maxClockSkew time.Duration, _ error) {
@@ -415,16 +441,21 @@ func loadTimingConfig(
 	if err != nil {
 		return 0, 0, err
 	}
-	if commitTimeout == 0 {
-		return 0, 0, fmt.Errorf(
-			"s3store: %s/%s/%s resolves to 0s — CommitTimeout "+
-				"must be strictly positive (zero is not "+
-				"\"unlimited\"; it would cause every write to "+
-				"exceed the timeout and return an error); "+
-				"operators typically pick a value tuned to "+
-				"their max expected upload duration, on the "+
-				"order of seconds",
-			t.cfg.Bucket, t.cfg.Prefix, commitTimeoutConfigKey)
+	if commitTimeout < CommitTimeoutAdvisory {
+		slog.Warn(
+			"s3store: CommitTimeout is below the advisory floor — "+
+				"transient S3 retries on the ref-PUT or "+
+				"token-commit-PUT could exceed CommitTimeout and "+
+				"cause stream readers to skip the write; the "+
+				"advisory floor leaves ~2× safety on the worst-"+
+				"case retry envelope of the two PUTs (~2.8 s of "+
+				"backoff sleep across 4 attempts each). Acceptable "+
+				"for tightly-clocked dev/test deployments; "+
+				"production should size above the advisory.",
+			"bucket", t.cfg.Bucket,
+			"prefix", t.cfg.Prefix,
+			"commitTimeout", commitTimeout,
+			"advisoryFloor", CommitTimeoutAdvisory)
 	}
 	maxClockSkew, err = loadDurationConfig(
 		ctx, t, maxClockSkewConfigKey, MaxClockSkewFloor)
@@ -495,11 +526,17 @@ func (t S3Target) ConsistencyControl() ConsistencyLevel {
 
 // CommitTimeout returns the value resolved at construction time
 // from <Prefix>/_config/commit-timeout. Pure accessor — no I/O.
-// Bounds the writer's end-to-end wall-clock budget for one Write:
-// past CommitTimeout, the s3store.write.commit_after_timeout
-// counter increments (the commit still lands; the metric flags
-// that the reader's SettleWindow tuned for this CommitTimeout may
-// not yet have included this write in the stream window).
+// Bounds the writer's ref-PUT-to-token-commit-completion budget
+// for one Write: past CommitTimeout (measured from refMicroTs,
+// captured just before the ref PUT, to the moment the
+// token-commit PUT returns), the s3store.write.commit_after_timeout
+// counter increments and Write returns an error (the commit still
+// lands; the metric flags that the reader's SettleWindow tuned
+// for this CommitTimeout may not yet have included this write in
+// the stream window). Pre-ref work — parquet encoding, marker
+// PUTs, data PUT — is deliberately outside the budget; only the
+// ref-LIST-visible → token-commit-visible window can put the
+// SettleWindow contract at risk.
 func (t S3Target) CommitTimeout() time.Duration {
 	return t.commitTimeout
 }
@@ -517,9 +554,10 @@ func (t S3Target) MaxClockSkew() time.Duration {
 // SettleWindow returns the derived sum CommitTimeout + MaxClockSkew.
 // Used by Poll's `refCutoff = now - SettleWindow`. Sized so the
 // cutoff cannot overtake refs whose token-commit is still being
-// written: CommitTimeout bounds the writer's full ref-PUT +
-// token-commit-PUT envelope, MaxClockSkew bounds the
-// writer↔reader wall-clock divergence applied to the
+// written: CommitTimeout bounds the writer's ref-PUT +
+// token-commit-PUT envelope (measured from refMicroTs onward;
+// pre-ref work is outside the budget by design), MaxClockSkew
+// bounds the writer↔reader wall-clock divergence applied to the
 // writer-stamped refMicroTs. Pure accessor — no I/O.
 func (t S3Target) SettleWindow() time.Duration {
 	return t.commitTimeout + t.maxClockSkew

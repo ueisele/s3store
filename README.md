@@ -103,14 +103,18 @@ in [go.mod](go.mod)).
 Each dataset's timing config is persisted as **two** objects so
 writer and reader agree on the values by construction:
 
-- `<Prefix>/_config/commit-timeout` — the writer's elapsed
-  wall-clock budget for the full write sequence (encode → marker
-  PUT → data PUT → ref PUT → token-commit PUT). A write that
-  exceeds this budget returns an error to the caller — the
-  token-commit still lands, so a same-token retry recovers via
-  the upfront HEAD; the error surfaces that the stream reader's
-  `SettleWindow` (derived from this same value) may already have
-  advanced past the write's `refMicroTs`.
+- `<Prefix>/_config/commit-timeout` — the writer's budget for
+  the contract-relevant tail of the write: the elapsed wall-clock
+  from `refMicroTs` (captured just before the ref PUT) to
+  token-commit-PUT completion. Pre-ref work (parquet encoding,
+  marker PUTs, data PUT — the last of which scales with payload
+  size) is **not** in the budget. A write whose ref→commit
+  elapsed exceeds this budget returns an error to the caller —
+  the token-commit still lands, so a same-token retry recovers
+  via the upfront HEAD; the error surfaces that the stream
+  reader's `SettleWindow` (derived from this same value) may
+  already have advanced past the write's `refMicroTs`. See
+  *Tuning CommitTimeout* below for the recommended range.
 - `<Prefix>/_config/max-clock-skew` — the operator's assumed
   bound on writer↔reader wall-clock divergence. Refs encode
   the writer's `refMicroTs` directly, so this skew is what the
@@ -130,15 +134,16 @@ is missing.
 Each body is a Go `time.Duration` string. The library has no
 fallback — a missing or unparseable object fails construction
 with a hint at the seeding step. Floors:
-`commit-timeout > 0s` (zero is rejected because writer elapsed is
-always strictly positive, so a zero-budget write would always
-surface the timeout error; most operators pick something on the
-order of seconds — 5–30s, tuned to expected upload duration),
-`max-clock-skew ≥ 0` (zero is valid on tightly-clocked
-deployments, negative is incoherent). The boto3 snippet below
-ships `5s` / `1s` as sensible starting values for a typical
-deployment with NTP-synced nodes; tune higher when you can't rule
-out larger skew or longer uploads.
+`commit-timeout ≥ 1ms` (`CommitTimeoutFloor` — strictly positive;
+zero would cause every write to exceed the timeout); construction
+additionally emits a `slog.Warn` at level WARN when the configured
+value is below `CommitTimeoutAdvisory` (6s — see *Tuning
+CommitTimeout* below). `max-clock-skew ≥ 0` (zero is valid on
+tightly-clocked deployments, negative is incoherent). The boto3
+snippet below ships `10s` / `1s` as sensible starting values for a
+typical deployment with NTP-synced nodes; tune higher when you
+can't rule out larger skew, lower (down to ~6s) when you want a
+tighter stream-reader cutoff.
 
 Once seeded, both values are **immutable** — changing either
 silently rewrites history (decreasing `commit-timeout` makes valid
@@ -158,7 +163,7 @@ s3 = boto3.client("s3", endpoint_url="https://s3.example.com")
 s3.put_object(
     Bucket="my-bucket",
     Key="my-prefix/_config/commit-timeout",
-    Body=b"5s",
+    Body=b"10s",
     ContentType="text/plain",
 )
 s3.put_object(
@@ -172,6 +177,50 @@ s3.put_object(
 The integration-test fixture (`fixture_test.go`) provides a
 `SeedTimingConfig` helper that does the same thing, called once
 per test.
+
+### Tuning `CommitTimeout`
+
+`CommitTimeout` bounds the elapsed wall-clock from `refMicroTs`
+(captured just before the ref PUT) to token-commit-PUT
+completion. Two PUTs participate in that window. Each S3 call is
+wrapped by the library's transient-error retry policy:
+`retryMaxAttempts = 4` (1 initial + 3 retries) with
+`retryBackoff = [200ms, 400ms, 800ms]` — total **1.4s of backoff
+sleep** per call in the worst case, plus the per-attempt request
+time. Across the two PUTs, the worst-case retry-sleep envelope is
+**~2.8s**, again before counting actual request time.
+
+`CommitTimeoutAdvisory` is set to **6s** — roughly 2× the worst-
+case retry envelope, with headroom for actual request latency.
+Values below this still pass construction (the hard floor is
+`CommitTimeoutFloor = 1ms`), but `NewS3Target` emits a
+`slog.Warn` at level WARN naming the configured value and the
+advisory floor:
+
+| Configured value | Behaviour                                                |
+|------------------|----------------------------------------------------------|
+| `< 1ms` or `≤ 0` | Construction fails — "below the floor".                  |
+| `1ms` … `< 6s`   | Construction succeeds with a `slog.Warn`. Acceptable on tightly-clocked dev/test deployments where you control retry behaviour and want a tight `SettleWindow`. |
+| `≥ 6s`           | No warning. Recommended for production.                  |
+
+Sizing guidance:
+
+- **Production on AWS S3 / MinIO / single-site StorageGRID with
+  NTP-synced nodes**: 10–30s. Leaves headroom on transient retries
+  and keeps `SettleWindow = CommitTimeout + MaxClockSkew` at a
+  modest tens of seconds.
+- **Multi-site StorageGRID**: tune higher (30–120s) if your
+  cross-site replication adds visible latency to PUT
+  acknowledgement at `strong-global`.
+- **Dev/test loops where you want sub-second `SettleWindow`**:
+  pick `< 6s`, accept the warning, run on a backend where retries
+  are unlikely (local MinIO).
+
+The advisory floor is a recommendation, not a contract — the
+library's correctness invariants don't depend on it. It exists so
+operators see a clear signal when their configured budget is
+below the worst-case retry envelope of the two SettleWindow-
+relevant PUTs.
 
 ## Quick start
 
@@ -1454,40 +1503,78 @@ Refs on S3 (chronological):
                               ──────→ don't read yet
 ```
 
-S3 PUTs aren't globally ordered, so `Poll` reads up to `now - SettleWindow`
-to guarantee no newer-than-cutoff ref "sneaks in" behind an already-read
-one. `SettleWindow = CommitTimeout + MaxClockSkew` is **derived** from
+Refs don't appear in LIST in `refMicroTs` order. `refMicroTs` is
+captured by the writer with `time.Now()` *before* the ref PUT
+issues, but the ref isn't LIST-visible until the PUT is
+acknowledged — and the PUT's duration varies per writer (per
+request, per network blip, per retry). Two concurrent writers
+that capture `refMicroTs` 10 ms apart can land in LIST in the
+opposite order if their PUTs took 50 ms vs 200 ms. This is not a
+consistency-model artifact; it happens on every backend
+including AWS S3, MinIO, and StorageGRID at `strong-global`. So
+`Poll` reads up to `now - SettleWindow` to give the slowest
+in-flight PUT enough time to land before its `refMicroTs` falls
+inside the cutoff.
+
+`SettleWindow = CommitTimeout + MaxClockSkew` is **derived** from
 the two persisted timing knobs (see
-[Initializing a new dataset](#initializing-a-new-dataset) for seeding).
-The two-knob shape decomposes what the cutoff actually has to cover:
-`CommitTimeout` covers the writer's elapsed wall-clock budget from
-ref PUT to commit visibility (the window during which a ref exists
-but its `<token>.commit` may not yet be HEAD-visible to the reader);
-`MaxClockSkew` covers writer↔reader wall-clock divergence (refs
-encode the writer's `refMicroTs` directly, so the reader's
-`refCutoff` is a writer↔reader comparison). Together they bound
-the cutoff so it can't overtake a ref whose token-commit might
-still be landing server-side. This gives you a single monotonic
-offset with no seen-set or dedup bookkeeping.
+[Initializing a new dataset](#initializing-a-new-dataset) for
+seeding). The two-knob shape decomposes what the cutoff actually
+has to cover:
+
+- **`CommitTimeout`** absorbs the per-PUT wall-clock duration
+  drift described above. A successful write — by the writer-side
+  enforcement check — has `time.Since(refMicroTs) ≤ CommitTimeout`
+  at token-commit completion, which means its ref PUT (one of
+  the two PUTs in the budget) also completed within
+  `CommitTimeout` of `refMicroTs`. So if `refCutoff = now -
+  SettleWindow` ever advances past a ref's `refMicroTs`, the ref
+  has already had at least `CommitTimeout` to land in LIST and
+  its `<token>.commit` to land for HEAD — both are visible to
+  the reader (under read-after-new-write, which the library's
+  backend assumptions require). The drift caused by parallel
+  writers with varying PUT durations is exactly what
+  `CommitTimeout` is sized to absorb; no separate
+  "concurrent-writer drift" term is needed.
+- **`MaxClockSkew`** absorbs writer↔reader wall-clock
+  divergence. Refs encode `refMicroTs` directly, so the reader's
+  comparison `refMicroTs ≤ now - SettleWindow` is across two
+  different machines' clocks. `MaxClockSkew` is the operator's
+  declared bound on that divergence (zero on tightly-clocked
+  NTP-synced fleets).
+
+Together they bound the cutoff so it can't overtake a ref whose
+ref PUT or token-commit PUT might still be landing server-side.
+This gives you a single monotonic offset with no seen-set or
+dedup bookkeeping.
+
+The formula assumes **read-after-new-write on the ref LIST and
+the token-commit HEAD** — the library's documented backend
+prerequisite (see [CLAUDE.md](CLAUDE.md) "Backend assumptions").
+On a backend that doesn't honor that, no `SettleWindow` value is
+sufficient; the cutoff math has nothing to lean on.
 
 ### Enforcement: the writer's elapsed-time check
 
-The whole `SettleWindow` contract rests on one assumption: by
-the time `Poll`'s cutoff (`now - SettleWindow`) advances past a
-ref's `refMicroTs`, either the ref's `<token>.commit` is
-HEAD-visible or the ref is permanently invisible (its writer
-exceeded `CommitTimeout`, so a same-token retry has to land a
-fresh commit before the ref appears in any stream window).
-
-The write path enforces this directly. After the token-commit
-PUT, the writer compares its own elapsed wall-clock against
-`CommitTimeout`. If exceeded, it returns an error to the caller
-— the commit IS in place (data is durable; snapshot reads see
-the new records immediately), but a stream reader whose
-`SettleWindow` already advanced past `refMicroTs` may have
-emitted past the ref. The error tells the caller their write is
-at risk; a same-token retry recovers via the upfront HEAD with
-the original `WriteResult`.
+The "`CommitTimeout` absorbs the per-PUT drift" claim above
+holds **only if every successful write actually fits inside
+`CommitTimeout`**. The writer enforces that directly. After the
+token-commit PUT, the writer compares
+`time.Since(time.UnixMicro(refMicroTs))` — elapsed wall-clock
+from the moment just before the ref PUT — against
+`CommitTimeout`. Pre-ref work (parquet encoding, marker PUTs,
+data PUT) is deliberately outside the budget: only the
+ref-LIST-visible → token-commit-visible window can put the
+`SettleWindow` contract at risk. If exceeded, the writer returns
+an error to the caller — the commit IS in place (data is
+durable; snapshot reads see the new records immediately), but a
+stream reader whose `SettleWindow` already advanced past
+`refMicroTs` may have emitted past the ref. The error tells the
+caller their write is at risk; a same-token retry recovers via
+the upfront HEAD with the original `WriteResult`. Either way the
+contract holds: a ref is permanently invisible (writer raised
+the error → caller retries, fresh `refMicroTs`) or it landed
+within budget (the absorber claim holds for it).
 
 If any PUT in the sequence fails (markers, data, ref, or
 token-commit), the call returns a wrapped error. The library
@@ -1591,8 +1678,9 @@ subsequent `Read`, `Poll`, `PollRecords`, and
 `ProjectionReader.Lookup` for the lifetime of the data. The write
 path commits in order: marker PUTs → data PUT → ref PUT →
 `<token>.commit` PUT, returning success only after the
-token-commit lands and the writer's elapsed wall-clock check
-against `CommitTimeout` passes.
+token-commit lands and the writer's ref→commit elapsed
+(`time.Since(time.UnixMicro(refMicroTs))`) is within
+`CommitTimeout`.
 
 If `Write` returns an **error**, state is indeterminate — the
 records may or may not be durable, and the commit may or may
@@ -1774,12 +1862,14 @@ not terminal error class — keeping cardinality bounded).
 | `s3store.read.commit_head` | counter | 1 |
 | `s3store.read.commit_head_cache_hit` | counter | 1 |
 
-`s3store.write.commit_after_timeout` increments when the writer's
-end-to-end elapsed wall-clock exceeded `CommitTimeout` after the
-token-commit landed. The write surfaces an error to the caller
-(commit is durable; the stream reader's `SettleWindow` may
-already have advanced past `refMicroTs` — a same-token retry
-recovers via the upfront HEAD).
+`s3store.write.commit_after_timeout` increments when the
+writer's elapsed time from `refMicroTs` (just before the ref PUT)
+to token-commit-PUT completion exceeded `CommitTimeout`. The
+write surfaces an error to the caller (commit is durable; the
+stream reader's `SettleWindow` may already have advanced past
+`refMicroTs` — a same-token retry recovers via the upfront HEAD).
+Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside
+the budget by design.
 
 `s3store.read.commit_head` increments on every commit-marker
 HEAD that the read paths issue: snapshot reads HEAD only when

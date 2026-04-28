@@ -292,7 +292,7 @@ func newMetrics(
 		"{event}")
 	m.writeCommitAfterTO = mustCounter(
 		"s3store.write.commit_after_timeout",
-		"Writes whose end-to-end wall-clock elapsed exceeded CommitTimeout by the time the token-commit PUT completed. Not a failure — the commit landed; signals that a SettleWindow tuned for this CommitTimeout may not yet have included this write in the stream window.",
+		"Writes whose elapsed time from refMicroTs (just before the ref PUT) to token-commit-PUT completion exceeded CommitTimeout. The commit landed; signals that a SettleWindow tuned for this CommitTimeout may not yet have included this write in the stream window. Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside the budget by design.",
 		"{event}")
 	m.readCommitHead = mustCounter(
 		"s3store.read.commit_head",
@@ -738,12 +738,15 @@ func (m *metrics) recordReadCommitHeadCacheHit(ctx context.Context, method metho
 }
 
 // recordCommitAfterTimeout increments the commit_after_timeout
-// counter for one Write whose end-to-end wall-clock elapsed
-// exceeded CommitTimeout by the time the token-commit PUT
-// completed. The commit landed (the write returns success); this
-// is an observability signal that a SettleWindow tuned to the
-// CommitTimeout may not yet have included this write in the
-// stream window. No scope dimension — Write is the only emitter.
+// counter for one Write whose elapsed time from refMicroTs (just
+// before the ref PUT) to token-commit-PUT completion exceeded
+// CommitTimeout. The commit landed; this is an observability
+// signal that a SettleWindow tuned to the CommitTimeout may not
+// yet have included this write in the stream window. Pre-ref
+// work (parquet encoding, marker PUTs, data PUT) is outside the
+// budget by design — only the ref-LIST-visible →
+// token-commit-visible window can put the SettleWindow contract
+// at risk. No scope dimension — Write is the only emitter.
 func (m *metrics) recordCommitAfterTimeout(ctx context.Context) {
 	if m == nil {
 		return

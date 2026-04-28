@@ -326,12 +326,17 @@ func (s *Writer[T]) writeWithKeyResolved(
 //     zero-byte body, with user-metadata `attemptid` + `refmicrots`
 //     so reads can reconstruct the WriteResult on retry without a
 //     LIST. Single atomic event flipping read-side visibility.
-//  8. Sanity check (writer-local). When the writer's local
-//     elapsed exceeds CommitTimeout, increment
-//     s3store.write.commit_after_timeout and warn. Not a failure
-//     — the commit landed; this just signals that a SettleWindow
-//     tuned to this CommitTimeout may not yet have included this
-//     write in the stream window.
+//  8. Sanity check (writer-local). When the elapsed time from
+//     refMicroTs (step 6) to now exceeds CommitTimeout, increment
+//     s3store.write.commit_after_timeout and return an error. The
+//     commit landed and the data is durable for snapshot reads;
+//     the error signals that a stream reader's SettleWindow
+//     (= CommitTimeout + MaxClockSkew) may have already advanced
+//     past refMicroTs before the token-commit became visible.
+//     Pre-ref work (parquet encoding, marker PUTs, data PUT — the
+//     last scaling with payload size) is deliberately excluded:
+//     the SettleWindow contract is bounded by ref-LIST-visible →
+//     token-commit-visible only.
 //
 // Per-attempt data paths sidestep multi-site StorageGRID's
 // eventual-consistency exposure on data-file overwrites. The
@@ -452,15 +457,24 @@ func (s *Writer[T]) writeEncodedPayload(
 	// write is at risk; the token-commit IS in place (the data is
 	// durable + committed for snapshot reads), so an idempotent
 	// retry recovers automatically via the upfront-HEAD path.
+	//
+	// Measured from `refMicroTs` (the wall-clock stamped just before
+	// the ref PUT), not from writeStartTime: the contract-relevant
+	// interval is ref-LIST-visible → token-commit-visible. Anything
+	// before the ref PUT (parquet encoding, marker PUTs, data PUT —
+	// the last of which scales with payload size) cannot put the
+	// SettleWindow contract at risk, so it doesn't belong in the
+	// budget.
 	commitTimeout := s.cfg.Target.CommitTimeout()
-	if elapsed := time.Since(writeStartTime); elapsed > commitTimeout {
+	tCommitWindowStart := time.UnixMicro(refMicroTs)
+	if elapsed := time.Since(tCommitWindowStart); elapsed > commitTimeout {
 		s.cfg.Target.metrics.recordCommitAfterTimeout(ctx)
 		return nil, fmt.Errorf(
 			"s3store: write committed after CommitTimeout "+
-				"(elapsed %v > %v) — stream reader's SettleWindow "+
-				"may not include this write; data is durable at "+
-				"%s, retry with the same WithIdempotencyToken "+
-				"recovers via upfront-HEAD",
+				"(elapsed %v > %v from ref PUT) — stream reader's "+
+				"SettleWindow may not include this write; data is "+
+				"durable at %s, retry with the same "+
+				"WithIdempotencyToken recovers via upfront-HEAD",
 			elapsed, commitTimeout, dataKey)
 	}
 
