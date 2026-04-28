@@ -112,14 +112,13 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 // slice. PartitionKeyOf is optional at construction — Write
 // errors if called without it, but WriteWithKey works regardless.
 //
-// Constructor performs no S3 I/O. Idempotent writes always go
-// through If-None-Match: * (handled by S3Target.putIfAbsent),
-// which AWS / MinIO honour natively and StorageGRID deployments
-// honour via the s3:PutOverwriteObject deny policy. On backends
-// without either mechanism the conditional PUT silently succeeds
-// on retries — the data path is deterministic + the body is
-// byte-identical, so the duplicate write is harmless and any
-// extra ref it produces is absorbed by reader dedup.
+// Constructor performs no S3 I/O. Idempotent retries are gated
+// by the writer's upfront LIST under {partition}/{token}- (see
+// WithIdempotencyToken): no PUT in the write path ever overwrites,
+// every attempt lands at a fresh per-attempt path, and the
+// upfront-LIST gate finds any prior valid commit and returns
+// its WriteResult unchanged. Cross-backend uniformity — no
+// dependency on If-None-Match support or bucket-policy denies.
 func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err := cfg.Target.Validate(); err != nil {
 		return nil, err

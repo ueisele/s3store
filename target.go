@@ -79,10 +79,12 @@ func isTransientS3Error(err error) bool {
 }
 
 // ErrAlreadyExists is the sentinel returned by putIfAbsent when
-// the target key is already present at the destination. Signals
-// the write path that the current attempt is a retry of a
-// previously-persisted logical write; callers scope-LIST the ref
-// stream to decide whether the ref also needs re-emission.
+// the target key is already present at the destination. Phase 4's
+// per-attempt-paths design no longer routes data PUTs through
+// putIfAbsent (every attempt id is unique by construction), so
+// the write path doesn't observe this sentinel today; callers
+// that build their own conditional PUTs against an S3Target may
+// still encounter it.
 var ErrAlreadyExists = errors.New("s3store: object already exists")
 
 // consistencyHeader is the HTTP header name routed through every
@@ -176,11 +178,14 @@ type S3TargetConfig struct {
 
 	// ConsistencyControl sets the Consistency-Control HTTP header
 	// applied to every correctness-critical S3 operation routed
-	// through this target — data PUTs (idempotent and unconditional),
-	// ref PUTs, projection marker PUTs, data GETs, HEADs, and every LIST
-	// (partition LIST on the read path, marker LIST in ProjectionReader.Lookup,
+	// through this target — data PUTs (per-attempt-path, never
+	// overwriting), ref PUTs, commit-marker PUTs, projection
+	// marker PUTs, data / config GETs, post-data and post-marker
+	// HEADs, and every LIST (partition LIST on the read path,
+	// projection-marker LIST in ProjectionReader.Lookup,
 	// ref-stream LIST in Poll/PollRecords/ReadRangeIter, and the
-	// scoped retry-LIST in findExistingRef).
+	// upfront-LIST dedup gate under {partition}/{token}- on
+	// idempotent writes).
 	//
 	// Zero value (ConsistencyDefault) sends no header — bucket
 	// default applies. Correct on AWS S3 and MinIO (strongly
@@ -558,6 +563,22 @@ func (t S3Target) get(
 func (t S3Target) put(
 	ctx context.Context, key string, data []byte, contentType string,
 ) (err error) {
+	return t.putWithMeta(ctx, key, data, contentType, nil)
+}
+
+// putWithMeta uploads data under key, attaching meta as
+// x-amz-meta-<k> user-metadata headers. Used by the commit-marker
+// PUT to stamp the data file's server-stamped LastModified into
+// the marker so the change-stream read path can apply the
+// timeliness check with a single per-ref HEAD on the marker
+// (no second HEAD on the data file). Carries the target's
+// ConsistencyControl on every call.
+//
+// meta=nil is equivalent to put — no metadata sent.
+func (t S3Target) putWithMeta(
+	ctx context.Context, key string, data []byte,
+	contentType string, meta map[string]string,
+) (err error) {
 	scope := t.metrics.s3OpScope(ctx, s3OpPut)
 	scope.setReqBytes(int64(len(data)))
 	defer scope.end(&err)
@@ -573,6 +594,7 @@ func (t S3Target) put(
 			Key:         aws.String(key),
 			Body:        bytes.NewReader(data),
 			ContentType: aws.String(contentType),
+			Metadata:    meta,
 		}, func(o *s3.Options) {
 			o.APIOptions = append(o.APIOptions, apiOpts...)
 		})
@@ -670,23 +692,25 @@ func (t S3Target) putIfAbsent(
 	return putErr
 }
 
-// headMetadata HEADs key and returns its user-defined metadata
-// (the x-amz-meta-* headers, surfaced by the SDK with lowercase
-// keys). Used on the idempotent-retry path to read the data file's
-// created-at stamp without downloading the body. Carries the
-// target's ConsistencyControl so the HEAD pairs with the
-// preceding data PUT under NetApp's "same level" rule.
-func (t S3Target) headMetadata(
+// head HEADs key and returns its server-stamped LastModified plus
+// user-defined metadata (the x-amz-meta-* headers, surfaced by the
+// SDK with lowercase keys). Used by the write path's post-PUT
+// verification (post-data HEAD captures data.LM as refTsMicros;
+// post-marker HEAD captures marker.LM and reads the dataLM
+// metadata for the timeliness check) and by the change-stream
+// read path (per-ref HEAD on the marker reads marker.LM + dataLM
+// metadata). Carries the target's ConsistencyControl so the HEAD
+// pairs with its preceding PUT under NetApp's "same level" rule.
+func (t S3Target) head(
 	ctx context.Context, key string,
-) (_ map[string]string, err error) {
+) (lastModified time.Time, meta map[string]string, err error) {
 	scope := t.metrics.s3OpScope(ctx, s3OpHead)
 	defer scope.end(&err)
 	if err = t.acquire(ctx); err != nil {
-		return nil, err
+		return time.Time{}, nil, err
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	var meta map[string]string
 	err = retry(ctx, func() error {
 		scope.incAttempts()
 		resp, err := t.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -698,10 +722,11 @@ func (t S3Target) headMetadata(
 		if err != nil {
 			return err
 		}
+		lastModified = aws.ToTime(resp.LastModified)
 		meta = resp.Metadata
 		return nil
 	})
-	return meta, err
+	return lastModified, meta, err
 }
 
 // existsLocked is the slot-already-held variant of exists. Called
@@ -787,9 +812,10 @@ func (t S3Target) listPage(
 // single page round-trip suffices.
 //
 // Single LIST primitive across the library — partition LIST,
-// projection marker LIST, ref-stream LIST (Poll), and the bounded
-// retry-dedup LIST (findExistingRef) all funnel through here so
-// the "semaphore + retry + consistency header" wrapping is
+// projection-marker LIST, ref-stream LIST (Poll), and the
+// upfront-LIST dedup gate under {partition}/{token}- on
+// idempotent writes all funnel through here so the
+// "semaphore + retry + consistency header" wrapping is
 // implemented once. Carries the target's ConsistencyControl on
 // every page fetch.
 func (t S3Target) listEach(

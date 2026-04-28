@@ -1,6 +1,7 @@
 package s3store
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -66,14 +67,25 @@ func TestApplyIdempotentRead_FirstAttempt(t *testing.T) {
 	}
 }
 
+// tokenAttempt builds a per-attempt data file basename of shape
+// "{token}-{tsMicros}-{shortID}.parquet" — the format the writer
+// produces under WithIdempotencyToken (see Phase 4 plan). tsMicros
+// is rendered as 16 fixed-width decimal digits (the operating-
+// range invariant refTsKey relies on); shortID is supplied by the
+// caller so multiple attempts in one partition are distinct.
+func tokenAttempt(token string, tsMicros int64, shortID string) string {
+	return fmt.Sprintf("%s-%016d-%s.parquet", token, tsMicros, shortID)
+}
+
 // TestApplyIdempotentRead_SelfExclusion guards that token-matching
 // files are dropped even when no other files in the partition
 // would be filtered.
 func TestApplyIdempotentRead_SelfExclusion(t *testing.T) {
 	now := time.UnixMicro(100)
 	earlier := now.Add(-time.Second)
+	tokFile := "p/data/period=A/" + tokenAttempt("tok42", 100, "deadbeef")
 	in := []KeyMeta{
-		{Key: "p/data/period=A/tok42.parquet", InsertedAt: now},
+		{Key: tokFile, InsertedAt: now},
 		{Key: "p/data/period=A/x.parquet", InsertedAt: earlier},
 	}
 	got := applyIdempotentRead(in, "p/data", "tok42")
@@ -93,8 +105,9 @@ func TestApplyIdempotentRead_LaterWriteExclusion(t *testing.T) {
 	laterTs := time.UnixMicro(2_000)
 	earlierTs := time.UnixMicro(500)
 
+	tokFile := "p/data/period=A/" + tokenAttempt("tok42", 1000, "deadbeef")
 	in := []KeyMeta{
-		{Key: "p/data/period=A/tok42.parquet", InsertedAt: ownTs},
+		{Key: tokFile, InsertedAt: ownTs},
 		{Key: "p/data/period=A/later.parquet", InsertedAt: laterTs},
 		{Key: "p/data/period=A/earlier.parquet", InsertedAt: earlierTs},
 	}
@@ -114,8 +127,9 @@ func TestApplyIdempotentRead_PerPartitionIsolation(t *testing.T) {
 	ownTs := time.UnixMicro(1_000)
 	laterTs := time.UnixMicro(2_000)
 
+	tokFile := "p/data/period=A/" + tokenAttempt("tok42", 1000, "deadbeef")
 	in := []KeyMeta{
-		{Key: "p/data/period=A/tok42.parquet", InsertedAt: ownTs},
+		{Key: tokFile, InsertedAt: ownTs},
 		{Key: "p/data/period=A/blocked.parquet", InsertedAt: laterTs},
 		{Key: "p/data/period=B/unfiltered.parquet", InsertedAt: laterTs},
 	}
@@ -130,9 +144,10 @@ func TestApplyIdempotentRead_PerPartitionIsolation(t *testing.T) {
 }
 
 // TestApplyIdempotentRead_MultipleOwnAttempts handles the case
-// where the same token produced two files in the same partition.
-// The barrier is min(LastModified of own files) so the earliest
-// attempt defines the cutoff.
+// where the same token produced two per-attempt files in the same
+// partition (Phase 4 retry overlap). The barrier is
+// min(LastModified of own files) so the earliest attempt defines
+// the cutoff.
 func TestApplyIdempotentRead_MultipleOwnAttempts(t *testing.T) {
 	t1 := time.UnixMicro(1_000)
 	t2 := time.UnixMicro(2_000)
@@ -142,8 +157,8 @@ func TestApplyIdempotentRead_MultipleOwnAttempts(t *testing.T) {
 	postBar := time.UnixMicro(1_500)
 
 	in := []KeyMeta{
-		{Key: "p/data/period=A/tok42.parquet", InsertedAt: t1},
-		{Key: "p/data/period=A/tok42.parquet", InsertedAt: t2},
+		{Key: "p/data/period=A/" + tokenAttempt("tok42", 1000, "11111111"), InsertedAt: t1},
+		{Key: "p/data/period=A/" + tokenAttempt("tok42", 2000, "22222222"), InsertedAt: t2},
 		{Key: "p/data/period=A/pre.parquet", InsertedAt: pre},
 		{Key: "p/data/period=A/at.parquet", InsertedAt: atBar},
 		{Key: "p/data/period=A/post.parquet", InsertedAt: postBar},
@@ -163,8 +178,9 @@ func TestApplyIdempotentRead_MultipleOwnAttempts(t *testing.T) {
 // pass through unfiltered so the helper doesn't mask an upstream
 // bug.
 func TestApplyIdempotentRead_NonDataFileKeysPassThrough(t *testing.T) {
+	tokFile := "p/data/period=A/" + tokenAttempt("tok42", 1000, "deadbeef")
 	in := []KeyMeta{
-		{Key: "p/data/period=A/tok42.parquet", InsertedAt: time.UnixMicro(1_000)},
+		{Key: tokFile, InsertedAt: time.UnixMicro(1_000)},
 		{Key: "p/data/period=A/blocked.parquet", InsertedAt: time.UnixMicro(2_000)},
 		{Key: "some/other/path.txt", InsertedAt: time.UnixMicro(5_000)},
 	}
@@ -179,20 +195,65 @@ func TestApplyIdempotentRead_NonDataFileKeysPassThrough(t *testing.T) {
 }
 
 // TestApplyIdempotentRead_TokenWithDashes guards that token
-// values containing dashes are matched via exact basename
-// comparison.
+// values containing dashes are matched correctly under per-
+// attempt-paths: the matcher anchors on the trailing
+// "-{16 digits}-{8 hex}.parquet" suffix, so a dashy token doesn't
+// confuse the auto-id portion.
 func TestApplyIdempotentRead_TokenWithDashes(t *testing.T) {
 	t1 := time.UnixMicro(1_000)
 	tLater := time.UnixMicro(2_000)
 	token := "2026-04-22T10:15:00Z-batch42"
 
 	in := []KeyMeta{
-		{Key: "p/data/period=A/" + token + ".parquet", InsertedAt: t1},
+		{Key: "p/data/period=A/" + tokenAttempt(token, 1000, "deadbeef"), InsertedAt: t1},
 		{Key: "p/data/period=A/blocked.parquet", InsertedAt: tLater},
 	}
 	got := applyIdempotentRead(in, "p/data", token)
 
 	if len(got) != 0 {
 		t.Fatalf("got %d survivors, want 0 (both filtered)", len(got))
+	}
+}
+
+// TestDataFileBasenameMatchesToken pins the per-attempt-id shape
+// matcher down to its corner cases. Critical for the
+// applyIdempotentRead behaviour above and for any future caller
+// that needs to recognise "this data file belongs to {token}".
+func TestDataFileBasenameMatchesToken(t *testing.T) {
+	cases := []struct {
+		base  string
+		token string
+		want  bool
+	}{
+		// Happy paths.
+		{tokenAttempt("tok42", 1700_000_000_000_000, "deadbeef"), "tok42", true},
+		{tokenAttempt("2026-04-22T10:15:00Z-batch42", 1700_000_000_000_000, "abcdef01"),
+			"2026-04-22T10:15:00Z-batch42", true},
+
+		// Wrong token (prefix mismatch).
+		{tokenAttempt("tok42", 1700_000_000_000_000, "deadbeef"), "tok99", false},
+		// Wrong suffix shape: bare token (Phase 3 shape, not Phase 4).
+		{"tok42.parquet", "tok42", false},
+		// Wrong suffix shape: missing shortID.
+		{"tok42-1700000000000000.parquet", "tok42", false},
+		// Wrong tsMicros width (15 digits instead of 16).
+		{"tok42-170000000000000-deadbeef.parquet", "tok42", false},
+		// Wrong shortID width (7 chars).
+		{"tok42-1700000000000000-deadbee.parquet", "tok42", false},
+		// Non-hex chars in shortID.
+		{"tok42-1700000000000000-deadbeeg.parquet", "tok42", false},
+		// Non-digit in tsMicros.
+		{"tok42-170000000000000a-deadbeef.parquet", "tok42", false},
+		// Wrong extension.
+		{"tok42-1700000000000000-deadbeef.txt", "tok42", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.base, func(t *testing.T) {
+			got := dataFileBasenameMatchesToken(tc.base, tc.token)
+			if got != tc.want {
+				t.Errorf("dataFileBasenameMatchesToken(%q, %q) = %v, want %v",
+					tc.base, tc.token, got, tc.want)
+			}
+		})
 	}
 }

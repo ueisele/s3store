@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"reflect"
 	"strings"
 	"sync"
@@ -2891,9 +2892,10 @@ func TestSort_AppliesToAllReadPaths(t *testing.T) {
 }
 
 // newIdempotentStore builds a Store with idempotency-specific
-// config: entity-key dedup so a retry that leaks through
-// produces at-most-one record at the reader layer. Used by the
-// Phase 3 end-to-end tests below.
+// config: entity-key dedup so a near-concurrent retry overlap
+// (two attempts of the same token whose upfront LISTs both miss
+// the prior commit) collapses to one record at the reader layer.
+// Used by the WithIdempotencyToken end-to-end tests below.
 func newIdempotentStore(t *testing.T) *Store[Rec] {
 	t.Helper()
 	f := newFixture(t)
@@ -2908,8 +2910,8 @@ func newIdempotentStore(t *testing.T) *Store[Rec] {
 				r.Period, r.Customer)
 		},
 		// MinIO is in fact strongly consistent; the claim keeps
-		// idempotent writes on the conditional-PUT path and lets
-		// the scoped retry LIST linearize against prior writes.
+		// the upfront-LIST dedup gate linearized against prior
+		// writes on a multi-site StorageGRID-style backend.
 		ConsistencyControl: ConsistencyStrongGlobal,
 		EntityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
@@ -2924,16 +2926,21 @@ func newIdempotentStore(t *testing.T) *Store[Rec] {
 	return store
 }
 
-// TestWriteWithIdempotencyToken_HEAD_FreshAndRetry exercises the
-// HEAD-before-PUT detection path end-to-end on MinIO:
+// TestWriteWithIdempotencyToken_FreshAndRetry exercises the
+// upfront-LIST dedup gate end-to-end on MinIO:
 //
-//  1. A fresh write with a token creates the token-named data file.
-//  2. A retry with the same token hits HEAD 200 → skips body upload
-//     and scope-LISTs for the existing ref → returns the same
-//     RefPath, no duplicate data/ref objects under the prefix.
-//  3. A Read sees exactly one record — reader dedup isn't even
-//     exercised, because no duplicate data/ref lands.
-func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
+//  1. A fresh write with a token writes a per-attempt triple
+//     (data + ref + commit marker) at id = "{token}-{tsMicros}-
+//     {shortID}".
+//  2. A retry with the same token runs an upfront LIST under
+//     {partition}/{token}-, finds the prior valid commit pair
+//     ({.parquet} + {.commit} with marker.LM - data.LM <
+//     CommitTimeout), reconstructs the WriteResult from the
+//     LIST response — no body re-upload, no extra PUTs, same
+//     DataPath / RefPath returned.
+//  3. A Read sees exactly one record — the retry's upfront LIST
+//     short-circuited before any new objects landed.
+func TestWriteWithIdempotencyToken_FreshAndRetry(t *testing.T) {
 	ctx := context.Background()
 	store := newIdempotentStore(t)
 
@@ -2953,14 +2960,19 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	if first == nil {
 		t.Fatal("fresh write: nil result")
 	}
-	if !strings.HasSuffix(first.DataPath, "/"+token+".parquet") {
-		t.Errorf("data path %q does not end with token filename",
-			first.DataPath)
+	// DataPath has shape "{prefix}/data/{partition}/{token}-{tsMicros}-{shortID}.parquet"
+	// — the per-attempt id under WithIdempotencyToken.
+	wantPrefix := "/" + token + "-"
+	if !strings.Contains(first.DataPath, wantPrefix) {
+		t.Errorf("data path %q does not contain per-attempt token prefix %q",
+			first.DataPath, wantPrefix)
 	}
 
-	// Retry with the same token. HEAD → 200 → ErrAlreadyExists →
-	// scope-LIST finds the ref from attempt #1 → return its
-	// RefPath (no ref PUT on retry, no body re-upload).
+	// Retry with the same token. The upfront LIST under
+	// {partition}/{token}- finds the prior valid commit
+	// ({.parquet} + {.commit} pair with marker.LM - data.LM <
+	// CommitTimeout) and returns its WriteResult unchanged — no
+	// new PUTs.
 	second, err := store.WriteWithKey(ctx, key, rec,
 		WithIdempotencyToken(token))
 	if err != nil {
@@ -2970,7 +2982,8 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 		t.Fatal("retry write: nil result")
 	}
 	if second.DataPath != first.DataPath {
-		t.Errorf("retry DataPath drift: fresh=%q retry=%q",
+		t.Errorf("retry DataPath drift: fresh=%q retry=%q "+
+			"(upfront-LIST should reconstruct the same path)",
 			first.DataPath, second.DataPath)
 	}
 	if second.RefPath != first.RefPath {
@@ -2979,9 +2992,8 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	}
 
 	// Read should see exactly one record — the idempotent retry
-	// didn't land a duplicate. Wait past SettleWindow first so
-	// Read can observe the ref in full.
-	time.Sleep(testSettleWindow + 100*time.Millisecond)
+	// didn't land a duplicate. No SettleWindow sleep needed:
+	// snapshot reads are read-after-write.
 	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -2995,12 +3007,16 @@ func TestWriteWithIdempotencyToken_HEAD_FreshAndRetry(t *testing.T) {
 	}
 }
 
-// TestWriteWithIdempotencyToken_OverwritePrevention_Probe tests
-// the auto-detect Probe strategy against MinIO. Whether MinIO
-// enforces If-None-Match or not, the Probe resolves to either
-// overwrite-prevention-active or falls back to HEAD — either way
-// the end-to-end retry-dedup property must hold.
-func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
+// TestWriteWithIdempotencyToken_RetryAfterFailedAttempt simulates
+// a failed prior attempt (data + ref landed but the commit marker
+// got externally deleted, mimicking "marker PUT failed" or
+// "operator-driven sweeper reclaimed an orphan"). The retry's
+// upfront LIST sees no valid commit and creates a fresh
+// per-attempt path with a fresh server-stamped data.LM.
+//
+// Asserts the per-attempt-path uniqueness invariant: two attempts
+// of the same token land at *different* data files.
+func TestWriteWithIdempotencyToken_RetryAfterFailedAttempt(t *testing.T) {
 	ctx := context.Background()
 	store := newIdempotentStore(t)
 
@@ -3016,37 +3032,119 @@ func TestWriteWithIdempotencyToken_OverwritePrevention_Probe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fresh write: %v", err)
 	}
+
+	// Simulate a failed prior attempt: delete the commit marker
+	// out-of-band so the upfront LIST sees a .parquet without a
+	// timely .commit sibling. Under Phase 4 a missing or stale
+	// marker means "no valid commit"; the retry must take the
+	// fresh-attempt path.
+	firstID := strings.TrimSuffix(path.Base(first.DataPath), ".parquet")
+	markerKey := strings.TrimSuffix(first.DataPath, ".parquet") + ".commit"
+	if _, err := store.Target().S3Client().DeleteObject(ctx,
+		&s3.DeleteObjectInput{
+			Bucket: aws.String(store.Target().Bucket()),
+			Key:    aws.String(markerKey),
+		}); err != nil {
+		t.Fatalf("DeleteObject marker: %v", err)
+	}
+
 	second, err := store.WriteWithKey(ctx, key, rec,
 		WithIdempotencyToken(token))
 	if err != nil {
 		t.Fatalf("retry write: %v", err)
 	}
-	if second.DataPath != first.DataPath {
-		t.Errorf("retry DataPath drift: fresh=%q retry=%q",
-			first.DataPath, second.DataPath)
+
+	// Per-attempt-path uniqueness: the retry must not overwrite
+	// the prior data file, must produce its own per-attempt path.
+	if second.DataPath == first.DataPath {
+		t.Errorf("retry reused failed attempt's DataPath %q — "+
+			"per-attempt-path invariant broken (no overwrite "+
+			"should ever happen)", first.DataPath)
 	}
-	if second.RefPath != first.RefPath {
-		t.Errorf("retry RefPath drift: fresh=%q retry=%q",
-			first.RefPath, second.RefPath)
+	secondID := strings.TrimSuffix(path.Base(second.DataPath), ".parquet")
+	if !strings.HasPrefix(firstID, token+"-") ||
+		!strings.HasPrefix(secondID, token+"-") {
+		t.Errorf("ids %q / %q do not both carry token prefix",
+			firstID, secondID)
 	}
 
-	time.Sleep(testSettleWindow + 100*time.Millisecond)
+	// Reader-side dedup (EntityKeyOf+VersionOf on this fixture)
+	// collapses the two attempts to one logical record on Read.
 	got, err := store.Read(ctx, []string{key})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
 	if len(got) != 1 {
-		t.Fatalf("got %d records, want 1", len(got))
+		t.Errorf("got %d records, want 1 (reader dedup should "+
+			"collapse the two per-attempt files to one)",
+			len(got))
+	}
+}
+
+// TestWriteWithIdempotencyToken_PerAttemptTriple verifies that a
+// successful Write under WithIdempotencyToken lands all three
+// per-attempt objects: data (.parquet), commit marker (.commit),
+// and ref. The .parquet and .commit are siblings in the partition
+// directory under the same id; the ref is in _ref/. Plain Write
+// (no token) lands the same triple, just with a token-less id.
+func TestWriteWithIdempotencyToken_PerAttemptTriple(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	key := "period=2026-04-22/customer=eve"
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "eve",
+		SKU: "sku1", Value: 1, Ts: time.UnixMilli(1),
+	}}
+	const token = "job-2026-04-22-triple"
+
+	wr, err := store.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token))
+	if err != nil {
+		t.Fatalf("WriteWithKey: %v", err)
+	}
+
+	id := strings.TrimSuffix(path.Base(wr.DataPath), ".parquet")
+	if !strings.HasPrefix(id, token+"-") {
+		t.Errorf("id %q does not carry token prefix", id)
+	}
+	wantMarker := strings.TrimSuffix(wr.DataPath, ".parquet") + ".commit"
+
+	// Confirm all three objects exist on S3.
+	for _, key := range []string{wr.DataPath, wantMarker, wr.RefPath} {
+		_, err := store.Target().S3Client().HeadObject(ctx,
+			&s3.HeadObjectInput{
+				Bucket: aws.String(store.Target().Bucket()),
+				Key:    aws.String(key),
+			})
+		if err != nil {
+			t.Errorf("HeadObject(%q): %v (per-attempt triple "+
+				"must include data + ref + commit marker)", key, err)
+		}
+	}
+
+	// Confirm the marker carries the dataLM user metadata that
+	// the change-stream read path will consume in Phase 6.
+	hd, err := store.Target().S3Client().HeadObject(ctx,
+		&s3.HeadObjectInput{
+			Bucket: aws.String(store.Target().Bucket()),
+			Key:    aws.String(wantMarker),
+		})
+	if err != nil {
+		t.Fatalf("HeadObject(marker): %v", err)
+	}
+	if _, ok := hd.Metadata["datalm"]; !ok {
+		t.Errorf("marker metadata missing datalm: %v", hd.Metadata)
 	}
 }
 
 // TestWriteWithIdempotencyToken_SameTokenAcrossPartitions: the
 // same token may be reused across distinct partition keys without
-// colliding. findExistingRef scopes its match to (partitionKey,
-// token) so each partition's retry-dedup runs independently.
-// Two writes with the same token to different partitions both
-// produce fresh data + ref; a retry of either is dedup'd to its
-// own partition's prior attempt.
+// colliding. The upfront LIST under {partition}/{token}- is
+// scoped to one partition, so each partition's dedup runs
+// independently. Two writes with the same token to different
+// partitions both produce fresh per-attempt triples; a retry of
+// either is dedup'd to its own partition's prior attempt.
 func TestWriteWithIdempotencyToken_SameTokenAcrossPartitions(t *testing.T) {
 	ctx := context.Background()
 	store := newIdempotentStore(t)
@@ -3315,153 +3413,6 @@ func TestIdempotentRead_RejectsBadToken(t *testing.T) {
 	if _, err := store.Read(ctx, []string{"period=2026-04-22/customer=*"},
 		WithIdempotentRead("has/slash")); err == nil {
 		t.Fatal("want error for barrier token with '/', got nil")
-	}
-}
-
-// TestIdempotency_FullCycle_ScenarioBRefMissing exercises the
-// end-to-end exactly-once-with-token contract through a simulated
-// "scenario B" partial failure: data PUT landed, ref PUT did not.
-// Pairs the writer's retry-fill-in-ref path with the reader's
-// WithIdempotentRead barrier so a caller that retries a read-
-// modify-write across the failure observes the same state twice
-// and writes the same bytes (idempotently, thanks to the token).
-//
-// Sequence:
-//
-//  1. Seed a baseline record (no token).
-//  2. Attempt-1 reads with WithIdempotentRead(T) → token unmatched,
-//     baseline returned. This is the read half of the would-be
-//     read-modify-write.
-//  3. Attempt-1 writes a derived record with WithIdempotencyToken(T):
-//     data + ref both PUT, caller logically commits.
-//  4. Operator simulates the scenario-B failure: DELETE the ref
-//     out-of-band. The data file remains; no ref exists.
-//  5. Attempt-2 retries the same write with the same token. The
-//     writer detects existing data via overwrite-prevention, scope-
-//     LISTs for the ref, finds none, writes a fresh ref to complete
-//     the interrupted attempt. DataPath is identical to attempt-1's
-//     (token-deterministic); RefPath is freshly minted (refTsMicros
-//     embeds the retry's wall-clock).
-//  6. PollRecords from offset "" sees both refs (baseline +
-//     reconstructed) so downstream consumers don't lose attempt-1's
-//     data across the partial failure.
-//  7. Re-read with WithIdempotentRead(T): the barrier matches the
-//     surviving attempt-1 data file (still under {token}.parquet)
-//     and self-excludes it; baseline-only is returned, matching
-//     attempt-1's pre-write view from step 2.
-//  8. Plain Read (no barrier) returns the full state.
-func TestIdempotency_FullCycle_ScenarioBRefMissing(t *testing.T) {
-	ctx := context.Background()
-	store := newIdempotentStore(t)
-
-	key := "period=2026-04-22/customer=alice"
-	const token = "2026-04-22T10:15:00Z-fullcycle"
-
-	// 1. Seed baseline.
-	if _, err := store.WriteWithKey(ctx, key, []Rec{{
-		Period: "2026-04-22", Customer: "alice",
-		SKU: "baseline", Value: 1, Ts: time.UnixMilli(1),
-	}}); err != nil {
-		t.Fatalf("seed write: %v", err)
-	}
-	// Spread LastModified so the WithIdempotentRead barrier
-	// (LastModified-based) cleanly orders baseline before attempt-1
-	// — MinIO has whole-second granularity on some versions.
-	time.Sleep(1100 * time.Millisecond)
-
-	// 2. Attempt-1 reads with the barrier: no token matches yet,
-	// so the full current state (baseline only) is returned.
-	pre, err := store.Read(ctx, []string{key}, WithIdempotentRead(token))
-	if err != nil {
-		t.Fatalf("attempt-1 Read: %v", err)
-	}
-	if len(pre) != 1 || pre[0].SKU != "baseline" {
-		t.Fatalf("attempt-1 saw %+v, want [baseline]", pre)
-	}
-
-	// 3. Attempt-1 writes the derived record with the token.
-	first, err := store.WriteWithKey(ctx, key, []Rec{{
-		Period: "2026-04-22", Customer: "alice",
-		SKU: "derived", Value: 100, Ts: time.UnixMilli(10),
-	}}, WithIdempotencyToken(token))
-	if err != nil {
-		t.Fatalf("attempt-1 write: %v", err)
-	}
-	if first.RefPath == "" {
-		t.Fatal("attempt-1 RefPath empty — expected a ref PUT on " +
-			"the fresh-write path")
-	}
-
-	// 4. Simulate scenario-B partial failure: DELETE the ref,
-	// leave the data file in place.
-	if _, err := store.Target().S3Client().DeleteObject(ctx,
-		&s3.DeleteObjectInput{
-			Bucket: aws.String(store.Target().Bucket()),
-			Key:    aws.String(first.RefPath),
-		}); err != nil {
-		t.Fatalf("DeleteObject ref: %v", err)
-	}
-	time.Sleep(testSettleWindow + 100*time.Millisecond)
-
-	// 5. Attempt-2 retries with the same token. The writer must
-	// detect existing data, scope-LIST for the ref, find none,
-	// then PUT a fresh ref to complete the interrupted attempt.
-	second, err := store.WriteWithKey(ctx, key, []Rec{{
-		Period: "2026-04-22", Customer: "alice",
-		SKU: "derived", Value: 100, Ts: time.UnixMilli(10),
-	}}, WithIdempotencyToken(token))
-	if err != nil {
-		t.Fatalf("attempt-2 write: %v", err)
-	}
-	if second.DataPath != first.DataPath {
-		t.Errorf("retry DataPath drift: fresh=%q retry=%q "+
-			"(token-deterministic path is the contract)",
-			first.DataPath, second.DataPath)
-	}
-	if second.RefPath == "" {
-		t.Errorf("retry RefPath empty — scenario-B fill-in did " +
-			"not PUT a replacement ref")
-	}
-	if second.RefPath == first.RefPath {
-		t.Errorf("retry RefPath %q equals attempt-1's deleted "+
-			"ref — fill-in must mint a fresh ref (refTsMicros "+
-			"embeds the retry's wall-clock)", second.RefPath)
-	}
-
-	// 6. PollRecords sees both refs (baseline + reconstructed
-	// attempt-1). Wait past SettleWindow first.
-	time.Sleep(testSettleWindow + 100*time.Millisecond)
-	polled, _, err := store.PollRecords(ctx, "", 100)
-	if err != nil {
-		t.Fatalf("PollRecords: %v", err)
-	}
-	if len(polled) != 2 {
-		t.Fatalf("PollRecords got %d records, want 2 "+
-			"(baseline + reconstructed)", len(polled))
-	}
-
-	// 7. Re-read with the barrier. The token file still exists
-	// (only the ref was deleted), so the barrier fires and the
-	// derived record is self-excluded. Baseline survives —
-	// retry-safe read-modify-write across the partial failure.
-	post, err := store.Read(ctx, []string{key},
-		WithIdempotentRead(token))
-	if err != nil {
-		t.Fatalf("post-retry barrier Read: %v", err)
-	}
-	if len(post) != 1 || post[0].SKU != "baseline" {
-		t.Fatalf("post-retry barrier saw %+v, want [baseline] "+
-			"(retry must preserve attempt-1's read view)", post)
-	}
-
-	// 8. Plain Read (no barrier): full state — both records.
-	full, err := store.Read(ctx, []string{key})
-	if err != nil {
-		t.Fatalf("full Read: %v", err)
-	}
-	if len(full) != 2 {
-		t.Fatalf("full Read got %d records, want 2 "+
-			"(baseline + derived)", len(full))
 	}
 }
 

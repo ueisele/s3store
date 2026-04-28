@@ -831,96 +831,94 @@ _, err := store.WriteWithKey(ctx, key, records,
 
 On retry with the same token:
 
-- **Data file path is deterministic** — the token replaces the
-  default `{tsMicros}-{shortID}` id in the filename. The backend's
-  overwrite-prevention rejects the second PUT, so the parquet body
-  is not re-uploaded.
-- **Ref dedup via scoped LIST** — the writer HEADs the existing
-  data file, reads its `x-amz-meta-created-at` stamp, and LISTs
-  refs from that timestamp forward. If a ref for this token
-  already exists, the retry skips the ref PUT. If the original
-  attempt wrote data but not the ref ("scenario B"), the retry
-  completes by emitting the ref only.
+- **Per-attempt data path** — every attempt lands at a fresh
+  `{token}-{tsMicros}-{shortID}.parquet`. No PUT in the write
+  path ever overwrites — sidesteps multi-site StorageGRID's
+  eventual-consistency exposure on overwrites; uniform behaviour
+  across AWS S3, MinIO, and StorageGRID at any consistency level.
+- **Upfront-LIST dedup gate** — before generating a fresh
+  attempt-id, the writer LISTs under `{partition}/{token}-` and
+  pairs `.parquet` siblings with their `.commit` siblings by id.
+  If any pair passes the timeliness check (`marker.LM - data.LM
+  < CommitTimeout`), the retry returns that prior commit's
+  `WriteResult` unchanged — no body re-upload, no new PUTs. If
+  no valid commit exists, the retry proceeds with a fresh
+  attempt-id and a fresh server-stamped `data.LM`.
+- **Recovery from arbitrarily long outages.** Same token works
+  forever: retries across S3 outages, orchestrator restarts,
+  process crashes — all converge automatically. There's no
+  `ErrCommitWindowExpired`, no generation-suffix juggling on
+  the orchestrator side.
+
+**Cost: per-attempt orphans on failure.** Every failed attempt
+under `WithIdempotencyToken` leaves data + ref + (possibly)
+marker on S3 as orphans. Reader paths filter them out via the
+commit-marker timeliness check; the deferred operator-driven
+sweeper reclaims them. A retry storm with sane orchestrator
+backoff produces orphans bounded by `(retry rate) × (parquet
+size)` per token.
 
 ### Idempotency and reader dedup are complementary
 
-Tokens reduce *storage* duplication. They do **not** on their own
-guarantee exactly-once at the consumer. For that, pair tokens with
-reader-side dedup: configure `EntityKeyOf` + `VersionOf` so
+Tokens recover the same `WriteResult` for sequential retries
+once the prior commit has landed and is still timely. They do
+**not** absorb every form of duplication on their own:
+
+- **Near-concurrent retry overlap** — two attempts of the same
+  token whose upfront LISTs both miss the prior commit (slow
+  original + fast retry). Both write their own per-attempt
+  triple; both commit; the partition has two valid commits for
+  the token, both with bit-identical records (deterministic
+  parquet encoding). Without reader-side dedup, the application
+  sees doubled rows.
+- **Different tokens for the same logical write** — two distinct
+  per-attempt triples; reader dedup is the only collapse point.
+
+Pair tokens with `EntityKeyOf` + `VersionOf` so
 `Read` / `ReadIter` / `PollRecords` collapse latest-per-entity.
 
 | Config | Storage layer | Consumer layer |
 |---|---|---|
 | No token, no dedup | at-least-once | at-least-once |
 | No token, dedup configured | at-least-once | **exactly-once** (per entity) |
-| Token + dedup, strong consistency | at-least-once (minimal duplication) | **exactly-once** (across sessions) |
-| Token + dedup, weak consistency (StorageGRID `read-after-new-write`) | at-least-once (some residual duplication) | **exactly-once** — reader dedup collapses storage replicas |
+| Token + dedup | at-least-once (per-attempt orphans on failure) | **exactly-once** (across sessions) |
+| Token alone (no dedup) | at-least-once with sequential-retry collapse | at-least-once on retry overlap |
 
-**Recommendation**: enable reader dedup whenever correctness matters.
-Tokens are additive — they cut S3 cost and traffic on retry.
+**Recommendation**: enable reader dedup whenever correctness
+matters. Under `WithIdempotencyToken`, reader dedup is
+**required** to absorb near-concurrent retry overlap.
 
-### Retry-detection mechanism
+### Cross-backend uniformity
 
-Idempotent writes always go through `If-None-Match: *` on the
-data PUT. Three backend behaviours collapse onto the same
-`ErrAlreadyExists` outcome:
+Per-attempt-paths plus the upfront-LIST dedup gate produce the
+same retry semantics on every supported backend:
 
-- **AWS S3 / recent MinIO** honour `If-None-Match: *` natively
-  and return 412 on a re-PUT.
-- **StorageGRID with the `s3:PutOverwriteObject` deny policy
-  applied** ignores the header but rejects the re-PUT with 403;
-  the writer follows the 403 with a HEAD that confirms the
-  object exists and returns the same `ErrAlreadyExists`.
-- **Backends with neither mechanism** silently accept the re-PUT.
-  No `ErrAlreadyExists` fires; the data file is overwritten with
-  byte-identical content (deterministic encoding under a token),
-  the markers re-PUT to byte-identical paths, and a fresh ref
-  emits — reader dedup absorbs the rare visible duplicate.
-
-In all three cases the data file at the token-derived path
-matches the caller's bytes after the write returns. The only
-behavioural difference is whether retries skip the body upload
-(yes on the first two, no on the third) — a bandwidth concern,
-not a correctness one.
-
-There's no probe at constructor time, no detection-strategy
-config knob, and no DELETE permission required for retry
-detection.
-
-### StorageGRID requires extra configuration
-
-StorageGRID doesn't honour `If-None-Match: *` natively — the
-conditional-PUT path above relies instead on a narrow
-`s3:PutOverwriteObject` deny on `{prefix}/data/*` (the writer
-treats the resulting 403 + HEAD as `ErrAlreadyExists`). That
-deny plus a per-target `ConsistencyControl` strong enough to
-make the scoped retry-LIST list-after-write across nodes are
-the two backend-side settings the library can't apply for you.
-Both are documented in [STORAGEGRID.md](STORAGEGRID.md), along
-with what each consistency level means for every correctness-
-critical call s3store makes and why `strong-*` is required on
-both halves of the library.
+- **AWS S3 / MinIO** — read-after-new-write is strongly
+  consistent out of the box. The writer's post-PUT HEADs always
+  observe what was just written; the upfront-LIST always sees
+  any prior commit.
+- **NetApp StorageGRID** — set `ConsistencyControl` to
+  `strong-site` or `strong-global` (per topology — see
+  [STORAGEGRID.md](STORAGEGRID.md)) so the LIST half of the
+  upfront-dedup gate gets list-after-write across the relevant
+  scope. **No `s3:PutOverwriteObject` bucket policy required**
+  — Phase 4 of the commit-marker design replaced that mechanism
+  with per-attempt paths. Earlier versions of the library
+  required this policy; operators upgrading can drop it.
 
 ### Zombie writers and orchestrators
 
 The library does not enforce single-writer-per-partition —
 that's a caller invariant. Two cases:
 
-- **Same token.** Parquet encoding is deterministic under a
-  token, so the data files are byte-identical regardless of
-  who wins StorageGRID's [latest-wins][sgcwl] arbitration.
-  *Sequential* retries collapse via the `s3:PutOverwriteObject`
-  deny → `ErrAlreadyExists` → ref dedup. *Truly concurrent*
-  writers both succeed at the storage layer (the deny is a
-  post-completion gate — see
-  [the post-completion-gate note][cdpg]) and both emit fresh
-  refs; reader dedup via `(entity, version)` absorbs the
-  duplicate records on read.
-- **Different tokens.** Two distinct data files (different
-  paths) and two distinct refs; reader dedup via
+- **Same token.** Sequential retries collapse via the
+  upfront-LIST gate. Truly concurrent writers' upfront LISTs
+  may both miss the prior commit (the partition has two valid
+  commits for the token after both finish); reader dedup via
+  `(entity, version)` collapses the duplicate records on read.
+- **Different tokens.** Two distinct per-attempt triples
+  (different paths, different refs); reader dedup via
   `(entity, version)` collapses them at read time.
-
-[cdpg]: STORAGEGRID.md#s3putoverwriteobject-deny-is-a-post-completion-gate-not-a-mutex
 
 For orchestrator-driven jobs: **reuse the same token across
 failovers** (persist it in your job state). A fresh token per
@@ -1385,59 +1383,57 @@ the cutoff so it can't overtake a ref whose marker might still be
 landing server-side, even at the worst-case skew. This gives you a
 single monotonic offset with no seen-set or dedup bookkeeping.
 
-### Enforcement: the ref PUT is budgeted against SettleWindow
+### Enforcement: the post-marker HEAD verifies the timeliness check
 
-The whole SettleWindow contract rests on one assumption: by the
-time `Poll`'s cutoff (`now - SettleWindow`) advances past a ref's
-`refTsMicros`, the ref is LIST-visible. The timestamp is captured
-just before the ref PUT (not after), so `SettleWindow` has to
-cover the PUT's own network time plus LIST propagation on the
-backend.
+The whole `SettleWindow` contract rests on one assumption: by
+the time `Poll`'s cutoff (`now - SettleWindow`) advances past a
+ref's `refTsMicros`, either the ref's commit marker has landed
+server-side or the marker is permanently invalid (took longer
+than `CommitTimeout` to land, so it fails the timeliness check
+on every read path).
 
-The write path enforces this with a `SettleWindow / 2`
-client-side timeout on the ref PUT. The reserved half covers
-LIST propagation between the node that accepted the PUT and the
-node a concurrent `Poll` hits — zero on strong-consistency
-backends, nonzero on weak ones.
+The write path enforces this directly. After the marker PUT,
+the writer issues an HEAD on the marker, reads its server-stamped
+`LastModified`, and verifies `marker.LM - data.LM <
+CommitTimeout` — the same check the reader runs, with the same
+S3-server-stamped values, so the answer is identical regardless
+of the writer's or reader's clock state. On violation the writer
+returns an explicit error; the per-attempt orphan triple
+(data + ref + marker) stays on S3, filtered out by every read
+path's timeliness check, and the caller retries.
 
-Real PUT latencies (tens of ms) fit comfortably inside
-`SettleWindow / 2` for any reasonable `SettleWindow`, so the
-halved budget doesn't cost the happy path anything. The budget
-does **not** vary with `ConsistencyControl`.
-
-If the ref PUT misses the deadline (or fails for any other
-reason), the call returns a wrapped error. The data file is left
-in S3 as an orphan — the library never deletes data it has
-written. The caller retries — under `WithIdempotencyToken` the
-retry is deterministic (same data path), conditional `If-None-
-Match: *` on the data PUT routes into the retry-dedup branch, and
-`findExistingRef`'s freshness filter ignores any stale ref a
-previous attempt may have left behind, so the retry emits a fresh
-in-budget ref rather than silently matching the stale one.
+If any PUT in the sequence fails (data, ref, or marker), the
+call returns a wrapped error. The library never deletes anything
+it has written; per-attempt-paths mean the failed attempt's
+files don't conflict with a retry. Under `WithIdempotencyToken`
+the retry runs the upfront-LIST gate first — if the failed
+attempt happened to land its full triple, the retry returns its
+`WriteResult` unchanged; otherwise the retry generates a fresh
+attempt-id and proceeds end-to-end with a fresh server-stamped
+`data.LM`.
 
 ```go
 if _, err := store.Write(ctx, recs,
     s3store.WithIdempotencyToken(token),
 ); err != nil {
-    // ctx.DeadlineExceeded indicates the ref PUT missed its
-    // SettleWindow/2 budget; any wrapped put error means the
-    // ref didn't land. Retry with the same token.
+    // The post-marker timeliness check failed, or some PUT in the
+    // sequence didn't land. Retry with the same token — the
+    // upfront-LIST gate dedups the prior attempt if it secretly
+    // succeeded; otherwise the retry writes a fresh attempt.
     return retry(...)
 }
 ```
 
 For **exactly-once at the consumer**, configure reader dedup
-(`EntityKeyOf + VersionOf`) — the rare duplicates produced by
-the narrow ack-loss-after-server-persist window all share
-`(entity, version)` and dedup collapses them.
+(`EntityKeyOf + VersionOf`). Near-concurrent retry overlap can
+produce two valid commits whose records share
+`(entity, version)`; dedup collapses them.
 
-**AWS S3 / MinIO users**: `ConsistencyControl` doesn't change the
-ref-PUT budget — it's a uniform `SettleWindow / 2` regardless.
-The header remains useful on StorageGRID for the data-PUT
-overwrite-prevention and the scoped retry LIST, but for the ref
-PUT specifically there's no strong-vs-weak distinction. Real PUT
-latencies (tens of ms) fit comfortably inside the halved budget
-for any reasonable `SettleWindow`.
+**AWS S3 / MinIO users**: `ConsistencyControl` is a no-op (both
+backends ignore the header). The write-path budget is the
+persisted `CommitTimeout`, set per-prefix at dataset
+initialization — see
+[Initializing a new dataset](#initializing-a-new-dataset).
 
 ## StorageGRID
 
@@ -1446,18 +1442,19 @@ MinIO need no configuration — both are strongly consistent on
 LIST and GET by default and ignore the `Consistency-Control`
 header. **StorageGRID needs explicit setup:**
 
-1. A bucket policy denying `s3:PutOverwriteObject` on the
-   `data/` subtree of the s3store prefix.
-2. `ConsistencyControl: ConsistencyStrongGlobal` (multi-site
-   grid with cross-cutting traffic) or `ConsistencyStrongSite`
-   (single-site grid, or co-located reader/writer pairs) on
-   the `S3Target`.
+- `ConsistencyControl: ConsistencyStrongGlobal` (multi-site
+  grid with cross-cutting traffic) or `ConsistencyStrongSite`
+  (single-site grid, or co-located reader/writer pairs) on
+  the `S3Target`.
 
-See [STORAGEGRID.md](STORAGEGRID.md) for the full setup,
-including a ready-to-run boto3 example for the bucket policy,
-the topology decision matrix, operational notes on the 11.9
-availability cliff, and the consistency-model reasoning that
-motivates these requirements.
+No bucket policy required: per-attempt-paths under
+`WithIdempotencyToken` make every PUT a first write to a new
+key, so the `s3:PutOverwriteObject` deny earlier versions
+required is no longer used. See
+[STORAGEGRID.md](STORAGEGRID.md) for the full topology decision
+matrix, operational notes on the 11.9 availability cliff, and
+the consistency-model reasoning that motivates the
+`ConsistencyControl` requirement.
 
 ## Durability guarantees
 
@@ -1515,13 +1512,14 @@ those on read via `EntityKeyOf` + `VersionOf`. Multi-group
 records that *did* commit before the error so a retry can skip
 them if needed.
 
-To make retries produce deterministic data paths at the storage
-layer (no duplicate bytes, no duplicate refs within a bounded
-window), pass `WithIdempotencyToken` — see
-[Idempotent writes](#idempotent-writes). The ref PUT itself is
-budgeted at `SettleWindow / 2`; a slow write that misses the
-deadline returns a wrapped put-ref error so the caller retries
-(see [Settle window](#settle-window)).
+To make retries dedup against prior successful attempts, pass
+`WithIdempotencyToken` — see
+[Idempotent writes](#idempotent-writes). Each attempt writes
+to its own per-attempt path; the upfront-LIST gate dedups
+sequential retries; the post-marker timeliness check
+(`marker.LM - data.LM < CommitTimeout`) verifies the commit
+landed within budget, returning a wrapped error otherwise so
+the caller retries.
 
 ### Read
 

@@ -34,79 +34,31 @@ documented mechanism.
 
 ## Required configuration
 
-Two things are required:
+One thing is required:
 
-1. A **bucket policy** denying `s3:PutOverwriteObject` on the
-   `data/` subtree of the s3store prefix.
-2. **`ConsistencyControl`** on the `S3Target` set to one of the
+- **`ConsistencyControl`** on the `S3Target` set to one of the
    stronger levels (`strong-global` or `strong-site` — see
    [Choosing the consistency level](#choosing-the-consistency-level)
-   for which one).
+   for which one). The level applies to every paired LIST / PUT /
+   GET / HEAD the library issues, so writer and reader observe
+   the same metadata view (NetApp's "same consistency for paired
+   operations" rule).
 
-### 1. Bucket policy
+> **No `s3:PutOverwriteObject` deny needed.** Earlier versions
+> of the library required a bucket policy denying
+> `s3:PutOverwriteObject` on the `data/` subtree to make
+> idempotent retries route into a HEAD-then-LIST dedup path.
+> Phase 4 of the commit-marker work replaced that mechanism
+> with **per-attempt paths**: every retry under
+> `WithIdempotencyToken` writes to a fresh path
+> (`{token}-{tsMicros}-{shortID}`), so no PUT in the write path
+> ever overwrites — sidestepping multi-site StorageGRID's
+> eventual-consistency exposure on overwrites. The library's
+> upfront LIST under `{partition}/{token}-` is the dedup gate
+> instead. Operators who carried this policy from earlier
+> versions can drop it; correctness no longer depends on it.
 
-The deny scopes idempotent writes: a retry against an already-
-written data key gets `403 → ErrAlreadyExists` and the writer
-pivots to ref dedup instead of re-uploading the body. Apply with
-boto3:
-
-```python
-import json
-import boto3
-
-# Point boto3 at your StorageGRID endpoint.
-s3 = boto3.client(
-    "s3",
-    endpoint_url="https://your-storagegrid-endpoint",
-    aws_access_key_id="...",
-    aws_secret_access_key="...",
-    region_name="us-east-1",  # any value; StorageGRID ignores it
-)
-
-BUCKET = "your-bucket"
-PREFIX = "your-prefix"  # the Prefix you pass to s3store.Config
-
-policy = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "DenyDataOverwrite",
-            "Effect": "Deny",
-            "Principal": "*",
-            "Action": ["s3:PutOverwriteObject"],
-            "Resource": [
-                f"arn:aws:s3:::{BUCKET}/{PREFIX}/data/*",
-            ],
-        },
-    ],
-}
-
-s3.put_bucket_policy(Bucket=BUCKET, Policy=json.dumps(policy))
-```
-
-> **Scope the deny narrowly.** s3store's layout has three
-> subtrees under `{prefix}`:
->
-> - `data/` — parquet files. Deterministic paths under
->   `WithIdempotencyToken`; the deny fires here on retry so the
->   body isn't re-uploaded. **This is what needs the deny.**
-> - `_projection/` — secondary-projection markers. **Byte-identical
->   idempotent overwrites by design** — the same
->   `{col}={value}/m.proj` marker is written every time that
->   `(col, value)` tuple recurs in a batch. A bucket-wide deny
->   rejects the second write with `403 AccessDenied` and breaks
->   projection writes entirely.
-> - `_ref/` — ref files. Unique per-PUT keys
->   (refTsMicros prefix), so they never overwrite either way.
->
-> **Symptom of an over-scoped deny**: data writes succeed, then
-> markers fail with `403 AccessDenied` as soon as any
-> `(col, value)` tuple recurs. The library does not delete the
-> data file on this failure (the at-least-once contract), so
-> orphan parquet accumulates under `data/` with no markers and
-> no ref until an operator-driven prune removes it.
-
-### 2. `ConsistencyControl` on the S3 target
+### `ConsistencyControl` on the S3 target
 
 Set the level on the target so every S3 call routed through it
 inherits the same value:
@@ -147,7 +99,7 @@ two axes, not a tuning knob:
 | Topology | Recommended | Correctness rationale | Availability rationale |
 |---|---|---|---|
 | **Single-site grid** | `strong-site` | One site, so `strong-site` ≡ `strong-global`. | Same fault tolerance — only that one site has to be up either way. |
-| **Multi-site grid, every reader/writer pair co-located per site** (Site A's app talks only to Site A's bucket; Site B is DR) | `strong-site` *with caveat* | Safe in steady state. Breaks on **cross-site failover** — if a writer fails over to Site B mid-batch, `findExistingRef` in Site B may not yet see the ref Site A wrote, and idempotent retry detection silently degrades until propagation catches up. | **`strong-site` is more available than 11.9 `strong-global`** here. A failure of any non-local site doesn't block local writes; under `strong-global` (11.9) it would. |
+| **Multi-site grid, every reader/writer pair co-located per site** (Site A's app talks only to Site A's bucket; Site B is DR) | `strong-site` *with caveat* | Safe in steady state. Breaks on **cross-site failover** — if a writer fails over to Site B mid-batch, the upfront-LIST dedup gate in Site B may not yet see the .commit Site A wrote, and an idempotent retry produces a duplicate per-attempt commit (collapsed by reader-side dedup with `EntityKeyOf` + `VersionOf`, but not silently absorbed without it). | **`strong-site` is more available than 11.9 `strong-global`** here. A failure of any non-local site doesn't block local writes; under `strong-global` (11.9) it would. |
 | **Multi-site grid with cross-cutting traffic** (any reader/writer pair can land on different sites — global load balancer, readers in different regions than writers) | `strong-global` | Required for correctness. | **In 11.9, the cost is severe: any single site outage causes all writes to fail.** Plan for this — operators of 11.9 multi-site grids should understand strong-global as a *consistency-availability trade*, not a free upgrade over strong-site. |
 
 ## Operational notes
@@ -200,11 +152,13 @@ topology + availability decision deliberately.
 ## Appendix: why this configuration
 
 The rest of this document explains the reasoning that motivates
-the two required pieces of configuration above. **You don't need
-to read it to use s3store on StorageGRID.** Use it when you're
-debugging a consistency-related symptom, designing a topology
-where the simple recommendations above don't obviously apply, or
-auditing the library's safety claims against the StorageGRID docs.
+the `ConsistencyControl` requirement above and the per-attempt-paths
+rationale that replaced the earlier `s3:PutOverwriteObject` deny
+mechanism. **You don't need to read it to use s3store on
+StorageGRID.** Use it when you're debugging a consistency-related
+symptom, designing a topology where the simple recommendations
+above don't obviously apply, or auditing the library's safety
+claims against the StorageGRID docs.
 
 ### The five consistency levels
 
@@ -230,11 +184,13 @@ Per the StorageGRID 11.9 [docs][sgcc]:
 ### Operation × level matrix
 
 The matrix lists S3 operation types — pure storage-layer
-semantics, not s3store-specific use cases. **Authorization is
-a separate axis from consistency**: the
-`s3:PutOverwriteObject` deny is part of the auth layer, applies
-independently of the level, and is discussed in
-[its own subsection](#s3putoverwriteobject-deny-is-a-post-completion-gate-not-a-mutex).
+semantics, not s3store-specific use cases. **The library never
+overwrites under Phase 4 of the commit-marker design** (every
+attempt writes to a per-attempt path), so the "PUT (overwrite)"
+column applies only when an external operator overwrites a key
+out-of-band — not to anything the library does. The previously-
+required `s3:PutOverwriteObject` deny is no longer needed (see
+the note on per-attempt-paths in [Required configuration](#required-configuration)).
 
 Cells describe the **within-level guarantee** the docs commit
 to (paired PUT + GET at the same level). Specific write scope
@@ -253,22 +209,31 @@ for what we do and don't know about the mechanism.
 These S3 operations correspond to s3store call sites as
 follows:
 
-- **PUT (new)** — data PUT on first attempt ([writer_write.go](writer_write.go));
-  ref PUT ([writer_write.go](writer_write.go)) always (the
-  refTsMicros prefix is unique per call); projection marker PUT
-  ([projection_write.go](projection_write.go)) on first occurrence of a
-  `(col, value)` tuple.
-- **PUT (overwrite)** — data PUT on retry under
-  `WithIdempotencyToken` (deterministic paths produce the same
-  key); marker PUT on a recurring `(col, value)`. *Same call
-  sites as PUT (new)* — whether a given attempt is "new" or
-  "overwrite" depends on whether the target key already exists.
-- **GET** — parquet body fetch ([reader_read.go](reader_read.go)).
-- **HEAD** — `putIfAbsent` 403→404 disambiguation ([target.go](target.go)).
-- **LIST** — partition LIST, marker LIST (`ProjectionReader.Lookup`),
-  ref-stream LIST (`Poll` / `PollRecords` / `ReadRangeIter`),
-  scoped retry-LIST (`findExistingRef`); all funnel through
-  `listEach` ([target.go](target.go)).
+- **PUT (new)** — every PUT the library issues. Per-attempt-paths
+  make data, ref, and commit-marker writes unique by construction
+  (id = `{token}-{tsMicros}-{shortID}` under
+  `WithIdempotencyToken`, or `{tsMicros}-{shortID}` for
+  token-less writes); projection markers under
+  `_projection/{Name}/{col}={value}/m.proj` are byte-identical
+  empty objects, so even a recurring write to the same marker
+  key is semantically a "new write" (not a content change). No
+  PUT in the write path overwrites an existing key.
+- **PUT (overwrite)** — only reachable through external operator
+  action (e.g. manual S3 console PUT). The library does not
+  produce overwrites itself.
+- **GET** — parquet body fetch ([reader_read.go](reader_read.go));
+  timing-config object fetch on `S3Target` construction
+  ([target.go](target.go)).
+- **HEAD** — post-data HEAD and post-marker HEAD on the write
+  path (server-stamped LM capture + commit-marker timeliness
+  verify, [writer_write.go](writer_write.go)); per-ref marker
+  HEAD on the change-stream read path
+  ([reader_poll.go](reader_poll.go)).
+- **LIST** — partition LIST (snapshot reads); projection-marker
+  LIST (`ProjectionReader.Lookup`); ref-stream LIST
+  (`Poll` / `PollRecords` / `ReadRangeIter`); upfront-LIST dedup
+  gate under `{partition}/{token}-` on the write path; all
+  funnel through `listEach` ([target.go](target.go)).
 
 ### Why LIST is the load-bearing operation
 
@@ -301,13 +266,14 @@ requests" — phrasing broad enough to include LIST.
 
 s3store relies on LIST seeing recent PUTs in four places:
 
-1. **Idempotent retry dedup** — `findExistingRef` LISTs the ref
-   stream to find the prior attempt's ref. A LIST that misses
-   it produces a duplicate ref. (The conditional data PUT's
-   overwrite-deny *may* fire under default; the docs don't
-   address that case. But even if it doesn't, the byte-identical
-   re-upload is a bandwidth concern, not a correctness one — the
-   correctness break is on this LIST.)
+1. **Idempotent retry dedup (upfront-LIST gate)** — under
+   `WithIdempotencyToken`, the writer LISTs under
+   `{partition}/{token}-` to find any prior valid commit. A LIST
+   that misses the prior commit produces a duplicate per-attempt
+   triple (data + ref + commit marker). Reader-side dedup with
+   `EntityKeyOf + VersionOf` collapses the duplicate records, but
+   without it the duplicate is visible. Strong list-after-write
+   keeps the gate reliable.
 2. **`Reader.Read` / `ReadIter`** — partition LIST surfaces
    freshly-written data files for the read-after-write contract.
 3. **`ProjectionReader.Lookup`** — LIST under `_projection/{col}={value}/`
@@ -315,8 +281,9 @@ s3store relies on LIST seeing recent PUTs in four places:
 4. **`Poll` / `PollRecords` / `ReadRangeIter`** — ref-stream LIST
    advances the consumer's cutoff. Without `strong-*`,
    `SettleWindow` would have to be sized as pure LIST-propagation
-   slack; with it, `SettleWindow` only has to cover the writer's
-   in-flight ref-PUT budget.
+   slack; with it, `SettleWindow = CommitTimeout + MaxClockSkew`
+   only has to cover the writer's in-flight commit-marker budget
+   plus the reader↔server clock-skew bound.
 
 HEAD and GET are *not* the bottleneck — they would be safe on
 their own under default thanks to the documented ladder. We send
@@ -387,34 +354,22 @@ on the mechanism alone.
 
 More generally, asymmetric setups can't help s3store: both
 halves of the library issue LISTs that need list-after-write.
-The *write* side does `findExistingRef` (idempotency dedup);
-the *read* side does partition LIST, marker LIST, and `Poll`
-LIST. Whichever side you weaken to a non-strong level loses
+The *write* side does the upfront-LIST dedup gate under
+`{partition}/{token}-` for idempotent retries; the *read* side
+does partition LIST, projection-marker LIST, and ref-stream LIST.
+Whichever side you weaken to a non-strong level loses
 list-after-write on its own LISTs — independently of any
 PUT/GET pairing concern.
 
-### `s3:PutOverwriteObject` deny is a post-completion gate, not a mutex
+### Why per-attempt-paths replaced the `s3:PutOverwriteObject` deny
 
-The `s3:PutOverwriteObject` deny is part of StorageGRID's
-**authorization** layer. Authorization and consistency are
-independent axes:
-
-- **Consistency** governs how widely metadata propagates after
-  PUT and what subsequent reads see. The matrix above describes
-  this.
-- **Authorization** decides whether a given PUT is *allowed* to
-  proceed at all. The `s3:PutOverwriteObject` deny matches when
-  the auth-layer's existence check sees an object at the target
-  key, regardless of the consistency level configured on the
-  PUT request.
-
-The deny's *reliability* depends on whether the auth layer's
-existence check sees a recent PUT — which is itself a metadata
-read. **The docs don't tell us what consistency that internal
-check uses.** Empirically (and based on the latest-wins
-mechanism documented below) the deny fires reliably for
-sequential retries when the original PUT was at `strong-*`;
-under weaker levels we have no documented guarantee.
+Earlier versions of the library required a bucket policy
+denying `s3:PutOverwriteObject` on the `data/` subtree to make
+idempotent retries route into a HEAD-then-LIST dedup branch.
+**Phase 4 of the commit-marker design replaced that mechanism
+with per-attempt paths.** The motivation is correctness on
+multi-site StorageGRID — the deny had two structural problems
+that per-attempt-paths sidestep entirely:
 
 #### Concurrent writers always race
 
@@ -431,43 +386,50 @@ That means **two parallel writes to the same key both succeed,
 on every consistency level**. At the moment each PUT is
 authorized, neither has *completed* yet — so neither's existence
 check sees an object, and the deny doesn't fire. Latest-wins
-arbitrates the bytes after the fact. The deny is a
-post-completion gate, not a synchronization primitive.
+arbitrates the bytes after the fact. The deny was a
+post-completion gate, not a synchronization primitive — and the
+library has no use for a "first writer wins" synchronization
+primitive on this path: idempotency tokens are per-(partition,
+logical-write) unique, so two concurrent attempts of the same
+token writing to the same key would race only across retries
+of the same logical work.
 
-#### Sequential retries
+#### Read-after-overwrite is eventually consistent on multi-site
 
-For a retry that arrives *after* the prior PUT has completed,
-the auth layer's existence check has a chance to see the prior
-object. Whether it does depends on metadata visibility:
+Even when the deny fired and a sequential retry routed into the
+old HEAD-then-LIST dedup branch, the retry's HEAD on the existing
+data file relied on metadata propagation under
+`strong-global` — and StorageGRID's docs explicitly call out
+that **overwrites** of existing keys are eventually consistent
+even at strong levels (*"Overwrites of existing objects,
+metadata updates, and deletes are eventually consistent.
+Overwrites generally take seconds or minutes to propagate, but
+can take up to 15 days."* — [sgcc][sgcc]). A retry whose
+auth-layer check missed the prior data file (because cross-site
+metadata replication had not yet propagated) would route into
+the fresh-write branch, write the body again, and produce a
+duplicate.
 
-- Under `strong-global` (11.9 EACH_QUORUM): every site has the
-  metadata after the original PUT succeeds, so the auth layer's
-  check sees the existing object regardless of which node the
-  retry lands on. Deny fires reliably.
-- Under `strong-site`: the retry's auth check sees the existing
-  object only if it lands on the same site as the original
-  writer. Cross-site retries may miss until propagation.
-- Under `read-after-new-write` and `available`: we don't know
-  what consistency the auth layer uses for its existence check;
-  the docs are silent. Could be reliable, could not be.
+#### Per-attempt-paths sidestep both
 
-#### Why s3store's correctness doesn't depend on the deny firing
+Phase 4's per-attempt id (`{token}-{tsMicros}-{shortID}`) makes
+every PUT in the write path a **first write to a new key**. The
+docs commit to read-after-new-write at every supported level (the
+ladder always reaches `strong-global` on miss), so a post-PUT
+HEAD against the data file always sees the bytes the writer just
+wrote — no eventual-consistency exposure. The upfront-LIST dedup
+gate runs at LIST level (where the strong-* levels deliver
+list-after-write within a site / globally), reliably finding any
+prior valid commit when one exists. Multi-site StorageGRID
+correctness no longer depends on the auth-layer's existence
+check seeing a recent overwrite.
 
-For s3store's idempotency model under `WithIdempotencyToken`:
-
-- Parquet encoding is deterministic, so the data PUT's bytes on
-  retry are byte-identical to the first attempt. Latest-wins on
-  identical bytes is a no-op.
-- Marker overwrites are byte-identical empty markers — same.
-- The load-bearing dedup primitive is the **`findExistingRef`
-  LIST**, not the deny. Even if the deny silently misses a
-  retry, `findExistingRef` finds the prior ref and the writer
-  returns the existing offset without emitting a duplicate.
-
-The deny is best understood as a *bandwidth* optimization — when
-it fires on a sequential retry, the writer skips re-uploading
-the body. It's not a correctness lever. Correctness lives on the
-LIST side.
+The trade is **per-attempt orphans on failure**: every failed
+attempt under `WithIdempotencyToken` leaves data + ref +
+(possibly) marker on S3 as orphans, where earlier designs would
+have produced a single deterministic-path orphan. Reader paths
+filter them out via the commit-marker timeliness check; the
+deferred operator-driven sweeper reclaims them.
 
 ### No per-call consistency overrides
 
@@ -559,8 +521,18 @@ candidate models.
 
 #### Inferences specific to s3store's correctness reasoning
 
-Two inferences specific to *how s3store's call paths interact
-with those levels* matter for the recommendations above:
+The library's only structural dependency on a docs-stated fact
+is **list-after-write at the strong levels**: the upfront-LIST
+dedup gate, projection-marker LIST, ref-stream LIST, and
+partition LIST under `Reader.Read` all need it. Strong-* is
+documented to provide list-after-write within its scope (within
+a site for `strong-site`, across all sites for `strong-global`).
+Per-attempt paths remove the previous design's dependency on
+read-after-overwrite and on the auth-layer's existence check
+for the conditional PUT — both of which had documented
+eventual-consistency exposure on multi-site grids.
+
+That leaves one inference for s3store-specific behaviour:
 
 1. **LIST under `read-after-new-write` is eventually
    consistent.** *Evidence:* the HEAD/GET ladder is documented
@@ -570,26 +542,11 @@ with those levels* matter for the recommendations above:
    evidence the underlying state is eventual; LIST has no
    equivalent, so it sees that state directly.
 
-2. **The conditional-PUT existence check fires reliably on a
-   sequential retry under `strong-*`.** *Evidence:* the
-   latest-wins doc says conflict resolution is based on
-   "completed" requests; under `strong-*` a completed PUT is
-   grid-visible, so the next PUT's check sees the prior object.
-   Truly concurrent writers fall under
-   [latest-wins → post-completion gate](#s3putoverwriteobject-deny-is-a-post-completion-gate-not-a-mutex)
-   and produce byte-identical re-uploads under
-   `WithIdempotencyToken`.
-
 #### What we'd be wrong about, and how it'd fail
 
 - *(1) wrong* → LIST under `read-after-new-write` is actually
   list-after-write. We'd be over-paying by sending `strong-*`
   for our LIST calls. **Failure mode: latency cost only.**
-- *(2) wrong* → conditional-PUT existence check is unreliable
-  under `strong-*` even for sequential retries. **Failure
-  mode: bandwidth (byte-identical re-upload), not correctness
-  — the load-bearing dedup happens via the `findExistingRef`
-  LIST.**
 
 #### Bottom line
 
@@ -604,6 +561,6 @@ from the docs alone.
 The asymmetric mistake — assuming a weaker or mismatched setup
 works when it doesn't — would fail *silently*: a LIST that
 misses a recent PUT, a Lookup that returns no marker for a
-record just written, a `findExistingRef` retry that emits a
-duplicate ref. We default to symmetric `strong-*` to keep every
-load-bearing call inside an explicit doc guarantee.
+record just written, an upfront-LIST dedup gate that produces a
+duplicate per-attempt commit. We default to symmetric `strong-*`
+to keep every load-bearing call inside an explicit doc guarantee.

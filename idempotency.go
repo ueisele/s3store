@@ -83,13 +83,17 @@ func applyIdempotentReadOpts(
 // use-case).
 //
 // The token is a raw idempotency token as passed to
-// WithIdempotencyToken on the write side — the data file's id
-// equals the token verbatim, so its filename is "{token}.parquet".
+// WithIdempotencyToken on the write side. Under per-attempt-paths
+// (Phase 4), every successful attempt of the token lands at a
+// fresh data file whose basename has shape
+// "{token}-{tsMicros}-{shortID}.parquet" — so the matcher here
+// has to recognize that shape rather than a single canonical
+// filename.
 //
 // Two filters apply per partition:
 //
-//   - Self-exclusion: files whose basename equals "{token}.parquet"
-//     are dropped.
+//   - Self-exclusion: files whose basename matches the token's
+//     per-attempt shape are dropped.
 //   - Later-write exclusion: among files matching the token, the
 //     minimum LastModified becomes barrier[partition]. For every
 //     other file in the same partition, files whose LastModified
@@ -109,13 +113,12 @@ func applyIdempotentRead(
 	if token == "" || len(keys) == 0 {
 		return keys
 	}
-	tokenFilename := token + ".parquet"
 
 	// Pass 1: compute min(LastModified) per partition across token
 	// matches.
 	barrier := make(map[string]time.Time)
 	for _, k := range keys {
-		if path.Base(k.Key) != tokenFilename {
+		if !dataFileBasenameMatchesToken(path.Base(k.Key), token) {
 			continue
 		}
 		hk, ok := hiveKeyOfDataFile(k.Key, dataPath)
@@ -147,7 +150,7 @@ func applyIdempotentRead(
 			out = append(out, k)
 			continue
 		}
-		if path.Base(k.Key) == tokenFilename {
+		if dataFileBasenameMatchesToken(path.Base(k.Key), token) {
 			continue
 		}
 		if !k.InsertedAt.Before(b) {
@@ -156,4 +159,43 @@ func applyIdempotentRead(
 		out = append(out, k)
 	}
 	return out
+}
+
+// dataFileBasenameMatchesToken reports whether base (a parquet
+// data-file basename) has the per-attempt shape
+// "{token}-{tsMicros}-{shortID}.parquet". tsMicros is exactly 16
+// decimal digits (the realistic operating range — see refTsKey)
+// and shortID is exactly 8 lowercase hex characters (the
+// makeAutoID format), so a token that itself contains dashes can
+// be matched unambiguously: only the trailing 25 characters
+// "-{16 digits}-{8 hex}" form the auto-id, anything before is
+// the token verbatim.
+func dataFileBasenameMatchesToken(base, token string) bool {
+	const wantSuffixLen = 1 + 16 + 1 + 8 + len(".parquet") // -ts-short.parquet
+	if len(base) != len(token)+wantSuffixLen {
+		return false
+	}
+	if !strings.HasPrefix(base, token+"-") {
+		return false
+	}
+	if !strings.HasSuffix(base, ".parquet") {
+		return false
+	}
+	rest := base[len(token)+1 : len(base)-len(".parquet")]
+	// rest = "{16 digits}-{8 hex}" = 25 chars total.
+	if rest[16] != '-' {
+		return false
+	}
+	for i := 0; i < 16; i++ {
+		if rest[i] < '0' || rest[i] > '9' {
+			return false
+		}
+	}
+	for i := 17; i < 25; i++ {
+		c := rest[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
