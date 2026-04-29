@@ -19,7 +19,7 @@ import (
 )
 
 // Transient-error retry policy applied by S3Target's helpers
-// around every S3 call (put / get / head / delete / list). The
+// around every S3 call (put / get / head / list). The
 // AWS SDK runs its own retryer under us; this is an outer layer
 // that survives an exhausted SDK budget and keeps behaviour
 // predictable when callers plug in aws.NopRetryer or a custom
@@ -78,15 +78,6 @@ func isTransientS3Error(err error) bool {
 	// No HTTP response attached — transport-layer error. Retry.
 	return true
 }
-
-// ErrAlreadyExists is the sentinel returned by putIfAbsent when
-// the target key is already present at the destination. Phase 4's
-// per-attempt-paths design no longer routes data PUTs through
-// putIfAbsent (every attempt id is unique by construction), so
-// the write path doesn't observe this sentinel today; callers
-// that build their own conditional PUTs against an S3Target may
-// still encounter it.
-var ErrAlreadyExists = errors.New("s3store: object already exists")
 
 // consistencyHeader is the HTTP header name routed through every
 // correctness-critical S3 call when ConsistencyControl is set.
@@ -646,11 +637,11 @@ func (t S3Target) put(
 }
 
 // putWithMeta uploads data under key, attaching meta as
-// x-amz-meta-<k> user-metadata headers. Used by the commit-marker
-// PUT to stamp the data file's server-stamped LastModified into
-// the marker so the change-stream read path can apply the
-// timeliness check with a single per-ref HEAD on the marker
-// (no second HEAD on the data file). Carries the target's
+// x-amz-meta-<k> user-metadata headers. Used by the token-commit
+// PUT (see putTokenCommit) to stamp the canonical attempt-id,
+// refMicroTs, and writer-stamped insertedAt onto the marker so a
+// same-token retry's upfront HEAD can reconstruct the original
+// WriteResult without a second round trip. Carries the target's
 // ConsistencyControl on every call.
 //
 // meta=nil is equivalent to put — no metadata sent.
@@ -682,111 +673,23 @@ func (t S3Target) putWithMeta(
 	return err
 }
 
-// putIfAbsent PUTs data at key with an If-None-Match: * header so
-// the PUT is rejected by the backend when the object already
-// exists. Returns ErrAlreadyExists on:
+// head HEADs key and returns its user-defined metadata (the
+// x-amz-meta-* headers, surfaced by the SDK with lowercase keys).
+// Carries the target's ConsistencyControl so the HEAD pairs with
+// its preceding PUT under NetApp's "same consistency for paired
+// operations" rule. Today's only caller is the token-commit HEAD
+// on the read- and retry-paths (see headTokenCommit).
 //
-//   - HTTP 412 PreconditionFailed — direct If-None-Match rejection
-//     (AWS S3, recent MinIO).
-//   - HTTP 403 AccessDenied followed by a HEAD that finds the
-//     object — StorageGRID path where a bucket policy denies
-//     s3:PutOverwriteObject. A 403 whose follow-up HEAD returns
-//     404 or 403 is a real permission error and surfaces
-//     unchanged so callers don't mask it.
-//
-// Any other error propagates as-is. On success returns nil with
-// the object written. meta is attached as x-amz-meta-<k> headers
-// when non-nil — used by the data PUT to stamp
-// x-amz-meta-created-at so external tooling sees the writer's
-// wall-clock alongside the in-file InsertedAtField column.
-func (t S3Target) putIfAbsent(
-	ctx context.Context, key string, data []byte,
-	contentType string, meta map[string]string,
-) (err error) {
-	scope := t.metrics.s3OpScope(ctx, s3OpPut)
-	scope.setReqBytes(int64(len(data)))
-	// Safety-net defer for early-return paths (acquire failure).
-	// Idempotent: a no-op once we manually call end() below after
-	// the PUT, so the disambiguation HEAD on the 403 branch
-	// doesn't inflate the PUT duration histogram.
-	defer scope.end(&err)
-	if err = t.acquire(ctx); err != nil {
-		return err
-	}
-	defer t.release()
-	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	putErr := retry(ctx, func() error {
-		scope.incAttempts()
-		_, err := t.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:      aws.String(t.cfg.Bucket),
-			Key:         aws.String(key),
-			Body:        bytes.NewReader(data),
-			ContentType: aws.String(contentType),
-			Metadata:    meta,
-			IfNoneMatch: aws.String("*"),
-		}, func(o *s3.Options) {
-			o.APIOptions = append(o.APIOptions, apiOpts...)
-		})
-		return err
-	})
-	// End the PUT scope here with the raw S3 outcome — any
-	// follow-up HEAD on the 403 branch must not pollute the PUT
-	// duration histogram. The deferred end() above becomes a no-op.
-	scope.end(&putErr)
-	if putErr == nil {
-		return nil
-	}
-	// 412 PreconditionFailed: direct If-None-Match rejection. Any
-	// HTTP response error carrying that status lands us here —
-	// smithy wraps it in *smithyhttp.ResponseError, and retry()
-	// classifies 412 as non-transient so we see it on the first
-	// attempt.
-	if status, ok := httpStatusOf(putErr); ok {
-		switch status {
-		case 412:
-			return ErrAlreadyExists
-		case 403:
-			// Could be overwrite-deny (StorageGRID bucket policy)
-			// or a real permission error. Disambiguate via HEAD.
-			//
-			// The HEAD reuses the same consistency level so it
-			// pairs with the PUT under NetApp's "same consistency
-			// for paired operations" rule.
-			//
-			// existsLocked reads the same semaphore slot we hold
-			// (we're inside the acquire/release pair) — calling
-			// the public exists() would deadlock waiting for our
-			// own slot.
-			ok, headErr := t.existsLocked(ctx, key)
-			if headErr == nil && ok {
-				return ErrAlreadyExists
-			}
-			// Either HEAD failed (surface the HEAD error, still a
-			// real failure) or the object genuinely doesn't exist
-			// — the 403 is a permission problem. Either way, don't
-			// mask the error as "already exists".
-			return putErr
-		}
-	}
-	return putErr
-}
-
-// head HEADs key and returns its server-stamped LastModified plus
-// user-defined metadata (the x-amz-meta-* headers, surfaced by the
-// SDK with lowercase keys). Used by the write path's post-PUT
-// verification (post-data HEAD captures data.LM as refTsMicros;
-// post-marker HEAD captures marker.LM and reads the dataLM
-// metadata for the timeliness check) and by the change-stream
-// read path (per-ref HEAD on the marker reads marker.LM + dataLM
-// metadata). Carries the target's ConsistencyControl so the HEAD
-// pairs with its preceding PUT under NetApp's "same level" rule.
+// 404 propagates as the SDK's *s3types.NotFound; callers
+// distinguish "missing" from "transport error" themselves
+// (headTokenCommit converts NotFound to ok=false).
 func (t S3Target) head(
 	ctx context.Context, key string,
-) (lastModified time.Time, meta map[string]string, err error) {
+) (meta map[string]string, err error) {
 	scope := t.metrics.s3OpScope(ctx, s3OpHead)
 	defer scope.end(&err)
 	if err = t.acquire(ctx); err != nil {
-		return time.Time{}, nil, err
+		return nil, err
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
@@ -801,51 +704,10 @@ func (t S3Target) head(
 		if err != nil {
 			return err
 		}
-		lastModified = aws.ToTime(resp.LastModified)
 		meta = resp.Metadata
 		return nil
 	})
-	return lastModified, meta, err
-}
-
-// existsLocked is the slot-already-held variant of exists. Called
-// from putIfAbsent's 403 branch where the caller is already inside
-// an acquire/release pair — re-acquiring would deadlock when the
-// semaphore is sized to 1 (or saturated by the writer's other
-// concurrent calls). Carries the target's ConsistencyControl so
-// the HEAD pairs with the PUT under NetApp's "same level" rule.
-func (t S3Target) existsLocked(
-	ctx context.Context, key string,
-) (bool, error) {
-	scope := t.metrics.s3OpScope(ctx, s3OpHead)
-	// s3Err is the raw outcome of the HEAD round-trip — including
-	// NotFound, which is a real S3 4xx response. The s3.head
-	// instrument records what S3 actually did (latency + outcome
-	// breakdown), so a 404 lands as outcome=error/error.type=not_found
-	// even though the caller-facing return is (false, nil). Splitting
-	// the metric-level truth from the caller-level abstraction needs
-	// a separate variable — a named-return err would be overwritten
-	// by the explicit `return false, nil` below before the defer runs.
-	var s3Err error
-	defer func() { scope.end(&s3Err) }()
-	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	s3Err = retry(ctx, func() error {
-		scope.incAttempts()
-		_, err := t.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(t.cfg.Bucket),
-			Key:    aws.String(key),
-		}, func(o *s3.Options) {
-			o.APIOptions = append(o.APIOptions, apiOpts...)
-		})
-		return err
-	})
-	if s3Err == nil {
-		return true, nil
-	}
-	if _, ok := errors.AsType[*s3types.NotFound](s3Err); ok {
-		return false, nil
-	}
-	return false, s3Err
+	return meta, err
 }
 
 // listPage fetches the next page from p, wrapping NextPage in
@@ -930,17 +792,4 @@ func (t S3Target) listEach(
 		}
 	}
 	return nil
-}
-
-// httpStatusOf extracts the HTTP status code from a smithy-wrapped
-// S3 error. Returns (0, false) when err carries no HTTP response
-// (transport-level failure or non-SDK error).
-func httpStatusOf(err error) (int, bool) {
-	if err == nil {
-		return 0, false
-	}
-	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
-		return respErr.HTTPStatusCode(), true
-	}
-	return 0, false
 }

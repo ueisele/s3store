@@ -19,10 +19,12 @@ import (
 // without an extra HEAD.
 //
 // Source of InsertedAt depends on the call site:
-//   - ListDataFiles: S3 LastModified from the LIST response.
-//   - PollRecords: the ref filename's dataTsMicros (writer's
-//     wall clock at write-start), which is more accurate than
-//     the ref's LastModified.
+//   - listDataFiles (snapshot reads): S3 LastModified from the
+//     LIST response.
+//   - PollRecords / ReadRangeIter: the ref filename's refMicroTs
+//     (writer's wall clock captured immediately before the ref
+//     PUT), which is the same value the writer encodes into the
+//     ref key.
 //
 // Both are monotonic; consumed by the no-dedup sort cascade
 // (sort by insertedAt asc) when EntityKeyOf isn't configured.

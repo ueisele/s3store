@@ -10,11 +10,12 @@ type WriteOption func(*WriteOpts)
 // sub-package can build its own option handling without a second
 // layer of indirection.
 type WriteOpts struct {
-	// IdempotencyToken, when set, prefixes the per-attempt id
-	// (id = {token}-{tsMicros}-{shortID}) so the writer's
-	// upfront-LIST dedup gate under {partition}/{token}- can
-	// recognize prior attempts of the same logical write.
-	// Validated via validateIdempotencyToken at the
+	// IdempotencyToken, when set, anchors the per-attempt id
+	// (id = {token}-{attemptID:32hex UUIDv7}) and the per-token
+	// commit marker (`<dataPath>/<partition>/<token>.commit`).
+	// The writer's upfront HEAD on that commit marker recognises
+	// prior attempts of the same logical write and short-circuits
+	// the retry. Validated via validateIdempotencyToken at the
 	// option-application site, not at PUT time, so typos / illegal
 	// characters surface immediately.
 	IdempotencyToken string
@@ -31,30 +32,32 @@ func (o *WriteOpts) Apply(opts ...WriteOption) {
 // unit identified by token. Recovery on retry is automatic and
 // works across arbitrarily long S3 outages:
 //
-//   - Each attempt writes to a fresh per-attempt path (id =
-//     {token}-{tsMicros}-{shortID}). No PUT in the write path
-//     ever overwrites — sidesteps multi-site StorageGRID's
-//     eventual-consistency exposure on overwrites.
-//   - On retry, the writer's upfront LIST under
-//     {partition}/{token}- pairs .parquet siblings with their
-//     .commit siblings by id and returns the first valid commit
-//     unchanged (no body re-upload, same DataPath / RefPath /
-//     InsertedAt as the prior successful attempt).
-//   - If no valid commit exists (no prior attempt landed, or
-//     every prior attempt's commit failed the timeliness check),
-//     the retry proceeds with a fresh attempt-id and a fresh
-//     server-stamped data.LM.
+//   - Each attempt writes data and ref to fresh per-attempt
+//     paths (id = {token}-{attemptID:32hex UUIDv7}). No data
+//     or ref PUT in the write path ever overwrites — sidesteps
+//     multi-site StorageGRID's eventual-consistency exposure on
+//     overwrites.
+//   - On retry, the writer issues an upfront HEAD on
+//     `<dataPath>/<partition>/<token>.commit`. If a prior
+//     attempt's commit is in place, the writer reconstructs the
+//     original WriteResult from the marker's metadata (no body
+//     re-upload, same DataPath / RefPath / InsertedAt as the
+//     prior successful attempt) and returns.
+//   - If the commit is missing (no prior attempt landed, or
+//     every prior attempt crashed before the commit PUT), the
+//     retry proceeds with a fresh attempt-id end-to-end.
 //
 // Tokens are unique per (partition key, logical write), not
 // globally — the same token may be reused across different
-// partition keys without colliding. Each partition's
-// upfront-LIST dedup runs independently. Within one partition
-// the token must remain unique per logical write.
+// partition keys without colliding. The upfront HEAD runs
+// per-partition. Within one partition the token must remain
+// unique per logical write.
 //
 // **Reader-side dedup recommended.** Near-concurrent retry
-// overlap can produce two valid commits for the same token
-// (slow original + fast retry both succeed). Both contain
-// bit-identical records (parquet encoding is deterministic;
+// overlap (out of contract per the README's Concurrency
+// contract, but bounded if it arises by accident) can produce
+// two committed attempts whose records share (entity, version).
+// Records are bit-identical (parquet encoding is deterministic;
 // the writer captures InsertedAt once and the same value drives
 // every column / filename / metadata field). Configure
 // `EntityKeyOf` + `VersionOf` on the reader to collapse the
@@ -67,8 +70,8 @@ func (o *WriteOpts) Apply(opts ...WriteOption) {
 //
 // Returns a no-op option if token is empty (convenience for
 // callers whose token might be unset in some code paths) — the
-// resulting write runs the non-idempotent path (auto-id, no
-// upfront LIST).
+// resulting write runs the non-idempotent path (auto-token, no
+// upfront HEAD).
 func WithIdempotencyToken(token string) WriteOption {
 	return func(o *WriteOpts) {
 		o.IdempotencyToken = token

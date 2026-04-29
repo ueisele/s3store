@@ -113,12 +113,13 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 // errors if called without it, but WriteWithKey works regardless.
 //
 // Constructor performs no S3 I/O. Idempotent retries are gated
-// by the writer's upfront LIST under {partition}/{token}- (see
-// WithIdempotencyToken): no PUT in the write path ever overwrites,
-// every attempt lands at a fresh per-attempt path, and the
-// upfront-LIST gate finds any prior valid commit and returns
-// its WriteResult unchanged. Cross-backend uniformity — no
-// dependency on If-None-Match support or bucket-policy denies.
+// by the writer's upfront HEAD on
+// `<dataPath>/<partition>/<token>.commit` (see
+// WithIdempotencyToken): data and ref PUTs land at fresh
+// per-attempt paths and never overwrite, and a prior attempt's
+// commit marker reconstructs the original WriteResult unchanged.
+// Cross-backend uniformity — no dependency on If-None-Match
+// support or bucket-policy denies.
 func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err := cfg.Target.Validate(); err != nil {
 		return nil, err

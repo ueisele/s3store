@@ -155,7 +155,7 @@ func headTokenCommit(
 	dataPath, partition, token string,
 ) (meta tokenCommitMeta, ok bool, err error) {
 	key := tokenCommitKey(dataPath, partition, token)
-	_, raw, err := target.head(ctx, key)
+	raw, err := target.head(ctx, key)
 	if err != nil {
 		if _, notFound := errors.AsType[*s3types.NotFound](err); notFound {
 			return tokenCommitMeta{}, false, nil

@@ -274,7 +274,8 @@ func commonPrefix(a, b string) string {
 // S3: a prefix to LIST under, and a per-key predicate that picks
 // out only the matching Hive paths. The predicate accepts the
 // Hive key portion of the S3 object key (everything after
-// dataPath + "/" and before the trailing /<shortID>.parquet).
+// dataPath + "/" and before the trailing
+// /<token>-<attemptID>.parquet).
 type readPlan struct {
 	listPrefix string
 	match      func(hiveKey string) bool
@@ -399,8 +400,9 @@ func matchHiveKey(hiveKey string, segs []segment) bool {
 
 // hiveKeyOfDataFile returns the Hive-key portion of a data-file
 // key (the part between dataPath + "/" and the final
-// "/<shortID>.parquet"). Returns the key and true if the input
-// is shaped like a data file under dataPath; false otherwise.
+// "/<token>-<attemptID>.parquet"). Returns the key and true if
+// the input is shaped like a data file under dataPath; false
+// otherwise.
 func hiveKeyOfDataFile(s3Key, dataPath string) (string, bool) {
 	prefix := dataPath + "/"
 	if !strings.HasPrefix(s3Key, prefix) {

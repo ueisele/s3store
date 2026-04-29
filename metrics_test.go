@@ -93,7 +93,6 @@ func TestClassifyError(t *testing.T) {
 		{"nil success", nil, outcomeSuccess, ""},
 		{"context canceled", context.Canceled, outcomeCanceled, errTypeCanceled},
 		{"deadline", context.DeadlineExceeded, outcomeCanceled, errTypeCanceled},
-		{"already exists sentinel", ErrAlreadyExists, outcomeError, errTypePreconditionFail},
 		{"NoSuchKey", &s3types.NoSuchKey{}, outcomeError, errTypeNotFound},
 		{"NotFound", &s3types.NotFound{}, outcomeError, errTypeNotFound},
 		{"412 precondition", preconditionErr, outcomeError, errTypePreconditionFail},
@@ -241,7 +240,15 @@ func TestMetrics_S3OpScope_ErrorClassification(t *testing.T) {
 	ctx := context.Background()
 
 	scope := m.s3OpScope(ctx, s3OpPut)
-	err := ErrAlreadyExists
+	// 412 Precondition Failed exercises the same classifier branch
+	// (errTypePreconditionFail) the dropped ErrAlreadyExists
+	// sentinel used to cover.
+	var err error = &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{
+			Response: &http.Response{StatusCode: 412},
+		},
+		Err: &smithy.GenericAPIError{Code: "PreconditionFailed"},
+	}
 	scope.end(&err)
 
 	rm := collectMetrics(t, reader)

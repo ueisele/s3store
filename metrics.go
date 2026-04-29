@@ -499,9 +499,8 @@ func (m *metrics) recordIterDecodeDuration(ctx context.Context, dur time.Duratio
 // read the eventual error via &err.
 //
 // end is idempotent — call it manually when you need the duration
-// to stop before the function returns (e.g. putIfAbsent ending the
-// PUT scope before running the disambiguation HEAD), and the
-// matching defer becomes a no-op.
+// to stop before the function returns and the matching defer
+// becomes a no-op.
 type s3OpScope struct {
 	m         *metrics
 	ctx       context.Context
@@ -514,9 +513,9 @@ type s3OpScope struct {
 }
 
 // s3OpScope begins observing one outer S3 wrapper call (one
-// S3Target.put / get / del / listPage / existsLocked). Returns a
-// scope; defer scope.end(&err) at the call site so duration +
-// outcome are recorded on every exit path.
+// S3Target.put / get / head / listPage). Returns a scope; defer
+// scope.end(&err) at the call site so duration + outcome are
+// recorded on every exit path.
 func (m *metrics) s3OpScope(ctx context.Context, op s3OpKind) *s3OpScope {
 	if m == nil {
 		return &s3OpScope{}
@@ -832,9 +831,6 @@ func classifyError(err error) (outcome, errType string) {
 	if errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) {
 		return outcomeCanceled, errTypeCanceled
-	}
-	if errors.Is(err, ErrAlreadyExists) {
-		return outcomeError, errTypePreconditionFail
 	}
 	if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
 		return outcomeError, errTypeNotFound
