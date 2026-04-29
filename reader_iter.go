@@ -292,12 +292,16 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	})
 
 	// Stage 3: decoder. Channel cap = ReadAheadPartitions so the
-	// pipeline buffers up to N decoded partitions ahead. Floor at
-	// 1 so the default (zero value) gets one-partition lookahead —
-	// decode of partition N+1 overlaps yield of partition N, the
-	// minimum useful pipeline shape. To bound stacking when N>1,
-	// use WithReadAheadBytes.
-	readAheadParts := max(1, opts.ReadAheadPartitions)
+	// pipeline buffers up to N decoded partitions ahead. The
+	// pointer-typed option distinguishes "not supplied" (nil →
+	// default 1, the minimum useful pipeline shape — decode of
+	// partition N+1 overlaps yield of partition N) from "explicit
+	// zero" (cap=0, unbuffered handoff). To bound stacking when
+	// N>1, combine with WithReadAheadBytes.
+	readAheadParts := 1
+	if opts.ReadAheadPartitions != nil {
+		readAheadParts = *opts.ReadAheadPartitions
+	}
 	decodedCh := make(chan decodedBatch[T], readAheadParts)
 	wg.Go(func() { s.runDecoder(ctx, state, opts, decodedCh) })
 

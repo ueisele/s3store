@@ -12,11 +12,19 @@ type QueryOpts struct {
 	IncludeHistory bool
 	// ReadAheadPartitions controls how many partitions ahead of
 	// the current yield position a streaming read (ReadIter) may
-	// download. Zero keeps the current strict-serial behavior
-	// (download one, yield all, advance, repeat); higher values
-	// overlap the next partition's download with the current
-	// partition's yield loop, at O(N+1 partitions) memory.
-	ReadAheadPartitions int
+	// buffer in the decoder→yield channel. nil (the default
+	// when the option is not supplied) means "1" — minimum
+	// useful lookahead so decode of partition N+1 overlaps yield
+	// of partition N. *p == 0 is the explicit-no-buffer mode:
+	// unbuffered handoff, decoder still works on N+1 concurrent
+	// with yield emitting N but never holds two partitions in
+	// memory at once. *p > 0 buffers up to p partitions in the
+	// channel, at O(p+1 partitions) memory.
+	//
+	// Pointer-typed so the zero value of WithReadAheadPartitions
+	// (an explicit 0) stays distinguishable from "option not
+	// supplied" (which falls back to the default of 1).
+	ReadAheadPartitions *int
 	// ReadAheadBytes caps the cumulative uncompressed parquet
 	// bytes that may sit decoded in the streaming read pipeline
 	// ahead of the current yield position. Zero disables the cap
@@ -61,23 +69,33 @@ func WithHistory() QueryOption {
 	}
 }
 
-// WithReadAheadPartitions tells ReadIter / ReadRangeIter to
-// prefetch n partitions ahead of the current yield position.
-// Default is 1 — minimum useful lookahead so
-// decode of partition N+1 overlaps yield of partition N. Pass a
-// larger value for more aggressive prefetch on consumers that do
-// non-trivial per-record work; combine with WithReadAheadBytes
-// to bound stacking of skewed-size partitions. Values < 1 are
-// floored to 1 (strict-serial decode is no longer offered as a
-// public mode — the byte cap handles bounded-memory pipelines).
+// WithReadAheadPartitions tells ReadIter / ReadRangeIter how
+// many partitions to buffer ahead of the current yield position.
+// Default (option not supplied) is 1 — minimum useful lookahead
+// so decode of partition N+1 overlaps yield of partition N.
+// Pass a larger value for more aggressive prefetch on consumers
+// that do non-trivial per-record work; combine with
+// WithReadAheadBytes to bound stacking of skewed-size partitions.
 //
-// Each partition is downloaded + decoded into a single buffered
-// batch; a background decoder keeps the pipeline topped up to n
-// ahead while the main goroutine yields records from the current
-// batch. Memory: O((n+1) partitions) — current + n prefetched.
+// n=0 is the explicit-no-buffer mode: unbuffered handoff between
+// decoder and yield loop. The decoder still works on partition
+// N+1 concurrent with yield emitting N (the handoff just blocks
+// the decoder briefly), but never two decoded partitions sit in
+// memory at once. Useful when records are large and the
+// consumer's per-record work is fast — the byte cap is then the
+// only memory regulator.
+//
+// Negative values are floored to 0.
+//
+// Each buffered partition holds its decoded records in memory
+// until the yield loop consumes them. Memory: O((n+1) partitions)
+// — current + n prefetched.
 func WithReadAheadPartitions(n int) QueryOption {
+	if n < 0 {
+		n = 0
+	}
 	return func(o *QueryOpts) {
-		o.ReadAheadPartitions = n
+		o.ReadAheadPartitions = &n
 	}
 }
 
