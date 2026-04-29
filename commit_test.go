@@ -18,12 +18,13 @@ func TestTokenCommitKey(t *testing.T) {
 }
 
 // TestReadTokenCommitMeta_HappyPath confirms that the parser
-// extracts all three fields from a well-formed metadata map.
+// extracts all four fields from a well-formed metadata map.
 func TestReadTokenCommitMeta_HappyPath(t *testing.T) {
 	meta := map[string]string{
 		attemptIDMetaKey:  testAttemptIDA,
 		refMicroTsMetaKey: "1710684000000000",
 		insertedAtMetaKey: "1710683999500000",
+		rowCountMetaKey:   "42",
 	}
 	got, err := readTokenCommitMeta(meta)
 	if err != nil {
@@ -39,6 +40,9 @@ func TestReadTokenCommitMeta_HappyPath(t *testing.T) {
 	if got.insertedAtUs != 1710683999500000 {
 		t.Errorf("insertedAtUs = %d, want %d",
 			got.insertedAtUs, int64(1710683999500000))
+	}
+	if got.rowCount != 42 {
+		t.Errorf("rowCount = %d, want %d", got.rowCount, int64(42))
 	}
 }
 
@@ -56,6 +60,7 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 			meta: map[string]string{
 				refMicroTsMetaKey: "1710684000000000",
 				insertedAtMetaKey: "1710683999500000",
+				rowCountMetaKey:   "1",
 			},
 		},
 		{
@@ -63,6 +68,7 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 			meta: map[string]string{
 				attemptIDMetaKey:  testAttemptIDA,
 				insertedAtMetaKey: "1710683999500000",
+				rowCountMetaKey:   "1",
 			},
 		},
 		{
@@ -70,6 +76,15 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 			meta: map[string]string{
 				attemptIDMetaKey:  testAttemptIDA,
 				refMicroTsMetaKey: "1710684000000000",
+				rowCountMetaKey:   "1",
+			},
+		},
+		{
+			name: "missing rowcount",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA,
+				refMicroTsMetaKey: "1710684000000000",
+				insertedAtMetaKey: "1710683999500000",
 			},
 		},
 		{
@@ -78,6 +93,7 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 				attemptIDMetaKey:  testAttemptIDA[:31],
 				refMicroTsMetaKey: "1710684000000000",
 				insertedAtMetaKey: "1710683999500000",
+				rowCountMetaKey:   "1",
 			},
 		},
 		{
@@ -86,6 +102,7 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 				attemptIDMetaKey:  strings.ToUpper(testAttemptIDA),
 				refMicroTsMetaKey: "1710684000000000",
 				insertedAtMetaKey: "1710683999500000",
+				rowCountMetaKey:   "1",
 			},
 		},
 		{
@@ -94,6 +111,7 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 				attemptIDMetaKey:  testAttemptIDA[:31] + "z",
 				refMicroTsMetaKey: "1710684000000000",
 				insertedAtMetaKey: "1710683999500000",
+				rowCountMetaKey:   "1",
 			},
 		},
 		{
@@ -102,6 +120,7 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 				attemptIDMetaKey:  testAttemptIDA,
 				refMicroTsMetaKey: "notanumber",
 				insertedAtMetaKey: "1710683999500000",
+				rowCountMetaKey:   "1",
 			},
 		},
 		{
@@ -110,6 +129,16 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 				attemptIDMetaKey:  testAttemptIDA,
 				refMicroTsMetaKey: "1710684000000000",
 				insertedAtMetaKey: "notanumber",
+				rowCountMetaKey:   "1",
+			},
+		},
+		{
+			name: "rowcount not a number",
+			meta: map[string]string{
+				attemptIDMetaKey:  testAttemptIDA,
+				refMicroTsMetaKey: "1710684000000000",
+				insertedAtMetaKey: "1710683999500000",
+				rowCountMetaKey:   "notanumber",
 			},
 		},
 	}
@@ -133,10 +162,12 @@ func TestReadTokenCommitMeta_Invalid(t *testing.T) {
 func TestReconstructWriteResult(t *testing.T) {
 	const refMicroTs int64 = 1_700_000_000_500_000
 	const insertedAtUs int64 = 1_700_000_000_000_000
+	const rowCount int64 = 17
 	meta := tokenCommitMeta{
 		attemptID:    testAttemptIDA,
 		refMicroTs:   refMicroTs,
 		insertedAtUs: insertedAtUs,
+		rowCount:     rowCount,
 	}
 	wr := reconstructWriteResult(
 		"p/data", "p/_ref", "period=A", "tok42", meta)
@@ -156,6 +187,10 @@ func TestReconstructWriteResult(t *testing.T) {
 	if wr.InsertedAt != time.UnixMicro(insertedAtUs) {
 		t.Errorf("InsertedAt = %v, want %v (from insertedat metadata)",
 			wr.InsertedAt, time.UnixMicro(insertedAtUs))
+	}
+	if wr.RowCount != rowCount {
+		t.Errorf("RowCount = %d, want %d (from rowcount metadata)",
+			wr.RowCount, rowCount)
 	}
 }
 
@@ -292,10 +327,12 @@ func TestCommitCache_StartsEmpty(t *testing.T) {
 func TestPutTokenCommit_MetaShape(t *testing.T) {
 	const refMicroTs int64 = 1_710_684_000_000_000
 	const insertedAtUs int64 = 1_710_683_999_500_000
+	const rowCount int64 = 5
 	meta := map[string]string{
 		attemptIDMetaKey:  testAttemptIDA,
 		refMicroTsMetaKey: strconv.FormatInt(refMicroTs, 10),
 		insertedAtMetaKey: strconv.FormatInt(insertedAtUs, 10),
+		rowCountMetaKey:   strconv.FormatInt(rowCount, 10),
 	}
 	got, err := readTokenCommitMeta(meta)
 	if err != nil {
@@ -303,9 +340,10 @@ func TestPutTokenCommit_MetaShape(t *testing.T) {
 	}
 	if got.attemptID != testAttemptIDA ||
 		got.refMicroTs != refMicroTs ||
-		got.insertedAtUs != insertedAtUs {
-		t.Errorf("round-trip drift: got (%q, %d, %d), want (%q, %d, %d)",
-			got.attemptID, got.refMicroTs, got.insertedAtUs,
-			testAttemptIDA, refMicroTs, insertedAtUs)
+		got.insertedAtUs != insertedAtUs ||
+		got.rowCount != rowCount {
+		t.Errorf("round-trip drift: got (%q, %d, %d, %d), want (%q, %d, %d, %d)",
+			got.attemptID, got.refMicroTs, got.insertedAtUs, got.rowCount,
+			testAttemptIDA, refMicroTs, insertedAtUs, rowCount)
 	}
 }

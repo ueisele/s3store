@@ -43,12 +43,18 @@ type Offset string
 //     write-start so the column reflects logical record time, not
 //     commit-finalize time); the two values can drift by the
 //     encode + data-PUT duration.
+//   - RowCount is the number of records in the data file this ref
+//     points at, recovered from the token-commit's `rowcount`
+//     user-metadata. Free for Poll to surface — the gate already
+//     HEADs the marker per ref/token (cached per poll cycle), so
+//     no extra round trip.
 type StreamEntry struct {
 	Offset     Offset
 	Key        string
 	DataPath   string
 	RefPath    string
 	InsertedAt time.Time
+	RowCount   int64
 }
 
 // PollOption / pollOpts / WithUntilOffset live in reader_options.go.
@@ -163,6 +169,7 @@ func (s *Reader[T]) Poll(
 				DataPath:   buildDataFilePath(s.dataPath, hiveKey, id),
 				RefPath:    objKey,
 				InsertedAt: time.UnixMicro(refMicroTs),
+				RowCount:   entry.rowCount,
 			})
 			return true, nil
 		})

@@ -1769,6 +1769,10 @@ func TestPoll(t *testing.T) {
 			t.Errorf("[%d] offset %q != write offset %q",
 				i, e.Offset, lastOffset[i])
 		}
+		if e.RowCount != 1 {
+			t.Errorf("[%d] RowCount = %d, want 1 (one record per write)",
+				i, e.RowCount)
+		}
 	}
 
 	gone, off2, err := store.Poll(ctx, newOffset, 100)
@@ -3849,6 +3853,13 @@ func TestLookupCommit_RoundTrip(t *testing.T) {
 	}
 	if !got.InsertedAt.Equal(wr.InsertedAt) {
 		t.Errorf("InsertedAt = %v, want %v", got.InsertedAt, wr.InsertedAt)
+	}
+	if got.RowCount != wr.RowCount {
+		t.Errorf("RowCount = %d, want %d", got.RowCount, wr.RowCount)
+	}
+	if wr.RowCount != int64(len(rec)) {
+		t.Errorf("fresh-write RowCount = %d, want %d (len(records))",
+			wr.RowCount, len(rec))
 	}
 }
 

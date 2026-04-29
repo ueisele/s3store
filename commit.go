@@ -30,6 +30,12 @@ import (
 //     reconstructed WriteResult.InsertedAt matches the original
 //     attempt's column value (without it, retries would surface
 //     `refMicroTs` — a slightly later wall-clock).
+//   - rowCountMetaKey ("rowcount"): the number of records
+//     persisted in this commit's parquet, decimal int64. Stored
+//     on the marker so LookupCommit and the upfront-HEAD retry
+//     path surface WriteResult.RowCount without GETting the
+//     parquet, and so Poll can report each StreamEntry's
+//     RowCount from the per-poll commit-cache HEAD.
 //
 // Together with the partition Hive key (known from the lookup
 // path) and the dataset's data / ref prefixes (known from the
@@ -61,6 +67,13 @@ const refMicroTsMetaKey = "refmicrots"
 // path (fresh write, retry-found-commit, LookupCommit).
 const insertedAtMetaKey = "insertedat"
 
+// rowCountMetaKey is the user-metadata header carrying the count
+// of records persisted in this commit's parquet (decimal int64).
+// Surfaces on WriteResult.RowCount and StreamEntry.RowCount so
+// callers know batch size on the retry-recovery path and on
+// stream consumption without GETting the parquet.
+const rowCountMetaKey = "rowcount"
+
 // tokenCommitKey returns the S3 object key of the token-level
 // commit marker. Format:
 // `{dataPath}/{partition}/{token}.commit`.
@@ -83,12 +96,14 @@ func commitTokenFromBasename(basename string) (token string, ok bool) {
 
 // tokenCommitMeta is the parsed user-metadata of a token-commit:
 // the canonical attempt-id (UUIDv7 hex), the canonical ref's
-// refMicroTs, and the writer's pre-encode wall-clock at
-// write-start (= InsertedAtField column value).
+// refMicroTs, the writer's pre-encode wall-clock at write-start
+// (= InsertedAtField column value), and the row count of the
+// canonical parquet.
 type tokenCommitMeta struct {
 	attemptID    string
 	refMicroTs   int64
 	insertedAtUs int64
+	rowCount     int64
 }
 
 // readTokenCommitMeta extracts the structured metadata from a
@@ -117,16 +132,23 @@ func readTokenCommitMeta(meta map[string]string) (tokenCommitMeta, error) {
 	if err != nil {
 		return tokenCommitMeta{}, err
 	}
+	rowCount, err := readMicrosMeta(meta, rowCountMetaKey)
+	if err != nil {
+		return tokenCommitMeta{}, err
+	}
 	return tokenCommitMeta{
 		attemptID:    attemptID,
 		refMicroTs:   refMicroTs,
 		insertedAtUs: insertedAtUs,
+		rowCount:     rowCount,
 	}, nil
 }
 
-// readMicrosMeta extracts a decimal-microsecond field from a
+// readMicrosMeta extracts a decimal int64 field from a
 // token-commit's user-metadata. Centralised so the missing /
-// unparseable error messages are uniform across fields.
+// unparseable error messages are uniform across fields. Used for
+// the microsecond-stamped fields and for `rowcount` — both are
+// decimal int64 on the wire.
 func readMicrosMeta(meta map[string]string, key string) (int64, error) {
 	raw, ok := meta[key]
 	if !ok {
@@ -189,6 +211,7 @@ func reconstructWriteResult(
 		DataPath:   buildDataFilePath(dataPath, partition, id),
 		RefPath:    refKey,
 		InsertedAt: time.UnixMicro(meta.insertedAtUs),
+		RowCount:   meta.rowCount,
 	}
 }
 
@@ -349,10 +372,12 @@ type commitCache struct {
 }
 
 // commitCacheEntry is a single cached HEAD outcome plus the
-// metadata needed to compare against a ref's attempt-id.
+// metadata needed to compare against a ref's attempt-id and to
+// stamp StreamEntry.RowCount on Poll without a second HEAD.
 type commitCacheEntry struct {
 	exists    bool
 	attemptID string
+	rowCount  int64
 }
 
 // newCommitCache returns an empty cache ready for one poll cycle.
@@ -390,6 +415,7 @@ func (c *commitCache) lookupOrFetch(
 	entry := commitCacheEntry{exists: exists}
 	if exists {
 		entry.attemptID = meta.attemptID
+		entry.rowCount = meta.rowCount
 	}
 
 	c.mu.Lock()
@@ -400,13 +426,14 @@ func (c *commitCache) lookupOrFetch(
 
 // putTokenCommit writes the zero-byte token-commit marker with
 // the canonical attempt's metadata (attempt-id, ref's
-// refMicroTs, and the writer's pre-encode wall-clock for
-// InsertedAt round-tripping). Single point of metadata shape so
-// writer and any future test fixture build the same headers.
+// refMicroTs, the writer's pre-encode wall-clock for InsertedAt
+// round-tripping, and the row count of the canonical parquet).
+// Single point of metadata shape so writer and any future test
+// fixture build the same headers.
 func putTokenCommit(
 	ctx context.Context, target S3Target,
 	dataPath, partition, token, attemptID string,
-	refMicroTs, insertedAtUs int64,
+	refMicroTs, insertedAtUs, rowCount int64,
 ) error {
 	key := tokenCommitKey(dataPath, partition, token)
 	return target.putWithMeta(ctx, key, []byte{},
@@ -415,5 +442,6 @@ func putTokenCommit(
 			attemptIDMetaKey:  attemptID,
 			refMicroTsMetaKey: strconv.FormatInt(refMicroTs, 10),
 			insertedAtMetaKey: strconv.FormatInt(insertedAtUs, 10),
+			rowCountMetaKey:   strconv.FormatInt(rowCount, 10),
 		})
 }

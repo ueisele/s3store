@@ -37,6 +37,14 @@ type WriteResult struct {
 	DataPath   string
 	RefPath    string
 	InsertedAt time.Time
+	// RowCount is the number of records persisted in this commit's
+	// parquet file. On a fresh write this is len(records) for the
+	// partition; on the retry-finds-prior-commit path it is recovered
+	// from the token-commit's `rowcount` user-metadata so the value
+	// matches the original attempt's parquet exactly. Surfaced so
+	// retry-recovery callers — who don't have the original records
+	// slice — can still report batch size without GETting the parquet.
+	RowCount int64
 }
 
 // LookupCommit returns the WriteResult of the canonical write
@@ -499,13 +507,15 @@ func (s *Writer[T]) writeEncodedPayload(
 		return nil, fmt.Errorf("s3store: put ref: %w", err)
 	}
 
-	// Step 7: token-commit PUT with attempt-id, refMicroTs, and
-	// writeStartTime (for InsertedAt round-tripping on retry).
-	// The single atomic event that flips visibility for both
-	// read paths.
+	// Step 7: token-commit PUT with attempt-id, refMicroTs,
+	// writeStartTime (for InsertedAt round-tripping on retry), and
+	// the parquet's row count (so LookupCommit / retry-recovery /
+	// Poll surface RowCount without a parquet GET). The single
+	// atomic event that flips visibility for both read paths.
+	rowCount := int64(len(records))
 	if err := putTokenCommit(commitCtx, s.cfg.Target,
 		s.dataPath, key, token, attemptID,
-		refMicroTs, writeStartTime.UnixMicro()); err != nil {
+		refMicroTs, writeStartTime.UnixMicro(), rowCount); err != nil {
 		return nil, fmt.Errorf(
 			"s3store: put token-commit: %w", err)
 	}
@@ -545,6 +555,7 @@ func (s *Writer[T]) writeEncodedPayload(
 		DataPath:   dataKey,
 		RefPath:    refKey,
 		InsertedAt: writeStartTime,
+		RowCount:   rowCount,
 	}, nil
 }
 
