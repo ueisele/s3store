@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWithIdempotencyToken(t *testing.T) {
@@ -167,5 +168,36 @@ func TestResolveWriteOpts_StaticInvalidToken(t *testing.T) {
 	}, []testRec(nil))
 	if err == nil {
 		t.Fatal("expected error from invalid static token")
+	}
+}
+
+func TestWithInsertedAt(t *testing.T) {
+	want := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	var o WriteOpts
+	WithInsertedAt(want)(&o)
+	if !o.InsertedAt.Equal(want) {
+		t.Errorf("InsertedAt = %v, want %v", o.InsertedAt, want)
+	}
+}
+
+func TestWithInsertedAt_ZeroIsNotSupplied(t *testing.T) {
+	var o WriteOpts
+	WithInsertedAt(time.Time{})(&o)
+	if !o.InsertedAt.IsZero() {
+		t.Errorf("zero-value time should round-trip as zero, got %v",
+			o.InsertedAt)
+	}
+}
+
+func TestResolveWriteOpts_WithInsertedAt(t *testing.T) {
+	want := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	o, err := resolveWriteOpts([]WriteOption{
+		WithInsertedAt(want),
+	}, []testRec(nil))
+	if err != nil {
+		t.Fatalf("resolveWriteOpts: %v", err)
+	}
+	if !o.InsertedAt.Equal(want) {
+		t.Errorf("InsertedAt = %v, want %v", o.InsertedAt, want)
 	}
 }

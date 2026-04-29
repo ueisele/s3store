@@ -16,8 +16,9 @@ import (
 
 // WriteResult contains metadata about a completed write.
 //
-// InsertedAt is the writer's wall-clock capture at write-start
-// (pre-encode), microsecond precision — the same value stamped
+// InsertedAt is the writer's pre-encode wall-clock at write-start
+// (microsecond precision) by default — or the caller's
+// WithInsertedAt override, when supplied — the same value stamped
 // into the parquet's InsertedAtField column. Surfaced on the
 // result so callers can log / persist it (e.g., into an outbox
 // table) without parsing the data path or issuing a HEAD.
@@ -299,13 +300,19 @@ func (s *Writer[T]) writeWithKeyResolved(
 	// is used to populate the InsertedAtField column AND to stamp
 	// the token-commit's `insertedat` metadata — a single "when
 	// was this batch written" value propagates to every downstream
-	// surface. Truncated to microsecond precision so a LookupCommit
-	// round-trip (which reads back through UnixMicro / time.UnixMicro)
-	// yields a time.Time that compares Equal to the value embedded
-	// in the original WriteResult; without truncation, sub-µs
-	// nanoseconds are lost on the wire and the round-trip mismatches
-	// on platforms whose clocks have sub-µs resolution (Linux).
-	writeStartTime := time.Now().Truncate(time.Microsecond)
+	// surface. WithInsertedAt overrides the auto-capture; a
+	// zero-value option falls back to time.Now(). Truncated to
+	// microsecond precision so a LookupCommit round-trip (which
+	// reads back through UnixMicro / time.UnixMicro) yields a
+	// time.Time that compares Equal to the value embedded in the
+	// original WriteResult; without truncation, sub-µs nanoseconds
+	// are lost on the wire and the round-trip mismatches on
+	// platforms whose clocks have sub-µs resolution (Linux).
+	writeStartTime := writeOpts.InsertedAt
+	if writeStartTime.IsZero() {
+		writeStartTime = time.Now()
+	}
+	writeStartTime = writeStartTime.Truncate(time.Microsecond)
 	if s.insertedAtFieldIndex != nil {
 		populateInsertedAt(records, s.insertedAtFieldIndex, writeStartTime)
 	}

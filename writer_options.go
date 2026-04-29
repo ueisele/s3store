@@ -1,5 +1,7 @@
 package s3store
 
+import "time"
+
 // WriteOption configures write-path behavior. Mirrors the
 // QueryOption pattern so the write side has the same mental model:
 // one option type, one accumulator, one place to add new knobs.
@@ -41,6 +43,21 @@ type WriteOpts struct {
 	//
 	// Mutually exclusive with IdempotencyToken.
 	IdempotencyTokenFn any
+
+	// InsertedAt, when non-zero, overrides the writer's default
+	// pre-encode wall-clock capture as the "insertion time" of the
+	// batch. The supplied value drives every downstream surface
+	// uniformly: the parquet InsertedAtField column (when configured
+	// on the schema), the token-commit `insertedat` user-metadata,
+	// and WriteResult.InsertedAt. Truncation to microsecond
+	// precision happens at use site so a LookupCommit round-trip
+	// (UnixMicro / time.UnixMicro) compares Equal to the original
+	// value.
+	//
+	// The zero value (time.Time{}) means "not supplied" — the writer
+	// falls back to time.Now() captured immediately before parquet
+	// encode. Set via WithInsertedAt.
+	InsertedAt time.Time
 }
 
 // Apply runs every option against the receiver.
@@ -135,5 +152,44 @@ func WithIdempotencyTokenOf[T any](
 			return
 		}
 		o.IdempotencyTokenFn = fn
+	}
+}
+
+// WithInsertedAt overrides the writer's default "insertion time"
+// for this batch. The supplied value flows uniformly to every
+// downstream surface — the parquet InsertedAtField column (when
+// configured), the token-commit `insertedat` user-metadata, and
+// WriteResult.InsertedAt — replacing the default capture of
+// time.Now() taken just before parquet encoding.
+//
+// Use cases:
+//
+//   - Caller-owned event time. The "real" insertion timestamp
+//     lives in an outbox row / external system; passing it here
+//     keeps the in-file column and result aligned with that
+//     source rather than the writer's wall-clock.
+//   - Reproducible writes. Tests and replays that supply the same
+//     records + same InsertedAt + same compression codec produce
+//     byte-identical parquet bytes (the only non-determinism in
+//     the encode path is the InsertedAtField injection).
+//
+// Truncated to microsecond precision at use site so a LookupCommit
+// round-trip yields a time.Time that compares Equal to the value
+// in the original WriteResult.
+//
+// The zero value (time.Time{}) is treated as "not supplied" — the
+// writer falls back to time.Now(). Callers who legitimately need
+// to stamp the year-1 zero time should pass a value with a
+// non-zero monotonic component, but no real workload needs this.
+//
+// Idempotency-retry interaction: when the upfront HEAD on
+// `<token>.commit` finds a prior commit, the returned WriteResult
+// is reconstructed from the prior commit's metadata —
+// WithInsertedAt on the retry attempt is ignored in favour of the
+// original attempt's value. This preserves the contract that a
+// same-token retry returns the original WriteResult unchanged.
+func WithInsertedAt(t time.Time) WriteOption {
+	return func(o *WriteOpts) {
+		o.InsertedAt = t
 	}
 }
