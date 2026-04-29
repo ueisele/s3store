@@ -2123,6 +2123,102 @@ rush it.
   Renames, splits, type changes, and row-level computed
   derivations require rewriting the affected files.
 
+## Appendix: S3 calls per method
+
+Every method's S3-call breakdown, for capacity-planning, cost
+estimation, and operator dashboards. Counts are per call; multi-
+pattern / multi-partition variants fan out independently and
+deduplicate at the key level. All ops route through the per-
+target `MaxInflightRequests` semaphore, carry the configured
+`ConsistencyControl` header, and have their own retry budget
+(`retryMaxAttempts = 4` with backoffs 200ms / 400ms / 800ms).
+
+### Write
+
+Fresh write (auto-token, or `WithIdempotencyToken` /
+`WithIdempotencyTokenOf` with no prior commit):
+
+| Op   | Count | Key                                                             |
+|------|-------|-----------------------------------------------------------------|
+| HEAD | 0–1   | `<Prefix>/data/<partition>/<token>.commit` (skipped on auto-token; 1× upfront on the idempotent path, returns 404) |
+| PUT  | M     | `<Prefix>/_projection/<name>/.../m.proj` — one per distinct projection-marker key in the batch (M = 0 with no projections registered) |
+| PUT  | 1     | `<Prefix>/data/<partition>/<token>-<attemptID>.parquet` (data) |
+| PUT  | 1     | `<Prefix>/_ref/<refMicroTs>-<token>-<attemptID>;<hiveEsc>.ref` (ref) |
+| PUT  | 1     | `<Prefix>/data/<partition>/<token>.commit` (token-commit, atomic visibility flip) |
+
+Total: M+3 PUTs (auto-token) or 1 HEAD + M+3 PUTs (idempotent).
+
+Idempotent retry (prior commit exists):
+
+| Op   | Count | Key                                                |
+|------|-------|----------------------------------------------------|
+| HEAD | 1     | `<Prefix>/data/<partition>/<token>.commit` → 200, reconstruct WriteResult and return |
+
+Total: 1 HEAD; no PUTs, no body re-upload.
+
+Multi-partition `Write` (one logical call) fans out: each
+partition runs the full sequence in parallel, capped by
+`MaxInflightRequests`. Marker PUTs fan out across all partitions'
+combined marker set.
+
+### LookupCommit
+
+| Op   | Count | Key                                                  |
+|------|-------|------------------------------------------------------|
+| HEAD | 1     | `<Prefix>/data/<partition>/<token>.commit`           |
+
+200 → reconstructed WriteResult; 404 → ok=false; other → wrapped
+error.
+
+### Snapshot read
+
+`Read` / `ReadIter` / `ReadRangeIter` (snapshot half) /
+`BackfillProjection` share the same listing-and-gating skeleton:
+
+| Op   | Count   | Key                                                           |
+|------|---------|---------------------------------------------------------------|
+| LIST | ≥1 per plan | `<Prefix>/data/<plan-prefix>/` — one plan per pattern, paginated (~1000 keys/page); per-plan results unioned and key-deduplicated |
+| HEAD | 0–T     | `<Prefix>/data/<partition>/<token>.commit` — T = (partition, token) tuples with ≥2 parquets in the LIST (multi-attempt orphans). 0 in steady state |
+| GET  | N       | `<Prefix>/data/<partition>/<token>-<attemptID>.parquet` — one per surviving parquet (post-commit-gate) |
+
+`Read` materializes records into a slice; `ReadIter` /
+`ReadRangeIter` stream them via iterator with bounded memory
+(`WithReadAheadPartitions` / `WithReadAheadBytes`).
+`BackfillProjection` adds **1 PUT per derived marker per parquet**
+(deduped within the parquet) on top of the GETs.
+
+`ReadRangeIter` walks the ref stream first (see Stream read
+below) to collect data-file paths, then runs the GET stage above.
+
+### Snapshot read — `ProjectionReader.Lookup`
+
+LIST-only. Marker objects are zero-byte; key parsing alone
+yields the projection's column values.
+
+| Op   | Count        | Key                                          |
+|------|--------------|----------------------------------------------|
+| LIST | ≥1 per plan  | `<Prefix>/_projection/<name>/<plan-prefix>/` |
+
+No GETs, no HEADs. The ref-stream LIST runs in `Poll`, but
+`Lookup` doesn't touch the data tree.
+
+### Stream read — `Poll`
+
+| Op   | Count | Key                                                       |
+|------|-------|-----------------------------------------------------------|
+| LIST | ≥1    | `<Prefix>/_ref/` — one paginated LIST starting at `since`, capped by `maxEntries` (≤1000 per page) |
+| HEAD | 0–U   | `<Prefix>/data/<partition>/<token>.commit` — U = unique (partition, token) tuples in the page; per-poll cache collapses repeats |
+
+No GETs. Returns refs only.
+
+`PollRecords` = `Poll` + **1 GET per returned ref** for the data
+file body (decoded via the same byte-budget pipeline as
+`ReadIter`).
+
+`ReadRangeIter` = one or more `Poll` cycles to walk the
+`[since, until)` window into a flat ref list, then **1 GET per
+data file** through the iter pipeline.
+
 ## License
 
 See [LICENSE](LICENSE).
