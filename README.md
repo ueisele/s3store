@@ -988,36 +988,49 @@ printable ASCII, ≤200 chars).
 
 ### Idempotency and reader dedup are complementary
 
-Tokens recover the same `WriteResult` for sequential retries
-once the prior commit has landed and is still timely. They do
-**not** absorb every form of duplication on their own:
+Reader dedup (`EntityKeyOf` + `VersionOf`) and idempotency
+tokens cover different concerns; pick by what your data and
+your pipeline give you.
 
-- **Near-concurrent retry overlap (out of contract).** Two
-  in-flight attempts of the same token are explicitly out of
-  contract (see [Concurrency contract](#guarantees)). If the
-  invariant is violated by accident, both upfront HEADs miss the
-  prior commit (slow original + fast retry); both write their
-  own per-attempt data + ref; both PUT `<token>.commit` (latest-
-  wins arbitrates the metadata, but both attempts' records are
-  byte-identical thanks to deterministic parquet encoding).
-  Without reader-side dedup, the application sees doubled rows
-  via two distinct refs.
-- **Different tokens for the same logical write** — two distinct
-  per-attempt triples; reader dedup is the only collapse point.
+**Reader dedup is primarily latest-version selection.** When
+the same entity is written multiple times with different
+`VersionOf` values, dedup collapses to the latest version per
+entity. This is its main job, and tokens don't replace it.
 
-Pair tokens with `EntityKeyOf` + `VersionOf` so
-`Read` / `ReadIter` / `PollRecords` collapse latest-per-entity.
+**Tokens collapse physical replicas of the same logical
+record.** Sequential retries short-circuit at the upfront HEAD
+on `<token>.commit`. Out-of-contract near-concurrent retries
+are still absorbed at read time — the commit's `attemptid`
+arbitrates one canonical attempt; both read paths filter
+LIST/refs down to it. The reader sees one set of rows, not
+two. This works only under **token stability**: the same
+logical record must always derive the same token, across
+retries, restarts, and process boundaries. (On multi-site
+StorageGRID below `strong-global` the canonical-attempt choice
+can differ transiently across sites during overwrite
+propagation, but deterministic parquet encoding makes both
+attempts' records byte-equivalent — undetectable to the
+consumer.)
+
+**Reader dedup also handles replica collapse when token
+stability isn't achievable** — token store lost, derivation
+differs across processes/replays, multiple writers emit the
+same logical record under independent tokens. No cross-token
+arbitration exists, so `EntityKeyOf` + `VersionOf` becomes the
+only collapse point.
 
 | Config | Storage layer | Consumer layer |
 |---|---|---|
 | No token, no dedup | at-least-once | at-least-once |
-| No token, dedup configured | at-least-once | **exactly-once** (per entity) |
-| Token + dedup | at-least-once (per-attempt orphans on failure) | **exactly-once** (across sessions) |
-| Token alone (no dedup) | at-least-once with sequential-retry collapse | at-least-once on retry overlap |
+| No token, dedup configured | at-least-once | **exactly-once** (latest version per entity) |
+| Stable token + dedup | at-least-once (per-attempt orphans on failure) | **exactly-once** (latest version per entity, across retry sessions) |
+| Stable token alone | at-least-once (per-attempt orphans) | **exactly-once** per logical record; versions not collapsed |
 
-**Recommendation**: enable reader dedup whenever correctness
-matters. Under `WithIdempotencyToken`, reader dedup is
-**required** to absorb near-concurrent retry overlap.
+**Recommendation**: enable reader dedup whenever the data has
+versions to collapse (the typical case). Tokens are
+orthogonal — they make retries cheap and absorb replica
+duplication when token stability holds; reader dedup picks up
+both replica and version collapse when stability doesn't.
 
 ### Cross-backend uniformity
 
