@@ -820,6 +820,66 @@
       ],
       "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
       "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 158},
+      "id": 9000,
+      "panels": [],
+      "title": "Commit-marker gate — selected bucket / prefix",
+      "type": "row"
+    },
+    {
+      "id": 9001,
+      "type": "timeseries",
+      "title": "Commit-marker HEAD rate by method",
+      "description": "HEAD requests issued against `<token>.commit` to gate visibility. Snapshot reads (read / read_iter / lookup / lookup_commit / backfill) HEAD per multi-attempt token; stream reads (poll / poll_records / read_range_iter) HEAD per ref on per-poll cache misses. Sustained high rate on stream paths at low cache hit ratio means tokens rarely repeat within a poll cycle (each ref pays a HEAD).",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 159},
+      "targets": [
+        {
+          "expr": "sum by (s3store_method) (rate(s3store_read_commit_head_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "legendFormat": "{{s3store_method}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never", "stacking": {"mode": "normal"}}}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 9002,
+      "type": "timeseries",
+      "title": "Stream-read commit-cache hit ratio",
+      "description": "Per-poll (partition, token) cache hit ratio on the stream-read commit gate (poll / poll_records / read_range_iter). Each repeat-token ref within one poll cycle hits the cache instead of issuing a fresh HEAD. Ratio = hits / (hits + HEADs issued by stream-read methods). High ratio means many refs share tokens within one cycle — the cache pays off, especially on backends that charge per HEAD. Snapshot reads have no cache and are excluded.",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 159},
+      "targets": [
+        {
+          "expr": "sum(rate(s3store_read_commit_head_cache_hit_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) / (sum(rate(s3store_read_commit_head_cache_hit_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) + sum(rate(s3store_read_commit_head_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_method=~\"poll|poll_records|read_range_iter\"}[$__rate_interval])))",
+          "legendFormat": "hit ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 2, "min": 0, "max": 1, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"calcs": ["mean", "lastNotNull", "max"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 9003,
+      "type": "timeseries",
+      "title": "Write commit-after-timeout rate",
+      "description": "Writes whose elapsed time from refMicroTs (just before the ref PUT) to token-commit-PUT completion exceeded CommitTimeout. The commit landed — this is not a Write failure — but a SettleWindow tuned to the configured CommitTimeout may not yet include this Write in the stream window when a Poll fires. Sustained > 0 means SettleWindow risks under-counting recent writes; either tighten CommitTimeout (and surface failures earlier) or raise SettleWindow. Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside the budget by design.",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 167},
+      "targets": [
+        {
+          "expr": "sum(rate(s3store_write_commit_after_timeout_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "legendFormat": "commit-after-timeout/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never"}, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
     }
   ],
   "refresh": "30s",
