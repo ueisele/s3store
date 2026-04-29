@@ -116,26 +116,56 @@ func (s *Writer[T]) Write(
 			"s3store: PartitionKeyOf is required for Write; " +
 				"use WriteWithKey for explicit keys")
 	}
-	writeOpts, err := resolveWriteOpts(opts)
-	if err != nil {
-		return nil, err
-	}
 	results, err = s.writeGroupedFanOut(ctx, records,
 		func(ctx context.Context, key string, recs []T) (*WriteResult, error) {
-			r, _, err := s.writeWithKeyResolved(ctx, key, recs, writeOpts, scope)
+			r, _, err := s.writeWithKeyResolved(ctx, key, recs, opts, scope)
 			return r, err
 		})
 	return results, err
 }
 
 // resolveWriteOpts folds the variadic WriteOption chain into a
-// WriteOpts and validates embedded values (IdempotencyToken
-// passes ValidateIdempotencyToken). Done once per Write call so
-// per-partition dispatch doesn't re-validate on every goroutine.
-func resolveWriteOpts(opts []WriteOption) (WriteOpts, error) {
+// WriteOpts and resolves the per-partition idempotency token. The
+// records slice is pass-by-header (no copy of the underlying
+// array) and is consumed by IdempotencyTokenFn — when set — to
+// derive the per-partition token; the static IdempotencyToken
+// branch ignores records entirely. Mutual-exclusion between the
+// two options is enforced first so the resolution path is
+// unambiguous.
+//
+// The type-assertion on IdempotencyTokenFn (any → func([]T)
+// (string, error)) lives here because WriteOpts can't be generic
+// — it's the boundary type WriteOption closures write into. A
+// closure whose T doesn't match the writer's surfaces a clear
+// error naming the mismatch.
+func resolveWriteOpts[T any](opts []WriteOption, records []T) (WriteOpts, error) {
 	var w WriteOpts
 	w.Apply(opts...)
-	if w.IdempotencyToken != "" {
+	if w.IdempotencyToken != "" && w.IdempotencyTokenFn != nil {
+		return WriteOpts{}, fmt.Errorf(
+			"s3store: WithIdempotencyToken and WithIdempotencyTokenOf " +
+				"are mutually exclusive")
+	}
+	if w.IdempotencyTokenFn != nil {
+		fn, ok := w.IdempotencyTokenFn.(func([]T) (string, error))
+		if !ok {
+			return WriteOpts{}, fmt.Errorf(
+				"s3store: WithIdempotencyTokenOf: closure type %T does not "+
+					"match writer's record type — pass "+
+					"WithIdempotencyTokenOf[T] with the same T as the Writer",
+				w.IdempotencyTokenFn)
+		}
+		token, err := fn(records)
+		if err != nil {
+			return WriteOpts{}, fmt.Errorf(
+				"s3store: WithIdempotencyTokenOf: %w", err)
+		}
+		if err := validateIdempotencyToken(token); err != nil {
+			return WriteOpts{}, fmt.Errorf(
+				"s3store: WithIdempotencyTokenOf: %w", err)
+		}
+		w.IdempotencyToken = token
+	} else if w.IdempotencyToken != "" {
 		if err := validateIdempotencyToken(
 			w.IdempotencyToken); err != nil {
 			return WriteOpts{}, err
@@ -229,36 +259,38 @@ func (s *Writer[T]) WriteWithKey(
 	if len(records) == 0 {
 		return nil, nil
 	}
-	writeOpts, err := resolveWriteOpts(opts)
-	if err != nil {
-		return nil, err
-	}
-	result, _, err = s.writeWithKeyResolved(ctx, key, records, writeOpts, scope)
+	result, _, err = s.writeWithKeyResolved(ctx, key, records, opts, scope)
 	return result, err
 }
 
-// writeWithKeyResolved is the post-option-resolution shared entry
-// point for Write (per-partition dispatch) and WriteWithKey (direct
-// call). Lets Write resolve options once and avoid the per-
-// partition revalidation that calling WriteWithKey in the fan-out
-// closure would imply.
+// writeWithKeyResolved is the shared per-partition entry point
+// for Write (per-partition dispatch via writeGroupedFanOut) and
+// WriteWithKey (direct single-partition call). It owns the option-
+// resolution step so both entry points see consistent semantics:
+// the static IdempotencyToken is pre-validated, the per-partition
+// IdempotencyTokenFn (if set) is invoked here with the partition's
+// records, and the resulting token is validated and substituted
+// into a local WriteOpts before encode/PUT.
 //
 // scope is the caller's methodScope. On commit (ref PUT succeeded),
-// this function increments the
-// scope's record / byte / partition counters via the additive
-// addX methods. Failures before commit don't touch the scope, so
-// the scope reports "what actually landed in S3," not "what we
-// attempted to write." Safe under Write's parallel partition
-// fan-out — addX is atomic.
+// this function increments the scope's record / byte / partition
+// counters via the additive addX methods. Failures before commit
+// don't touch the scope, so the scope reports "what actually
+// landed in S3," not "what we attempted to write." Safe under
+// Write's parallel partition fan-out — addX is atomic.
 //
 // Returns the parquet body byte count alongside the WriteResult
 // because writeEncodedPayload also exposes it; the caller doesn't
 // need it (the scope already has it on commit) but pre-existing
 // signatures are preserved.
 func (s *Writer[T]) writeWithKeyResolved(
-	ctx context.Context, key string, records []T, opts WriteOpts,
+	ctx context.Context, key string, records []T, opts []WriteOption,
 	scope *methodScope,
 ) (*WriteResult, int, error) {
+	writeOpts, err := resolveWriteOpts(opts, records)
+	if err != nil {
+		return nil, 0, err
+	}
 	if err := s.validateKey(key); err != nil {
 		return nil, 0, err
 	}
@@ -285,7 +317,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 			"s3store: parquet encode: %w", err)
 	}
 	r, err := s.writeEncodedPayload(
-		ctx, key, records, parquetBytes, writeStartTime, opts)
+		ctx, key, records, parquetBytes, writeStartTime, writeOpts)
 	if err == nil && r != nil {
 		// Commit semantics: writeEncodedPayload returned a non-nil
 		// WriteResult ⇒ data is durable, markers are written, and

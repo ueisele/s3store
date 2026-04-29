@@ -956,6 +956,36 @@ sweeper reclaims them. A retry storm with sane orchestrator
 backoff produces orphans bounded by `(retry rate) × (parquet
 size)` per token.
 
+#### Per-partition tokens
+
+When a single `Write` call spans several partitions and each
+partition has its own logical-write identifier (one outbox row
+per partition, distinct upstream batch IDs, etc.), use
+`WithIdempotencyTokenOf` instead of `WithIdempotencyToken`. The
+closure runs once per partition with the partition's records in
+hand and returns the token to use for that partition:
+
+```go
+_, err := store.Write(ctx, records,
+    s3store.WithIdempotencyTokenOf(func(part []Rec) (string, error) {
+        // The partition is non-empty by construction (Write
+        // groups by PartitionKeyOf and skips empty groups).
+        // part[0] is sufficient for any per-partition derivation.
+        return outboxRowID(part[0]), nil
+    }))
+```
+
+Each partition's commit marker, upfront HEAD, and per-attempt id
+use the per-partition token; retries dedup independently per
+partition. Mutually exclusive with `WithIdempotencyToken` —
+combining them surfaces an error at option-resolution time. A
+non-nil error from the closure aborts that partition's write
+(under multi-partition fan-out, sibling partitions whose closure
+succeeded may still commit — partial-success contract). Tokens
+returned from the closure are validated per partition via the
+same rules as the static option (non-empty, no `/`, no `..`,
+printable ASCII, ≤200 chars).
+
 ### Idempotency and reader dedup are complementary
 
 Tokens recover the same `WriteResult` for sequential retries

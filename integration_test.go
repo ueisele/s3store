@@ -3249,6 +3249,119 @@ func TestWriteWithIdempotencyToken_RejectsBadToken(t *testing.T) {
 	}
 }
 
+// TestWriteWithIdempotencyTokenOf_PerPartitionToken: a single
+// multi-partition Write derives a different token per partition
+// via WithIdempotencyTokenOf. Each partition's retry is dedup'd
+// against its own token's commit marker — so a retry of one
+// partition returns the prior WriteResult unchanged, while a
+// fresh different-token partition lands a fresh per-attempt
+// triple in parallel.
+func TestWriteWithIdempotencyTokenOf_PerPartitionToken(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	recs := []Rec{
+		{Period: "2026-04-22", Customer: "alpha",
+			SKU: "s1", Value: 1, Ts: time.UnixMilli(1)},
+		{Period: "2026-04-22", Customer: "beta",
+			SKU: "s2", Value: 2, Ts: time.UnixMilli(2)},
+	}
+	// One token per partition: encode the partition key into the
+	// token so every partition gets its own distinct commit
+	// marker. Realistic shape (caller usually has an outbox row
+	// per partition).
+	tokenOf := func(part []Rec) (string, error) {
+		if len(part) == 0 {
+			return "", fmt.Errorf("empty partition")
+		}
+		r := part[0]
+		return fmt.Sprintf("job-2026-04-22-%s-%s",
+			r.Period, r.Customer), nil
+	}
+
+	fresh, err := store.Write(ctx, recs, WithIdempotencyTokenOf(tokenOf))
+	if err != nil {
+		t.Fatalf("fresh Write: %v", err)
+	}
+	if len(fresh) != 2 {
+		t.Fatalf("fresh: got %d results, want 2", len(fresh))
+	}
+
+	// Retry with the same closure: each partition's upfront HEAD
+	// finds its own commit marker and returns the prior
+	// WriteResult unchanged.
+	retry, err := store.Write(ctx, recs, WithIdempotencyTokenOf(tokenOf))
+	if err != nil {
+		t.Fatalf("retry Write: %v", err)
+	}
+	if len(retry) != len(fresh) {
+		t.Fatalf("retry: got %d results, want %d", len(retry), len(fresh))
+	}
+	for i := range fresh {
+		if retry[i].RefPath != fresh[i].RefPath {
+			t.Errorf("partition %d: retry RefPath = %q, want %q",
+				i, retry[i].RefPath, fresh[i].RefPath)
+		}
+		if retry[i].DataPath != fresh[i].DataPath {
+			t.Errorf("partition %d: retry DataPath = %q, want %q",
+				i, retry[i].DataPath, fresh[i].DataPath)
+		}
+	}
+	// Cross-partition isolation: alpha's token must differ from
+	// beta's, so their commit markers don't collide.
+	if fresh[0].DataPath == fresh[1].DataPath {
+		t.Errorf("partitions collided on DataPath: %q",
+			fresh[0].DataPath)
+	}
+}
+
+// TestWriteWithIdempotencyTokenOf_PropagatesFnError: a non-nil
+// error from the per-partition token closure aborts that
+// partition's write. Under multi-partition fan-out it surfaces
+// as a wrapped error; sibling partitions whose closure succeeded
+// may have committed (partial-success contract).
+func TestWriteWithIdempotencyTokenOf_PropagatesFnError(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "errfn",
+		SKU: "s1", Value: 1, Ts: time.UnixMilli(1),
+	}}
+	tokenOf := func(_ []Rec) (string, error) {
+		return "", fmt.Errorf("caller-supplied failure")
+	}
+	_, err := store.WriteWithKey(ctx, "period=2026-04-22/customer=errfn",
+		rec, WithIdempotencyTokenOf(tokenOf))
+	if err == nil {
+		t.Fatal("want non-nil error from token-fn failure")
+	}
+	if !strings.Contains(err.Error(), "caller-supplied failure") {
+		t.Errorf("error %q did not include the fn's error message", err)
+	}
+}
+
+// TestWriteWithIdempotencyTokenOf_RejectsBadToken: a closure that
+// returns a token failing validateIdempotencyToken surfaces the
+// validation error to the caller without touching S3.
+func TestWriteWithIdempotencyTokenOf_RejectsBadToken(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "badtok",
+		SKU: "s1", Value: 1, Ts: time.UnixMilli(1),
+	}}
+	tokenOf := func(_ []Rec) (string, error) {
+		return "has/slash", nil
+	}
+	_, err := store.WriteWithKey(ctx, "period=2026-04-22/customer=badtok",
+		rec, WithIdempotencyTokenOf(tokenOf))
+	if err == nil {
+		t.Fatal("want error for token with '/', got nil")
+	}
+}
+
 // TestIdempotentRead_ReadModifyWriteRetrySafe drives the full
 // Phase 3b read-modify-write cycle end-to-end on MinIO:
 //

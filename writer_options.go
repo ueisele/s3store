@@ -15,10 +15,32 @@ type WriteOpts struct {
 	// commit marker (`<dataPath>/<partition>/<token>.commit`).
 	// The writer's upfront HEAD on that commit marker recognises
 	// prior attempts of the same logical write and short-circuits
-	// the retry. Validated via validateIdempotencyToken at the
-	// option-application site, not at PUT time, so typos / illegal
-	// characters surface immediately.
+	// the retry. Validated via validateIdempotencyToken when the
+	// option chain is resolved so typos / illegal characters
+	// surface before any S3 call.
+	//
+	// Mutually exclusive with IdempotencyTokenFn — pick a static
+	// token OR a per-partition function, not both.
 	IdempotencyToken string
+
+	// IdempotencyTokenFn, when set, is invoked per partition with
+	// that partition's records and returns the token to use. Lets
+	// a multi-partition Write derive a different token per
+	// partition — useful when each partition's logical write has
+	// its own outbox row / external identifier.
+	//
+	// Type-erased as `any` because WriteOpts is not generic; the
+	// concrete shape is `func(partitionRecords []T) (string, error)`
+	// for the writer's T. The writer type-asserts at write-time and
+	// surfaces a clear error if the closure's T doesn't match.
+	//
+	// The returned token is validated via validateIdempotencyToken
+	// per partition (non-empty, no "/", no "..", printable ASCII,
+	// ≤200 chars). A non-nil error from the closure aborts the
+	// partition's write. Set via WithIdempotencyTokenOf.
+	//
+	// Mutually exclusive with IdempotencyToken.
+	IdempotencyTokenFn any
 }
 
 // Apply runs every option against the receiver.
@@ -72,8 +94,46 @@ func (o *WriteOpts) Apply(opts ...WriteOption) {
 // callers whose token might be unset in some code paths) — the
 // resulting write runs the non-idempotent path (auto-token, no
 // upfront HEAD).
+//
+// Mutually exclusive with WithIdempotencyTokenOf — combining the
+// two surfaces an error at option-resolution time.
 func WithIdempotencyToken(token string) WriteOption {
 	return func(o *WriteOpts) {
 		o.IdempotencyToken = token
+	}
+}
+
+// WithIdempotencyTokenOf is the per-partition variant of
+// WithIdempotencyToken: fn is invoked once per partition with the
+// records routed to that partition, and its return value drives
+// that partition's idempotency token. Lets a single multi-
+// partition Write retry with a different token per partition
+// (e.g. one outbox row per partition).
+//
+// Semantics on each partition match WithIdempotencyToken: the
+// returned token anchors the per-attempt id and the
+// `<dataPath>/<partition>/<token>.commit` marker, the upfront HEAD
+// dedups same-token retries, and the token must pass
+// validateIdempotencyToken.
+//
+// On WriteWithKey (single partition) fn is invoked once with the
+// full records slice — symmetric with the multi-partition case.
+//
+// fn returning an error fails that partition's write; under
+// Write's parallel fan-out a single failure propagates as
+// "first error wins" with partial-success on already-committed
+// partitions (same shape as any other write-path error).
+//
+// Mutually exclusive with WithIdempotencyToken — passing both
+// surfaces an error at option-resolution time. fn=nil is a no-op
+// (the partition runs the non-idempotent auto-token path).
+func WithIdempotencyTokenOf[T any](
+	fn func(partitionRecords []T) (string, error),
+) WriteOption {
+	return func(o *WriteOpts) {
+		if fn == nil {
+			return
+		}
+		o.IdempotencyTokenFn = fn
 	}
 }
