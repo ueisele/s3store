@@ -265,9 +265,15 @@ func (s *Writer[T]) writeWithKeyResolved(
 
 	// Capture writeStartTime here (before encode) so the same value
 	// is used to populate the InsertedAtField column AND to stamp
-	// the data filename's tsMicros — a single "when was this batch
-	// written" value propagates to every downstream surface.
-	writeStartTime := time.Now()
+	// the token-commit's `insertedat` metadata — a single "when
+	// was this batch written" value propagates to every downstream
+	// surface. Truncated to microsecond precision so a LookupCommit
+	// round-trip (which reads back through UnixMicro / time.UnixMicro)
+	// yields a time.Time that compares Equal to the value embedded
+	// in the original WriteResult; without truncation, sub-µs
+	// nanoseconds are lost on the wire and the round-trip mismatches
+	// on platforms whose clocks have sub-µs resolution (Linux).
+	writeStartTime := time.Now().Truncate(time.Microsecond)
 	if s.insertedAtFieldIndex != nil {
 		populateInsertedAt(records, s.insertedAtFieldIndex, writeStartTime)
 	}
