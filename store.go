@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
 )
@@ -36,7 +35,7 @@ const (
 	CompressionUncompressed CompressionCodec = "uncompressed"
 )
 
-// Config defines how a Store is set up. T is the record type,
+// StoreConfig defines how a Store is set up. T is the record type,
 // which must be encodable and decodable by parquet-go directly
 // (struct fields tagged with `parquet:"..."`, primitive-friendly
 // types). Types with fields parquet-go can't encode (e.g.
@@ -44,23 +43,16 @@ const (
 // parquet-layout struct and a translation step in the caller's
 // package.
 //
-// Internally New() projects this onto the narrower WriterConfig[T]
-// and ReaderConfig[T] (both of which take an S3Target directly).
-// Advanced users who want just one side can skip this type and call
-// NewWriter / NewReader with a hand-built WriterConfig / ReaderConfig.
-type Config[T any] struct {
-	// Bucket is the S3 bucket name.
-	Bucket string
-
-	// Prefix under which data files are stored.
-	Prefix string
-
-	// PartitionKeyParts defines the Hive-partition key segments in order.
-	PartitionKeyParts []string
-
-	// S3Client is the AWS S3 client to use. Its endpoint, region,
-	// credentials, and path-style setting are used as-is.
-	S3Client *s3.Client
+// Embeds S3TargetConfig so the S3 wiring (Bucket, Prefix, S3Client,
+// PartitionKeyParts, MaxInflightRequests, ConsistencyControl,
+// MeterProvider) lives in exactly one place. New() reads the
+// embedded value, builds an S3Target via NewS3Target, then projects
+// the side-specific knobs onto WriterConfig[T] / ReaderConfig[T]
+// (both of which take a built S3Target directly). Advanced users
+// who only need one side can skip this type and call NewWriter /
+// NewReader with a hand-built S3Target — see those constructors.
+type StoreConfig[T any] struct {
+	S3TargetConfig
 
 	// PartitionKeyOf extracts the Hive-partition key from a
 	// record. Required for Write(). The returned string must
@@ -112,20 +104,6 @@ type Config[T any] struct {
 	// the hot-path Write doesn't reparse it.
 	Compression CompressionCodec
 
-	// ConsistencyControl is the Consistency-Control HTTP header
-	// value applied to correctness-critical S3 operations.
-	// Forwarded onto the shared S3Target so every S3 call (write
-	// path, read path, marker LISTs) uses the same value, which
-	// is what NetApp StorageGRID requires for paired operations.
-	// See S3TargetConfig.ConsistencyControl for the full contract.
-	ConsistencyControl ConsistencyLevel
-
-	// MaxInflightRequests caps S3 requests in flight per call.
-	// Zero → default (32). Forwarded onto the shared S3Target
-	// so both Writer and Reader see the same cap. See
-	// S3Target.MaxInflightRequests for the full contract.
-	MaxInflightRequests int
-
 	// Projections lists the secondary projections the writer
 	// should maintain. See WriterConfig.Projections for the full
 	// contract. Forwarded to WriterConfig only — readers don't
@@ -136,7 +114,7 @@ type Config[T any] struct {
 // dedupEnabled reports whether latest-per-entity dedup applies.
 // EntityKeyOf and VersionOf must be set together (both required
 // for dedup) — New / NewReader reject partial configurations.
-func (c Config[T]) dedupEnabled() bool {
+func (c StoreConfig[T]) dedupEnabled() bool {
 	return c.EntityKeyOf != nil
 }
 
@@ -157,23 +135,27 @@ func (s *Store[T]) Target() S3Target {
 	return s.Reader.Target()
 }
 
-// New constructs a Store by projecting Config onto WriterConfig
-// and ReaderConfig, then delegating to NewWriter + NewReader.
-// The unified Config[T] is kept as a back-compat entry point;
-// new code that only writes or only reads should prefer
-// NewWriter / NewReader directly.
+// New constructs a Store from StoreConfig: builds an S3Target
+// from the embedded S3TargetConfig, then projects the side-specific
+// knobs onto WriterConfig[T] / ReaderConfig[T] and delegates to
+// NewWriter + NewReader. The Writer and Reader share the one
+// constructed S3Target — same MaxInflightRequests semaphore, same
+// ConsistencyControl, same resolved CommitTimeout + MaxClockSkew.
 //
 // Performs two S3 GETs at construction time — the persisted
 // timing-config objects at <Prefix>/_config/commit-timeout and
 // <Prefix>/_config/max-clock-skew — via NewS3Target. Construction
 // fails when either object is missing, unparseable, or below its
 // floor (CommitTimeoutFloor / MaxClockSkewFloor).
-func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
-	s3cfg := s3TargetConfigFrom(cfg)
-	if err := s3cfg.Validate(); err != nil {
+//
+// Services that only write or only read can skip this and call
+// NewS3Target + NewWriter / NewReader directly with hand-built
+// WriterConfig / ReaderConfig values.
+func New[T any](ctx context.Context, cfg StoreConfig[T]) (*Store[T], error) {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	target, err := NewS3Target(ctx, s3cfg)
+	target, err := NewS3Target(ctx, cfg.S3TargetConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +165,7 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 // newStoreFromTarget wires Writer + Reader from cfg + a pre-built
 // target. Shared between New (production path, GETs the persisted
 // config) and unit-test helpers that bypass the GET.
-func newStoreFromTarget[T any](cfg Config[T], target S3Target) (*Store[T], error) {
+func newStoreFromTarget[T any](cfg StoreConfig[T], target S3Target) (*Store[T], error) {
 	w, err := NewWriter(writerConfigFrom(cfg, target))
 	if err != nil {
 		return nil, err
@@ -195,27 +177,10 @@ func newStoreFromTarget[T any](cfg Config[T], target S3Target) (*Store[T], error
 	return &Store[T]{Writer: w, Reader: r}, nil
 }
 
-// s3TargetConfigFrom lifts the S3-wiring fields off a unified
-// Config[T] into an S3TargetConfig. Called by New so the Writer
-// and Reader projections share one S3Target instance — and
-// therefore one MaxInflightRequests semaphore, one
-// ConsistencyControl value, and one resolved CommitTimeout +
-// MaxClockSkew pair — automatically.
-func s3TargetConfigFrom[T any](c Config[T]) S3TargetConfig {
-	return S3TargetConfig{
-		Bucket:              c.Bucket,
-		Prefix:              c.Prefix,
-		S3Client:            c.S3Client,
-		PartitionKeyParts:   c.PartitionKeyParts,
-		MaxInflightRequests: c.MaxInflightRequests,
-		ConsistencyControl:  c.ConsistencyControl,
-	}
-}
-
-// writerConfigFrom projects a unified Config[T] onto the narrower
+// writerConfigFrom projects a StoreConfig[T] onto the narrower
 // WriterConfig[T]. Central place so drift between the two types
 // is easy to spot.
-func writerConfigFrom[T any](c Config[T], target S3Target) WriterConfig[T] {
+func writerConfigFrom[T any](c StoreConfig[T], target S3Target) WriterConfig[T] {
 	return WriterConfig[T]{
 		Target:          target,
 		PartitionKeyOf:  c.PartitionKeyOf,
@@ -225,11 +190,11 @@ func writerConfigFrom[T any](c Config[T], target S3Target) WriterConfig[T] {
 	}
 }
 
-// readerConfigFrom projects a unified Config[T] onto the narrower
+// readerConfigFrom projects a StoreConfig[T] onto the narrower
 // ReaderConfig[T]. InsertedAtField is writer-only — the reader
 // sees that column like any other parquet field, decoded
 // natively into T by parquet-go.
-func readerConfigFrom[T any](c Config[T], target S3Target) ReaderConfig[T] {
+func readerConfigFrom[T any](c StoreConfig[T], target S3Target) ReaderConfig[T] {
 	return ReaderConfig[T]{
 		Target:      target,
 		EntityKeyOf: c.EntityKeyOf,

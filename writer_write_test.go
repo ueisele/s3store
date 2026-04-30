@@ -135,16 +135,18 @@ func TestEncodeParquet_Compression(t *testing.T) {
 // TestNew_CompressionValidation guards that New() rejects an
 // unknown Compression value before any S3 work.
 func TestNew_CompressionValidation(t *testing.T) {
-	cfg := Config[testRec]{
-		Bucket:            "b",
-		Prefix:            "p",
-		PartitionKeyParts: []string{"period", "customer"},
-		S3Client:          &s3.Client{},
-		PartitionKeyOf:    func(r testRec) string { return "" },
-		Compression:       "brotli", // not supported
+	cfg := StoreConfig[testRec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            "b",
+			Prefix:            "p",
+			PartitionKeyParts: []string{"period", "customer"},
+			S3Client:          &s3.Client{},
+		},
+		PartitionKeyOf: func(r testRec) string { return "" },
+		Compression:    "brotli", // not supported
 	}
 	_, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

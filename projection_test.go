@@ -28,15 +28,17 @@ type SkuProjectionEntry struct {
 
 func newProjectionTestStore(t *testing.T, projections ...ProjectionDef[testProjectionRec]) *Store[testProjectionRec] {
 	t.Helper()
-	cfg := Config[testProjectionRec]{
-		Bucket:            "b",
-		Prefix:            "p",
-		S3Client:          &s3.Client{},
-		PartitionKeyParts: []string{"period", "customer"},
-		Projections:       projections,
+	cfg := StoreConfig[testProjectionRec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            "b",
+			Prefix:            "p",
+			S3Client:          &s3.Client{},
+			PartitionKeyParts: []string{"period", "customer"},
+		},
+		Projections: projections,
 	}
 	s, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err != nil {
 		t.Fatalf("newStoreFromTarget: %v", err)
 	}
@@ -258,11 +260,13 @@ func TestOf_AutoProjectsT(t *testing.T) {
 // NewWriter when a Columns entry doesn't match any parquet tag
 // on T.
 func TestOf_AutoRejectsMissingTag(t *testing.T) {
-	cfg := Config[testProjectionRec]{
-		Bucket:            "b",
-		Prefix:            "p",
-		S3Client:          &s3.Client{},
-		PartitionKeyParts: []string{"period", "customer"},
+	cfg := StoreConfig[testProjectionRec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            "b",
+			Prefix:            "p",
+			S3Client:          &s3.Client{},
+			PartitionKeyParts: []string{"period", "customer"},
+		},
 		Projections: []ProjectionDef[testProjectionRec]{{
 			Name:    "bad_idx",
 			Columns: []string{"sku", "not_on_t"},
@@ -270,7 +274,7 @@ func TestOf_AutoRejectsMissingTag(t *testing.T) {
 		}},
 	}
 	_, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err == nil {
 		t.Fatal("expected error for unknown column, got nil")
 	}
@@ -287,18 +291,20 @@ func TestOf_AutoRejectsNonStringTag(t *testing.T) {
 		SKU    string `parquet:"sku"`
 		Amount int    `parquet:"amount"`
 	}
-	cfg := Config[RecWithInt]{
-		Bucket:            "b",
-		Prefix:            "p",
-		S3Client:          &s3.Client{},
-		PartitionKeyParts: []string{"sku"},
+	cfg := StoreConfig[RecWithInt]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            "b",
+			Prefix:            "p",
+			S3Client:          &s3.Client{},
+			PartitionKeyParts: []string{"sku"},
+		},
 		Projections: []ProjectionDef[RecWithInt]{{
 			Name:    "amount_idx",
 			Columns: []string{"sku", "amount"},
 		}},
 	}
 	_, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err == nil {
 		t.Fatal("expected error for non-string field, got nil")
 	}
@@ -316,11 +322,13 @@ func TestOf_AutoProjectsTimeWithLayout(t *testing.T) {
 		SKU string    `parquet:"sku"`
 		At  time.Time `parquet:"at"`
 	}
-	cfg := Config[Rec]{
-		Bucket:            "b",
-		Prefix:            "p",
-		S3Client:          &s3.Client{},
-		PartitionKeyParts: []string{"sku"},
+	cfg := StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            "b",
+			Prefix:            "p",
+			S3Client:          &s3.Client{},
+			PartitionKeyParts: []string{"sku"},
+		},
 		Projections: []ProjectionDef[Rec]{{
 			Name:    "at_idx",
 			Columns: []string{"sku", "at"},
@@ -328,7 +336,7 @@ func TestOf_AutoProjectsTimeWithLayout(t *testing.T) {
 		}},
 	}
 	s, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err != nil {
 		t.Fatalf("newStoreFromTarget: %v", err)
 	}
@@ -353,11 +361,13 @@ func TestOf_AutoTimeRequiresLayout(t *testing.T) {
 		SKU string    `parquet:"sku"`
 		At  time.Time `parquet:"at"`
 	}
-	cfg := Config[Rec]{
-		Bucket:            "b",
-		Prefix:            "p",
-		S3Client:          &s3.Client{},
-		PartitionKeyParts: []string{"sku"},
+	cfg := StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            "b",
+			Prefix:            "p",
+			S3Client:          &s3.Client{},
+			PartitionKeyParts: []string{"sku"},
+		},
 		Projections: []ProjectionDef[Rec]{{
 			Name:    "at_idx",
 			Columns: []string{"sku", "at"},
@@ -365,7 +375,7 @@ func TestOf_AutoTimeRequiresLayout(t *testing.T) {
 		}},
 	}
 	_, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err == nil {
 		t.Fatal("expected error for empty Layout.Time, got nil")
 	}
@@ -457,15 +467,17 @@ func TestWriterConfig_ProjectionValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config[testProjectionRec]{
-				Bucket:            "b",
-				Prefix:            "p",
-				S3Client:          &s3.Client{},
-				PartitionKeyParts: []string{"period", "customer"},
-				Projections:       []ProjectionDef[testProjectionRec]{tc.idx},
+			cfg := StoreConfig[testProjectionRec]{
+				S3TargetConfig: S3TargetConfig{
+					Bucket:            "b",
+					Prefix:            "p",
+					S3Client:          &s3.Client{},
+					PartitionKeyParts: []string{"period", "customer"},
+				},
+				Projections: []ProjectionDef[testProjectionRec]{tc.idx},
 			}
 			_, err := newStoreFromTarget(cfg,
-				newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+				newS3TargetSkipConfig(cfg.S3TargetConfig))
 			if err == nil {
 				t.Error("expected error, got nil")
 			}
@@ -478,15 +490,17 @@ func TestWriterConfig_ProjectionValidation(t *testing.T) {
 			Columns: []string{"sku", "period", "customer"},
 			Of:      ofStub,
 		}
-		cfg := Config[testProjectionRec]{
-			Bucket:            "b",
-			Prefix:            "p",
-			S3Client:          &s3.Client{},
-			PartitionKeyParts: []string{"period", "customer"},
-			Projections:       []ProjectionDef[testProjectionRec]{def, def},
+		cfg := StoreConfig[testProjectionRec]{
+			S3TargetConfig: S3TargetConfig{
+				Bucket:            "b",
+				Prefix:            "p",
+				S3Client:          &s3.Client{},
+				PartitionKeyParts: []string{"period", "customer"},
+			},
+			Projections: []ProjectionDef[testProjectionRec]{def, def},
 		}
 		_, err := newStoreFromTarget(cfg,
-			newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+			newS3TargetSkipConfig(cfg.S3TargetConfig))
 		if err == nil {
 			t.Error("expected error for duplicate names, got nil")
 		}

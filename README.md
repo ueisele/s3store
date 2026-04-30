@@ -126,7 +126,7 @@ persisted; it's the cutoff `Poll` / `PollRecords` / `ReadRangeIter`
 apply to the live tip.
 
 Operators seed both objects once when provisioning a new prefix;
-`NewS3Target` (and `New(Config)`) GET them at construction time
+`NewS3Target` (and `New(StoreConfig)`) GET them at construction time
 and stamp the resolved values (plus the derived `SettleWindow`)
 on the Target. Construction fails with a hint when either object
 is missing.
@@ -238,11 +238,13 @@ type CostRecord struct {
 // <Prefix>/_config/commit-timeout and <Prefix>/_config/max-clock-skew
 // — seed both once via the snippet in "Initializing a new dataset"
 // before this call.
-store, err := s3store.New[CostRecord](ctx, s3store.Config[CostRecord]{
-    Bucket:            "warehouse",
-    Prefix:            "billing",
-    S3Client:          s3Client,
-    PartitionKeyParts: []string{"charge_period", "customer"},
+store, err := s3store.New[CostRecord](ctx, s3store.StoreConfig[CostRecord]{
+    S3TargetConfig: s3store.S3TargetConfig{
+        Bucket:            "warehouse",
+        Prefix:            "billing",
+        S3Client:          s3Client,
+        PartitionKeyParts: []string{"charge_period", "customer"},
+    },
     PartitionKeyOf: func(r CostRecord) string {
         return fmt.Sprintf("charge_period=%s/customer=%s",
             r.ChargePeriod, r.CustomerID)
@@ -286,7 +288,7 @@ file lands as Go's zero value.
 
 `s3store.Store[T]` is a composition of two public halves: a `Writer[T]`
 for the write path and a `Reader[T]` for the read path. Most users keep
-using `New(Config)` and get both through `Store`. Services that only
+using `New(StoreConfig)` and get both through `Store`. Services that only
 write or only read can construct a single half with a narrower config:
 
 ```go
@@ -350,7 +352,7 @@ The relationship between constructors:
 
 | Want | Call |
 |---|---|
-| Both write and read, same `T` | `New(Config[T])` → `*Store[T]` |
+| Both write and read, same `T` | `New(StoreConfig[T])` → `*Store[T]` |
 | Write only, narrow config | `NewWriter(WriterConfig[T])` → `*Writer[T]` |
 | Read only, narrow config | `NewReader(ReaderConfig[T])` → `*Reader[T]` |
 | Same-/narrower-`T'` Reader over a Writer | `NewReaderFromWriter[T', U](writer, cfg)` |
@@ -410,7 +412,7 @@ func fromFile(f UsageFile) (Usage, error) {
 }
 
 // Hand the library UsageFile, not Usage.
-store, _ := s3store.New[UsageFile](s3store.Config[UsageFile]{ /* ... */ })
+store, _ := s3store.New[UsageFile](s3store.StoreConfig[UsageFile]{ /* ... */ })
 
 // Writes:
 files := make([]UsageFile, len(usages))
@@ -666,7 +668,7 @@ over it.
 ### Per-record "when was this inserted"
 
 If a consumer needs the write time of every record, set
-`Config.InsertedAtField` to the name of a `time.Time` field on
+`StoreConfig.InsertedAtField` to the name of a `time.Time` field on
 `T`. The field must carry a non-empty, non-`"-"` parquet tag — the
 writer populates it with its wall-clock time at write-start and
 persists the value as a real parquet column, so both read paths
@@ -679,7 +681,7 @@ type Event struct {
     InsertedAt time.Time `parquet:"inserted_at"` // writer populates this column
 }
 
-s3store.Config[Event]{
+s3store.StoreConfig[Event]{
     // ...
     InsertedAtField: "InsertedAt",
 }
@@ -1141,7 +1143,7 @@ parquet reads.
 
 A projection has two halves that are wired separately:
 
-- **Write side (`ProjectionDef[T]`)** lives in `Config.Projections` /
+- **Write side (`ProjectionDef[T]`)** lives in `StoreConfig.Projections` /
   `WriterConfig.Projections`. `Of` returns the per-record column
   values as a `[]string` aligned to `Columns` (positional, in
   declared order). `Of` is optional — nil means the library
@@ -1316,7 +1318,7 @@ set.
 
 ### What's in scope for v1
 
-- Wire projections via `Config.Projections`; auto-write on `Write` +
+- Wire projections via `StoreConfig.Projections`; auto-write on `Write` +
   `Lookup` via the typed `ProjectionReader[K]` handle.
 - Read-after-write on Lookup: the marker PUT and the marker LIST
   both inherit `ConsistencyControl` from the shared `S3Target`,
@@ -1329,12 +1331,12 @@ set.
 
 ### Backfill
 
-The normal path is to wire a projection into `Config.Projections`
+The normal path is to wire a projection into `StoreConfig.Projections`
 before the first `Write` so every record produces markers. When
 that isn't possible — adding a projection to a store that
 already has data — the typical shape is:
 
-1. Deploy the live app with the projection in `Config.Projections`; every
+1. Deploy the live app with the projection in `StoreConfig.Projections`; every
    new `Write` emits markers from time T0 onward.
 2. Capture `until := T0` — the watermark before which historical
    data is uncovered.
@@ -1420,10 +1422,10 @@ path a pure round-trip.
 
 Write uses snappy by default — same as Spark, DuckDB's parquet writer,
 Trino, and Athena emit out of the box. Snappy cuts file size 2-3× on
-typical data with negligible CPU cost. Change via `Config.Compression`:
+typical data with negligible CPU cost. Change via `StoreConfig.Compression`:
 
 ```go
-s3store.Config[T]{
+s3store.StoreConfig[T]{
     // ...
     Compression: s3store.CompressionZstd,
 }
@@ -1702,12 +1704,14 @@ transient failure is worse than propagating.
 ## Configuration
 
 ```go
-type Config[T any] struct {
-    // Required
-    Bucket            string     // S3 bucket name
-    Prefix            string     // prefix under which data lives
-    PartitionKeyParts []string   // ordered Hive partition key names
-    S3Client          *s3.Client // AWS SDK v2 S3 client
+type StoreConfig[T any] struct {
+    // S3 wiring (Bucket, Prefix, S3Client, PartitionKeyParts,
+    // ConsistencyControl, MaxInflightRequests, MeterProvider) —
+    // see the S3TargetConfig docstring for the full per-field
+    // contract. Embedded so callers can build helpers against
+    // *S3TargetConfig once and reuse them across StoreConfig,
+    // WriterConfig (via NewS3Target), and ReaderConfig.
+    s3store.S3TargetConfig
 
     // Required for Write
     PartitionKeyOf func(T) string  // derive key from record (Write)
@@ -1718,12 +1722,12 @@ type Config[T any] struct {
     EntityKeyOf func(T) string  // identifies a unique entity
     VersionOf   func(T) int64   // monotonic version per entity
 
-    // CommitTimeout / MaxClockSkew are NOT Config fields. They're
+    // CommitTimeout / MaxClockSkew are NOT StoreConfig fields. They're
     // persisted at <Prefix>/_config/commit-timeout and
     // <Prefix>/_config/max-clock-skew so writer and reader agree
     // by construction. Seed once via the boto3 snippet in
-    // "Initializing a new dataset"; New(Config) GETs both values
-    // at construction time and stamps them (plus the derived
+    // "Initializing a new dataset"; New(StoreConfig) GETs both
+    // values at construction time and stamps them (plus the derived
     // SettleWindow = CommitTimeout + MaxClockSkew) on the Target.
 
     // Optional write-time column: if set, the writer populates
@@ -1739,25 +1743,13 @@ type Config[T any] struct {
     // Parquet compression codec (default snappy).
     Compression CompressionCodec
 
-    // Consistency-Control HTTP header value applied to every
-    // correctness-critical S3 operation (one knob, target-wide).
-    // Zero value substitutes ConsistencyStrongGlobal at
-    // construction — the safe multi-site StorageGRID choice
-    // and a no-op on AWS / MinIO (those backends ignore the
-    // header). Single-site StorageGRID grids can downgrade
-    // explicitly to ConsistencyStrongSite to save the cross-
-    // site PUT cost. See STORAGEGRID.md for the topology
-    // decision matrix.
-    ConsistencyControl ConsistencyLevel
-
-    // Optional tuning knobs.
-    MaxInflightRequests int
-    Projections         []ProjectionDef[T]
+    // Optional projections.
+    Projections []ProjectionDef[T]
 }
 ```
 
-`Config` is the all-in-one form for `New(Config[T])`. Services that
-only write or only read can use the narrower `WriterConfig[T]` /
+`StoreConfig` is the all-in-one form for `New(StoreConfig[T])`. Services
+that only write or only read can use the narrower `WriterConfig[T]` /
 `ReaderConfig[T]` directly with `NewWriter` / `NewReader` — see the
 [Writer / Reader / Narrow-T reads](#writer--reader--narrow-t-reads) section.
 
@@ -1908,22 +1900,44 @@ Breaking changes in the single-package collapse:
   workload needs SQL aggregation, use DuckDB directly (point its
   `httpfs` extension at the same bucket and `read_parquet()` over
   the data path) or pin an older release.
-- **`s3parquet` package collapsed into the root `s3store` package.**
-  The single-package layout is the new home for everything:
+- **`Config[T]` renamed to `StoreConfig[T]`; S3 wiring moved to
+  embedded `S3TargetConfig`.** The flattened wiring fields
+  (`Bucket`, `Prefix`, `S3Client`, `PartitionKeyParts`,
+  `ConsistencyControl`, `MaxInflightRequests`) now live on the
+  embedded `S3TargetConfig` value — single source of truth for
+  the S3 wiring across `StoreConfig`, `WriterConfig` (via
+  `NewS3Target`), and `ReaderConfig`. Side knobs
+  (`PartitionKeyOf`, `EntityKeyOf`, `VersionOf`, `Compression`,
+  `InsertedAtField`, `Projections`) stay at the top level.
 
   ```go
   // Before
-  import "github.com/ueisele/s3store/s3parquet"
-  store, _ := s3store.New[T](s3store.Config[T]{ ... })
+  s3store.Config[T]{
+      Bucket: "...", Prefix: "...", S3Client: c,
+      PartitionKeyParts:  []string{"period", "customer"},
+      ConsistencyControl: s3store.ConsistencyStrongGlobal,
+      PartitionKeyOf:     ...,
+  }
 
   // After
-  import "github.com/ueisele/s3store"
-  store, _ := s3store.New[T](s3store.Config[T]{ ... })
+  s3store.StoreConfig[T]{
+      S3TargetConfig: s3store.S3TargetConfig{
+          Bucket: "...", Prefix: "...", S3Client: c,
+          PartitionKeyParts:  []string{"period", "customer"},
+          ConsistencyControl: s3store.ConsistencyStrongGlobal,
+      },
+      PartitionKeyOf: ...,
+  }
   ```
 
-  Mechanical rename — every public symbol moved with the same
-  name (`Writer[T]`, `Reader[T]`, `Config[T]`, `S3Target`,
-  `ProjectionDef[T]`, `ProjectionReader[K]`, `BackfillProjection`, etc.).
+  Field-promotion still gives `cfg.Bucket = "..."` access for
+  callers that mutate after construction.
+- **`s3parquet` package collapsed into the root `s3store` package.**
+  The single-package layout is the new home for everything: drop
+  the `s3parquet/` import path and use `github.com/ueisele/s3store`
+  directly. Every public symbol moved with the same name
+  (`Writer[T]`, `Reader[T]`, `S3Target`, `ProjectionDef[T]`,
+  `ProjectionReader[K]`, `BackfillProjection`, etc.).
 - **DuckDB-only umbrella fields removed from `Config`.**
   `TableAlias`, `VersionColumn`, `EntityKeyColumns`,
   `ExtraInitSQL`, `Store.Query`, `Store.Close`, and `Store.SQL`

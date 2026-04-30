@@ -69,19 +69,21 @@ func newStore(t *testing.T, opts storeOpts) *Store[Rec] {
 	t.Helper()
 	f := newFixture(t)
 	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
-	store, err := New[Rec](t.Context(), Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New[Rec](t.Context(), StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
-		EntityKeyOf:        opts.entityKeyOf,
-		VersionOf:          opts.versionOf,
-		Projections:        opts.projections,
+		EntityKeyOf: opts.entityKeyOf,
+		VersionOf:   opts.versionOf,
+		Projections: opts.projections,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -198,17 +200,19 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 		},
 	}
 	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
-	store, err := New(ctx, Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New(ctx, StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
-		Projections:        []ProjectionDef[Rec]{projectionDef},
+		Projections: []ProjectionDef[Rec]{projectionDef},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -257,16 +261,18 @@ func TestWrite_MarkersFirst(t *testing.T) {
 
 	failClient := newDataPUTFailingClient(t, f)
 
-	store, err := New(ctx, Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          failClient,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New(ctx, StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           failClient,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
 		Projections: []ProjectionDef[Rec]{{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
@@ -672,16 +678,18 @@ func TestMissingData_PollSkipsReadIsLISTConsistent(t *testing.T) {
 	f := newFixture(t)
 	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
-	store, err := New(ctx, Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New(ctx, StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -830,17 +838,19 @@ func TestInsertedAtField_Populate(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := New[RecWithMeta](ctx, Config[RecWithMeta]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New[RecWithMeta](ctx, StoreConfig[RecWithMeta]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r RecWithMeta) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
-		InsertedAtField:    "InsertedAt",
+		InsertedAtField: "InsertedAt",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -910,24 +920,28 @@ func TestInsertedAtField_Validation(t *testing.T) {
 		Ignored  time.Time `parquet:"-"`
 	}
 
-	mkCfgRec := func(field string) Config[Rec] {
-		return Config[Rec]{
-			Bucket:            f.Bucket,
-			Prefix:            "store",
-			S3Client:          f.S3Client,
-			PartitionKeyParts: []string{"period", "customer"},
+	mkCfgRec := func(field string) StoreConfig[Rec] {
+		return StoreConfig[Rec]{
+			S3TargetConfig: S3TargetConfig{
+				Bucket:            f.Bucket,
+				Prefix:            "store",
+				S3Client:          f.S3Client,
+				PartitionKeyParts: []string{"period", "customer"},
+			},
 			PartitionKeyOf: func(r Rec) string {
 				return "period=p/customer=c"
 			},
 			InsertedAtField: field,
 		}
 	}
-	mkCfgIgnored := func(field string) Config[RecIgnoredMeta] {
-		return Config[RecIgnoredMeta]{
-			Bucket:            f.Bucket,
-			Prefix:            "store",
-			S3Client:          f.S3Client,
-			PartitionKeyParts: []string{"period", "customer"},
+	mkCfgIgnored := func(field string) StoreConfig[RecIgnoredMeta] {
+		return StoreConfig[RecIgnoredMeta]{
+			S3TargetConfig: S3TargetConfig{
+				Bucket:            f.Bucket,
+				Prefix:            "store",
+				S3Client:          f.S3Client,
+				PartitionKeyParts: []string{"period", "customer"},
+			},
 			PartitionKeyOf: func(r RecIgnoredMeta) string {
 				return "period=p/customer=c"
 			},
@@ -987,16 +1001,18 @@ func TestNewReaderFromStore_NarrowT(t *testing.T) {
 
 	f := newFixture(t)
 	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
-	store, err := New[FullRec](ctx, Config[FullRec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New[FullRec](ctx, StoreConfig[FullRec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r FullRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1807,16 +1823,18 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	f := newFixture(t)
 	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
-	wNarrow, err := New[RecNarrow](ctx, Config[RecNarrow]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	wNarrow, err := New[RecNarrow](ctx, StoreConfig[RecNarrow]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r RecNarrow) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
 		t.Fatalf("New(RecNarrow): %v", err)
@@ -1828,16 +1846,18 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	rWide, err := New[Rec](ctx, Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	rWide, err := New[Rec](ctx, StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
 		t.Fatalf("New(Rec): %v", err)
@@ -2228,16 +2248,18 @@ func TestWriteRead_NamedInt8EnumInNestedStruct(t *testing.T) {
 	f := newFixture(t)
 	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
 
-	store, err := New[ParquetRec](ctx, Config[ParquetRec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New[ParquetRec](ctx, StoreConfig[ParquetRec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r ParquetRec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -2633,17 +2655,19 @@ func TestInsertedAtField_PopulatedByWriter(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := New[RecWithMeta](ctx, Config[RecWithMeta]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New[RecWithMeta](ctx, StoreConfig[RecWithMeta]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r RecWithMeta) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
-		InsertedAtField:    "InsertedAt",
+		InsertedAtField: "InsertedAt",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -2695,17 +2719,19 @@ func TestInsertedAtField_ColumnIsAuthoritativeOverLastModified(t *testing.T) {
 		InsertedAt time.Time `parquet:"inserted_at,timestamp(millisecond)"`
 	}
 
-	store, err := New[RecWithMeta](ctx, Config[RecWithMeta]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New[RecWithMeta](ctx, StoreConfig[RecWithMeta]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r RecWithMeta) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		ConsistencyControl: ConsistencyStrongGlobal,
-		InsertedAtField:    "InsertedAt",
+		InsertedAtField: "InsertedAt",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -2920,19 +2946,21 @@ func newIdempotentStore(t *testing.T) *Store[Rec] {
 	t.Helper()
 	f := newFixture(t)
 	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
-	store, err := New[Rec](t.Context(), Config[Rec]{
-		Bucket:            f.Bucket,
-		Prefix:            "store",
-		S3Client:          f.S3Client,
-		PartitionKeyParts: []string{"period", "customer"},
+	store, err := New[Rec](t.Context(), StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            f.Bucket,
+			Prefix:            "store",
+			S3Client:          f.S3Client,
+			PartitionKeyParts: []string{"period", "customer"},
+			// MinIO is in fact strongly consistent; the claim keeps
+			// the upfront-LIST dedup gate linearized against prior
+			// writes on a multi-site StorageGRID-style backend.
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
 		PartitionKeyOf: func(r Rec) string {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		// MinIO is in fact strongly consistent; the claim keeps
-		// the upfront-LIST dedup gate linearized against prior
-		// writes on a multi-site StorageGRID-style backend.
-		ConsistencyControl: ConsistencyStrongGlobal,
 		EntityKeyOf: func(r Rec) string {
 			return r.Customer + "|" + r.SKU
 		},

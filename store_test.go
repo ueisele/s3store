@@ -17,25 +17,27 @@ type testRec struct {
 	Value    int64  `parquet:"value"`
 }
 
-func validConfig() Config[testRec] {
-	return Config[testRec]{
-		Bucket:            "b",
-		Prefix:            "p",
-		PartitionKeyParts: []string{"period", "customer"},
-		S3Client:          &s3.Client{},
+func validConfig() StoreConfig[testRec] {
+	return StoreConfig[testRec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:            "b",
+			Prefix:            "p",
+			PartitionKeyParts: []string{"period", "customer"},
+			S3Client:          &s3.Client{},
+		},
 	}
 }
 
 func TestNew_Validation(t *testing.T) {
 	cases := []struct {
 		name    string
-		mutate  func(*Config[testRec])
+		mutate  func(*StoreConfig[testRec])
 		wantSub string
 	}{
-		{"missing Bucket", func(c *Config[testRec]) { c.Bucket = "" }, "Bucket is required"},
-		{"missing Prefix", func(c *Config[testRec]) { c.Prefix = "" }, "Prefix is required"},
-		{"missing S3Client", func(c *Config[testRec]) { c.S3Client = nil }, "S3Client is required"},
-		{"missing PartitionKeyParts", func(c *Config[testRec]) { c.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
+		{"missing Bucket", func(c *StoreConfig[testRec]) { c.Bucket = "" }, "Bucket is required"},
+		{"missing Prefix", func(c *StoreConfig[testRec]) { c.Prefix = "" }, "Prefix is required"},
+		{"missing S3Client", func(c *StoreConfig[testRec]) { c.S3Client = nil }, "S3Client is required"},
+		{"missing PartitionKeyParts", func(c *StoreConfig[testRec]) { c.PartitionKeyParts = nil }, "PartitionKeyParts is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -158,7 +160,7 @@ func TestWriteEmptyRecords(t *testing.T) {
 // consulted the gating fact is whether the user asked for
 // dedup at all (by providing an entity key).
 func TestDedupEnabled(t *testing.T) {
-	c := Config[testRec]{}
+	c := StoreConfig[testRec]{}
 	if c.dedupEnabled() {
 		t.Error("dedupEnabled: no EntityKeyOf, want false")
 	}
@@ -174,17 +176,17 @@ func TestDedupEnabled(t *testing.T) {
 func TestNewRejectsPartialDedupConfig(t *testing.T) {
 	cases := []struct {
 		name   string
-		mutate func(*Config[testRec])
+		mutate func(*StoreConfig[testRec])
 	}{
 		{
 			name: "EntityKeyOf without VersionOf",
-			mutate: func(c *Config[testRec]) {
+			mutate: func(c *StoreConfig[testRec]) {
 				c.EntityKeyOf = func(r testRec) string { return r.Customer }
 			},
 		},
 		{
 			name: "VersionOf without EntityKeyOf",
-			mutate: func(c *Config[testRec]) {
+			mutate: func(c *StoreConfig[testRec]) {
 				c.VersionOf = func(r testRec) int64 { return r.Value }
 			},
 		},
@@ -194,7 +196,7 @@ func TestNewRejectsPartialDedupConfig(t *testing.T) {
 			cfg := validConfig()
 			tc.mutate(&cfg)
 			if _, err := newStoreFromTarget(cfg,
-				newS3TargetSkipConfig(s3TargetConfigFrom(cfg))); err == nil {
+				newS3TargetSkipConfig(cfg.S3TargetConfig)); err == nil {
 				t.Error("expected error, got nil")
 			}
 		})
@@ -209,7 +211,7 @@ func TestNewKeepsUserVersionOf(t *testing.T) {
 	cfg.VersionOf = func(r testRec) int64 { return r.Value * 2 }
 
 	s, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err != nil {
 		t.Fatalf("newStoreFromTarget: %v", err)
 	}
@@ -226,7 +228,7 @@ func TestNewKeepsUserVersionOf(t *testing.T) {
 // time window into the correct half-open offset range.
 func TestOffsetAt(t *testing.T) {
 	cfg := validConfig()
-	target := newS3TargetSkipConfig(s3TargetConfigFrom(cfg))
+	target := newS3TargetSkipConfig(cfg.S3TargetConfig)
 	s := &Reader[testRec]{
 		cfg:     readerConfigFrom(cfg, target),
 		refPath: "p/_ref",
@@ -256,17 +258,18 @@ func TestOffsetAt(t *testing.T) {
 	}
 }
 
-// TestWriterConfigMirroredInConfig guards the projection from the
-// unified Config onto WriterConfig: every non-Target field on
-// WriterConfig must also appear on Config with the same name and
-// type, so writerConfigFrom can forward it. Target is excluded
-// because Config flattens its fields to the top level. Without
-// this, adding a new write knob to WriterConfig and forgetting
-// Config would silently go unnoticed — Store users would see the
-// default, direct NewWriter users the override.
-func TestWriterConfigMirroredInConfig(t *testing.T) {
+// TestWriterConfigMirroredInStoreConfig guards the projection
+// from the unified StoreConfig onto WriterConfig: every non-Target
+// field on WriterConfig must also appear on StoreConfig with the
+// same name and type, so writerConfigFrom can forward it. Target
+// is excluded because StoreConfig embeds S3TargetConfig instead
+// (the Target is built from there at New time). Without this,
+// adding a new write knob to WriterConfig and forgetting
+// StoreConfig would silently go unnoticed — Store users would see
+// the default, direct NewWriter users the override.
+func TestWriterConfigMirroredInStoreConfig(t *testing.T) {
 	wc := reflect.TypeFor[WriterConfig[testRec]]()
-	c := reflect.TypeFor[Config[testRec]]()
+	c := reflect.TypeFor[StoreConfig[testRec]]()
 
 	for i := range wc.NumField() {
 		wf := wc.Field(i)
@@ -275,12 +278,12 @@ func TestWriterConfigMirroredInConfig(t *testing.T) {
 		}
 		cf, ok := c.FieldByName(wf.Name)
 		if !ok {
-			t.Errorf("WriterConfig field %q missing from Config",
+			t.Errorf("WriterConfig field %q missing from StoreConfig",
 				wf.Name)
 			continue
 		}
 		if wf.Type != cf.Type {
-			t.Errorf("WriterConfig.%s type %s != Config.%s type %s",
+			t.Errorf("WriterConfig.%s type %s != StoreConfig.%s type %s",
 				wf.Name, wf.Type, cf.Name, cf.Type)
 		}
 	}
@@ -295,7 +298,7 @@ func TestNewSkipsDefaultWhenNoEntityKey(t *testing.T) {
 	// both EntityKeyOf and VersionOf left nil
 
 	s, err := newStoreFromTarget(cfg,
-		newS3TargetSkipConfig(s3TargetConfigFrom(cfg)))
+		newS3TargetSkipConfig(cfg.S3TargetConfig))
 	if err != nil {
 		t.Fatalf("newStoreFromTarget: %v", err)
 	}
