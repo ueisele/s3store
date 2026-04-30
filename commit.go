@@ -116,12 +116,12 @@ func readTokenCommitMeta(meta map[string]string) (tokenCommitMeta, error) {
 	attemptID, ok := meta[attemptIDMetaKey]
 	if !ok {
 		return tokenCommitMeta{}, fmt.Errorf(
-			"s3store: token-commit missing %s metadata",
+			"token-commit missing %s metadata",
 			attemptIDMetaKey)
 	}
 	if len(attemptID) != attemptIDHexLen || !isLowerHex(attemptID) {
 		return tokenCommitMeta{}, fmt.Errorf(
-			"s3store: token-commit %s = %q (want %d lowercase hex chars)",
+			"token-commit %s = %q (want %d lowercase hex chars)",
 			attemptIDMetaKey, attemptID, attemptIDHexLen)
 	}
 	refMicroTs, err := readMicrosMeta(meta, refMicroTsMetaKey)
@@ -153,12 +153,12 @@ func readMicrosMeta(meta map[string]string, key string) (int64, error) {
 	raw, ok := meta[key]
 	if !ok {
 		return 0, fmt.Errorf(
-			"s3store: token-commit missing %s metadata", key)
+			"token-commit missing %s metadata", key)
 	}
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf(
-			"s3store: token-commit %s = %q: %w", key, raw, err)
+			"token-commit %s = %q: %w", key, raw, err)
 	}
 	return v, nil
 }
@@ -322,7 +322,7 @@ func gateByCommit(
 				dataPath, b.partition, b.token)
 			if err != nil {
 				return fmt.Errorf(
-					"s3store: head token-commit %s/%s: %w",
+					"head token-commit %s/%s: %w",
 					b.partition, b.token, err)
 			}
 			if !ok {

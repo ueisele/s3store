@@ -39,7 +39,7 @@ func (s *Reader[T]) Read(
 	keys, err := ResolvePatterns(
 		ctx, s.cfg.Target, keyPatterns, methodRead)
 	if err != nil {
-		return nil, fmt.Errorf("s3store: Read %w", err)
+		return nil, fmt.Errorf("Read: %w", err)
 	}
 	if len(keys) == 0 {
 		return nil, nil
@@ -149,13 +149,13 @@ func (s *Reader[T]) downloadAndDecodeOne(
 				scope.recordMissingData()
 				return nil, 0, nil
 			}
-			return nil, 0, fmt.Errorf("s3store: get %s: %w", key, err)
+			return nil, 0, fmt.Errorf("get %s: %w", key, err)
 		}
-		return nil, 0, fmt.Errorf("s3store: get %s: %w", key, err)
+		return nil, 0, fmt.Errorf("get %s: %w", key, err)
 	}
 	recs, err := decodeParquet[T](data)
 	if err != nil {
-		return nil, 0, fmt.Errorf("s3store: decode %s: %w", key, err)
+		return nil, 0, fmt.Errorf("decode %s: %w", key, err)
 	}
 	return recs, int64(len(data)), nil
 }

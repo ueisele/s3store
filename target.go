@@ -315,13 +315,13 @@ func (c S3TargetConfig) Validate() error {
 // ProjectionReader.
 func (c S3TargetConfig) ValidateLookup() error {
 	if c.Bucket == "" {
-		return fmt.Errorf("s3store: Bucket is required")
+		return errors.New("Bucket is required")
 	}
 	if c.Prefix == "" {
-		return fmt.Errorf("s3store: Prefix is required")
+		return errors.New("Prefix is required")
 	}
 	if c.S3Client == nil {
-		return fmt.Errorf("s3store: S3Client is required")
+		return errors.New("S3Client is required")
 	}
 	return nil
 }
@@ -468,25 +468,24 @@ func loadDurationConfig(
 	if err != nil {
 		if _, notFound := errors.AsType[*s3types.NoSuchKey](err); notFound {
 			return 0, fmt.Errorf(
-				"s3store: %s/%s missing — seed the dataset's "+
+				"%s/%s missing — seed the dataset's "+
 					"timing config before constructing a Target "+
 					"(see README \"Initializing a new dataset\")",
 				t.cfg.Bucket, key)
 		}
 		return 0, fmt.Errorf(
-			"s3store: get %s/%s: %w", t.cfg.Bucket, key, err)
+			"get %s/%s: %w", t.cfg.Bucket, key, err)
 	}
 	raw := strings.TrimSpace(string(body))
 	value, err := time.ParseDuration(raw)
 	if err != nil {
 		return 0, fmt.Errorf(
-			"s3store: %s/%s body %q: parse as time.Duration: %w",
+			"%s/%s body %q: parse as time.Duration: %w",
 			t.cfg.Bucket, key, raw, err)
 	}
 	if value < floor {
 		return 0, fmt.Errorf(
-			"s3store: %s/%s body %q resolves to %s, below the "+
-				"%s floor",
+			"%s/%s body %q resolves to %s, below the %s floor",
 			t.cfg.Bucket, key, raw, value, floor)
 	}
 	return value, nil

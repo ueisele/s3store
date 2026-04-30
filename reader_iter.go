@@ -50,7 +50,7 @@ func (s *Reader[T]) ReadIter(
 		keys, err := ResolvePatterns(
 			ctx, s.cfg.Target, keyPatterns, methodReadIter)
 		if err != nil {
-			iterErr = fmt.Errorf("s3store: ReadIter %w", err)
+			iterErr = fmt.Errorf("ReadIter: %w", err)
 			yield(*new(T), iterErr)
 			return
 		}
@@ -452,12 +452,12 @@ func (s *Reader[T]) runDownloader(
 					continue
 				}
 				state.markComplete(job.partIdx, job.fileIdx, nil,
-					fmt.Errorf("s3store: get %s: %w", key, err))
+					fmt.Errorf("get %s: %w", key, err))
 				cancel()
 				continue
 			}
 			state.markComplete(job.partIdx, job.fileIdx, nil,
-				fmt.Errorf("s3store: get %s: %w", key, err))
+				fmt.Errorf("get %s: %w", key, err))
 			cancel()
 			continue
 		}
@@ -557,7 +557,7 @@ func (s *Reader[T]) decodePartition(
 		state.releaseBodySlots(1)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3store: decode %s: %w", ps.files[fi].Key, err)
+				"decode %s: %w", ps.files[fi].Key, err)
 		}
 		out = append(out, recs...)
 	}
@@ -818,7 +818,7 @@ func footerStats(p *partState) (uncomp, totalRows int64, err error) {
 			bytes.NewReader(body), int64(len(body)))
 		if openErr != nil {
 			return 0, 0, fmt.Errorf(
-				"s3store: open %s: %w", p.files[fi].Key, openErr)
+				"open %s: %w", p.files[fi].Key, openErr)
 		}
 		for _, rg := range f.Metadata().RowGroups {
 			uncomp += rg.TotalByteSize

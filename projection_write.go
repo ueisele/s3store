@@ -36,7 +36,7 @@ func buildProjectionWriters[T any](
 		}
 		if _, dup := seenNames[def.Name]; dup {
 			return nil, fmt.Errorf(
-				"s3store: duplicate projection name %q in WriterConfig.Projections",
+				"duplicate projection name %q in WriterConfig.Projections",
 				def.Name)
 		}
 		seenNames[def.Name] = struct{}{}
@@ -82,7 +82,7 @@ func (s *Writer[T]) collectProjectionMarkerPaths(records []T) ([]string, error) 
 			p, err := proj.pathOf(rec)
 			if err != nil {
 				return nil, fmt.Errorf(
-					"s3store: projection %q: %w", proj.name, err)
+					"projection %q: %w", proj.name, err)
 			}
 			if p == "" {
 				continue

@@ -95,7 +95,7 @@ func makeID(token, attemptID string) string {
 func newAttemptID() (string, error) {
 	u, err := uuid.NewV7()
 	if err != nil {
-		return "", fmt.Errorf("s3store: generate UUIDv7: %w", err)
+		return "", fmt.Errorf("generate UUIDv7: %w", err)
 	}
 	return hex.EncodeToString(u[:]), nil
 }
@@ -131,17 +131,17 @@ func parseAttemptID(id string) (token, attemptID string, err error) {
 	const tail = 1 + attemptIDHexLen // "-{attemptID}"
 	if len(id) < tail+1 {
 		return "", "", fmt.Errorf(
-			"s3store: id %q too short for <token>-<attemptID:%d>",
+			"id %q too short for <token>-<attemptID:%d>",
 			id, attemptIDHexLen)
 	}
 	if id[len(id)-tail] != '-' {
 		return "", "", fmt.Errorf(
-			"s3store: id %q: missing '-' before attemptID", id)
+			"id %q: missing '-' before attemptID", id)
 	}
 	attemptID = id[len(id)-attemptIDHexLen:]
 	if !isLowerHex(attemptID) {
 		return "", "", fmt.Errorf(
-			"s3store: id %q: attemptID %q is not %d lowercase-hex chars",
+			"id %q: attemptID %q is not %d lowercase-hex chars",
 			id, attemptID, attemptIDHexLen)
 	}
 	token = id[:len(id)-tail]
@@ -239,7 +239,7 @@ func parseRefKey(refKey string) (
 	parts := strings.SplitN(name, refSeparator, 2)
 	if len(parts) != 2 {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid ref key: %s", refKey)
+			"invalid ref key: %s", refKey)
 	}
 	pre, hiveEsc := parts[0], parts[1]
 
@@ -252,52 +252,52 @@ func parseRefKey(refKey string) (
 	const minPreLen = refMicroTsLen + 1 + 1 + 1 + attemptIDHexLen
 	if len(pre) < minPreLen {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid ref key %q: pre-separator too short",
+			"invalid ref key %q: pre-separator too short",
 			refKey)
 	}
 	if pre[refMicroTsLen] != '-' {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid ref key %q: missing '-' after refMicroTs",
+			"invalid ref key %q: missing '-' after refMicroTs",
 			refKey)
 	}
 	if pre[len(pre)-attemptIDHexLen-1] != '-' {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid ref key %q: missing '-' before attemptID",
+			"invalid ref key %q: missing '-' before attemptID",
 			refKey)
 	}
 	tsStr := pre[:refMicroTsLen]
 	for i := 0; i < refMicroTsLen; i++ {
 		if tsStr[i] < '0' || tsStr[i] > '9' {
 			return "", 0, "", "", fmt.Errorf(
-				"s3store: invalid ref key %q: refMicroTs has non-digit",
+				"invalid ref key %q: refMicroTs has non-digit",
 				refKey)
 		}
 	}
 	refMicroTs, err = strconv.ParseInt(tsStr, 10, 64)
 	if err != nil {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid refMicroTs in ref key %q: %w",
+			"invalid refMicroTs in ref key %q: %w",
 			refKey, err)
 	}
 
 	attemptID = pre[len(pre)-attemptIDHexLen:]
 	if !isLowerHex(attemptID) {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid ref key %q: attemptID %q not lowercase hex",
+			"invalid ref key %q: attemptID %q not lowercase hex",
 			refKey, attemptID)
 	}
 
 	token = pre[refMicroTsLen+1 : len(pre)-attemptIDHexLen-1]
 	if token == "" {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid ref key %q: token segment is empty",
+			"invalid ref key %q: token segment is empty",
 			refKey)
 	}
 
 	hiveKey, err = url.PathUnescape(hiveEsc)
 	if err != nil {
 		return "", 0, "", "", fmt.Errorf(
-			"s3store: invalid ref key %q: %w", refKey, err)
+			"invalid ref key %q: %w", refKey, err)
 	}
 	return hiveKey, refMicroTs, token, attemptID, nil
 }

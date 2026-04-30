@@ -1,6 +1,7 @@
 package s3store
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -25,28 +26,26 @@ import (
 //     under S3's 1024-byte key limit even with long Hive keys
 func validateIdempotencyToken(token string) error {
 	if token == "" {
-		return fmt.Errorf(
-			"s3store: IdempotencyToken must not be empty")
+		return errors.New("IdempotencyToken must not be empty")
 	}
 	if len(token) > 200 {
 		return fmt.Errorf(
-			"s3store: IdempotencyToken must be <= 200 characters "+
-				"(got %d)", len(token))
+			"IdempotencyToken must be <= 200 characters (got %d)",
+			len(token))
 	}
 	if strings.Contains(token, "/") {
 		return fmt.Errorf(
-			"s3store: IdempotencyToken %q must not contain '/'",
-			token)
+			"IdempotencyToken %q must not contain '/'", token)
 	}
 	if strings.Contains(token, ";") {
 		return fmt.Errorf(
-			"s3store: IdempotencyToken %q must not contain "+
+			"IdempotencyToken %q must not contain "+
 				"';' (reserved as the ref-filename header/hive "+
 				"separator)", token)
 	}
 	if strings.Contains(token, "..") {
 		return fmt.Errorf(
-			"s3store: IdempotencyToken %q must not contain "+
+			"IdempotencyToken %q must not contain "+
 				"'..' (reserved by the key-pattern grammar)",
 			token)
 	}
@@ -54,7 +53,7 @@ func validateIdempotencyToken(token string) error {
 		c := token[i]
 		if c < 0x21 || c > 0x7E {
 			return fmt.Errorf(
-				"s3store: IdempotencyToken %q contains a "+
+				"IdempotencyToken %q contains a "+
 					"non-printable-ASCII byte at index %d "+
 					"(want 0x21..0x7E)", token, i)
 		}

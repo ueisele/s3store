@@ -3,6 +3,7 @@ package s3store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"reflect"
@@ -121,8 +122,8 @@ func (s *Writer[T]) Write(
 		return nil, nil
 	}
 	if s.cfg.PartitionKeyOf == nil {
-		return nil, fmt.Errorf(
-			"s3store: PartitionKeyOf is required for Write; " +
+		return nil, errors.New(
+			"PartitionKeyOf is required for Write; " +
 				"use WriteWithKey for explicit keys")
 	}
 	results, err = s.writeGroupedFanOut(ctx, records,
@@ -151,15 +152,15 @@ func resolveWriteOpts[T any](opts []WriteOption, records []T) (writeOpts, error)
 	var w writeOpts
 	w.apply(opts...)
 	if w.idempotencyToken != "" && w.idempotencyTokenFn != nil {
-		return writeOpts{}, fmt.Errorf(
-			"s3store: WithIdempotencyToken and WithIdempotencyTokenOf " +
+		return writeOpts{}, errors.New(
+			"WithIdempotencyToken and WithIdempotencyTokenOf " +
 				"are mutually exclusive")
 	}
 	if w.idempotencyTokenFn != nil {
 		fn, ok := w.idempotencyTokenFn.(func([]T) (string, error))
 		if !ok {
 			return writeOpts{}, fmt.Errorf(
-				"s3store: WithIdempotencyTokenOf: closure type %T does not "+
+				"WithIdempotencyTokenOf: closure type %T does not "+
 					"match writer's record type — pass "+
 					"WithIdempotencyTokenOf[T] with the same T as the Writer",
 				w.idempotencyTokenFn)
@@ -167,11 +168,11 @@ func resolveWriteOpts[T any](opts []WriteOption, records []T) (writeOpts, error)
 		token, err := fn(records)
 		if err != nil {
 			return writeOpts{}, fmt.Errorf(
-				"s3store: WithIdempotencyTokenOf: %w", err)
+				"WithIdempotencyTokenOf: %w", err)
 		}
 		if err := validateIdempotencyToken(token); err != nil {
 			return writeOpts{}, fmt.Errorf(
-				"s3store: WithIdempotencyTokenOf: %w", err)
+				"WithIdempotencyTokenOf: %w", err)
 		}
 		w.idempotencyToken = token
 	} else if w.idempotencyToken != "" {
@@ -328,8 +329,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 	parquetBytes, err := encodeParquet(
 		records, s.compressionCodec)
 	if err != nil {
-		return nil, 0, fmt.Errorf(
-			"s3store: parquet encode: %w", err)
+		return nil, 0, fmt.Errorf("parquet encode: %w", err)
 	}
 	r, err := s.writeEncodedPayload(
 		ctx, key, records, parquetBytes, writeStartTime, o)
@@ -430,8 +430,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	if token == "" {
 		auto, err := newAttemptID()
 		if err != nil {
-			return nil, fmt.Errorf(
-				"s3store: generate auto-token: %w", err)
+			return nil, fmt.Errorf("generate auto-token: %w", err)
 		}
 		token = auto
 		autoToken = true
@@ -444,8 +443,7 @@ func (s *Writer[T]) writeEncodedPayload(
 		meta, exists, err := headTokenCommit(ctx, s.cfg.Target,
 			s.dataPath, key, token)
 		if err != nil {
-			return nil, fmt.Errorf(
-				"s3store: head token-commit: %w", err)
+			return nil, fmt.Errorf("head token-commit: %w", err)
 		}
 		if exists {
 			wr := reconstructWriteResult(s.dataPath, s.refPath,
@@ -463,8 +461,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	} else {
 		fresh, err := newAttemptID()
 		if err != nil {
-			return nil, fmt.Errorf(
-				"s3store: generate attempt-id: %w", err)
+			return nil, fmt.Errorf("generate attempt-id: %w", err)
 		}
 		attemptID = fresh
 	}
@@ -473,15 +470,14 @@ func (s *Writer[T]) writeEncodedPayload(
 
 	// Step 4: projection markers, before data (Phase 3 ordering).
 	if err := s.putMarkers(ctx, markerPaths); err != nil {
-		return nil, fmt.Errorf(
-			"s3store: put projection markers: %w", err)
+		return nil, fmt.Errorf("put projection markers: %w", err)
 	}
 
 	// Step 5: data PUT to fresh path. Unconditional (path is
 	// unique per attempt by construction).
 	if err := s.cfg.Target.put(ctx, dataKey, parquetBytes,
 		"application/octet-stream"); err != nil {
-		return nil, fmt.Errorf("s3store: put data: %w", err)
+		return nil, fmt.Errorf("put data: %w", err)
 	}
 
 	// Step 6 + 7: ref PUT and token-commit PUT issue under a
@@ -504,7 +500,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	refKey := encodeRefKey(s.refPath, refMicroTs, token, attemptID, key)
 	if err := s.cfg.Target.put(commitCtx, refKey, []byte{},
 		"application/octet-stream"); err != nil {
-		return nil, fmt.Errorf("s3store: put ref: %w", err)
+		return nil, fmt.Errorf("put ref: %w", err)
 	}
 
 	// Step 7: token-commit PUT with attempt-id, refMicroTs,
@@ -516,8 +512,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	if err := putTokenCommit(commitCtx, s.cfg.Target,
 		s.dataPath, key, token, attemptID,
 		refMicroTs, writeStartTime.UnixMicro(), rowCount); err != nil {
-		return nil, fmt.Errorf(
-			"s3store: put token-commit: %w", err)
+		return nil, fmt.Errorf("put token-commit: %w", err)
 	}
 
 	// Step 8: writer-local contract enforcement. Past
@@ -542,7 +537,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	if elapsed := time.Since(tCommitWindowStart); elapsed > commitTimeout {
 		s.cfg.Target.metrics.recordCommitAfterTimeout(ctx)
 		return nil, fmt.Errorf(
-			"s3store: write committed after CommitTimeout "+
+			"write committed after CommitTimeout "+
 				"(elapsed %v > %v from ref PUT) — stream reader's "+
 				"SettleWindow may not include this write; data is "+
 				"durable at %s, retry with the same "+
@@ -582,8 +577,7 @@ func (s *Writer[T]) validateKey(key string) error {
 	segments := strings.Split(key, "/")
 	if len(segments) != len(s.cfg.Target.PartitionKeyParts()) {
 		return fmt.Errorf(
-			"s3store: key %q has %d segments, "+
-				"expected %d (%v)",
+			"key %q has %d segments, expected %d (%v)",
 			key, len(segments),
 			len(s.cfg.Target.PartitionKeyParts()), s.cfg.Target.PartitionKeyParts())
 	}
@@ -592,14 +586,13 @@ func (s *Writer[T]) validateKey(key string) error {
 		prefix := part + "="
 		if !strings.HasPrefix(seg, prefix) {
 			return fmt.Errorf(
-				"s3store: key %q segment %d is %q, "+
-					"expected prefix %q",
+				"key %q segment %d is %q, expected prefix %q",
 				key, i, seg, prefix)
 		}
 		value := seg[len(prefix):]
 		if err := validateHivePartitionValue(value); err != nil {
 			return fmt.Errorf(
-				"s3store: key %q segment %d (%q): %w",
+				"key %q segment %d (%q): %w",
 				key, i, part, err)
 		}
 	}

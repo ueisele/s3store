@@ -1,6 +1,7 @@
 package s3store
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -135,14 +136,14 @@ type Layout struct {
 // NewWriter.
 func validateProjectionDefShape(name string, columns []string) error {
 	if name == "" {
-		return fmt.Errorf("s3store: projection: Name is required")
+		return errors.New("projection: Name is required")
 	}
 	if strings.Contains(name, "/") {
 		return fmt.Errorf(
-			"s3store: projection: Name %q must not contain '/'", name)
+			"projection: Name %q must not contain '/'", name)
 	}
 	if err := validatePartitionKeyParts(columns); err != nil {
-		return fmt.Errorf("s3store: projection %q: %w", name, err)
+		return fmt.Errorf("projection %q: %w", name, err)
 	}
 	return nil
 }
@@ -256,7 +257,7 @@ func resolveOf[T any](def ProjectionDef[T]) (func(T) ([]string, error), error) {
 	plans, err := buildFieldPlans(
 		reflect.TypeFor[T](), def.Columns, def.Layout, false, "Of")
 	if err != nil {
-		return nil, fmt.Errorf("s3store: projection %q: %w", def.Name, err)
+		return nil, fmt.Errorf("projection %q: %w", def.Name, err)
 	}
 	return func(rec T) ([]string, error) {
 		v := reflect.ValueOf(rec)
@@ -313,21 +314,21 @@ func parseProjectionMarkerKey(
 	prefix := projectionPath + "/"
 	if !strings.HasPrefix(markerKey, prefix) {
 		return nil, fmt.Errorf(
-			"s3store: marker key %q outside projection path %q",
+			"marker key %q outside projection path %q",
 			markerKey, projectionPath)
 	}
 	body := markerKey[len(prefix):]
 	tail := "/" + projectionMarkerFilename
 	if !strings.HasSuffix(body, tail) {
 		return nil, fmt.Errorf(
-			"s3store: marker key %q missing %q suffix",
+			"marker key %q missing %q suffix",
 			markerKey, projectionMarkerFilename)
 	}
 	body = body[:len(body)-len(tail)]
 	segs := strings.Split(body, "/")
 	if len(segs) != len(columns) {
 		return nil, fmt.Errorf(
-			"s3store: marker key %q has %d segments, want %d",
+			"marker key %q has %d segments, want %d",
 			markerKey, len(segs), len(columns))
 	}
 	out := make([]string, len(columns))
@@ -335,8 +336,7 @@ func parseProjectionMarkerKey(
 		colPrefix := columns[i] + "="
 		if !strings.HasPrefix(seg, colPrefix) {
 			return nil, fmt.Errorf(
-				"s3store: marker key %q segment %d is %q, "+
-					"expected prefix %q",
+				"marker key %q segment %d is %q, expected prefix %q",
 				markerKey, i, seg, colPrefix)
 		}
 		out[i] = seg[len(colPrefix):]
@@ -360,19 +360,19 @@ func markerPathFromValues(
 ) (string, error) {
 	if len(values) != len(columns) {
 		return "", fmt.Errorf(
-			"s3store: projection %q: Of returned %d values, want %d "+
+			"projection %q: Of returned %d values, want %d "+
 				"(one per Column)", name, len(values), len(columns))
 	}
 	for j, col := range columns {
 		if err := validateHivePartitionValue(values[j]); err != nil {
 			return "", fmt.Errorf(
-				"s3store: projection %q column %q: %w", name, col, err)
+				"projection %q column %q: %w", name, col, err)
 		}
 	}
 	p := buildProjectionMarkerPath(projectionPath, columns, values)
 	if len(p) > maxMarkerKeyLen {
 		return "", fmt.Errorf(
-			"s3store: projection %q marker key is %d bytes, exceeds "+
+			"projection %q marker key is %d bytes, exceeds "+
 				"%d (S3 limit is 1024; narrow Columns or shorten "+
 				"values)", name, len(p), maxMarkerKeyLen)
 	}

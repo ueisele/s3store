@@ -97,7 +97,7 @@ func BackfillProjection[T any](
 	plans, err := buildReadPlans(keyPatterns, dataPath, target.PartitionKeyParts())
 	if err != nil {
 		return stats, fmt.Errorf(
-			"s3store: BackfillProjection %w", err)
+			"BackfillProjection: %w", err)
 	}
 
 	keys, commits, err := listDataFiles(ctx, target, plans)
@@ -159,7 +159,7 @@ func BackfillProjection[T any](
 					ctx, p, nil, "application/octet-stream",
 				); err != nil {
 					return fmt.Errorf(
-						"s3store: backfill projection %q: put marker: %w",
+						"backfill projection %q: put marker: %w",
 						def.Name, err)
 				}
 			}
@@ -190,12 +190,12 @@ func backfillMarkersForObject[T any](
 	data, err := target.get(ctx, key)
 	if err != nil {
 		return nil, 0, fmt.Errorf(
-			"s3store: backfill get %s: %w", key, err)
+			"backfill get %s: %w", key, err)
 	}
 	recs, err := decodeParquet[T](data)
 	if err != nil {
 		return nil, 0, fmt.Errorf(
-			"s3store: backfill decode %s: %w", key, err)
+			"backfill decode %s: %w", key, err)
 	}
 
 	seen := make(map[string]struct{})
@@ -203,7 +203,7 @@ func backfillMarkersForObject[T any](
 		values, err := of(rec)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"s3store: backfill projection %q on %s: %w",
+				"backfill projection %q on %s: %w",
 				name, key, err)
 		}
 		if values == nil {
@@ -212,7 +212,7 @@ func backfillMarkersForObject[T any](
 		p, err := markerPathFromValues(name, projectionPath, columns, values)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"s3store: backfill projection %q on %s: %w",
+				"backfill projection %q on %s: %w",
 				name, key, err)
 		}
 		seen[p] = struct{}{}

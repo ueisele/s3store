@@ -219,7 +219,7 @@ func resolveCompression(c CompressionCodec) (compress.Codec, error) {
 		return &parquet.Uncompressed, nil
 	}
 	return nil, fmt.Errorf(
-		"s3store: unknown Compression %q (want snappy, "+
+		"unknown Compression %q (want snappy, "+
 			"zstd, gzip, or uncompressed)", c)
 }
 
@@ -238,25 +238,25 @@ func validateInsertedAtField[T any](name string) ([]int, error) {
 	rt := reflect.TypeFor[T]()
 	if rt.Kind() != reflect.Struct {
 		return nil, fmt.Errorf(
-			"s3store: InsertedAtField requires T to be a struct, got %s",
+			"InsertedAtField requires T to be a struct, got %s",
 			rt)
 	}
 	f, ok := rt.FieldByName(name)
 	if !ok {
 		return nil, fmt.Errorf(
-			"s3store: InsertedAtField %q: no such field on %s",
+			"InsertedAtField %q: no such field on %s",
 			name, rt)
 	}
 	if f.Type != reflect.TypeFor[time.Time]() {
 		return nil, fmt.Errorf(
-			"s3store: InsertedAtField %q: must be time.Time, got %s",
+			"InsertedAtField %q: must be time.Time, got %s",
 			name, f.Type)
 	}
 	tag := f.Tag.Get("parquet")
 	name0, _, _ := strings.Cut(tag, ",")
 	if name0 == "" || name0 == "-" {
 		return nil, fmt.Errorf(
-			"s3store: InsertedAtField %q: must carry a non-empty, "+
+			"InsertedAtField %q: must carry a non-empty, "+
 				"non-\"-\" parquet tag so the value persists as a real "+
 				"parquet column (got %q)", name, tag)
 	}

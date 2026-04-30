@@ -2,6 +2,7 @@ package s3store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -93,8 +94,7 @@ func (s *Reader[T]) Poll(
 		scope.end(&err)
 	}()
 	if maxEntries <= 0 {
-		return nil, since, fmt.Errorf(
-			"s3store: maxEntries must be > 0")
+		return nil, since, errors.New("maxEntries must be > 0")
 	}
 
 	var o pollOpts
@@ -174,10 +174,10 @@ func (s *Reader[T]) Poll(
 			return true, nil
 		})
 	if gateErr != nil {
-		return nil, since, fmt.Errorf("s3store: gate ref by commit: %w", gateErr)
+		return nil, since, fmt.Errorf("gate ref by commit: %w", gateErr)
 	}
 	if listErr != nil {
-		return nil, since, fmt.Errorf("s3store: list refs: %w", listErr)
+		return nil, since, fmt.Errorf("list refs: %w", listErr)
 	}
 
 	if lastKey != "" {

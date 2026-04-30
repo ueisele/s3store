@@ -2,7 +2,7 @@ package s3store
 
 import (
 	"cmp"
-	"fmt"
+	"errors"
 )
 
 // ReaderConfig is the narrower Config form for constructing a
@@ -63,8 +63,8 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 		return nil, err
 	}
 	if (cfg.EntityKeyOf == nil) != (cfg.VersionOf == nil) {
-		return nil, fmt.Errorf(
-			"s3store: EntityKeyOf and VersionOf must be set together")
+		return nil, errors.New(
+			"EntityKeyOf and VersionOf must be set together")
 	}
 	return &Reader[T]{
 		cfg:      cfg,
@@ -111,8 +111,7 @@ func NewReaderFromWriter[T, U any](
 	w *Writer[U], cfg ReaderConfig[T],
 ) (*Reader[T], error) {
 	if w == nil {
-		return nil, fmt.Errorf(
-			"s3store: NewReaderFromWriter: writer is nil")
+		return nil, errors.New("NewReaderFromWriter: writer is nil")
 	}
 	cfg.Target = w.cfg.Target
 	return NewReader(cfg)
@@ -127,8 +126,7 @@ func NewReaderFromStore[T, U any](
 	s *Store[U], cfg ReaderConfig[T],
 ) (*Reader[T], error) {
 	if s == nil {
-		return nil, fmt.Errorf(
-			"s3store: NewReaderFromStore: store is nil")
+		return nil, errors.New("NewReaderFromStore: store is nil")
 	}
 	return NewReaderFromWriter(s.Writer, cfg)
 }

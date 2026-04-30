@@ -45,7 +45,7 @@ func NewProjectionReader[K comparable](
 		b, err := defaultBinder[K](def.Columns, def.Layout)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3store: projection %q: %w", def.Name, err)
+				"projection %q: %w", def.Name, err)
 		}
 		bind = b
 	}
@@ -130,7 +130,7 @@ func (i *ProjectionReader[K]) Lookup(
 	plans, err := buildReadPlans(patterns, i.projectionPath, i.columns)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"s3store: projection %q Lookup %w", i.name, err)
+			"projection %q Lookup: %w", i.name, err)
 	}
 
 	keys, err := i.listAllMatchingMarkers(ctx, plans)
@@ -148,7 +148,7 @@ func (i *ProjectionReader[K]) Lookup(
 		k, err := i.bind(values)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"s3store: projection %q: %w", i.name, err)
+				"projection %q: %w", i.name, err)
 		}
 		out = append(out, k)
 	}
@@ -190,7 +190,7 @@ func (i *ProjectionReader[K]) listAllMatchingMarkers(
 				})
 			if err != nil {
 				return nil, fmt.Errorf(
-					"s3store: projection %q list: %w", i.name, err)
+					"projection %q list: %w", i.name, err)
 			}
 			return keys, nil
 		},
