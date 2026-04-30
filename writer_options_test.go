@@ -8,25 +8,25 @@ import (
 )
 
 func TestWithIdempotencyToken(t *testing.T) {
-	var o WriteOpts
+	var o writeOpts
 	WithIdempotencyToken("tok-1")(&o)
-	if o.IdempotencyToken != "tok-1" {
-		t.Errorf("IdempotencyToken = %q, want %q",
-			o.IdempotencyToken, "tok-1")
+	if o.idempotencyToken != "tok-1" {
+		t.Errorf("idempotencyToken = %q, want %q",
+			o.idempotencyToken, "tok-1")
 	}
 }
 
 func TestWithIdempotencyTokenOf_StoresFn(t *testing.T) {
-	var o WriteOpts
+	var o writeOpts
 	fn := func(_ []testRec) (string, error) { return "x", nil }
 	WithIdempotencyTokenOf(fn)(&o)
-	if o.IdempotencyTokenFn == nil {
-		t.Fatal("IdempotencyTokenFn was not stored")
+	if o.idempotencyTokenFn == nil {
+		t.Fatal("idempotencyTokenFn was not stored")
 	}
-	got, ok := o.IdempotencyTokenFn.(func([]testRec) (string, error))
+	got, ok := o.idempotencyTokenFn.(func([]testRec) (string, error))
 	if !ok {
-		t.Fatalf("IdempotencyTokenFn type = %T, want func([]testRec) (string, error)",
-			o.IdempotencyTokenFn)
+		t.Fatalf("idempotencyTokenFn type = %T, want func([]testRec) (string, error)",
+			o.idempotencyTokenFn)
 	}
 	v, err := got(nil)
 	if err != nil || v != "x" {
@@ -35,10 +35,10 @@ func TestWithIdempotencyTokenOf_StoresFn(t *testing.T) {
 }
 
 func TestWithIdempotencyTokenOf_NilFnIsNoop(t *testing.T) {
-	var o WriteOpts
+	var o writeOpts
 	WithIdempotencyTokenOf[testRec](nil)(&o)
-	if o.IdempotencyTokenFn != nil {
-		t.Errorf("nil fn should be a no-op, got %T", o.IdempotencyTokenFn)
+	if o.idempotencyTokenFn != nil {
+		t.Errorf("nil fn should be a no-op, got %T", o.idempotencyTokenFn)
 	}
 }
 
@@ -68,19 +68,19 @@ func TestResolveWriteOpts_StaticOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveWriteOpts: %v", err)
 	}
-	if o.IdempotencyToken != "tok-1" {
-		t.Errorf("IdempotencyToken = %q, want %q",
-			o.IdempotencyToken, "tok-1")
+	if o.idempotencyToken != "tok-1" {
+		t.Errorf("idempotencyToken = %q, want %q",
+			o.idempotencyToken, "tok-1")
 	}
-	if o.IdempotencyTokenFn != nil {
-		t.Errorf("IdempotencyTokenFn should be nil, got %T",
-			o.IdempotencyTokenFn)
+	if o.idempotencyTokenFn != nil {
+		t.Errorf("idempotencyTokenFn should be nil, got %T",
+			o.idempotencyTokenFn)
 	}
 }
 
 // TestResolveWriteOpts_FnInvoked: the per-partition fn runs
 // inside resolveWriteOpts; its return value populates
-// IdempotencyToken so downstream code reads a single resolved
+// idempotencyToken so downstream code reads a single resolved
 // field regardless of which option the caller passed.
 func TestResolveWriteOpts_FnInvoked(t *testing.T) {
 	recs := []testRec{
@@ -98,9 +98,9 @@ func TestResolveWriteOpts_FnInvoked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveWriteOpts: %v", err)
 	}
-	if o.IdempotencyToken != "tok-from-fn" {
-		t.Errorf("IdempotencyToken = %q, want %q",
-			o.IdempotencyToken, "tok-from-fn")
+	if o.idempotencyToken != "tok-from-fn" {
+		t.Errorf("idempotencyToken = %q, want %q",
+			o.idempotencyToken, "tok-from-fn")
 	}
 	if len(seen) != len(recs) {
 		t.Fatalf("fn received %d records, want %d", len(seen), len(recs))
@@ -142,16 +142,16 @@ func TestResolveWriteOpts_FnReturnsInvalidToken(t *testing.T) {
 
 // TestResolveWriteOpts_FnTypeMismatch: a closure typed for a
 // different T than the writer's T surfaces a clear error at
-// resolution time. The type-erased IdempotencyTokenFn (any) is
+// resolution time. The type-erased idempotencyTokenFn (any) is
 // asserted to func([]T) (string, error) for the writer's T —
 // without this guard a typo'd generic instantiation would crash
 // with a stale "interface conversion" message inside the writer.
 func TestResolveWriteOpts_FnTypeMismatch(t *testing.T) {
 	mismatchFn := func(_ []string) (string, error) { return "x", nil }
-	var o WriteOpts
-	o.IdempotencyTokenFn = mismatchFn
+	var o writeOpts
+	o.idempotencyTokenFn = mismatchFn
 	_, err := resolveWriteOpts[testRec]([]WriteOption{
-		func(w *WriteOpts) { *w = o },
+		func(w *writeOpts) { *w = o },
 	}, nil)
 	if err == nil {
 		t.Fatal("expected error from closure-T / writer-T mismatch")
@@ -173,19 +173,19 @@ func TestResolveWriteOpts_StaticInvalidToken(t *testing.T) {
 
 func TestWithInsertedAt(t *testing.T) {
 	want := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
-	var o WriteOpts
+	var o writeOpts
 	WithInsertedAt(want)(&o)
-	if !o.InsertedAt.Equal(want) {
-		t.Errorf("InsertedAt = %v, want %v", o.InsertedAt, want)
+	if !o.insertedAt.Equal(want) {
+		t.Errorf("insertedAt = %v, want %v", o.insertedAt, want)
 	}
 }
 
 func TestWithInsertedAt_ZeroIsNotSupplied(t *testing.T) {
-	var o WriteOpts
+	var o writeOpts
 	WithInsertedAt(time.Time{})(&o)
-	if !o.InsertedAt.IsZero() {
+	if !o.insertedAt.IsZero() {
 		t.Errorf("zero-value time should round-trip as zero, got %v",
-			o.InsertedAt)
+			o.insertedAt)
 	}
 }
 
@@ -197,7 +197,7 @@ func TestResolveWriteOpts_WithInsertedAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveWriteOpts: %v", err)
 	}
-	if !o.InsertedAt.Equal(want) {
-		t.Errorf("InsertedAt = %v, want %v", o.InsertedAt, want)
+	if !o.insertedAt.Equal(want) {
+		t.Errorf("insertedAt = %v, want %v", o.insertedAt, want)
 	}
 }

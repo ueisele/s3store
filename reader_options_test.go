@@ -3,25 +3,25 @@ package s3store
 import "testing"
 
 func TestWithHistory(t *testing.T) {
-	var o QueryOpts
+	var o readOpts
 	WithHistory()(&o)
-	if !o.IncludeHistory {
-		t.Error("WithHistory() didn't set IncludeHistory=true")
+	if !o.includeHistory {
+		t.Error("WithHistory() didn't set includeHistory=true")
 	}
 }
 
-func TestQueryOptsApply(t *testing.T) {
-	var o QueryOpts
-	o.Apply(WithHistory())
-	if !o.IncludeHistory {
-		t.Error("Apply(WithHistory()) didn't set IncludeHistory=true")
+func TestReadOptsApply(t *testing.T) {
+	var o readOpts
+	o.apply(WithHistory())
+	if !o.includeHistory {
+		t.Error("apply(WithHistory()) didn't set includeHistory=true")
 	}
 }
 
-func TestQueryOptsApplyNoopOnZero(t *testing.T) {
-	var o QueryOpts
-	o.Apply()
-	if o.IncludeHistory {
-		t.Error("Apply() with no options should leave IncludeHistory=false")
+func TestReadOptsApplyNoopOnZero(t *testing.T) {
+	var o readOpts
+	o.apply()
+	if o.includeHistory {
+		t.Error("apply() with no options should leave includeHistory=false")
 	}
 }

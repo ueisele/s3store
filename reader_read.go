@@ -29,12 +29,12 @@ import (
 // use ReadIter instead. Empty patterns slice returns (nil, nil);
 // a malformed pattern fails with the offending index.
 func (s *Reader[T]) Read(
-	ctx context.Context, keyPatterns []string, opts ...QueryOption,
+	ctx context.Context, keyPatterns []string, opts ...ReadOption,
 ) (out []T, err error) {
 	scope := s.cfg.Target.metrics.methodScope(ctx, methodRead)
 	defer scope.end(&err)
-	var o QueryOpts
-	o.Apply(opts...)
+	var o readOpts
+	o.apply(opts...)
 
 	keys, err := ResolvePatterns(
 		ctx, s.cfg.Target, keyPatterns, methodRead)
@@ -53,7 +53,7 @@ func (s *Reader[T]) Read(
 	if err != nil {
 		return nil, err
 	}
-	out = s.sortAndCollect(records, o.IncludeHistory)
+	out = s.sortAndCollect(records, o.includeHistory)
 	scope.addRecords(int64(len(out)))
 	scope.addFiles(int64(len(keys)))
 	scope.addBytes(bytesTotal)

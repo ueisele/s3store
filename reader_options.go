@@ -1,16 +1,18 @@
 package s3store
 
-// QueryOption configures read-path behavior. Shared across
+// ReadOption configures read-path behavior. Shared across
 // snapshot reads (Read / ReadIter / ReadRangeIter); Poll and
 // PollRecords have their own PollOption type — the option
 // spaces don't overlap.
-type QueryOption func(*QueryOpts)
+type ReadOption func(*readOpts)
 
-// QueryOpts is the resolved set of read-path options after
-// applying a chain of QueryOption values.
-type QueryOpts struct {
-	IncludeHistory bool
-	// ReadAheadPartitions controls how many partitions ahead of
+// readOpts is the resolved set of read-path options after
+// applying a chain of ReadOption values. Unexported because
+// callers should not construct it directly — every field is set
+// through a With* constructor.
+type readOpts struct {
+	includeHistory bool
+	// readAheadPartitions controls how many partitions ahead of
 	// the current yield position a streaming read (ReadIter) may
 	// buffer in the decoder→yield channel. nil (the default
 	// when the option is not supplied) means "1" — minimum
@@ -24,21 +26,21 @@ type QueryOpts struct {
 	// Pointer-typed so the zero value of WithReadAheadPartitions
 	// (an explicit 0) stays distinguishable from "option not
 	// supplied" (which falls back to the default of 1).
-	ReadAheadPartitions *int
-	// ReadAheadBytes caps the cumulative uncompressed parquet
+	readAheadPartitions *int
+	// readAheadBytes caps the cumulative uncompressed parquet
 	// bytes that may sit decoded in the streaming read pipeline
 	// ahead of the current yield position. Zero disables the cap
-	// (only ReadAheadPartitions binds). The value is checked
+	// (only readAheadPartitions binds). The value is checked
 	// against the sum of each buffered partition's
 	// total_uncompressed_size as reported by the parquet footer
 	// — exact, not a heuristic. Decoded Go memory typically runs
 	// 1–2× the uncompressed size depending on data shape (string
 	// headers, slice/map pointer overhead).
-	ReadAheadBytes int64
+	readAheadBytes int64
 }
 
-// Apply runs every option against the receiver.
-func (o *QueryOpts) Apply(opts ...QueryOption) {
+// apply runs every option against the receiver.
+func (o *readOpts) apply(opts ...ReadOption) {
 	for _, opt := range opts {
 		opt(o)
 	}
@@ -51,9 +53,9 @@ func (o *QueryOpts) Apply(opts ...QueryOption) {
 //
 // When no dedup rule is configured (EntityKeyOf or VersionOf nil),
 // dedup is a no-op regardless of this option.
-func WithHistory() QueryOption {
-	return func(o *QueryOpts) {
-		o.IncludeHistory = true
+func WithHistory() ReadOption {
+	return func(o *readOpts) {
+		o.includeHistory = true
 	}
 }
 
@@ -78,12 +80,12 @@ func WithHistory() QueryOption {
 // Each buffered partition holds its decoded records in memory
 // until the yield loop consumes them. Memory: O((n+1) partitions)
 // — current + n prefetched.
-func WithReadAheadPartitions(n int) QueryOption {
+func WithReadAheadPartitions(n int) ReadOption {
 	if n < 0 {
 		n = 0
 	}
-	return func(o *QueryOpts) {
-		o.ReadAheadPartitions = &n
+	return func(o *readOpts) {
+		o.readAheadPartitions = &n
 	}
 }
 
@@ -110,14 +112,14 @@ func WithReadAheadPartitions(n int) QueryOption {
 // cap can't be enforced below the partition granularity without
 // row-group-level streaming). The cap only prevents *additional*
 // partitions from joining the buffer.
-func WithReadAheadBytes(n int64) QueryOption {
-	return func(o *QueryOpts) {
-		o.ReadAheadBytes = n
+func WithReadAheadBytes(n int64) ReadOption {
+	return func(o *readOpts) {
+		o.readAheadBytes = n
 	}
 }
 
 // PollOption configures Poll / PollRecords. Separate from
-// QueryOption (which serves the snapshot read paths) so each
+// ReadOption (which serves the snapshot read paths) so each
 // option type only carries knobs its read path actually
 // honours — no "ignored on this path" footguns.
 type PollOption func(*pollOpts)

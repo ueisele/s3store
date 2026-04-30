@@ -3,16 +3,16 @@ package s3store
 import "time"
 
 // WriteOption configures write-path behavior. Mirrors the
-// QueryOption pattern so the write side has the same mental model:
+// ReadOption pattern so the write side has the same mental model:
 // one option type, one accumulator, one place to add new knobs.
-type WriteOption func(*WriteOpts)
+type WriteOption func(*writeOpts)
 
-// WriteOpts is the resolved set of write-path options after
-// applying a chain of WriteOption values. Exported so each
-// sub-package can build its own option handling without a second
-// layer of indirection.
-type WriteOpts struct {
-	// IdempotencyToken, when set, anchors the per-attempt id
+// writeOpts is the resolved set of write-path options after
+// applying a chain of WriteOption values. Unexported because
+// callers should not construct it directly — every field is set
+// through a With* constructor.
+type writeOpts struct {
+	// idempotencyToken, when set, anchors the per-attempt id
 	// (id = {token}-{attemptID:32hex UUIDv7}) and the per-token
 	// commit marker (`<dataPath>/<partition>/<token>.commit`).
 	// The writer's upfront HEAD on that commit marker recognises
@@ -21,17 +21,17 @@ type WriteOpts struct {
 	// option chain is resolved so typos / illegal characters
 	// surface before any S3 call.
 	//
-	// Mutually exclusive with IdempotencyTokenFn — pick a static
+	// Mutually exclusive with idempotencyTokenFn — pick a static
 	// token OR a per-partition function, not both.
-	IdempotencyToken string
+	idempotencyToken string
 
-	// IdempotencyTokenFn, when set, is invoked per partition with
+	// idempotencyTokenFn, when set, is invoked per partition with
 	// that partition's records and returns the token to use. Lets
 	// a multi-partition Write derive a different token per
 	// partition — useful when each partition's logical write has
 	// its own outbox row / external identifier.
 	//
-	// Type-erased as `any` because WriteOpts is not generic; the
+	// Type-erased as `any` because writeOpts is not generic; the
 	// concrete shape is `func(partitionRecords []T) (string, error)`
 	// for the writer's T. The writer type-asserts at write-time and
 	// surfaces a clear error if the closure's T doesn't match.
@@ -41,10 +41,10 @@ type WriteOpts struct {
 	// ≤200 chars). A non-nil error from the closure aborts the
 	// partition's write. Set via WithIdempotencyTokenOf.
 	//
-	// Mutually exclusive with IdempotencyToken.
-	IdempotencyTokenFn any
+	// Mutually exclusive with idempotencyToken.
+	idempotencyTokenFn any
 
-	// InsertedAt, when non-zero, overrides the writer's default
+	// insertedAt, when non-zero, overrides the writer's default
 	// pre-encode wall-clock capture as the "insertion time" of the
 	// batch. The supplied value drives every downstream surface
 	// uniformly: the parquet InsertedAtField column (when configured
@@ -57,11 +57,11 @@ type WriteOpts struct {
 	// The zero value (time.Time{}) means "not supplied" — the writer
 	// falls back to time.Now() captured immediately before parquet
 	// encode. Set via WithInsertedAt.
-	InsertedAt time.Time
+	insertedAt time.Time
 }
 
-// Apply runs every option against the receiver.
-func (o *WriteOpts) Apply(opts ...WriteOption) {
+// apply runs every option against the receiver.
+func (o *writeOpts) apply(opts ...WriteOption) {
 	for _, opt := range opts {
 		opt(o)
 	}
@@ -115,8 +115,8 @@ func (o *WriteOpts) Apply(opts ...WriteOption) {
 // Mutually exclusive with WithIdempotencyTokenOf — combining the
 // two surfaces an error at option-resolution time.
 func WithIdempotencyToken(token string) WriteOption {
-	return func(o *WriteOpts) {
-		o.IdempotencyToken = token
+	return func(o *writeOpts) {
+		o.idempotencyToken = token
 	}
 }
 
@@ -147,11 +147,11 @@ func WithIdempotencyToken(token string) WriteOption {
 func WithIdempotencyTokenOf[T any](
 	fn func(partitionRecords []T) (string, error),
 ) WriteOption {
-	return func(o *WriteOpts) {
+	return func(o *writeOpts) {
 		if fn == nil {
 			return
 		}
-		o.IdempotencyTokenFn = fn
+		o.idempotencyTokenFn = fn
 	}
 }
 
@@ -189,7 +189,7 @@ func WithIdempotencyTokenOf[T any](
 // original attempt's value. This preserves the contract that a
 // same-token retry returns the original WriteResult unchanged.
 func WithInsertedAt(t time.Time) WriteOption {
-	return func(o *WriteOpts) {
-		o.InsertedAt = t
+	return func(o *writeOpts) {
+		o.insertedAt = t
 	}
 }

@@ -134,50 +134,50 @@ func (s *Writer[T]) Write(
 }
 
 // resolveWriteOpts folds the variadic WriteOption chain into a
-// WriteOpts and resolves the per-partition idempotency token. The
+// writeOpts and resolves the per-partition idempotency token. The
 // records slice is pass-by-header (no copy of the underlying
-// array) and is consumed by IdempotencyTokenFn — when set — to
-// derive the per-partition token; the static IdempotencyToken
+// array) and is consumed by idempotencyTokenFn — when set — to
+// derive the per-partition token; the static idempotencyToken
 // branch ignores records entirely. Mutual-exclusion between the
 // two options is enforced first so the resolution path is
 // unambiguous.
 //
-// The type-assertion on IdempotencyTokenFn (any → func([]T)
-// (string, error)) lives here because WriteOpts can't be generic
+// The type-assertion on idempotencyTokenFn (any → func([]T)
+// (string, error)) lives here because writeOpts can't be generic
 // — it's the boundary type WriteOption closures write into. A
 // closure whose T doesn't match the writer's surfaces a clear
 // error naming the mismatch.
-func resolveWriteOpts[T any](opts []WriteOption, records []T) (WriteOpts, error) {
-	var w WriteOpts
-	w.Apply(opts...)
-	if w.IdempotencyToken != "" && w.IdempotencyTokenFn != nil {
-		return WriteOpts{}, fmt.Errorf(
+func resolveWriteOpts[T any](opts []WriteOption, records []T) (writeOpts, error) {
+	var w writeOpts
+	w.apply(opts...)
+	if w.idempotencyToken != "" && w.idempotencyTokenFn != nil {
+		return writeOpts{}, fmt.Errorf(
 			"s3store: WithIdempotencyToken and WithIdempotencyTokenOf " +
 				"are mutually exclusive")
 	}
-	if w.IdempotencyTokenFn != nil {
-		fn, ok := w.IdempotencyTokenFn.(func([]T) (string, error))
+	if w.idempotencyTokenFn != nil {
+		fn, ok := w.idempotencyTokenFn.(func([]T) (string, error))
 		if !ok {
-			return WriteOpts{}, fmt.Errorf(
+			return writeOpts{}, fmt.Errorf(
 				"s3store: WithIdempotencyTokenOf: closure type %T does not "+
 					"match writer's record type — pass "+
 					"WithIdempotencyTokenOf[T] with the same T as the Writer",
-				w.IdempotencyTokenFn)
+				w.idempotencyTokenFn)
 		}
 		token, err := fn(records)
 		if err != nil {
-			return WriteOpts{}, fmt.Errorf(
+			return writeOpts{}, fmt.Errorf(
 				"s3store: WithIdempotencyTokenOf: %w", err)
 		}
 		if err := validateIdempotencyToken(token); err != nil {
-			return WriteOpts{}, fmt.Errorf(
+			return writeOpts{}, fmt.Errorf(
 				"s3store: WithIdempotencyTokenOf: %w", err)
 		}
-		w.IdempotencyToken = token
-	} else if w.IdempotencyToken != "" {
+		w.idempotencyToken = token
+	} else if w.idempotencyToken != "" {
 		if err := validateIdempotencyToken(
-			w.IdempotencyToken); err != nil {
-			return WriteOpts{}, err
+			w.idempotencyToken); err != nil {
+			return writeOpts{}, err
 		}
 	}
 	return w, nil
@@ -296,7 +296,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 	ctx context.Context, key string, records []T, opts []WriteOption,
 	scope *methodScope,
 ) (*WriteResult, int, error) {
-	writeOpts, err := resolveWriteOpts(opts, records)
+	o, err := resolveWriteOpts(opts, records)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -316,7 +316,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 	// original WriteResult; without truncation, sub-µs nanoseconds
 	// are lost on the wire and the round-trip mismatches on
 	// platforms whose clocks have sub-µs resolution (Linux).
-	writeStartTime := writeOpts.InsertedAt
+	writeStartTime := o.insertedAt
 	if writeStartTime.IsZero() {
 		writeStartTime = time.Now()
 	}
@@ -332,7 +332,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 			"s3store: parquet encode: %w", err)
 	}
 	r, err := s.writeEncodedPayload(
-		ctx, key, records, parquetBytes, writeStartTime, writeOpts)
+		ctx, key, records, parquetBytes, writeStartTime, o)
 	if err == nil && r != nil {
 		// Commit semantics: writeEncodedPayload returned a non-nil
 		// WriteResult ⇒ data is durable, markers are written, and
@@ -412,7 +412,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 // InsertedAt unchanged via the token-commit metadata).
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
-	writeStartTime time.Time, opts WriteOpts,
+	writeStartTime time.Time, opts writeOpts,
 ) (*WriteResult, error) {
 	// Compute marker paths up-front so a bad ProjectionDef.Of
 	// fails the whole Write before we touch S3, matching how
@@ -425,7 +425,7 @@ func (s *Writer[T]) writeEncodedPayload(
 	// Step 1: token resolution. Auto-generate a UUIDv7 for the
 	// no-token path and use it as both the token and the
 	// attempt-id (path shape is uniform: <token>-<attemptID>).
-	token := opts.IdempotencyToken
+	token := opts.idempotencyToken
 	autoToken := false
 	if token == "" {
 		auto, err := newAttemptID()

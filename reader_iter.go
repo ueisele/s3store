@@ -35,14 +35,14 @@ import (
 // no manual Close. Empty patterns slice yields nothing; a
 // malformed pattern surfaces as the iter's first error.
 func (s *Reader[T]) ReadIter(
-	ctx context.Context, keyPatterns []string, opts ...QueryOption,
+	ctx context.Context, keyPatterns []string, opts ...ReadOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		scope := s.cfg.Target.metrics.methodScope(ctx, methodReadIter)
 		var iterErr error
 		defer scope.end(&iterErr)
-		var o QueryOpts
-		o.Apply(opts...)
+		var o readOpts
+		o.apply(opts...)
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -91,7 +91,7 @@ func (s *Reader[T]) ReadIter(
 func (s *Reader[T]) ReadRangeIter(
 	ctx context.Context,
 	since, until time.Time,
-	opts ...QueryOption,
+	opts ...ReadOption,
 ) iter.Seq2[T, error] {
 	// Resolve time bounds outside the closure so the live-tip
 	// snapshot freezes at call entry, not at first iteration:
@@ -118,8 +118,8 @@ func (s *Reader[T]) ReadRangeIter(
 		scope := s.cfg.Target.metrics.methodScope(ctx, methodReadRangeIter)
 		var iterErr error
 		defer scope.end(&iterErr)
-		var o QueryOpts
-		o.Apply(opts...)
+		var o readOpts
+		o.apply(opts...)
 
 		// Walk the ref stream into a flat KeyMeta slice. LIST-only
 		// (no parquet bodies fetched), so this phase is cheap. Use
@@ -186,7 +186,7 @@ func (s *Reader[T]) ReadRangeIter(
 // granularity without row-group-level streaming).
 func (s *Reader[T]) downloadAndDecodeIter(
 	ctx context.Context, keys []KeyMeta,
-	opts *QueryOpts, scope *methodScope,
+	opts *readOpts, scope *methodScope,
 	yield func(T, error) bool, iterErr *error,
 ) {
 	if len(keys) == 0 {
@@ -289,8 +289,8 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	// zero" (cap=0, unbuffered handoff). To bound stacking when
 	// N>1, combine with WithReadAheadBytes.
 	readAheadParts := 1
-	if opts.ReadAheadPartitions != nil {
-		readAheadParts = *opts.ReadAheadPartitions
+	if opts.readAheadPartitions != nil {
+		readAheadParts = *opts.readAheadPartitions
 	}
 	decodedCh := make(chan decodedBatch[T], readAheadParts)
 	wg.Go(func() { s.runDecoder(ctx, state, opts, decodedCh) })
@@ -305,7 +305,7 @@ func (s *Reader[T]) downloadAndDecodeIter(
 			return
 		}
 		emitted, ok := s.emitPartition(
-			batch.recs, opts.IncludeHistory, yield)
+			batch.recs, opts.includeHistory, yield)
 		recordsYielded += emitted
 		state.releaseBytes(batch.uncompBytes)
 		if !ok {
@@ -476,7 +476,7 @@ func (s *Reader[T]) runDownloader(
 // decodedCh.
 func (s *Reader[T]) runDecoder(
 	ctx context.Context, state *streamState,
-	opts *QueryOpts, decodedCh chan<- decodedBatch[T],
+	opts *readOpts, decodedCh chan<- decodedBatch[T],
 ) {
 	defer close(decodedCh)
 	for pi := range state.parts {
@@ -503,7 +503,7 @@ func (s *Reader[T]) runDecoder(
 		// Gate on byte budget if configured. A single oversized
 		// partition still flows once the buffer is empty —
 		// otherwise the pipeline would deadlock.
-		if !state.reserveBytes(ctx, uncomp, opts.ReadAheadBytes) {
+		if !state.reserveBytes(ctx, uncomp, opts.readAheadBytes) {
 			return
 		}
 
