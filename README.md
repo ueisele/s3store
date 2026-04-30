@@ -780,10 +780,6 @@ for {
   may carry a newer version of the same entity), so it's not
   offered. `WithHistory` is accepted but is the default here.
 
-`WithIdempotentRead` is supported on `ReadRangeIter` (snapshot
-semantics) and ignored on `PollRecords` (the offset cursor
-already provides retry-safety).
-
 `OffsetAt` is pure computation — no S3 call — and bridges
 `time.Time` to the offset cursor used by `Poll` / `PollRecords` /
 `WithUntilOffset`.
@@ -798,10 +794,6 @@ Returns every record matching the glob, decoded directly into `[]T`
 via parquet-go and the parquet tags on `T`. When dedup is configured
 (see Stream above), the result is the latest version per key;
 otherwise every version comes through.
-
-For retry-safe read-modify-write, pair the `Read` with
-`WithIdempotentRead(token)` and write with `WithIdempotencyToken(token)`;
-see [Idempotent reads](#idempotent-reads-withidempotentread).
 
 ### Snapshot — streaming (`ReadIter`)
 
@@ -1122,91 +1114,6 @@ outbox; consumers just ignore it.
 s3store does not ship this pattern; document it as a valid
 alternative for callers who already have the transactional
 infrastructure.
-
-### Idempotent reads (`WithIdempotentRead`)
-
-Read-modify-write under retry is the natural companion to
-`WithIdempotencyToken`: the pattern is "read current state →
-compute a diff → write the diff idempotently". If the write
-succeeds but the process dies before returning, the retry re-runs
-the full cycle. Without a read-side primitive, attempt 2 reads a
-*different* state than attempt 1 (attempt 1's own write is now
-visible, plus any concurrent data that landed in between), so the
-diff and the bytes written diverge — defeating the point of the
-idempotency token.
-
-`WithIdempotentRead(token)` makes this cycle retry-safe in one
-option. The read returns state as of the first attempt's write
-time, excluding both the caller's own prior attempts and any data
-written at or after them:
-
-```go
-const token = "job-2026-04-22T10:15:00Z-batch42"
-
-existing, err := store.Read(ctx, pattern,
-    s3store.WithIdempotentRead(token))
-if err != nil { return err }
-
-// compute diff against `existing` …
-
-_, err = store.WriteWithKey(ctx, key, changes,
-    s3store.WithIdempotencyToken(token))
-```
-
-The same token drives both sides. Persist only the token between
-attempts — the write time of attempt 1 is discovered at read time
-from the token file's `LastModified`, not from a caller-supplied
-timestamp that could drift hours on retry.
-
-**What the filter does** (LIST-time, no extra S3 calls):
-
-- **Self-exclusion** — files whose basename equals
-  `{token}.parquet` (the caller's own prior attempts) are dropped.
-- **Later-write exclusion** — per partition, the writer records
-  `barrier[partition] = min(LastModified)` across token-matching
-  files. For every other file in that partition, files with
-  `LastModified >= barrier[partition]` are dropped too.
-
-Partitions where the token hasn't been written are unfiltered.
-**On the first attempt, no barrier applies** — `Read` returns
-current state unchanged, so the option is safe to set
-unconditionally.
-
-**Correctness under single-writer-per-partition**: exact
-snapshotting requires that no other writer lands data in the
-same partition between attempt 1's read-start and attempt 1's
-first write. Under that condition, `min(LastModified)` of the
-caller's own token-files is a sufficient barrier — nothing
-could have snuck in during the read-compute-write window.
-
-This is a **caller invariant** — the library does not enforce
-single-writer-per-partition (see
-[Zombie writers and orchestrators](#zombie-writers-and-orchestrators)).
-If the invariant is violated (two writers on the same partition
-with different tokens), attempt 2 may include a concurrent
-writer's data attempt 1 didn't see; reader-side dedup
-(`EntityKeyOf`+`VersionOf`) absorbs the overlap at the record
-layer, but the read-modify-write diff itself is no longer
-deterministic across attempts. Callers who need that guarantee
-must enforce the single-writer invariant externally (e.g. via an
-orchestrator's partition-ownership lease or by reusing the same
-token across failovers so zombies produce byte-identical writes,
-not diverging ones).
-
-**Scope** — accepted by `Read`, `ReadIter`, `ReadRangeIter`, and
-`PollRecords`.
-
-**Performance impact** — the filter applies purely in memory on
-a LIST (or ref-stream) that runs anyway, so there's no extra S3
-work.
-
-**Zero matches under a barrier**: `Read*` normalizes to an empty
-result.
-
-The token passes `ValidateIdempotencyToken` — same grammar as
-`WithIdempotencyToken` (non-empty, no `/`, no `..`, printable
-ASCII, ≤200 chars). Invalid tokens surface at Read time with a
-clear error; no S3 call is issued.
 
 ## Schema evolution
 
