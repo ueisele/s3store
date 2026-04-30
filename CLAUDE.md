@@ -21,6 +21,27 @@ must preserve them — even when the change appears unrelated.
   not introduce automatic GC, age-based pruning, rewrite-in-
   place compaction, or in-Write cleanup of failed-Write
   orphans. Cleanup is operator-driven only.
+- **Stream replay stability** — once a record has been observed
+  at offset N by a stream reader (Poll / PollRecords /
+  ReadRangeIter), that record at offset N never changes;
+  replay from offset 0 produces the same sequence every time.
+  Three properties combine to back this:
+
+  1. Refs are written to per-attempt paths and never
+     overwritten or deleted by the library.
+  2. The ref filename encodes a writer-stamped refMicroTs with
+     fixed-width lex-numeric ordering (16 decimal digits via
+     `%016d`), so the LIST order is stable across calls.
+  3. SettleWindow (= CommitTimeout + MaxClockSkew) bounds how
+     late a writer's ref can become observable relative to its
+     stamped time; by the time a ref clears the cutoff, all
+     earlier writers' refs (within MaxClockSkew of reality) are
+     already visible — no retroactive insertion at or before an
+     observed offset.
+
+  Refactors must not introduce ref rewrites, ref deletion in
+  the write path, or non-monotonic refMicroTs (e.g., deriving
+  it from LastModified instead of writer wall-clock).
 - **Exactly-once at the consumer layer is opt-in via reader
   dedup** — `EntityKeyOf` + `VersionOf` collapse duplicates by
   (entity, version). `WithIdempotencyToken` makes retries

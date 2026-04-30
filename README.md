@@ -23,8 +23,19 @@ contract follows from that:
 
 - **At-least-once on storage.** A successful `Write` is durable; a
   retry after partial failure may produce duplicate data files and
-  refs. Dedupe on read via `EntityKeyOf` + `VersionOf`, or shrink
-  the duplicate window at storage with `WithIdempotencyToken`.
+  refs. The library never deletes data it has written.
+- **Exactly-once at the consumer is opt-in.** Two complementary
+  mechanisms collapse the at-least-once duplicates:
+  - `EntityKeyOf` + `VersionOf` on the reader collapses duplicates
+    with the same `(entity, version)` to one record — the
+    universal solution that works for any duplicate source.
+  - `WithIdempotencyToken` on the writer makes sequential retries
+    recover the prior commit unchanged via an upfront HEAD on
+    `<token>.commit` — no re-upload, byte-identical `WriteResult`.
+
+  Combine both for the strongest guarantee: tokens shrink the
+  duplicate window at storage; reader dedup catches whatever
+  slips through.
 - **Read-after-write on snapshot reads.** `Read` / `ReadIter` /
   `ProjectionReader.Lookup` / `BackfillProjection` see new records the moment
   `Write` returns. The change-stream APIs (`Poll`, `PollRecords`,
@@ -33,6 +44,19 @@ contract follows from that:
 - **Read stability.** Two consecutive snapshot reads with no
   intervening writes return the same records — the library never
   deletes or rewrites data on its own.
+- **Stream replay stability.** Refs (the change-stream offsets)
+  are immutable: once a record is observed at offset N by `Poll`
+  / `PollRecords` / `ReadRangeIter`, replaying from offset 0 sees
+  that same record at the same offset N, every time. Load-bearing
+  for checkpointed pipelines — a consumer that processed up to
+  offset 100 can crash, restart from offset 100, and resume
+  without missing or duplicating. Holds because the ref filename
+  embeds a writer-stamped `refMicroTs` (fixed-width lex-numeric),
+  refs are per-attempt paths the library never rewrites or
+  deletes, and `MaxClockSkew` + `SettleWindow` bound how late a
+  ref can become visible relative to its stamped time — no new
+  ref can be retroactively inserted at or before an
+  already-observed offset.
 - **Atomic per-file visibility via the token-commit marker.**
   Every `Write` lands a single `<token>.commit` zero-byte object
   *after* the data and ref PUTs. Both read paths gate on its
