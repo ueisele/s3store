@@ -122,14 +122,12 @@ honoured.
   reintroduce a server-`LastModified` dependency on the
   ordering path break this contract and must not be introduced.
 
-  The `WithIdempotentRead` barrier (per-partition
-  `min(LastModified)` over token-matching parquets) and
-  `BackfillProjection`'s `until time.Time` bound do still rely
+  `BackfillProjection`'s `until time.Time` bound still relies
   on `LastModified`, but only as a *relative* ordering signal
   across files written through the library — not as an
-  observability proxy. Both compare LMs that the same backend
+  observability proxy. It compares LMs that the same backend
   stamped at PUT time on new keys, which is monotonic enough
-  for those use cases on every supported backend.
+  for that use case on every supported backend.
 
 # Verification
 

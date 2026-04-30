@@ -294,12 +294,16 @@ write or only read can construct a single half with a narrower config:
 ```go
 // Build the shared S3 wiring once — Target is the untyped handle
 // Writer, Reader, ProjectionReader, and BackfillProjection all speak.
-target := s3store.NewS3Target(s3store.S3TargetConfig{
+// NewS3Target does two S3 GETs (commit-timeout + max-clock-skew) at
+// construction time; seed both via the snippet in "Initializing a new
+// dataset" before this call.
+target, err := s3store.NewS3Target(ctx, s3store.S3TargetConfig{
     Bucket:            "warehouse",
     Prefix:            "billing",
     S3Client:          s3Client,
     PartitionKeyParts: []string{"charge_period", "customer"},
 })
+if err != nil { log.Fatal(err) }
 
 // Write-only service: no read-side knobs in config.
 w, err := s3store.NewWriter[CostRecord](s3store.WriterConfig[CostRecord]{
@@ -1711,7 +1715,7 @@ type StoreConfig[T any] struct {
     // contract. Embedded so callers can build helpers against
     // *S3TargetConfig once and reuse them across StoreConfig,
     // WriterConfig (via NewS3Target), and ReaderConfig.
-    s3store.S3TargetConfig
+    S3TargetConfig
 
     // Required for Write
     PartitionKeyOf func(T) string  // derive key from record (Write)
@@ -1772,7 +1776,7 @@ otel.SetMeterProvider(sdkmetric.NewMeterProvider(
     sdkmetric.WithReader(prometheusReader), // or OTLP, etc.
 ))
 
-target := s3store.NewS3Target(s3store.S3TargetConfig{
+target, err := s3store.NewS3Target(ctx, s3store.S3TargetConfig{
     Bucket: "my-bucket", Prefix: "events",
     S3Client: s3Client,
     PartitionKeyParts: []string{"period", "customer"},
@@ -1900,6 +1904,22 @@ Breaking changes in the single-package collapse:
   workload needs SQL aggregation, use DuckDB directly (point its
   `httpfs` extension at the same bucket and `read_parquet()` over
   the data path) or pin an older release.
+- **`QueryOption` renamed to `ReadOption`.** The read-path option
+  type now matches the verbs it configures (`Read` / `ReadIter` /
+  `ReadRangeIter`). `QueryOpts` and `WriteOpts` were also unexported
+  to `readOpts` / `writeOpts` — the structs are an internal
+  implementation detail now, but `[]s3store.ReadOption` and
+  `[]s3store.WriteOption` slices built from the exported `With*`
+  functions continue to work unchanged.
+- **`WithIdempotentRead` removed.** The barrier was load-bearing
+  only under single-writer-per-partition, and even there the
+  upfront-HEAD-on-commit gate already short-circuits same-token
+  retries via `WithIdempotencyToken` — recalculated bytes on a
+  retry are discarded in favour of the prior commit's
+  `WriteResult`. For retry-safe read-modify-write under
+  `WithIdempotencyToken`, no read-side option is needed; for
+  read-modify-write without tokens, callers must enforce single-
+  writer themselves.
 - **`Config[T]` renamed to `StoreConfig[T]`; S3 wiring moved to
   embedded `S3TargetConfig`.** The flattened wiring fields
   (`Bucket`, `Prefix`, `S3Client`, `PartitionKeyParts`,

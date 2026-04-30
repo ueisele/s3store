@@ -276,10 +276,10 @@ func (s *Writer[T]) WriteWithKey(
 // for Write (per-partition dispatch via writeGroupedFanOut) and
 // WriteWithKey (direct single-partition call). It owns the option-
 // resolution step so both entry points see consistent semantics:
-// the static IdempotencyToken is pre-validated, the per-partition
-// IdempotencyTokenFn (if set) is invoked here with the partition's
+// the static idempotencyToken is pre-validated, the per-partition
+// idempotencyTokenFn (if set) is invoked here with the partition's
 // records, and the resulting token is validated and substituted
-// into a local WriteOpts before encode/PUT.
+// into a local writeOpts before encode/PUT.
 //
 // scope is the caller's methodScope. On commit (ref PUT succeeded),
 // this function increments the scope's record / byte / partition

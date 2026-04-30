@@ -9,10 +9,11 @@ the package:
 
 - **(a) Leaves keep `s3store:`, wrap layers drop it.** New wrap
   shape: `fmt.Errorf("head token-commit: %w", err)`. Matches the
-  existing `"WithIdempotentRead: %w"` site (option-validation
-  wrap in `idempotency.go`) — that one already follows the
-  convention, so picking this direction means most leaves are
-  already correct and most wrap sites need a touch.
+  existing `fmt.Errorf("LookupCommit: %w", err)` site in
+  `writer_write.go` and `fmt.Errorf("list data files: %w", err)`
+  in `listing.go` — those already follow the convention, so
+  picking this direction means most leaves are already correct
+  and most wrap sites need a touch.
 - **(b) Wrap layers keep `s3store:`, leaves drop it.** New leaf
   shape: `errors.New("IdempotencyToken must not be empty")`.
   Touches every leaf — `validateIdempotencyToken`,
