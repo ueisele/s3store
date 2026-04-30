@@ -70,7 +70,7 @@ Set the level on the target so every S3 call routed through it
 inherits the same value:
 
 ```go
-target := s3store.NewS3Target(s3store.S3TargetConfig{
+target, err := s3store.NewS3Target(ctx, s3store.S3TargetConfig{
     Bucket:            "your-bucket",
     Prefix:            "your-prefix",
     S3Client:          s3Client,
@@ -84,16 +84,20 @@ target := s3store.NewS3Target(s3store.S3TargetConfig{
     // reader/writer pairs per site:
     // ConsistencyControl: s3store.ConsistencyStrongSite,
 })
+if err != nil {
+    return err
+}
 ```
 
-`s3store.Config.ConsistencyControl` forwards onto the target it
-builds, so single-Config callers set the level once at the top of
-the umbrella. Setting it on the *target* (not on `WriterConfig` /
-`ReaderConfig` / `ProjectionDef`) means every S3 call routed through
-that target uses one and the same value — NetApp's
-"[same consistency for paired operations][sgcc]" rule is enforced
-by construction. On AWS / MinIO the header is unknown to the
-backend and ignored, so the substituted default is a no-op there.
+`s3store.StoreConfig` embeds `S3TargetConfig`, so umbrella
+callers set `ConsistencyControl` once on the embedded fields and
+`New` forwards it onto the target it builds. Setting it on the
+*target* (not on `WriterConfig` / `ReaderConfig` / `ProjectionDef`)
+means every S3 call routed through that target uses one and the
+same value — NetApp's "[same consistency for paired operations][sgcc]"
+rule is enforced by construction. On AWS / MinIO the header is
+unknown to the backend and ignored, so the substituted default is
+a no-op there.
 
 ## Choosing the consistency level
 
