@@ -198,9 +198,6 @@ func (s *Reader[T]) Poll(
 // version of the same entity. For latest-per-entity, use Read or
 // ReadRangeIter (snapshot-style).
 //
-// WithIdempotentRead is accepted but ignored: the offset cursor
-// already provides retry-safety on this path.
-//
 // Records follow ref order (= timestamp order), then parquet-file
 // row order within each ref.
 func (s *Reader[T]) PollRecords(

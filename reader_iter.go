@@ -48,7 +48,7 @@ func (s *Reader[T]) ReadIter(
 		defer cancel()
 
 		keys, err := ResolvePatterns(
-			ctx, s.cfg.Target, keyPatterns, &o, methodReadIter)
+			ctx, s.cfg.Target, keyPatterns, methodReadIter)
 		if err != nil {
 			iterErr = fmt.Errorf("s3store: ReadIter %w", err)
 			yield(*new(T), iterErr)
@@ -110,8 +110,8 @@ func (s *Reader[T]) ReadRangeIter(
 		untilOffset = s.OffsetAt(until)
 	}
 	// Poll only honours WithUntilOffset; the snapshot-side opts
-	// (WithHistory, WithReadAhead*, WithIdempotentRead) flow into
-	// the snapshot-style decode pipeline below, not into Poll.
+	// (WithHistory, WithReadAhead*) flow into the snapshot-style
+	// decode pipeline below, not into Poll.
 	pollOpts := []PollOption{WithUntilOffset(untilOffset)}
 
 	return func(yield func(T, error) bool) {
@@ -145,16 +145,6 @@ func (s *Reader[T]) ReadRangeIter(
 				})
 			}
 			cur = next
-		}
-		if len(keys) == 0 {
-			return
-		}
-
-		keys, err := applyIdempotentReadOpts(keys, s.dataPath, &o)
-		if err != nil {
-			iterErr = fmt.Errorf("s3store: %w", err)
-			yield(*new(T), iterErr)
-			return
 		}
 		if len(keys) == 0 {
 			return

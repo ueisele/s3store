@@ -35,18 +35,6 @@ type QueryOpts struct {
 	// 1–2× the uncompressed size depending on data shape (string
 	// headers, slice/map pointer overhead).
 	ReadAheadBytes int64
-	// IdempotentReadToken, when set, filters the LIST result so
-	// the Read returns state as of the first write of the given
-	// idempotency token — the caller's own prior attempts are
-	// dropped, and every other file with LastModified at or after
-	// the barrier is dropped too (per partition). Enables retry-
-	// safe read-modify-write: the second attempt reads the same
-	// state the first attempt saw, computes the same diff, writes
-	// the same bytes. Validated via validateIdempotencyToken at
-	// read time — shares the grammar with WithIdempotencyToken so
-	// the token a caller stores for their write also drives the
-	// matching read.
-	IdempotentReadToken string
 }
 
 // Apply runs every option against the receiver.
@@ -125,52 +113,6 @@ func WithReadAheadPartitions(n int) QueryOption {
 func WithReadAheadBytes(n int64) QueryOption {
 	return func(o *QueryOpts) {
 		o.ReadAheadBytes = n
-	}
-}
-
-// WithIdempotentRead makes a snapshot read retry-safe: the result
-// reflects state as of the first write of the given idempotency
-// token. Pairs with WithIdempotencyToken on the write side so a
-// read-modify-write cycle is deterministic across retries — the
-// second attempt's Read sees the same state the first attempt
-// saw, computes the same diff, and writes the same bytes. One
-// token, both sides.
-//
-// Applies to snapshot-style reads: Read / ReadIter /
-// ReadRangeIter. NOT applied on PollRecords (cursor-based,
-// CDC-style) — the offset cursor already provides retry-safety
-// on that path, and the by-LastModified barrier doesn't compose
-// cleanly with offset-window semantics.
-//
-// Two filters apply at LIST time, per partition:
-//
-//   - Self-exclusion: files whose basename equals "{token}.parquet"
-//     (the caller's own prior attempts) are dropped.
-//   - Later-write exclusion: among files matching the token, the
-//     writer records barrier[partition] = min(LastModified). For
-//     every other file in that partition, files with LastModified
-//     >= barrier[partition] are dropped.
-//
-// On the first attempt (no matching files yet) no barrier applies
-// — the Read returns the current state. Partitions where the
-// token does not appear are also unfiltered.
-//
-// Correctness relies on the caller's single-writer-per-partition
-// invariant: between the first attempt's read-start and its first
-// write, no other data lands in the partition, so min(LastModified
-// of own files) is a sufficient barrier. If the invariant is
-// violated, self-exclusion still catches own attempts but the
-// retry may include concurrent writers' data the first attempt
-// didn't see; record-layer dedup (EntityKeyOf + VersionOf)
-// absorbs the overlap.
-//
-// token must pass validateIdempotencyToken — same grammar as
-// WithIdempotencyToken so one stored token drives both sides.
-// Invalid tokens surface at LIST time (not option-application
-// time, since QueryOption has no error return).
-func WithIdempotentRead(token string) QueryOption {
-	return func(o *QueryOpts) {
-		o.IdempotentReadToken = token
 	}
 }
 

@@ -88,12 +88,10 @@ func dedupePatterns(patterns []string) []string {
 }
 
 // ResolvePatterns chains the standard pattern→keys pipeline:
-// dedupe → buildReadPlans → listDataFiles → gateByCommit →
-// applyIdempotentReadOpts. Returns the deduplicated KeyMetas
-// matching any pattern, gated against `<token>.commit` markers so
-// uncommitted parquets are invisible, with IdempotentRead
-// filtering applied when opts.IdempotentReadToken is set. Empty
-// patterns slice or no matches → (nil, nil).
+// dedupe → buildReadPlans → listDataFiles → gateByCommit. Returns
+// the deduplicated KeyMetas matching any pattern, gated against
+// `<token>.commit` markers so uncommitted parquets are invisible.
+// Empty patterns slice or no matches → (nil, nil).
 //
 // Used by every snapshot-style read entry point (Read / ReadIter /
 // ReadRangeIter) so the chain lives in exactly one place. Pattern
@@ -109,7 +107,7 @@ func dedupePatterns(patterns []string) []string {
 // commit-gate HEADs (s3store.read.commit_head{method=...}).
 func ResolvePatterns(
 	ctx context.Context, t S3Target, patterns []string,
-	opts *QueryOpts, method methodKind,
+	method methodKind,
 ) ([]KeyMeta, error) {
 	patterns = dedupePatterns(patterns)
 	if len(patterns) == 0 {
@@ -124,22 +122,17 @@ func ResolvePatterns(
 	if err != nil {
 		return nil, err
 	}
-	keys, err = gateByCommit(ctx, t, dataPath, keys, commits, method)
-	if err != nil {
-		return nil, err
-	}
-	return applyIdempotentReadOpts(keys, dataPath, opts)
+	return gateByCommit(ctx, t, dataPath, keys, commits, method)
 }
 
 // listDataFiles returns the deduplicated union of parquet objects
 // under each plan's ListPrefix whose Hive key matches the plan's
 // predicate, plus the set of `<token>.commit` markers visible in
 // the same LIST iteration. Each parquet KeyMeta carries S3
-// LastModified so downstream filters (WithIdempotentRead, sort
-// fallbacks) can reason about write time without a second round-
-// trip. Overlapping plans (e.g. "period=*" and "period=2026-03-*")
-// are deduped on key so downstream GET / scan work is not
-// duplicated.
+// LastModified so downstream sort fallbacks can reason about
+// write time without a second round-trip. Overlapping plans (e.g.
+// "period=*" and "period=2026-03-*") are deduped on key so
+// downstream GET / scan work is not duplicated.
 //
 // commits is keyed by `<partition>:<token>` and records every
 // `<token>.commit` whose containing partition matched its plan's
