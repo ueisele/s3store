@@ -186,9 +186,15 @@ func newMetrics(
 			metric.WithDescription(desc), metric.WithUnit(unit))
 		return h
 	}
-	mustHistInt := func(name, desc, unit string) metric.Int64Histogram {
-		h, _ := meter.Int64Histogram(name,
-			metric.WithDescription(desc), metric.WithUnit(unit))
+	mustHistInt := func(
+		name, desc, unit string,
+		extra ...metric.Int64HistogramOption,
+	) metric.Int64Histogram {
+		opts := []metric.Int64HistogramOption{
+			metric.WithDescription(desc), metric.WithUnit(unit),
+		}
+		opts = append(opts, extra...)
+		h, _ := meter.Int64Histogram(name, opts...)
 		return h
 	}
 	mustCounter := func(name, desc, unit string) metric.Int64Counter {
@@ -226,11 +232,17 @@ func newMetrics(
 	m.fanoutWorkers = mustHistInt(
 		"s3store.fanout.workers",
 		"Worker goroutines spawned per fan-out call",
-		"{goroutine}")
+		"{goroutine}",
+		// Bounded by MaxInflightRequests (default 32). Powers of
+		// two cover the common configurations without forcing
+		// histogram_quantile to interpolate inside one giant bucket.
+		metric.WithExplicitBucketBoundaries(1, 2, 4, 8, 16, 32, 64, 128))
 	m.fanoutItems = mustHistInt(
 		"s3store.fanout.items",
 		"Items dispatched per fan-out call",
-		"{item}")
+		"{item}",
+		metric.WithExplicitBucketBoundaries(
+			1, 2, 5, 10, 25, 50, 100, 250, 1000, 5000))
 
 	// S3 op level.
 	m.s3Duration = mustHist(
@@ -244,7 +256,14 @@ func newMetrics(
 	m.s3Attempts = mustHistInt(
 		"s3store.s3.request.attempts",
 		"Outer retry() attempts per S3 wrapper call (1..retryMaxAttempts)",
-		"{attempt}")
+		"{attempt}",
+		// Values are integers in [1, retryMaxAttempts=4]. Without
+		// these boundaries the OTel default first bucket [0, 5]
+		// catches every observation and Prometheus's
+		// histogram_quantile interpolates uniformly within it,
+		// returning ~4.75 for P95 even when every call succeeded
+		// on the first attempt.
+		metric.WithExplicitBucketBoundaries(1, 2, 3, 4))
 	m.s3ReqBytes = mustHistInt(
 		"s3store.s3.request.body.size",
 		"Request body size for outbound S3 PUTs",
@@ -270,7 +289,9 @@ func newMetrics(
 	m.writePartitions = mustHistInt(
 		"s3store.write.partitions",
 		"Distinct partition keys per Write call (always 1 for WriteWithKey)",
-		"{partition}")
+		"{partition}",
+		metric.WithExplicitBucketBoundaries(
+			1, 2, 5, 10, 25, 50, 100, 500))
 	m.writeBytes = mustHistInt(
 		"s3store.write.bytes",
 		"Total parquet body bytes uploaded per Write/WriteWithKey call",
@@ -282,7 +303,9 @@ func newMetrics(
 	m.readPartitions = mustHistInt(
 		"s3store.read.partitions",
 		"Distinct Hive partitions touched per read-side method call (every method that funnels through the iter pipeline: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Not recorded for Poll / Lookup / LookupCommit / BackfillProjection.",
-		"{partition}")
+		"{partition}",
+		metric.WithExplicitBucketBoundaries(
+			1, 2, 5, 10, 25, 50, 100, 500))
 	m.readBytes = mustHistInt(
 		"s3store.read.bytes",
 		"Total parquet body bytes downloaded per read-side method call",
@@ -290,7 +313,9 @@ func newMetrics(
 	m.readFiles = mustHistInt(
 		"s3store.read.files",
 		"Data files materialised per read-side method call",
-		"{file}")
+		"{file}",
+		metric.WithExplicitBucketBoundaries(
+			1, 5, 10, 25, 50, 100, 500, 1000, 5000))
 	m.readMissingData = mustCounter(
 		"s3store.read.missing_data",
 		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / BackfillProjection). Strict paths (Read / ReadIter / ReadPartitionIter) fail instead of recording.",
