@@ -435,8 +435,8 @@ func (s *Reader[T]) preparePartitions(
 	// through this sort. Removing it surfaces Go's randomized
 	// map iteration order to the consumer and breaks
 	// byte-for-byte stable output across calls — see
-	// "Deterministic emission order across read paths" in
-	// CLAUDE.md.
+	// "Deterministic emission order across read and write paths"
+	// in CLAUDE.md.
 	slices.Sort(partitionKeys)
 	parts := make([]*partState, len(partitionKeys))
 	for i, p := range partitionKeys {

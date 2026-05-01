@@ -2422,11 +2422,11 @@ func TestReadIter_PerPartitionDedup(t *testing.T) {
 // records yielded by ReadIter span partitions in lex-ascending
 // order of the Hive partition key, regardless of the order in
 // which the partitions were written. Guards the
-// "Deterministic emission order across read paths" invariant in
-// CLAUDE.md — a future refactor that drops the slices.Sort in
-// preparePartitions (or otherwise surfaces Go's randomized map
-// iteration order) would silently break consumer expectations
-// of byte-for-byte stable output.
+// "Deterministic emission order across read and write paths"
+// invariant in CLAUDE.md — a future refactor that drops the
+// slices.Sort in preparePartitions (or otherwise surfaces Go's
+// randomized map iteration order) would silently break consumer
+// expectations of byte-for-byte stable output.
 func TestReadIter_PartitionLexOrder(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})

@@ -200,19 +200,18 @@ func (s *Writer[T]) writeGroupedFanOut(
 		ctx context.Context, key string, recs []T,
 	) (*WriteResult, error),
 ) ([]WriteResult, error) {
-	grouped := s.groupByKey(records)
-	keys := slices.Sorted(maps.Keys(grouped))
+	parts := s.GroupByPartition(records)
 
-	// Slot i holds the result for keys[i] so completion order
+	// Slot i holds the result for parts[i] so completion order
 	// cannot leak into the returned slice even under parallel
 	// execution.
-	results := make([]*WriteResult, len(keys))
+	results := make([]*WriteResult, len(parts))
 
-	err := fanOut(ctx, keys,
+	err := fanOut(ctx, parts,
 		s.cfg.Target.EffectiveMaxInflightRequests(),
 		s.cfg.Target.metrics,
-		func(ctx context.Context, i int, key string) error {
-			r, err := perPartition(ctx, key, grouped[key])
+		func(ctx context.Context, i int, p HivePartition[T]) error {
+			r, err := perPartition(ctx, p.Key, p.Rows)
 			if err != nil {
 				return err
 			}
@@ -223,7 +222,7 @@ func (s *Writer[T]) writeGroupedFanOut(
 	// Compact successful results in sorted-key order regardless
 	// of err — partial success on failure is documented behaviour.
 	var out []WriteResult
-	for i := range keys {
+	for i := range parts {
 		if results[i] != nil {
 			out = append(out, *results[i])
 		}
@@ -554,13 +553,43 @@ func (s *Writer[T]) writeEncodedPayload(
 	}, nil
 }
 
-func (s *Writer[T]) groupByKey(records []T) map[string][]T {
+// GroupByPartition splits records by their Hive partition key
+// (PartitionKeyOf) and returns one HivePartition per distinct
+// key in lex-ascending order of Key. Deterministic across calls
+// — same input produces byte-identical output, mirroring the
+// read-side emission-order invariant. Same HivePartition[T]
+// type the ReadPartition* methods yield.
+//
+// Use to preview partitioning without paying the write cost
+// (logging, sharding decisions, dry-run validation) or as a
+// building block for custom write strategies (filter some
+// partitions, write the rest; route partitions to different
+// Targets; etc.).
+//
+// Empty records returns nil. Records whose PartitionKeyOf
+// returns the same string land in the same HivePartition;
+// per-partition record order is preserved (insertion order from
+// the input slice).
+//
+// Public contract: partition emission is lex-ordered. See
+// "Deterministic emission order across read and write paths"
+// in CLAUDE.md — GroupByPartition is the write-side
+// counterpart of that invariant.
+func (s *Writer[T]) GroupByPartition(records []T) []HivePartition[T] {
+	if len(records) == 0 {
+		return nil
+	}
 	grouped := make(map[string][]T)
 	for _, r := range records {
 		key := s.cfg.PartitionKeyOf(r)
 		grouped[key] = append(grouped[key], r)
 	}
-	return grouped
+	keys := slices.Sorted(maps.Keys(grouped))
+	out := make([]HivePartition[T], len(keys))
+	for i, k := range keys {
+		out[i] = HivePartition[T]{Key: k, Rows: grouped[k]}
+	}
+	return out
 }
 
 // validateKey enforces that the key is a "/"-delimited sequence

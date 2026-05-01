@@ -87,32 +87,40 @@ must preserve them — even when the change appears unrelated.
   No global-dedup escape hatch — refactors must not reintroduce
   one (the union-slice memory cost was real, and per-partition
   dedup is correctness-equivalent under the precondition).
-- **Deterministic emission order across read paths** — every
-  read path (`Read` / `ReadIter` / `ReadPartitionIter` /
+- **Deterministic emission order across read and write paths**
+  — every read path (`Read` / `ReadIter` / `ReadPartitionIter` /
   `ReadRangeIter` / `ReadPartitionRangeIter` / `PollRecords`)
-  emits partitions in **lex order of the Hive partition-key
-  string**, with per-partition records in **`(entity, version)`
-  ascending order** when dedup is configured (decode/insertion
-  order without it, file-lex then parquet-row). Same input on
-  the same data produces byte-identical output every time.
+  AND the write-side `GroupByPartition` emit partitions in
+  **lex order of the Hive partition-key string**, with
+  per-partition records in **`(entity, version)` ascending
+  order** when dedup is configured (decode/insertion order
+  without it, file-lex then parquet-row on reads; insertion
+  order on `GroupByPartition` since the writer has no
+  EntityKeyOf to sort on). Same input on the same data produces
+  byte-identical output every time.
 
-  Three load-bearing pieces back this:
+  Four load-bearing pieces back this:
 
   1. `preparePartitions` collects the `byPartition` map keys
      and `slices.Sort`s them before constructing the per-
      partition state — collapses Go's randomized map iteration
-     to deterministic lex order.
+     to deterministic lex order on the read side.
   2. `sortKeyMetasByKey` sorts each partition's files by S3
      key — deterministic decode order within a partition.
   3. `decodePartition` runs `sortAndDedup`, a stable
      `(entity, version)` sort followed by in-place dedup —
      deterministic record order within a partition's output.
+  4. `GroupByPartition` collects records into a `byKey` map and
+     `slices.Sorted(maps.Keys(...))`s them before building the
+     `[]HivePartition[T]` slice — same map-iteration-collapse
+     pattern as the read side. `writeGroupedFanOut` consumes
+     this slice directly.
 
   Refactors must not introduce non-deterministic partition
-  iteration (e.g., emitting from the `byPartition` map directly
-  without sorting), parallel-decode pipelines that race
-  `decodedBatch` sends to the channel out of order, or
-  non-stable record sorts inside a partition. Consumers may
+  iteration (e.g., emitting from the `byPartition` / `byKey`
+  map directly without sorting), parallel-decode pipelines
+  that race `decodedBatch` sends to the channel out of order,
+  or non-stable record sorts inside a partition. Consumers may
   rely on byte-for-byte stable output across calls — diffing,
   hashing, replay-equality, and golden-file tests all depend
   on it.

@@ -10,9 +10,10 @@ import (
 	"github.com/parquet-go/parquet-go/compress"
 )
 
-// TestGroupByKey guards that groupByKey partitions records by
-// PartitionKeyOf and preserves every record in its group.
-func TestGroupByKey(t *testing.T) {
+// TestGroupByPartition_PartitionsAndPreservesRecords guards that
+// GroupByPartition partitions records by PartitionKeyOf and
+// preserves every record in its group.
+func TestGroupByPartition_PartitionsAndPreservesRecords(t *testing.T) {
 	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
 		Target: newS3TargetSkipConfig(S3TargetConfig{
 			PartitionKeyParts: []string{"period", "customer"},
@@ -28,24 +29,119 @@ func TestGroupByKey(t *testing.T) {
 		{Period: "p1", Customer: "b", Value: 3},
 		{Period: "p2", Customer: "a", Value: 4},
 	}
-	got := s.groupByKey(records)
+	got := s.GroupByPartition(records)
 
 	if len(got) != 3 {
-		t.Fatalf("got %d groups, want 3", len(got))
+		t.Fatalf("got %d partitions, want 3", len(got))
 	}
-	cases := []struct {
-		key  string
-		want int
-	}{
-		{"period=p1/customer=a", 2},
-		{"period=p1/customer=b", 1},
-		{"period=p2/customer=a", 1},
+	wantSizes := map[string]int{
+		"period=p1/customer=a": 2,
+		"period=p1/customer=b": 1,
+		"period=p2/customer=a": 1,
 	}
-	for _, tc := range cases {
-		if n := len(got[tc.key]); n != tc.want {
-			t.Errorf("group %q: got %d records, want %d",
-				tc.key, n, tc.want)
+	for _, p := range got {
+		want, ok := wantSizes[p.Key]
+		if !ok {
+			t.Errorf("unexpected partition key %q", p.Key)
+			continue
 		}
+		if n := len(p.Rows); n != want {
+			t.Errorf("partition %q: got %d records, want %d",
+				p.Key, n, want)
+		}
+	}
+}
+
+// TestGroupByPartition_LexOrder pins the public contract that
+// partitions emit in lex-ascending order of Key regardless of
+// the order in which they appear in the input slice. Mirrors
+// the read-side TestReadIter_PartitionLexOrder — see
+// "Deterministic emission order across read and write paths"
+// in CLAUDE.md.
+func TestGroupByPartition_LexOrder(t *testing.T) {
+	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
+		Target: newS3TargetSkipConfig(S3TargetConfig{
+			PartitionKeyParts: []string{"period", "customer"},
+		}),
+		PartitionKeyOf: func(r testRec) string {
+			return "period=" + r.Period + "/customer=" + r.Customer
+		},
+	}}
+
+	// Input in reverse-lex order so any accidental
+	// insertion-order or map-iteration emission would produce
+	// (c, b, a) instead of (a, b, c).
+	records := []testRec{
+		{Period: "p1", Customer: "c", Value: 1},
+		{Period: "p1", Customer: "b", Value: 2},
+		{Period: "p1", Customer: "a", Value: 3},
+	}
+	got := s.GroupByPartition(records)
+
+	wantKeys := []string{
+		"period=p1/customer=a",
+		"period=p1/customer=b",
+		"period=p1/customer=c",
+	}
+	if len(got) != len(wantKeys) {
+		t.Fatalf("got %d partitions, want %d", len(got), len(wantKeys))
+	}
+	for i, want := range wantKeys {
+		if got[i].Key != want {
+			t.Errorf("[%d] Key=%q, want %q (lex)",
+				i, got[i].Key, want)
+		}
+	}
+}
+
+// TestGroupByPartition_InsertionOrderWithinPartition pins that
+// records that share a partition key retain their input order in
+// Rows — the writer doesn't sort within a partition (no
+// EntityKeyOf to compare on).
+func TestGroupByPartition_InsertionOrderWithinPartition(t *testing.T) {
+	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
+		Target: newS3TargetSkipConfig(S3TargetConfig{
+			PartitionKeyParts: []string{"period", "customer"},
+		}),
+		PartitionKeyOf: func(r testRec) string {
+			return "period=" + r.Period + "/customer=" + r.Customer
+		},
+	}}
+
+	records := []testRec{
+		{Period: "p1", Customer: "a", Value: 30},
+		{Period: "p1", Customer: "a", Value: 10},
+		{Period: "p1", Customer: "a", Value: 20},
+	}
+	got := s.GroupByPartition(records)
+	if len(got) != 1 {
+		t.Fatalf("got %d partitions, want 1", len(got))
+	}
+	wantValues := []int64{30, 10, 20}
+	for i, v := range wantValues {
+		if got[0].Rows[i].Value != v {
+			t.Errorf("[%d] Value=%d, want %d (insertion order)",
+				i, got[0].Rows[i].Value, v)
+		}
+	}
+}
+
+// TestGroupByPartition_EmptyInput guards the nil-return fast
+// path.
+func TestGroupByPartition_EmptyInput(t *testing.T) {
+	s := &Writer[testRec]{cfg: WriterConfig[testRec]{
+		Target: newS3TargetSkipConfig(S3TargetConfig{
+			PartitionKeyParts: []string{"period", "customer"},
+		}),
+		PartitionKeyOf: func(r testRec) string {
+			return "period=" + r.Period + "/customer=" + r.Customer
+		},
+	}}
+	if got := s.GroupByPartition(nil); got != nil {
+		t.Errorf("nil input: got %v, want nil", got)
+	}
+	if got := s.GroupByPartition([]testRec{}); got != nil {
+		t.Errorf("empty input: got %v, want nil", got)
 	}
 }
 

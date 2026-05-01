@@ -7,22 +7,32 @@ import (
 	"time"
 )
 
-// HivePartition is one Hive partition's worth of records yielded
-// by ReadPartitionIter / ReadPartitionRangeIter. Key is the
-// partition-key string ("period=X/customer=Y") that WriteWithKey
-// originally took as input. Rows is the partition's records,
-// already sort+dedup'd by the same logic ReadIter / ReadRangeIter
-// apply (per-partition latest-per-entity by default; opt out with
-// WithHistory for replica-only collapse).
+// HivePartition is the canonical (Key, Rows) value type for
+// per-partition reads and writes. Key is the partition-key
+// string ("period=X/customer=Y") matching what WriteWithKey
+// takes as input.
 //
-// Yield order matches ReadIter / ReadRangeIter at the partition
-// level: partitions emit in lex order of Key. Within Rows, order
-// depends on dedup configuration: when EntityKeyOf is set,
-// records are in (entity, version) ascending order under both
-// dedup paths (the WithHistory replica path still sorts by the
-// same comparator). When EntityKeyOf is nil (no dedup
-// configured), records emit in decode order: file lex order,
-// then parquet row order within each file.
+// Read-side: ReadPartitionIter / ReadPartitionRangeIter yield
+// one HivePartition per Hive partition with Rows already
+// sort+dedup'd (per-partition latest-per-entity by default; opt
+// out with WithHistory for replica-only collapse). Yield order
+// is lex-ascending by Key. Within Rows, order depends on dedup
+// configuration: when EntityKeyOf is set, records are in
+// (entity, version) ascending order under both dedup paths (the
+// WithHistory replica path still sorts by the same comparator).
+// When EntityKeyOf is nil (no dedup configured), records emit
+// in decode order: file lex order, then parquet row order
+// within each file.
+//
+// Write-side: GroupByPartition returns []HivePartition[T]
+// lex-ordered by Key, with per-partition Rows in input
+// (insertion) order. No sort or dedup runs on the write side —
+// the writer doesn't have an EntityKeyOf to compare on.
+//
+// Both sides share the deterministic-emission contract: same
+// input produces byte-identical HivePartition slices across
+// calls. See "Deterministic emission order across read and
+// write paths" in CLAUDE.md.
 type HivePartition[T any] struct {
 	Key  string
 	Rows []T
