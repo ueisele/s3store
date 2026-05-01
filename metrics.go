@@ -216,12 +216,16 @@ func newMetrics(
 		1024, 4096, 16384, 65536, 262144, 1048576,
 		4194304, 16777216, 33554432, 134217728, 1073741824,
 	}
-	// recordCountBuckets covers per-call record counts from
-	// single-row writes through million-row batches with ~5×
-	// jumps so a 1000-record CDC batch and a 10000-record bulk
-	// batch land in different buckets.
+	// recordCountBuckets covers per-call record counts from single-
+	// row writes through million-row batches. Real per-partition
+	// distributions for typical CDC workloads are heavily skewed
+	// toward the 10-1000 band (P50 ≈ 75, P95 ≈ 1000, P99 ≈ 5000)
+	// with a long thin tail to ~1M, so the boundaries are dense
+	// 2-2.5× jumps from 10-1000 and stretch out to 5× past 10000
+	// for outlier resolution without inflating cardinality.
 	recordCountBuckets := []float64{
-		1, 5, 25, 100, 500, 2500, 10000, 50000, 250000, 1000000,
+		1, 10, 25, 50, 100, 250, 500, 1000,
+		2500, 10000, 50000, 250000, 1000000,
 	}
 
 	// Helpers — discard error to keep newMetrics infallible. The
