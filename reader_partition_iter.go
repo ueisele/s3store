@@ -75,7 +75,7 @@ func (s *Reader[T]) ReadPartitionIter(
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		keys, err := ResolvePatterns(
+		keys, err := resolvePatterns(
 			ctx, s.cfg.Target, keyPatterns, methodReadPartitionIter)
 		if err != nil {
 			iterErr = fmt.Errorf("ReadPartitionIter: %w", err)
@@ -148,10 +148,52 @@ func (s *Reader[T]) ReadPartitionRangeIter(
 	}
 }
 
+// ReadPartitionEntriesIter is the partition-grouped variant of
+// ReadEntriesIter: streams records from a pre-resolved
+// []StreamEntry as one HivePartition[T] per Hive partition.
+//
+// Use when the consumer already has the entries (typically from
+// PollRange) AND wants per-partition batches for joins,
+// group-bys, or zip-by-partition workflows across multiple
+// Stores.
+//
+// Same per-partition dedup, byte-budget, read-ahead, tolerant-
+// NoSuchKey semantics as ReadPartitionRangeIter. Same upfront
+// cross-store guard as ReadEntriesIter — every entry's DataPath
+// must belong to this Reader's prefix or the iter yields a
+// wrapped error before any S3 traffic.
+//
+// Empty entries slice yields nothing without error. Partitions
+// emit in lex order of HivePartition.Key.
+func (s *Reader[T]) ReadPartitionEntriesIter(
+	ctx context.Context, entries []StreamEntry, opts ...ReadOption,
+) iter.Seq2[HivePartition[T], error] {
+	return func(yield func(HivePartition[T], error) bool) {
+		scope := s.cfg.Target.metrics.methodScope(ctx, methodReadPartitionEntriesIter)
+		var iterErr error
+		defer scope.end(&iterErr)
+		var o readOpts
+		o.apply(opts...)
+
+		if err := s.validateEntriesBelongHere(entries); err != nil {
+			iterErr = err
+			yield(HivePartition[T]{}, err)
+			return
+		}
+		if len(entries) == 0 {
+			return
+		}
+
+		keys := entriesToKeys(entries)
+		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+			partitionEmit(yield, &iterErr))
+	}
+}
+
 // partitionEmit returns the per-batch emit callback that yields
 // one HivePartition[T] per partition. Used by ReadPartitionIter /
-// ReadPartitionRangeIter — paths that surface records grouped by
-// Hive partition.
+// ReadPartitionRangeIter / ReadPartitionEntriesIter — paths that
+// surface records grouped by Hive partition.
 //
 // On a hard pipeline error: sets *iterErr, yields a zero
 // HivePartition with the error, returns (0, false) so the emit

@@ -221,7 +221,7 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 	s := newTestStreamState()
 	s.parts = []*partState{
 		{
-			files:  make([]KeyMeta, 3), // only len matters
+			files:  make([]keyMeta, 3), // only len matters
 			bodies: make([][]byte, 3),
 			errs:   make([]error, 3),
 		},

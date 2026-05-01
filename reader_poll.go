@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -230,12 +231,12 @@ func (s *Reader[T]) PollRecords(
 	}
 
 	// Carry each entry's InsertedAt (= dataTsMicros from the ref
-	// filename) on the KeyMeta. Used as the fallback when the
+	// filename) on the keyMeta. Used as the fallback when the
 	// reader has no InsertedAtField configured — same value the
 	// writer captured, so dedup / sort matches the column path.
-	keys := make([]KeyMeta, len(entries))
+	keys := make([]keyMeta, len(entries))
 	for i, e := range entries {
-		keys[i] = KeyMeta{
+		keys[i] = keyMeta{
 			Key:        e.DataPath,
 			InsertedAt: e.InsertedAt,
 		}
@@ -270,4 +271,83 @@ func (s *Reader[T]) PollRecords(
 // takes time.Time bounds directly.
 func (s *Reader[T]) OffsetAt(t time.Time) Offset {
 	return Offset(refCutoff(s.refPath, t, 0))
+}
+
+// PollRange drains the ref stream over the [since, until)
+// wall-clock window in one call, returning every StreamEntry
+// gated by the commit-marker (same gating Poll applies). Pages
+// internally at s3ListMaxKeys; one Poll per page until exhausted.
+//
+// Zero time.Time on either bound means unbounded: since=zero
+// starts at the stream head, until=zero walks to the live tip
+// (now - SettleWindow, captured at call entry so the upper
+// bound stays stable under concurrent writes). Same time-bound
+// semantics as ReadRangeIter.
+//
+// Use to enumerate refs / partitions before deciding scope,
+// intersect partition sets across Stores for a filtered zip,
+// or feed metadata into custom decode workflows. Each
+// StreamEntry carries the partition Key, DataPath, RefPath,
+// InsertedAt, and RowCount — everything a caller needs to
+// inspect or pass downstream.
+//
+// Memory: O(refs in range × StreamEntry size). For huge ranges
+// chunk by smaller windows or use ReadRangeIter (streaming) /
+// PollRecords (cursor-based) instead.
+//
+// Order: refs in time order (refMicroTs lex-ascending, same as
+// Poll). Partition emission order on snapshot reads is
+// lex-ascending by partition Key — re-group via
+// HivePartition.Key if you want partition-grouped output.
+func (s *Reader[T]) PollRange(
+	ctx context.Context, since, until time.Time,
+) ([]StreamEntry, error) {
+	sinceOffset, untilOffset := s.resolveRangeBounds(since, until)
+	pollOpts := []PollOption{WithUntilOffset(untilOffset)}
+	var entries []StreamEntry
+	cur := sinceOffset
+	for {
+		page, next, err := s.Poll(ctx, cur, s3ListMaxKeys, pollOpts...)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		entries = append(entries, page...)
+		cur = next
+	}
+	return entries, nil
+}
+
+// PartitionKeysOf extracts the distinct Hive partition keys from
+// a slice of StreamEntries, returned in lex-ascending order.
+// Useful for cross-store intersection workflows where each
+// Store's entries must be filtered to a common partition set
+// before passing to ReadEntriesIter / ReadPartitionEntriesIter:
+//
+//	entriesA, _ := storeA.PollRange(ctx, since, until)
+//	entriesB, _ := storeB.PollRange(ctx, since, until)
+//	common := intersect(
+//	    PartitionKeysOf(entriesA), PartitionKeysOf(entriesB),
+//	)
+//	// Filter each Store's entries by `common`, then pass to
+//	// the matching Store's ReadEntriesIter.
+//
+// Empty input returns nil. Returned slice is freshly allocated;
+// the caller may mutate it without affecting `entries`.
+func PartitionKeysOf(entries []StreamEntry) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		seen[e.Key] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
 }

@@ -42,7 +42,7 @@ func (s *Reader[T]) Read(
 	var o readOpts
 	o.apply(opts...)
 
-	keys, err := ResolvePatterns(
+	keys, err := resolvePatterns(
 		ctx, s.cfg.Target, keyPatterns, methodRead)
 	if err != nil {
 		return nil, fmt.Errorf("Read: %w", err)
@@ -81,6 +81,10 @@ func identityKey(s string) string { return s }
 //   - PollRecords / ReadRangeIter / ReadPartitionRangeIter walk
 //     the ref stream; an operator-driven prune can leave a ref
 //     pointing at nothing and the consumer must keep advancing.
+//   - ReadEntriesIter / ReadPartitionEntriesIter take pre-resolved
+//     StreamEntry slices; an operator prune between resolution
+//     and read can race the same way, with no caller retry able
+//     to resolve it (the entry set is fixed).
 //   - BackfillProjection is a long-running operator job; failing on
 //     one race-deleted file would force a full restart.
 //
@@ -94,7 +98,8 @@ func identityKey(s string) string { return s }
 func methodTolerantOfMissingData(m methodKind) bool {
 	switch m {
 	case methodPollRecords, methodReadRangeIter,
-		methodReadPartitionRangeIter, methodBackfill:
+		methodReadPartitionRangeIter, methodReadEntriesIter,
+		methodReadPartitionEntriesIter, methodBackfill:
 		return true
 	default:
 		return false

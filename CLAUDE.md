@@ -89,15 +89,15 @@ must preserve them — even when the change appears unrelated.
   dedup is correctness-equivalent under the precondition).
 - **Deterministic emission order across read and write paths**
   — every read path (`Read` / `ReadIter` / `ReadPartitionIter` /
-  `ReadRangeIter` / `ReadPartitionRangeIter` / `PollRecords`)
-  AND the write-side `GroupByPartition` emit partitions in
-  **lex order of the Hive partition-key string**, with
-  per-partition records in **`(entity, version)` ascending
-  order** when dedup is configured (decode/insertion order
-  without it, file-lex then parquet-row on reads; insertion
-  order on `GroupByPartition` since the writer has no
-  EntityKeyOf to sort on). Same input on the same data produces
-  byte-identical output every time.
+  `ReadRangeIter` / `ReadPartitionRangeIter` / `ReadEntriesIter`
+  / `ReadPartitionEntriesIter` / `PollRecords`) AND the
+  write-side `GroupByPartition` emit partitions in **lex order
+  of the Hive partition-key string**, with per-partition records
+  in **`(entity, version)` ascending order** when dedup is
+  configured (decode/insertion order without it, file-lex then
+  parquet-row on reads; insertion order on `GroupByPartition`
+  since the writer has no EntityKeyOf to sort on). Same input
+  on the same data produces byte-identical output every time.
 
   Four load-bearing pieces back this:
 

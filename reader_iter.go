@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,7 +57,7 @@ func (s *Reader[T]) ReadIter(
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		keys, err := ResolvePatterns(
+		keys, err := resolvePatterns(
 			ctx, s.cfg.Target, keyPatterns, methodReadIter)
 		if err != nil {
 			iterErr = fmt.Errorf("ReadIter: %w", err)
@@ -130,6 +131,58 @@ func (s *Reader[T]) ReadRangeIter(
 	}
 }
 
+// ReadEntriesIter streams records from a pre-resolved []StreamEntry
+// — typically the output of PollRange or Poll — as an
+// iter.Seq2[T, error]. Skips the LIST + commit-gate phase that
+// ReadIter / ReadRangeIter do internally; useful when a caller
+// already enumerated refs (for inspection, filtering, or
+// cross-store coordination) and wants to decode them without
+// paying the resolution cost a second time.
+//
+// Same per-partition dedup, byte-budget, and read-ahead semantics
+// as ReadRangeIter. Tolerant of NoSuchKey: an operator-driven
+// prune between resolution and decode is logged + counted via
+// s3store.read.missing_data and the affected file is skipped, so
+// the consumer keeps advancing.
+//
+// Cross-store safety: the iter validates upfront that every
+// entry's DataPath belongs to this Reader's prefix
+// (<prefix>/data/...). Passing entries from a different Store
+// yields a wrapped error before any S3 traffic — entries cannot
+// be silently mis-routed across Stores. Cross-bucket misuse
+// (same prefix, different bucket) bypasses this check but fails
+// loudly via NoSuchKey because the receiving bucket doesn't
+// have those exact keys (UUIDv7 in the data path makes accidental
+// hits effectively impossible).
+//
+// Empty entries slice yields nothing without error. Records emit
+// in partition-lex order (the entries are re-grouped into the
+// same per-partition pipeline ReadIter / ReadRangeIter use).
+func (s *Reader[T]) ReadEntriesIter(
+	ctx context.Context, entries []StreamEntry, opts ...ReadOption,
+) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		scope := s.cfg.Target.metrics.methodScope(ctx, methodReadEntriesIter)
+		var iterErr error
+		defer scope.end(&iterErr)
+		var o readOpts
+		o.apply(opts...)
+
+		if err := s.validateEntriesBelongHere(entries); err != nil {
+			iterErr = err
+			yield(*new(T), err)
+			return
+		}
+		if len(entries) == 0 {
+			return
+		}
+
+		keys := entriesToKeys(entries)
+		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+			s.recordEmit(yield, &iterErr))
+	}
+}
+
 // resolveRangeBounds converts a [since, until) wall-clock window
 // into stream Offset bounds. Pure computation — no I/O. Captures
 // the live-tip snapshot at call time when until is zero, freezing
@@ -158,7 +211,7 @@ func (s *Reader[T]) resolveRangeBounds(
 
 // walkRangeKeys walks the ref stream between sinceOffset and
 // untilOffset (resolved upfront by resolveRangeBounds) into a
-// flat list of data-file KeyMetas. LIST-only — no parquet bodies
+// flat list of data-file keyMetas. LIST-only — no parquet bodies
 // fetched, so this phase is cheap. Uses the LIST page max as the
 // per-Poll cap to minimize round trips. Slice growth here is
 // bounded metadata, not decoded record memory.
@@ -168,9 +221,9 @@ func (s *Reader[T]) resolveRangeBounds(
 // consumer on a non-nil return.
 func (s *Reader[T]) walkRangeKeys(
 	ctx context.Context, sinceOffset, untilOffset Offset,
-) ([]KeyMeta, error) {
+) ([]keyMeta, error) {
 	pollOpts := []PollOption{WithUntilOffset(untilOffset)}
-	var keys []KeyMeta
+	var keys []keyMeta
 	cur := sinceOffset
 	for {
 		entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, pollOpts...)
@@ -181,7 +234,7 @@ func (s *Reader[T]) walkRangeKeys(
 			break
 		}
 		for _, e := range entries {
-			keys = append(keys, KeyMeta{
+			keys = append(keys, keyMeta{
 				Key:        e.DataPath,
 				InsertedAt: e.InsertedAt,
 			})
@@ -193,8 +246,8 @@ func (s *Reader[T]) walkRangeKeys(
 
 // recordEmit returns the per-batch emit callback that flattens
 // each partition's already-dedup'd records into the consumer's
-// iter.Seq2[T, error] yield. Used by ReadIter / ReadRangeIter —
-// paths that surface records one at a time.
+// iter.Seq2[T, error] yield. Used by ReadIter / ReadRangeIter /
+// ReadEntriesIter — paths that surface records one at a time.
 //
 // On a hard pipeline error: sets *iterErr, yields (zero T, err)
 // once, returns (0, false) so the emit loop terminates and
@@ -215,8 +268,61 @@ func (s *Reader[T]) recordEmit(
 	}
 }
 
+// validateEntriesBelongHere checks that every entry's DataPath
+// is rooted at this Reader's dataPath (<prefix>/data/). Catches
+// the dominant misuse of ReadEntriesIter / ReadPartitionEntriesIter:
+// passing entries resolved from a different Store (different
+// prefix, possibly different bucket).
+//
+// Returns the first mismatch wrapped with index + paths so the
+// caller can find the bug. nil entries / empty slice → nil
+// (caller handles the empty case after this check). The check
+// is O(N) string-prefix-match — microseconds for typical batches,
+// negligible vs. the S3 round-trips that would otherwise burn
+// against the wrong Store.
+//
+// Does NOT catch cross-bucket misuse (same prefix, different
+// bucket). That case fails loudly via NoSuchKey because UUIDv7
+// in the data-file path makes accidental cross-bucket hits
+// effectively impossible — the failure mode is "loud read
+// error", not "silent wrong data".
+func (s *Reader[T]) validateEntriesBelongHere(
+	entries []StreamEntry,
+) error {
+	expected := s.dataPath + "/"
+	for i, e := range entries {
+		if !strings.HasPrefix(e.DataPath, expected) {
+			return fmt.Errorf(
+				"entry [%d] DataPath %q is outside this Reader's "+
+					"data path %q — entries from a different Store "+
+					"cannot be passed to ReadEntriesIter / "+
+					"ReadPartitionEntriesIter",
+				i, e.DataPath, s.dataPath)
+		}
+	}
+	return nil
+}
+
+// entriesToKeys flattens a []StreamEntry into the []keyMeta
+// shape downloadAndDecodeIter consumes. Used by ReadEntriesIter
+// / ReadPartitionEntriesIter after validateEntriesBelongHere
+// passes. Same keyMeta-construction shape walkRangeKeys uses
+// internally (DataPath + InsertedAt only — the pipeline doesn't
+// need the other StreamEntry fields).
+func entriesToKeys(entries []StreamEntry) []keyMeta {
+	keys := make([]keyMeta, len(entries))
+	for i, e := range entries {
+		keys[i] = keyMeta{
+			Key:        e.DataPath,
+			InsertedAt: e.InsertedAt,
+		}
+	}
+	return keys
+}
+
 // downloadAndDecodeIter is the byte-budget-aware streaming pipeline backing
-// ReadIter / ReadRangeIter / ReadPartitionIter / ReadPartitionRangeIter.
+// ReadIter / ReadRangeIter / ReadEntriesIter / ReadPartitionIter /
+// ReadPartitionRangeIter / ReadPartitionEntriesIter.
 // Three concurrent stages plus the caller's emit loop:
 //
 //  1. Producer goroutine: walks partitions in lex order and
@@ -256,7 +362,7 @@ func (s *Reader[T]) recordEmit(
 // partition still flows (the cap can't bind below partition
 // granularity without row-group-level streaming).
 func (s *Reader[T]) downloadAndDecodeIter(
-	ctx context.Context, keys []KeyMeta,
+	ctx context.Context, keys []keyMeta,
 	opts *readOpts, scope *methodScope,
 	emit func(partKey string, recs []T, err error) (int64, bool),
 ) {
@@ -408,7 +514,7 @@ func (s *Reader[T]) emitPartition(
 // pick a stable in-partition ordering before the pipeline fetches
 // bodies; user-visible emission order is then decided by
 // decodePartition's sortAndDedup on record content.
-func sortKeyMetasByKey(files []KeyMeta) {
+func sortKeyMetasByKey(files []keyMeta) {
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Key < files[j].Key
 	})
@@ -419,7 +525,7 @@ func sortKeyMetasByKey(files []KeyMeta) {
 // by S3 key (deterministic download order), and allocates the
 // per-partition slots.
 func (s *Reader[T]) preparePartitions(
-	keys []KeyMeta,
+	keys []keyMeta,
 ) []*partState {
 	byPartition := s.groupKeysByPartition(keys)
 	if len(byPartition) == 0 {
@@ -452,16 +558,16 @@ func (s *Reader[T]) preparePartitions(
 	return parts
 }
 
-// groupKeysByPartition splits a flat list of data-file KeyMetas
+// groupKeysByPartition splits a flat list of data-file keyMetas
 // into one slice per Hive partition (the path between dataPath
 // and the filename). Within-partition emission order is decided
 // downstream by decodePartition's sortAndDedup on record content
 // — groupKeysByPartition itself does not impose any record
 // ordering.
 func (s *Reader[T]) groupKeysByPartition(
-	keys []KeyMeta,
-) map[string][]KeyMeta {
-	out := make(map[string][]KeyMeta)
+	keys []keyMeta,
+) map[string][]keyMeta {
+	out := make(map[string][]keyMeta)
 	for _, k := range keys {
 		hk, ok := hiveKeyOfDataFile(k.Key, s.dataPath)
 		if !ok {
@@ -675,7 +781,7 @@ type downloadJob struct {
 // callback can surface it to partition-emitting public methods.
 type partState struct {
 	partitionKey string
-	files        []KeyMeta
+	files        []keyMeta
 	bodies       [][]byte
 	errs         []error
 	completed    int

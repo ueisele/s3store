@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -116,5 +117,52 @@ func TestPoll_EmptyConsistencyDefaultsToStrongGlobal(t *testing.T) {
 	if got != string(ConsistencyStrongGlobal) {
 		t.Errorf("Consistency-Control header = %q, want %q",
 			got, ConsistencyStrongGlobal)
+	}
+}
+
+// TestPartitionKeysOf_DistinctLexSorted pins the contract: the
+// helper extracts each unique partition Key, returns lex-ascending
+// order, and is freshly allocated (caller can mutate). Mirrors the
+// determinism contract every other partition-emitting API in the
+// library follows.
+func TestPartitionKeysOf_DistinctLexSorted(t *testing.T) {
+	entries := []StreamEntry{
+		{Key: "period=2026-03-17/customer=c"},
+		{Key: "period=2026-03-17/customer=a"},
+		{Key: "period=2026-03-17/customer=b"},
+		{Key: "period=2026-03-17/customer=a"}, // duplicate
+		{Key: "period=2026-03-17/customer=c"}, // duplicate
+	}
+	got := PartitionKeysOf(entries)
+	want := []string{
+		"period=2026-03-17/customer=a",
+		"period=2026-03-17/customer=b",
+		"period=2026-03-17/customer=c",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// TestPartitionKeysOf_EmptyInput guards the nil-return fast path
+// for both nil and empty-slice inputs.
+func TestPartitionKeysOf_EmptyInput(t *testing.T) {
+	if got := PartitionKeysOf(nil); got != nil {
+		t.Errorf("nil input: got %v, want nil", got)
+	}
+	if got := PartitionKeysOf([]StreamEntry{}); got != nil {
+		t.Errorf("empty input: got %v, want nil", got)
+	}
+}
+
+// TestPartitionKeysOf_SingleEntry is the trivial case — one
+// entry produces a one-element slice.
+func TestPartitionKeysOf_SingleEntry(t *testing.T) {
+	got := PartitionKeysOf([]StreamEntry{
+		{Key: "period=2026-03-17/customer=a"},
+	})
+	want := []string{"period=2026-03-17/customer=a"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }

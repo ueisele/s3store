@@ -1879,6 +1879,100 @@ func TestRead_MissingColumnZeroFills(t *testing.T) {
 	}
 }
 
+// TestPollRange drains the ref stream over a time window and
+// asserts: (1) every committed write surfaces as a StreamEntry,
+// (2) entries arrive in ref-time (refMicroTs lex-ascending)
+// order, (3) StreamEntry fields are populated correctly so
+// callers can inspect partitions / data paths / row counts, and
+// (4) zero-time bounds mean stream-head / live-tip same as
+// ReadRangeIter. Pins the public contract of the new range
+// enumeration API.
+func TestPollRange(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	before := time.Now().Add(-1 * time.Second).Truncate(time.Second)
+	wantPartitions := []string{
+		"period=2026-03-17/customer=a",
+		"period=2026-03-17/customer=b",
+		"period=2026-03-17/customer=c",
+	}
+	for _, c := range []string{"a", "b", "c"} {
+		key := fmt.Sprintf("period=2026-03-17/customer=%s", c)
+		if _, err := store.WriteWithKey(ctx, key, []Rec{
+			{Period: "2026-03-17", Customer: c, SKU: "s1", Value: 1},
+			{Period: "2026-03-17", Customer: c, SKU: "s2", Value: 2},
+		}); err != nil {
+			t.Fatalf("WriteWithKey %s: %v", c, err)
+		}
+	}
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
+	after := time.Now()
+
+	entries, err := store.PollRange(ctx, before, after)
+	if err != nil {
+		t.Fatalf("PollRange: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("got %d entries, want 3", len(entries))
+	}
+
+	// Entries arrive in ref-time order. Three writes happen
+	// within microseconds of each other so ordering is whatever
+	// refMicroTs the writers stamped — but the entries' Offsets
+	// MUST be lex-ascending (the pagination cursor advances
+	// monotonically through the LIST output).
+	for i := 1; i < len(entries); i++ {
+		if string(entries[i-1].Offset) >= string(entries[i].Offset) {
+			t.Errorf("offsets not strictly ascending: [%d]=%q, [%d]=%q",
+				i-1, entries[i-1].Offset, i, entries[i].Offset)
+		}
+	}
+
+	// Field population: partition Key, DataPath, RefPath,
+	// InsertedAt, RowCount should all be set.
+	gotPartitions := make(map[string]bool, len(entries))
+	for i, e := range entries {
+		gotPartitions[e.Key] = true
+		if e.DataPath == "" {
+			t.Errorf("[%d] empty DataPath", i)
+		}
+		if e.RefPath == "" {
+			t.Errorf("[%d] empty RefPath", i)
+		}
+		if e.InsertedAt.IsZero() {
+			t.Errorf("[%d] zero InsertedAt", i)
+		}
+		if e.RowCount != 2 {
+			t.Errorf("[%d] RowCount=%d, want 2", i, e.RowCount)
+		}
+	}
+	for _, want := range wantPartitions {
+		if !gotPartitions[want] {
+			t.Errorf("missing partition %q in entries", want)
+		}
+	}
+
+	// Open bounds (zero-value time) walk stream head → live tip.
+	openEntries, err := store.PollRange(ctx, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatalf("PollRange open bounds: %v", err)
+	}
+	if len(openEntries) != 3 {
+		t.Errorf("open bounds: got %d, want 3", len(openEntries))
+	}
+
+	// Empty window yields nothing without error.
+	emptyEntries, err := store.PollRange(ctx,
+		before.Add(-time.Hour), before.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("PollRange empty: %v", err)
+	}
+	if len(emptyEntries) != 0 {
+		t.Errorf("empty window: got %d, want 0", len(emptyEntries))
+	}
+}
+
 // TestPollRecords mirrors TestPoll for the typed-record path,
 // with dedup behaviour verified against the same expectations
 // as Read.

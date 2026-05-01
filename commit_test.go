@@ -256,13 +256,13 @@ func TestGateByCommit_DropsUncommittedAndKeepsSingles(t *testing.T) {
 	tokB := "tok-b"
 	tokC := "tok-c"
 
-	committedSingle := KeyMeta{
+	committedSingle := keyMeta{
 		Key: dataPath + "/period=A/" + makeID(tokA, testAttemptIDA) + ".parquet",
 	}
-	uncommitted := KeyMeta{
+	uncommitted := keyMeta{
 		Key: dataPath + "/period=A/" + makeID(tokB, testAttemptIDA) + ".parquet",
 	}
-	committedDifferentPartition := KeyMeta{
+	committedDifferentPartition := keyMeta{
 		Key: dataPath + "/period=B/" + makeID(tokC, testAttemptIDA) + ".parquet",
 	}
 
@@ -270,7 +270,7 @@ func TestGateByCommit_DropsUncommittedAndKeepsSingles(t *testing.T) {
 		"period=A:" + tokA: {},
 		"period=B:" + tokC: {},
 	}
-	in := []KeyMeta{committedSingle, uncommitted, committedDifferentPartition}
+	in := []keyMeta{committedSingle, uncommitted, committedDifferentPartition}
 
 	got, err := gateByCommit(t.Context(), S3Target{}, dataPath,
 		in, commits, methodRead)
@@ -298,11 +298,11 @@ func TestGateByCommit_DropsUncommittedAndKeepsSingles(t *testing.T) {
 func TestGateByCommit_PartitionScopedTokens(t *testing.T) {
 	const dataPath = "p/data"
 	const tok = "tok42"
-	commitA := KeyMeta{Key: dataPath + "/period=A/" + makeID(tok, testAttemptIDA) + ".parquet"}
-	uncommitB := KeyMeta{Key: dataPath + "/period=B/" + makeID(tok, testAttemptIDA) + ".parquet"}
+	commitA := keyMeta{Key: dataPath + "/period=A/" + makeID(tok, testAttemptIDA) + ".parquet"}
+	uncommitB := keyMeta{Key: dataPath + "/period=B/" + makeID(tok, testAttemptIDA) + ".parquet"}
 	commits := map[string]struct{}{"period=A:" + tok: {}}
 	got, err := gateByCommit(t.Context(), S3Target{}, dataPath,
-		[]KeyMeta{commitA, uncommitB}, commits, methodRead)
+		[]keyMeta{commitA, uncommitB}, commits, methodRead)
 	if err != nil {
 		t.Fatalf("gateByCommit: %v", err)
 	}

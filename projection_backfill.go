@@ -109,7 +109,7 @@ func BackfillProjection[T any](
 		return stats, err
 	}
 	// Apply the until cutoff in Go: the LIST already gave us
-	// LastModified per object via KeyMeta.InsertedAt, so we
+	// LastModified per object via keyMeta.InsertedAt, so we
 	// don't need a dedicated until-aware list helper. A zero
 	// until disables the filter.
 	if !until.IsZero() {
@@ -130,7 +130,7 @@ func BackfillProjection[T any](
 	err = fanOut(ctx, keys,
 		target.EffectiveMaxInflightRequests(),
 		target.metrics,
-		func(ctx context.Context, _ int, km KeyMeta) error {
+		func(ctx context.Context, _ int, km keyMeta) error {
 			key := km.Key
 			paths, nRecs, err := backfillMarkersForObject(
 				ctx, target, def.Name, def.Columns, of, projectionPath, key)

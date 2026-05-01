@@ -10,7 +10,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// KeyMeta pairs an S3 object key with an insertedAt timestamp
+// keyMeta pairs an S3 object key with an insertedAt timestamp
 // — the file's write time as best the caller can derive it —
 // and the compressed object size from the LIST response.
 // Threaded through the read path so downstream consumers can
@@ -31,11 +31,11 @@ import (
 //
 // Size is the compressed object size from the LIST response
 // (S3's Contents.Size). Zero when the call site doesn't have
-// access to a LIST result (e.g. PollRecords assembles KeyMetas
+// access to a LIST result (e.g. PollRecords assembles keyMetas
 // from ref filenames). Used by ReadIter as the download-stage
 // memory estimate; the uncompressed size used by the byte-budget
 // gate is read from each parquet file's footer after download.
-type KeyMeta struct {
+type keyMeta struct {
 	Key        string
 	InsertedAt time.Time
 	Size       int64
@@ -87,9 +87,9 @@ func dedupePatterns(patterns []string) []string {
 	return unionKeys([][]string{patterns}, func(s string) string { return s })
 }
 
-// ResolvePatterns chains the standard pattern→keys pipeline:
+// resolvePatterns chains the standard pattern→keys pipeline:
 // dedupe → buildReadPlans → listDataFiles → gateByCommit. Returns
-// the deduplicated KeyMetas matching any pattern, gated against
+// the deduplicated keyMetas matching any pattern, gated against
 // `<token>.commit` markers so uncommitted parquets are invisible.
 // Empty patterns slice or no matches → (nil, nil).
 //
@@ -105,10 +105,10 @@ func dedupePatterns(patterns []string) []string {
 //
 // method is the caller's methodKind used as the metric label for
 // commit-gate HEADs (s3store.read.commit_head{method=...}).
-func ResolvePatterns(
+func resolvePatterns(
 	ctx context.Context, t S3Target, patterns []string,
 	method methodKind,
-) ([]KeyMeta, error) {
+) ([]keyMeta, error) {
 	patterns = dedupePatterns(patterns)
 	if len(patterns) == 0 {
 		return nil, nil
@@ -128,7 +128,7 @@ func ResolvePatterns(
 // listDataFiles returns the deduplicated union of parquet objects
 // under each plan's ListPrefix whose Hive key matches the plan's
 // predicate, plus the set of `<token>.commit` markers visible in
-// the same LIST iteration. Each parquet KeyMeta carries S3
+// the same LIST iteration. Each parquet keyMeta carries S3
 // LastModified so downstream sort fallbacks can reason about
 // write time without a second round-trip. Overlapping plans (e.g.
 // "period=*" and "period=2026-03-*") are deduped on key so
@@ -136,7 +136,7 @@ func ResolvePatterns(
 //
 // commits is keyed by `<partition>:<token>` and records every
 // `<token>.commit` whose containing partition matched its plan's
-// predicate. Returned alongside the parquet KeyMetas because both
+// predicate. Returned alongside the parquet keyMetas because both
 // kinds of object live under the same partition prefix — capturing
 // them in one LIST iteration is one round-trip cheaper than a
 // separate scan.
@@ -149,11 +149,11 @@ func ResolvePatterns(
 func listDataFiles(
 	ctx context.Context, t S3Target,
 	plans []*readPlan,
-) (parquets []KeyMeta, commits map[string]struct{}, err error) {
+) (parquets []keyMeta, commits map[string]struct{}, err error) {
 	dataPath := dataPath(t.Prefix())
 
 	type planResult struct {
-		Parquets []KeyMeta
+		Parquets []keyMeta
 		Commits  []string // composite "partition:token"
 	}
 
@@ -180,7 +180,7 @@ func listDataFiles(
 							// written / stale layout) — skip.
 							return true, nil
 						}
-						pr.Parquets = append(pr.Parquets, KeyMeta{
+						pr.Parquets = append(pr.Parquets, keyMeta{
 							Key:        objKey,
 							InsertedAt: aws.ToTime(obj.LastModified),
 							Size:       aws.ToInt64(obj.Size),
@@ -226,7 +226,7 @@ func listDataFiles(
 		return nil, commits, nil
 	}
 	seen := make(map[string]struct{}, totalParquets)
-	parquets = make([]KeyMeta, 0, totalParquets)
+	parquets = make([]keyMeta, 0, totalParquets)
 	for _, pr := range merged {
 		for _, k := range pr.Parquets {
 			if _, dup := seen[k.Key]; dup {

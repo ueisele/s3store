@@ -41,18 +41,20 @@ const (
 type methodKind string
 
 const (
-	methodWrite                  methodKind = "write"
-	methodWriteWithKey           methodKind = "write_with_key"
-	methodRead                   methodKind = "read"
-	methodReadIter               methodKind = "read_iter"
-	methodReadPartitionIter      methodKind = "read_partition_iter"
-	methodReadRangeIter          methodKind = "read_range_iter"
-	methodReadPartitionRangeIter methodKind = "read_partition_range_iter"
-	methodPoll                   methodKind = "poll"
-	methodPollRecords            methodKind = "poll_records"
-	methodLookup                 methodKind = "lookup"
-	methodLookupCommit           methodKind = "lookup_commit"
-	methodBackfill               methodKind = "backfill"
+	methodWrite                    methodKind = "write"
+	methodWriteWithKey             methodKind = "write_with_key"
+	methodRead                     methodKind = "read"
+	methodReadIter                 methodKind = "read_iter"
+	methodReadPartitionIter        methodKind = "read_partition_iter"
+	methodReadRangeIter            methodKind = "read_range_iter"
+	methodReadPartitionRangeIter   methodKind = "read_partition_range_iter"
+	methodReadEntriesIter          methodKind = "read_entries_iter"
+	methodReadPartitionEntriesIter methodKind = "read_partition_entries_iter"
+	methodPoll                     methodKind = "poll"
+	methodPollRecords              methodKind = "poll_records"
+	methodLookup                   methodKind = "lookup"
+	methodLookupCommit             methodKind = "lookup_commit"
+	methodBackfill                 methodKind = "backfill"
 )
 
 // Attribute keys. Kept as constants so callers cannot misspell and
@@ -286,7 +288,7 @@ func newMetrics(
 		"{file}")
 	m.readMissingData = mustCounter(
 		"s3store.read.missing_data",
-		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / ReadPartitionRangeIter / BackfillProjection). Strict paths (Read / ReadIter / ReadPartitionIter) fail instead of recording.",
+		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / BackfillProjection). Strict paths (Read / ReadIter / ReadPartitionIter) fail instead of recording.",
 		"{event}")
 	m.readMalformedRefs = mustCounter(
 		"s3store.read.malformed_refs",
@@ -608,8 +610,9 @@ func (s *s3OpScope) end(errPtr *error) {
 // duration, outcome, and method-specific aggregates (records,
 // partitions, bytes, files) accumulated through the call.
 //
-// Streaming methods (ReadIter / ReadRangeIter / ReadPartitionIter
-// / ReadPartitionRangeIter) park the scope on the iterator and
+// Streaming methods (ReadIter / ReadRangeIter / ReadEntriesIter
+// / ReadPartitionIter / ReadPartitionRangeIter /
+// ReadPartitionEntriesIter) park the scope on the iterator and
 // call end in the iter's deferred cancel block — the totals
 // reflect everything actually drained, not just what fit in the
 // first batch.
@@ -808,6 +811,7 @@ func (s *methodScope) end(errPtr *error) {
 		}
 	case methodRead, methodReadIter, methodReadPartitionIter,
 		methodReadRangeIter, methodReadPartitionRangeIter,
+		methodReadEntriesIter, methodReadPartitionEntriesIter,
 		methodPollRecords, methodPoll, methodLookup,
 		methodLookupCommit, methodBackfill:
 		if records > 0 {

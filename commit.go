@@ -216,7 +216,7 @@ func reconstructWriteResult(
 }
 
 // gateByCommit applies the snapshot-read commit gate to a flat
-// LIST result of data-file KeyMetas, dropping uncommitted parquets
+// LIST result of data-file keyMetas, dropping uncommitted parquets
 // and resolving multi-attempt tokens to their canonical attempt:
 //
 //   - parquet whose token has no `<token>.commit` marker visible
@@ -246,9 +246,9 @@ func reconstructWriteResult(
 // doesn't re-LIST.
 func gateByCommit(
 	ctx context.Context, target S3Target, dataPath string,
-	dataFiles []KeyMeta, commits map[string]struct{},
+	dataFiles []keyMeta, commits map[string]struct{},
 	observabilityMethod methodKind,
-) ([]KeyMeta, error) {
+) ([]keyMeta, error) {
 	if len(dataFiles) == 0 {
 		return dataFiles, nil
 	}
@@ -261,10 +261,10 @@ func gateByCommit(
 	type bucket struct {
 		token     string
 		partition string
-		files     []KeyMeta
+		files     []keyMeta
 	}
 	buckets := make(map[bucketKey]*bucket, len(dataFiles))
-	var passthrough []KeyMeta
+	var passthrough []keyMeta
 	for _, k := range dataFiles {
 		partition, ok := hiveKeyOfDataFile(k.Key, dataPath)
 		if !ok {
@@ -294,7 +294,7 @@ func gateByCommit(
 	type ambiguous struct {
 		bucket *bucket
 	}
-	out := make([]KeyMeta, 0, len(dataFiles))
+	out := make([]keyMeta, 0, len(dataFiles))
 	out = append(out, passthrough...)
 	var pending []ambiguous
 	for bk, b := range buckets {
@@ -311,7 +311,7 @@ func gateByCommit(
 		return out, nil
 	}
 
-	resolved := make([][]KeyMeta, len(pending))
+	resolved := make([][]keyMeta, len(pending))
 	err := fanOut(ctx, pending,
 		target.EffectiveMaxInflightRequests(),
 		target.metrics,
@@ -336,7 +336,7 @@ func gateByCommit(
 			for _, k := range b.files {
 				base := k.Key[strings.LastIndex(k.Key, "/")+1:]
 				if base == canonicalBase {
-					resolved[i] = []KeyMeta{k}
+					resolved[i] = []keyMeta{k}
 					return nil
 				}
 			}
