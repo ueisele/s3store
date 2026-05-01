@@ -102,8 +102,13 @@ func defaultBinder[K any](columns []string, layout Layout) (
 // validateKeyPattern, evaluated against Columns. Pass
 // multiple patterns when the target set isn't a Cartesian product
 // (e.g. (sku=A, customer=X) and (sku=B, customer=Y) but not the
-// off-diagonal pairs); overlapping patterns are deduplicated, so
-// the result has no duplicate K entries.
+// off-diagonal pairs); overlapping patterns are deduplicated at
+// the marker-key level, so each distinct marker contributes at
+// most one entry. With the default reflection binder (or any
+// non-lossy custom From) that means no duplicate K's. A custom
+// From that drops a column — e.g. Columns=[sku, customer] but K
+// holds only SKU — collapses distinct markers to equal K's; the
+// returned slice will contain duplicates in that case.
 //
 // Read-after-write: the marker LIST inherits the target's
 // ConsistencyControl, so every marker the writer has already

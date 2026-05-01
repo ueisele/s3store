@@ -72,14 +72,12 @@ func BackfillProjection[T any](
 		scope.end(&err)
 	}()
 
-	keyPatterns = dedupePatterns(keyPatterns)
-	if len(keyPatterns) == 0 {
-		return stats, nil
-	}
-
-	// Full Target check — BackfillProjection LISTs partitioned data
-	// files (plan.Match consults PartitionKeyParts), so
-	// validateLookup's reduced subset isn't enough.
+	// Validate target + def before the empty-patterns short-circuit
+	// so a misconfigured call surfaces deterministically regardless
+	// of the patterns slice. Full Target check — BackfillProjection
+	// LISTs partitioned data files (plan.Match consults
+	// PartitionKeyParts), so validateLookup's reduced subset isn't
+	// enough.
 	if err := target.Validate(); err != nil {
 		return stats, err
 	}
@@ -89,6 +87,11 @@ func BackfillProjection[T any](
 	of, err := resolveOf(def)
 	if err != nil {
 		return stats, err
+	}
+
+	keyPatterns = dedupePatterns(keyPatterns)
+	if len(keyPatterns) == 0 {
+		return stats, nil
 	}
 
 	projectionPath := projectionBasePath(target.Prefix(), def.Name)
