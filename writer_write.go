@@ -212,11 +212,16 @@ func (s *Writer[T]) writeGroupedFanOut(
 		s.cfg.Target.metrics,
 		func(ctx context.Context, i int, p HivePartition[T]) error {
 			r, err := perPartition(ctx, p.Key, p.Rows)
-			if err != nil {
-				return err
+			// Capture the result even on err: writeEncodedPayload
+			// returns a non-nil WriteResult alongside a non-nil
+			// error on the CommitAfterTimeout path (data is durable;
+			// stream reader's SettleWindow may have moved past it),
+			// and the caller wants the offset/ref for outbox
+			// journaling on those partitions too.
+			if r != nil {
+				results[i] = r
 			}
-			results[i] = r
-			return nil
+			return err
 		})
 
 	// Compact successful results in sorted-key order regardless
@@ -304,6 +309,26 @@ func (s *Writer[T]) writeWithKeyResolved(
 		return nil, 0, err
 	}
 
+	// Resolve token + check for prior commit before any work that
+	// mutates caller state or burns CPU. populateInsertedAt writes
+	// into records via reflection; encodeParquet builds bytes that
+	// won't be PUT on retry-found-prior-commit. Lifting the HEAD
+	// here keeps the caller's slice untouched on the dedup path.
+	token, autoToken, prior, err := s.resolveTokenAndCheckCommit(
+		ctx, key, o.idempotencyToken)
+	if err != nil {
+		return nil, 0, err
+	}
+	if prior != nil {
+		// Retry-found-prior-commit short-circuit: no encode, no
+		// caller-slice mutation, no PUT. Account for the prior
+		// commit's RowCount so partial-success Write metrics still
+		// reflect what's durable.
+		scope.addRecords(prior.RowCount)
+		scope.addPartitions(1)
+		return prior, 0, nil
+	}
+
 	// Capture writeStartTime here (before encode) so the same value
 	// is used to populate the InsertedAtField column AND to stamp
 	// the token-commit's `insertedat` metadata — a single "when
@@ -331,19 +356,64 @@ func (s *Writer[T]) writeWithKeyResolved(
 		return nil, 0, fmt.Errorf("parquet encode: %w", err)
 	}
 	r, err := s.writeEncodedPayload(
-		ctx, key, records, parquetBytes, writeStartTime, o)
-	if err == nil && r != nil {
+		ctx, key, records, parquetBytes, writeStartTime,
+		token, autoToken)
+	if r != nil {
 		// Commit semantics: writeEncodedPayload returned a non-nil
-		// WriteResult ⇒ data is durable, markers are written, and
-		// the ref PUT succeeded. Update the scope here so partial-success Write calls
-		// (some partitions committed, others failed) report the
-		// committed records/bytes/partitions, not the attempted
-		// totals.
+		// WriteResult ⇒ data is durable, markers are written, ref
+		// PUT succeeded, and the token-commit landed. err may still
+		// be non-nil (CommitAfterTimeout — durable but the stream
+		// reader's SettleWindow may have advanced past refMicroTs);
+		// the records ARE persisted either way, so the scope
+		// reflects what's in S3, not "what we attempted to write."
 		scope.addRecords(int64(len(records)))
 		scope.addBytes(int64(len(parquetBytes)))
 		scope.addPartitions(1)
 	}
 	return r, len(parquetBytes), err
+}
+
+// resolveTokenAndCheckCommit owns step 1+2 of the write sequence
+// in isolation so writeWithKeyResolved can short-circuit on the
+// retry-found-prior-commit path before any CPU- or caller-state-
+// touching work (populateInsertedAt, encodeParquet).
+//
+// Returns:
+//   - token: the resolved token. Caller's explicit token verbatim,
+//     or a freshly-generated UUIDv7 on the auto-token path (used
+//     as both token and attempt-id downstream so the path layout
+//     is uniform: <token>-<attemptID>).
+//   - autoToken: true when the writer generated the token.
+//   - prior: non-nil when a same-token commit already exists. The
+//     reconstructed WriteResult is the original commit's payload —
+//     RefPath, Offset, InsertedAt, RowCount round-tripped through
+//     `<token>.commit` user-metadata. Caller returns this without
+//     any further work.
+//   - err: HEAD failure or auto-token generation failure.
+//
+// The auto-token path skips the HEAD entirely — a freshly-generated
+// UUIDv7 is guaranteed to 404 by construction.
+func (s *Writer[T]) resolveTokenAndCheckCommit(
+	ctx context.Context, key, callerToken string,
+) (token string, autoToken bool, prior *WriteResult, err error) {
+	if callerToken == "" {
+		auto, err := newAttemptID()
+		if err != nil {
+			return "", false, nil, fmt.Errorf("generate auto-token: %w", err)
+		}
+		return auto, true, nil, nil
+	}
+	meta, exists, err := headTokenCommit(ctx, s.cfg.Target,
+		s.dataPath, key, callerToken)
+	if err != nil {
+		return "", false, nil, fmt.Errorf("head token-commit: %w", err)
+	}
+	if exists {
+		wr := reconstructWriteResult(s.dataPath, s.refPath,
+			key, callerToken, meta)
+		return callerToken, false, &wr, nil
+	}
+	return callerToken, false, nil, nil
 }
 
 // writeEncodedPayload is the post-encode orchestration for
@@ -409,9 +479,15 @@ func (s *Writer[T]) writeWithKeyResolved(
 // only. The WriteResult's InsertedAt comes from refMicroTs (so
 // retries that find a prior commit return the original commit's
 // InsertedAt unchanged via the token-commit metadata).
+//
+// token / autoToken come from resolveTokenAndCheckCommit, which
+// the caller invoked before encode to short-circuit retry-found-
+// prior-commit without touching caller state. autoToken=true
+// signals "writer generated this token, use it as the attempt-id
+// too" (uniform path layout: <token>-<attemptID>).
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
-	writeStartTime time.Time, opts writeOpts,
+	writeStartTime time.Time, token string, autoToken bool,
 ) (*WriteResult, error) {
 	// Compute marker paths up-front so a bad ProjectionDef.Of
 	// fails the whole Write before we touch S3, matching how
@@ -419,36 +495,6 @@ func (s *Writer[T]) writeEncodedPayload(
 	markerPaths, err := s.collectProjectionMarkerPaths(records)
 	if err != nil {
 		return nil, err
-	}
-
-	// Step 1: token resolution. Auto-generate a UUIDv7 for the
-	// no-token path and use it as both the token and the
-	// attempt-id (path shape is uniform: <token>-<attemptID>).
-	token := opts.idempotencyToken
-	autoToken := false
-	if token == "" {
-		auto, err := newAttemptID()
-		if err != nil {
-			return nil, fmt.Errorf("generate auto-token: %w", err)
-		}
-		token = auto
-		autoToken = true
-	}
-
-	// Step 2: upfront HEAD on <token>.commit. Skipped on the
-	// auto-token path (HEAD would always 404 — we just generated
-	// the token).
-	if !autoToken {
-		meta, exists, err := headTokenCommit(ctx, s.cfg.Target,
-			s.dataPath, key, token)
-		if err != nil {
-			return nil, fmt.Errorf("head token-commit: %w", err)
-		}
-		if exists {
-			wr := reconstructWriteResult(s.dataPath, s.refPath,
-				key, token, meta)
-			return &wr, nil
-		}
 	}
 
 	// Step 3: attempt-id. The auto-token path reuses the token
@@ -524,6 +570,11 @@ func (s *Writer[T]) writeEncodedPayload(
 	// durable + committed for snapshot reads), so an idempotent
 	// retry recovers automatically via the upfront-HEAD path.
 	//
+	// The WriteResult is returned alongside the error so the caller
+	// retains the offset / refKey / row count for outbox journaling
+	// and `LookupCommit` use cases — the data IS in S3 at the
+	// returned paths, just maybe past the stream reader's window.
+	//
 	// Measured from `refMicroTs` (the wall-clock stamped just before
 	// the ref PUT), not from writeStartTime: the contract-relevant
 	// interval is ref-LIST-visible → token-commit-visible. Anything
@@ -531,26 +582,30 @@ func (s *Writer[T]) writeEncodedPayload(
 	// the last of which scales with payload size) cannot put the
 	// SettleWindow contract at risk, so it doesn't belong in the
 	// budget.
-	commitTimeout := s.cfg.Target.CommitTimeout()
-	tCommitWindowStart := time.UnixMicro(refMicroTs)
-	if elapsed := time.Since(tCommitWindowStart); elapsed > commitTimeout {
-		s.cfg.Target.metrics.recordCommitAfterTimeout(ctx)
-		return nil, fmt.Errorf(
-			"write committed after CommitTimeout "+
-				"(elapsed %v > %v from ref PUT) — stream reader's "+
-				"SettleWindow may not include this write; data is "+
-				"durable at %s, retry with the same "+
-				"WithIdempotencyToken recovers via upfront-HEAD",
-			elapsed, commitTimeout, dataKey)
-	}
-
-	return &WriteResult{
+	result := &WriteResult{
 		Offset:     Offset(refKey),
 		DataPath:   dataKey,
 		RefPath:    refKey,
 		InsertedAt: writeStartTime,
 		RowCount:   rowCount,
-	}, nil
+	}
+	commitTimeout := s.cfg.Target.CommitTimeout()
+	tCommitWindowStart := time.UnixMicro(refMicroTs)
+	if elapsed := time.Since(tCommitWindowStart); elapsed > commitTimeout {
+		// Use commitCtx (not the caller's ctx) so a caller cancel
+		// during the commit PUTs doesn't suppress the only signal
+		// that this write committed past CommitTimeout.
+		s.cfg.Target.metrics.recordCommitAfterTimeout(commitCtx)
+		return result, fmt.Errorf(
+			"write committed after CommitTimeout "+
+				"(elapsed %v > %v from ref PUT) — stream reader's "+
+				"SettleWindow may not include this write; data is "+
+				"durable at %s, ref at %s, retry with the same "+
+				"WithIdempotencyToken recovers via upfront-HEAD",
+			elapsed, commitTimeout, dataKey, refKey)
+	}
+
+	return result, nil
 }
 
 // GroupByPartition splits records by their Hive partition key
