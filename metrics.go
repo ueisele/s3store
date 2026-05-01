@@ -178,12 +178,55 @@ func newMetrics(
 	m.constSet = attribute.NewSet(constAttrs...)
 	m.constSetOpt = metric.WithAttributeSet(m.constSet)
 
+	// Shared bucket boundaries. The OTel SDK default boundaries
+	// (`[0, 5, 10, 25, 50, 75, 100, ...]`) are sized for milliseconds
+	// and small counts; for our second-scale durations and
+	// kilobyte-to-gigabyte payloads the entire useful range collapses
+	// into the first bucket and `histogram_quantile` returns
+	// interpolation artifacts (everything reads as ~4.75 in the [0, 5]
+	// bucket). Explicit boundaries below cover the realistic range
+	// for each metric family with enough resolution that P50/P95/P99
+	// reflect actual observations rather than bucket geometry.
+	//
+	// durationBuckets covers ~5ms (typical S3 HEAD on AWS) to 30s
+	// (a long Write or LIST under contention). Mirrors the shape
+	// OpenTelemetry's HTTP semantic-convention guidance recommends,
+	// extended to 30s for our heavier method calls.
+	durationBuckets := []float64{
+		0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30,
+	}
+	// shortWaitBuckets is for in-process wait durations (semaphore,
+	// body-slot pool, byte-budget reservation). Most observations
+	// are sub-millisecond when the system isn't saturated; only
+	// extends to 5s.
+	shortWaitBuckets := []float64{
+		0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5,
+	}
+	// byteBuckets covers payload sizes from sub-kilobyte ref/marker
+	// PUTs through gigabyte parquet bodies. Powers of ten keep the
+	// boundary set readable in dashboards.
+	byteBuckets := []float64{
+		1000, 10000, 100000, 1000000, 10000000,
+		100000000, 1000000000, 10000000000,
+	}
+	// recordCountBuckets covers per-call record counts from
+	// single-row writes through million-row batches.
+	recordCountBuckets := []float64{
+		1, 10, 100, 1000, 10000, 100000, 1000000,
+	}
+
 	// Helpers — discard error to keep newMetrics infallible. The
 	// OTel SDK only errors on duplicate-name-with-different-kind,
 	// which is a static bug.
-	mustHist := func(name, desc, unit string) metric.Float64Histogram {
-		h, _ := meter.Float64Histogram(name,
-			metric.WithDescription(desc), metric.WithUnit(unit))
+	mustHist := func(
+		name, desc, unit string,
+		extra ...metric.Float64HistogramOption,
+	) metric.Float64Histogram {
+		opts := []metric.Float64HistogramOption{
+			metric.WithDescription(desc), metric.WithUnit(unit),
+		}
+		opts = append(opts, extra...)
+		h, _ := meter.Float64Histogram(name, opts...)
 		return h
 	}
 	mustHistInt := func(
@@ -220,7 +263,8 @@ func newMetrics(
 	m.semWaitDuration = mustHist(
 		"s3store.target.semaphore.wait.duration",
 		"Time spent waiting in acquire() before a slot became available",
-		"s")
+		"s",
+		metric.WithExplicitBucketBoundaries(shortWaitBuckets...))
 	m.semAcquires = mustCounter(
 		"s3store.target.semaphore.acquires",
 		"Total semaphore acquire attempts, labelled by outcome",
@@ -248,7 +292,8 @@ func newMetrics(
 	m.s3Duration = mustHist(
 		"s3store.s3.request.duration",
 		"Wall-clock duration of one outer S3 wrapper call (acquire + retry + release)",
-		"s")
+		"s",
+		metric.WithExplicitBucketBoundaries(durationBuckets...))
 	m.s3Count = mustCounter(
 		"s3store.s3.request.count",
 		"Total S3 wrapper calls, labelled by operation and outcome",
@@ -267,17 +312,20 @@ func newMetrics(
 	m.s3ReqBytes = mustHistInt(
 		"s3store.s3.request.body.size",
 		"Request body size for outbound S3 PUTs",
-		"By")
+		"By",
+		metric.WithExplicitBucketBoundaries(byteBuckets...))
 	m.s3RespBytes = mustHistInt(
 		"s3store.s3.response.body.size",
 		"Response body size for inbound S3 GETs",
-		"By")
+		"By",
+		metric.WithExplicitBucketBoundaries(byteBuckets...))
 
 	// Library method level.
 	m.methodDuration = mustHist(
 		"s3store.method.duration",
 		"Wall-clock duration of one public library method call",
-		"s")
+		"s",
+		metric.WithExplicitBucketBoundaries(durationBuckets...))
 	m.methodCalls = mustCounter(
 		"s3store.method.calls",
 		"Total library method calls, labelled by method and outcome",
@@ -285,7 +333,8 @@ func newMetrics(
 	m.writeRecords = mustHistInt(
 		"s3store.write.records",
 		"Records per Write/WriteWithKey call",
-		"{record}")
+		"{record}",
+		metric.WithExplicitBucketBoundaries(recordCountBuckets...))
 	m.writePartitions = mustHistInt(
 		"s3store.write.partitions",
 		"Distinct partition keys per Write call (always 1 for WriteWithKey)",
@@ -295,11 +344,13 @@ func newMetrics(
 	m.writeBytes = mustHistInt(
 		"s3store.write.bytes",
 		"Total parquet body bytes uploaded per Write/WriteWithKey call",
-		"By")
+		"By",
+		metric.WithExplicitBucketBoundaries(byteBuckets...))
 	m.readRecords = mustHistInt(
 		"s3store.read.records",
 		"Records returned per read-side method call",
-		"{record}")
+		"{record}",
+		metric.WithExplicitBucketBoundaries(recordCountBuckets...))
 	m.readPartitions = mustHistInt(
 		"s3store.read.partitions",
 		"Distinct Hive partitions touched per read-side method call (every method that funnels through the iter pipeline: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Not recorded for Poll / Lookup / LookupCommit / BackfillProjection.",
@@ -309,7 +360,8 @@ func newMetrics(
 	m.readBytes = mustHistInt(
 		"s3store.read.bytes",
 		"Total parquet body bytes downloaded per read-side method call",
-		"By")
+		"By",
+		metric.WithExplicitBucketBoundaries(byteBuckets...))
 	m.readFiles = mustHistInt(
 		"s3store.read.files",
 		"Data files materialised per read-side method call",
@@ -341,7 +393,8 @@ func newMetrics(
 	m.iterBodySlotWait = mustHist(
 		"s3store.read.iter.body_slot.wait.duration",
 		"Time downloaders spent blocked acquiring a body-slot in the iter pipeline (recorded only when a wait actually occurred)",
-		"s")
+		"s",
+		metric.WithExplicitBucketBoundaries(shortWaitBuckets...))
 	m.iterBodySlotExhausted = mustCounter(
 		"s3store.read.iter.body_slot.exhausted",
 		"Times the iter pipeline's body-slot pool was full and a downloader had to wait",
@@ -349,7 +402,8 @@ func newMetrics(
 	m.iterByteBudgetWait = mustHist(
 		"s3store.read.iter.byte_budget.wait.duration",
 		"Time the decoder spent blocked reserving uncompressed bytes against ReadAheadBytes (recorded only when a wait actually occurred)",
-		"s")
+		"s",
+		metric.WithExplicitBucketBoundaries(shortWaitBuckets...))
 	m.iterByteBudgetExhausted = mustCounter(
 		"s3store.read.iter.byte_budget.exhausted",
 		"Times the iter pipeline's byte budget was full and the decoder had to wait",
@@ -357,7 +411,8 @@ func newMetrics(
 	m.iterDecodeDuration = mustHist(
 		"s3store.read.iter.partition.decode.duration",
 		"Wall-clock parquet decode time per partition (excludes byte-budget wait)",
-		"s")
+		"s",
+		metric.WithExplicitBucketBoundaries(durationBuckets...))
 
 	return m
 }
