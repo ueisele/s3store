@@ -256,7 +256,7 @@ func (s *Reader[T]) PollRecords(
 		out = append(out, recs...)
 		return int64(len(recs)), true
 	}
-	s.downloadAndDecodeIter(ctx, keys, &o, scope, emit)
+	s.downloadAndDecodeIter(ctx, keys, &o, scope, true, emit)
 	if batchErr != nil {
 		return nil, since, batchErr
 	}

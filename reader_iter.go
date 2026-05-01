@@ -68,7 +68,7 @@ func (s *Reader[T]) ReadIter(
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, false,
 			s.recordEmit(yield, &iterErr))
 	}
 }
@@ -126,7 +126,7 @@ func (s *Reader[T]) ReadRangeIter(
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, true,
 			s.recordEmit(yield, &iterErr))
 	}
 }
@@ -178,7 +178,7 @@ func (s *Reader[T]) ReadEntriesIter(
 		}
 
 		keys := entriesToKeys(entries)
-		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, true,
 			s.recordEmit(yield, &iterErr))
 	}
 }
@@ -364,6 +364,7 @@ func entriesToKeys(entries []StreamEntry) []keyMeta {
 func (s *Reader[T]) downloadAndDecodeIter(
 	ctx context.Context, keys []keyMeta,
 	opts *readOpts, scope *methodScope,
+	tolerantOfMissingData bool,
 	emit func(partKey string, recs []T, err error) (int64, bool),
 ) {
 	if len(keys) == 0 {
@@ -444,7 +445,7 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	for range concurrency {
 		wg.Go(func() {
 			s.runDownloader(ctx, jobsCh, state, bodyCap, scope, cancel,
-				&bytesDownloaded, &filesDownloaded)
+				tolerantOfMissingData, &bytesDownloaded, &filesDownloaded)
 		})
 	}
 	// Wake up any goroutine sleeping on state.cond when ctx
@@ -606,12 +607,12 @@ func (s *Reader[T]) runProducer(
 // nils the body. NoSuchKey and hard errors release the slot
 // immediately since no body is materialised.
 //
-// scope drives the missing-data policy via its method: tolerant
-// methods (ReadRangeIter) log + record the missing-data metric
-// and mark the file as visited so the iter continues; strict
-// methods (ReadIter) propagate the NoSuchKey as a wrapped error
-// so the caller's retry resolves it. See
-// methodTolerantOfMissingData.
+// tolerantOfMissingData picks the NoSuchKey policy: when true,
+// log + record the missing-data metric and mark the file as
+// visited so the iter continues (stream/entries paths — operator
+// prunes can leave refs pointing at deleted files); when false,
+// propagate the NoSuchKey as a wrapped error so the caller's
+// retry resolves the LIST-to-GET race (snapshot reads).
 //
 // filesDownloaded counts files with a definitive outcome — body
 // fetched OR tolerated NoSuchKey (the file was visited, just
@@ -624,6 +625,7 @@ func (s *Reader[T]) runDownloader(
 	ctx context.Context, jobsCh <-chan downloadJob,
 	state *streamState, bodyCap int, scope *methodScope,
 	cancel context.CancelFunc,
+	tolerantOfMissingData bool,
 	bytesDownloaded, filesDownloaded *atomic.Int64,
 ) {
 	for job := range jobsCh {
@@ -637,7 +639,7 @@ func (s *Reader[T]) runDownloader(
 			// No body materialised — return the slot.
 			state.releaseBodySlots(1)
 			if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
-				if methodTolerantOfMissingData(scope.method) {
+				if tolerantOfMissingData {
 					slog.Warn("s3store: data file missing, skipping",
 						"path", key, "method", string(scope.method))
 					scope.recordMissingData()

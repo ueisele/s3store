@@ -86,7 +86,7 @@ func (s *Reader[T]) ReadPartitionIter(
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, false,
 			partitionEmit(yield, &iterErr))
 	}
 }
@@ -143,7 +143,7 @@ func (s *Reader[T]) ReadPartitionRangeIter(
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, true,
 			partitionEmit(yield, &iterErr))
 	}
 }
@@ -185,7 +185,7 @@ func (s *Reader[T]) ReadPartitionEntriesIter(
 		}
 
 		keys := entriesToKeys(entries)
-		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+		s.downloadAndDecodeIter(ctx, keys, &o, scope, true,
 			partitionEmit(yield, &iterErr))
 	}
 }

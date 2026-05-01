@@ -60,7 +60,7 @@ func (s *Reader[T]) Read(
 		out = append(out, recs...)
 		return int64(len(recs)), true
 	}
-	s.downloadAndDecodeIter(ctx, keys, &o, scope, emit)
+	s.downloadAndDecodeIter(ctx, keys, &o, scope, false, emit)
 	if batchErr != nil {
 		return nil, batchErr
 	}
@@ -71,40 +71,6 @@ func (s *Reader[T]) Read(
 // element is itself the dedup key. Used by projection/backfill
 // callers that union per-pattern lookup results.
 func identityKey(s string) string { return s }
-
-// methodTolerantOfMissingData reports whether a method should
-// skip-and-warn on NoSuchKey rather than fail. Tolerant: paths
-// where a single missing data file shouldn't poison the whole
-// operation and a caller retry can't easily resolve it (refs and
-// projection markers persist beyond the data file).
-//
-//   - PollRecords / ReadRangeIter / ReadPartitionRangeIter walk
-//     the ref stream; an operator-driven prune can leave a ref
-//     pointing at nothing and the consumer must keep advancing.
-//   - ReadEntriesIter / ReadPartitionEntriesIter take pre-resolved
-//     StreamEntry slices; an operator prune between resolution
-//     and read can race the same way, with no caller retry able
-//     to resolve it (the entry set is fixed).
-//   - BackfillProjection is a long-running operator job; failing on
-//     one race-deleted file would force a full restart.
-//
-// Strict: paths where a NoSuchKey is genuinely a LIST-to-GET
-// race, narrow in practice, and a caller retry resolves it (the
-// next LIST won't include the deleted file).
-//
-//   - Read / ReadIter / ReadPartitionIter are user-facing
-//     single-shot snapshot reads; loud failure is more honest
-//     than silent skip.
-func methodTolerantOfMissingData(m methodKind) bool {
-	switch m {
-	case methodPollRecords, methodReadRangeIter,
-		methodReadPartitionRangeIter, methodReadEntriesIter,
-		methodReadPartitionEntriesIter, methodBackfill:
-		return true
-	default:
-		return false
-	}
-}
 
 // decodeParquet reads all rows of a parquet file into []T. T
 // must be parquet-go-friendly (field-tagged, primitive-backed).
