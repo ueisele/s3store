@@ -175,7 +175,10 @@ func resolveWriteOpts[T any](opts []WriteOption, records []T) (writeOpts, error)
 				"WithIdempotencyTokenOf: %w", err)
 		}
 		w.idempotencyToken = token
-	} else if w.idempotencyToken != "" {
+	} else if w.idempotencyTokenSet {
+		// User explicitly invoked WithIdempotencyToken — validate
+		// even if the value is empty so a wiring bug doesn't
+		// silently drop the idempotency contract.
 		if err := validateIdempotencyToken(
 			w.idempotencyToken); err != nil {
 			return writeOpts{}, err
@@ -301,11 +304,15 @@ func (s *Writer[T]) writeWithKeyResolved(
 	ctx context.Context, key string, records []T, opts []WriteOption,
 	scope *methodScope,
 ) (*WriteResult, int, error) {
-	o, err := resolveWriteOpts(opts, records)
-	if err != nil {
+	// Validate the partition key first — surfacing a malformed key
+	// before resolveWriteOpts means the user's idempotencyTokenFn
+	// closure (which may have side effects: outbox-row reads, log
+	// lines) doesn't run on a write that's about to fail anyway.
+	if err := s.validateKey(key); err != nil {
 		return nil, 0, err
 	}
-	if err := s.validateKey(key); err != nil {
+	o, err := resolveWriteOpts(opts, records)
+	if err != nil {
 		return nil, 0, err
 	}
 
@@ -366,7 +373,9 @@ func (s *Writer[T]) writeWithKeyResolved(
 		// reader's SettleWindow may have advanced past refMicroTs);
 		// the records ARE persisted either way, so the scope
 		// reflects what's in S3, not "what we attempted to write."
-		scope.addRecords(int64(len(records)))
+		// Source from r.RowCount so this path aligns symmetrically
+		// with the retry-found-prior-commit branch above.
+		scope.addRecords(r.RowCount)
 		scope.addBytes(int64(len(parquetBytes)))
 		scope.addPartitions(1)
 	}

@@ -26,9 +26,18 @@ type writeOpts struct {
 	// option chain is resolved so typos / illegal characters
 	// surface before any S3 call.
 	//
+	// idempotencyTokenSet tracks whether the caller actually
+	// invoked WithIdempotencyToken (vs. leaving the option off
+	// entirely). Without this flag, an explicit
+	// `WithIdempotencyToken("")` would silently fall through to
+	// the auto-token path and degrade the idempotency contract;
+	// the flag lets resolveWriteOpts run validateIdempotencyToken
+	// on the empty string and surface the error at the call site.
+	//
 	// Mutually exclusive with idempotencyTokenFn — pick a static
 	// token OR a per-partition function, not both.
-	idempotencyToken string
+	idempotencyToken    string
+	idempotencyTokenSet bool
 
 	// idempotencyTokenFn, when set, is invoked per partition with
 	// that partition's records and returns the token to use. Lets
@@ -112,16 +121,23 @@ func (o *writeOpts) apply(opts ...WriteOption) {
 // resolve time so bad tokens fail at the call site rather than
 // inside the write path.
 //
-// Returns a no-op option if token is empty (convenience for
-// callers whose token might be unset in some code paths) — the
-// resulting write runs the non-idempotent path (auto-token, no
-// upfront HEAD).
+// An empty string is rejected (not silently downgraded to the
+// auto-token path) so a caller wiring `WithIdempotencyToken(row.Token)`
+// can't accidentally turn off idempotency by forgetting to populate
+// the source. Callers whose token is genuinely optional should
+// branch at construction:
+//
+//	opts := []s3store.WriteOption{...}
+//	if row.Token != "" {
+//	    opts = append(opts, s3store.WithIdempotencyToken(row.Token))
+//	}
 //
 // Mutually exclusive with WithIdempotencyTokenOf — combining the
 // two surfaces an error at option-resolution time.
 func WithIdempotencyToken(token string) WriteOption {
 	return func(o *writeOpts) {
 		o.idempotencyToken = token
+		o.idempotencyTokenSet = true
 	}
 }
 
