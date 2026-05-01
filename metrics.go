@@ -43,6 +43,7 @@ type methodKind string
 const (
 	methodWrite                    methodKind = "write"
 	methodWriteWithKey             methodKind = "write_with_key"
+	methodRestampRef               methodKind = "restamp_ref"
 	methodRead                     methodKind = "read"
 	methodReadIter                 methodKind = "read_iter"
 	methodReadPartitionIter        methodKind = "read_partition_iter"
@@ -392,7 +393,7 @@ func newMetrics(
 		"{event}")
 	m.writeCommitAfterTO = mustCounter(
 		"s3store.write.commit_after_timeout",
-		"Writes whose elapsed time from refMicroTs (just before the ref PUT) to token-commit-PUT completion exceeded CommitTimeout. The commit landed; signals that a SettleWindow tuned for this CommitTimeout may not yet have included this write in the stream window. Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside the budget by design.",
+		"Writes whose elapsed time from refMicroTs (captured just before the ref PUT) to gate-visibility completion exceeded CommitTimeout. Fires from Write/WriteWithKey on token-commit-PUT completion (the gate flips when the commit becomes visible) and from RestampRef on ref-PUT completion (the commit gate is already satisfied; ref-LIST-visibility is the only contract-relevant interval). The write/restamp landed durably either way; signals that a SettleWindow tuned for this CommitTimeout may not yet have included it in the stream window. Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside the budget by design.",
 		"{event}")
 	m.writeOptimisticCollisions = mustCounter(
 		"s3store.write.optimistic_commit.collisions",

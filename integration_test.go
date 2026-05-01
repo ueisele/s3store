@@ -4301,6 +4301,259 @@ func TestLookupCommit_RejectsBadToken(t *testing.T) {
 	}
 }
 
+// TestRestampRef_BringsBackIntoSettleWindow exercises the
+// recovery flow for ErrCommitAfterTimeout end-to-end. After a
+// write commits and a stream consumer has already advanced past
+// its offset, RestampRef writes a fresh ref at a new refMicroTs
+// pointing at the same data file. A subsequent poll from the
+// consumer's offset picks up the new ref; the underlying
+// `<token>.commit` is reused unchanged.
+//
+// Verifies five things at once:
+//
+//  1. RestampRef's WriteResult shares DataPath / InsertedAt /
+//     RowCount with the original, but has a new RefPath / Offset.
+//  2. A consumer that's already past the original ref's offset
+//     sees the restamp on a follow-up poll (the bring-back-into-
+//     SettleWindow guarantee).
+//  3. The original ref is left in place — a replay from offset ""
+//     via raw Poll surfaces both refs (proves duplicate, opt-in
+//     dedup is consumer-side).
+//  4. PollRecords with EntityKeyOf+VersionOf collapses the
+//     duplicate to one record per (entity, version).
+//  5. LookupCommit still returns the ORIGINAL WriteResult — the
+//     `<token>.commit` metadata is unchanged by RestampRef, so
+//     same-token retry semantics are preserved.
+func TestRestampRef_BringsBackIntoSettleWindow(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+
+	key := "period=2026-04-22/customer=alice"
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "alice",
+		SKU: "sku1", Value: 7, Ts: time.UnixMilli(1),
+	}}
+	const token = "restamp-token-A"
+
+	first, err := store.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token))
+	if err != nil {
+		t.Fatalf("WriteWithKey: %v", err)
+	}
+	if first == nil {
+		t.Fatal("WriteWithKey: nil result")
+	}
+
+	// Drain the original ref past the consumer's SettleWindow so
+	// the consumer's offset advances past it — simulates a stream
+	// reader that already moved past the write before a hypothetical
+	// late commit (or here: simply already moved past).
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
+	first1, off1, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("first Poll: %v", err)
+	}
+	if len(first1) != 1 {
+		t.Fatalf("first Poll: got %d entries, want 1", len(first1))
+	}
+	if first1[0].RefPath != first.RefPath {
+		t.Errorf("first Poll RefPath = %q, want %q",
+			first1[0].RefPath, first.RefPath)
+	}
+	emptyAtTip, _, err := store.Poll(ctx, off1, 100)
+	if err != nil {
+		t.Fatalf("Poll past offset: %v", err)
+	}
+	if len(emptyAtTip) != 0 {
+		t.Fatalf("Poll past offset: got %d entries, want 0 "+
+			"(consumer is past the original ref)", len(emptyAtTip))
+	}
+
+	// Restamp: write an additional ref pointing at the same
+	// committed data. New refMicroTs, same (token, attemptID,
+	// hiveKey) triple under the hood.
+	second, err := store.RestampRef(ctx, first)
+	if err != nil {
+		t.Fatalf("RestampRef: %v", err)
+	}
+	if second == nil {
+		t.Fatal("RestampRef: nil result")
+	}
+
+	// (1) WriteResult invariants.
+	if second.DataPath != first.DataPath {
+		t.Errorf("DataPath drift: first=%q, restamp=%q "+
+			"(restamp must reuse the original data file)",
+			first.DataPath, second.DataPath)
+	}
+	if !second.InsertedAt.Equal(first.InsertedAt) {
+		t.Errorf("InsertedAt drift: first=%v, restamp=%v "+
+			"(restamp must preserve the original write-start time)",
+			first.InsertedAt, second.InsertedAt)
+	}
+	if second.RowCount != first.RowCount {
+		t.Errorf("RowCount drift: first=%d, restamp=%d",
+			first.RowCount, second.RowCount)
+	}
+	if second.RefPath == first.RefPath {
+		t.Error("restamp RefPath equals first RefPath; want distinct")
+	}
+	if string(second.Offset) != second.RefPath {
+		t.Errorf("Offset = %q, want RefPath %q",
+			second.Offset, second.RefPath)
+	}
+
+	// (2) Consumer past off1 sees the restamp on the next poll.
+	time.Sleep(testSettleWindow + 100*time.Millisecond)
+	afterRestamp, off2, err := store.Poll(ctx, off1, 100)
+	if err != nil {
+		t.Fatalf("Poll after restamp from off1: %v", err)
+	}
+	if len(afterRestamp) != 1 {
+		t.Fatalf("Poll after restamp: got %d entries, want 1 "+
+			"(restamp brought the write back into the window)",
+			len(afterRestamp))
+	}
+	if afterRestamp[0].RefPath != second.RefPath {
+		t.Errorf("post-restamp Poll RefPath = %q, want %q",
+			afterRestamp[0].RefPath, second.RefPath)
+	}
+	if afterRestamp[0].DataPath != first.DataPath {
+		t.Errorf("post-restamp Poll DataPath = %q, want original %q",
+			afterRestamp[0].DataPath, first.DataPath)
+	}
+	if afterRestamp[0].RowCount != first.RowCount {
+		t.Errorf("post-restamp Poll RowCount = %d, want %d",
+			afterRestamp[0].RowCount, first.RowCount)
+	}
+	if string(off2) == "" || off2 == off1 {
+		t.Errorf("offset did not advance past off1: %q -> %q",
+			off1, off2)
+	}
+
+	// (3) Replay from head: raw Poll surfaces both refs (the
+	// duplicate this primitive deliberately introduces).
+	allEntries, _, err := store.Poll(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("Poll replay: %v", err)
+	}
+	if len(allEntries) != 2 {
+		t.Fatalf("Poll replay: got %d entries, want 2 "+
+			"(original + restamp)", len(allEntries))
+	}
+	if allEntries[0].DataPath != allEntries[1].DataPath {
+		t.Errorf("replay entries point at different DataPaths: %q vs %q",
+			allEntries[0].DataPath, allEntries[1].DataPath)
+	}
+	if allEntries[0].RefPath == allEntries[1].RefPath {
+		t.Error("replay entries share a RefPath; want distinct refs")
+	}
+	// Lex order is by refMicroTs first; original came first so it
+	// must sort below the restamp.
+	if allEntries[0].RefPath != first.RefPath {
+		t.Errorf("replay[0].RefPath = %q, want original %q",
+			allEntries[0].RefPath, first.RefPath)
+	}
+	if allEntries[1].RefPath != second.RefPath {
+		t.Errorf("replay[1].RefPath = %q, want restamp %q",
+			allEntries[1].RefPath, second.RefPath)
+	}
+
+	// (4) PollRecords replay collapses the duplicate via dedup.
+	allRecords, _, err := store.PollRecords(ctx, "", 100)
+	if err != nil {
+		t.Fatalf("PollRecords replay: %v", err)
+	}
+	if len(allRecords) != 1 {
+		t.Fatalf("PollRecords replay: got %d records, want 1 "+
+			"(EntityKeyOf+VersionOf must collapse the duplicate)",
+			len(allRecords))
+	}
+	if allRecords[0].Value != 7 {
+		t.Errorf("PollRecords replay value = %d, want 7", allRecords[0].Value)
+	}
+
+	// (5) LookupCommit still returns the original WriteResult —
+	// `<token>.commit` metadata is untouched by RestampRef.
+	got, ok, err := store.LookupCommit(ctx, key, token)
+	if err != nil {
+		t.Fatalf("LookupCommit: %v", err)
+	}
+	if !ok {
+		t.Fatal("LookupCommit: ok=false, want true")
+	}
+	if got.RefPath != first.RefPath {
+		t.Errorf("LookupCommit RefPath = %q, want original %q "+
+			"(commit marker must not be touched by RestampRef)",
+			got.RefPath, first.RefPath)
+	}
+	if got.DataPath != first.DataPath {
+		t.Errorf("LookupCommit DataPath = %q, want %q",
+			got.DataPath, first.DataPath)
+	}
+}
+
+// TestRestampRef_RejectsCrossWriter guards the path-prefix check:
+// calling RestampRef on Writer B with a WriteResult produced by
+// Writer A (different prefix) surfaces a clear error instead of
+// silently writing a ref no reader on B can resolve.
+func TestRestampRef_RejectsCrossWriter(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.SeedTimingConfig(t, "storeA", testCommitTimeout, testMaxClockSkew)
+	f.SeedTimingConfig(t, "storeB", testCommitTimeout, testMaxClockSkew)
+
+	mkStore := func(prefix string) *Store[Rec] {
+		s, err := New[Rec](ctx, StoreConfig[Rec]{
+			S3TargetConfig: S3TargetConfig{
+				Bucket:             f.Bucket,
+				Prefix:             prefix,
+				S3Client:           f.S3Client,
+				PartitionKeyParts:  []string{"period", "customer"},
+				ConsistencyControl: ConsistencyStrongGlobal,
+			},
+			PartitionKeyOf: func(r Rec) string {
+				return fmt.Sprintf("period=%s/customer=%s",
+					r.Period, r.Customer)
+			},
+		})
+		if err != nil {
+			t.Fatalf("New(%s): %v", prefix, err)
+		}
+		return s
+	}
+	storeA := mkStore("storeA")
+	storeB := mkStore("storeB")
+
+	wrA, err := storeA.WriteWithKey(ctx,
+		"period=2026-04-22/customer=alice",
+		[]Rec{{Period: "2026-04-22", Customer: "alice", SKU: "s1"}},
+		WithIdempotencyToken("cross-writer-token"))
+	if err != nil {
+		t.Fatalf("storeA.WriteWithKey: %v", err)
+	}
+
+	_, err = storeB.RestampRef(ctx, wrA)
+	if err == nil {
+		t.Fatal("storeB.RestampRef on storeA's WriteResult returned nil err, " +
+			"want cross-Writer rejection")
+	}
+	if !strings.Contains(err.Error(), "ref prefix") &&
+		!strings.Contains(err.Error(), "data prefix") {
+		t.Errorf("error %q should name the path-prefix mismatch", err)
+	}
+}
+
+// TestRestampRef_RejectsNilPrior guards the parameter validation:
+// a nil prior surfaces immediately, with no S3 op.
+func TestRestampRef_RejectsNilPrior(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+	if _, err := store.RestampRef(ctx, nil); err == nil {
+		t.Fatal("RestampRef(nil) returned nil err, want validation error")
+	}
+}
+
 // fast when only commit-timeout is seeded. Mirrors
 // TestCommitTimeout_MissingRejected for the second knob.
 func TestMaxClockSkew_MissingRejected(t *testing.T) {

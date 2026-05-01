@@ -648,7 +648,7 @@ whether the call succeeded:
 | `result`  | `err`                       | Meaning                                                                                                                                                                          |
 |-----------|-----------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | non-nil   | `nil`                       | Committed normally.                                                                                                                                                              |
-| non-nil   | `ErrCommitAfterTimeout`     | Committed, but ref→commit elapsed exceeded `CommitTimeout`. Data is durable for snapshot reads; a stream reader's `SettleWindow` may already have advanced past `refMicroTs`.    |
+| non-nil   | `ErrCommitAfterTimeout`     | Committed, but ref→gate-visibility elapsed exceeded `CommitTimeout`. Data is durable for snapshot reads; a stream reader's `SettleWindow` may already have advanced past `refMicroTs`. `RestampRef` surfaces the same sentinel under the same semantics — the new ref is durable, but its `refMicroTs` may be past the cutoff before the ref becomes LIST-visible. |
 | `nil`     | non-nil                     | Nothing reached commit. Per-attempt orphans (data, possibly ref) may remain on S3 — operator-cleaned, invisible to readers via the commit gate.                                  |
 
 For `Write` (multi-partition), `err != nil` with `len(results) > 0`
@@ -682,8 +682,14 @@ case err == nil:
 
 case errors.Is(err, s3store.ErrCommitAfterTimeout):
     // Data is durable. Persist the result like a success.
-    // Optionally same-token retry to pull commit observability
-    // back inside the SettleWindow for stream consumers.
+    // Stream consumers: optionally call w.RestampRef(ctx, result)
+    // to write an additional ref with a fresh refMicroTs so the
+    // next poll past now+SettleWindow picks the write up. The
+    // original ref stays in place, so dedup-less stream readers
+    // see the records twice — collapsed by EntityKeyOf+VersionOf
+    // when configured. Same-token retry of WriteWithKey does NOT
+    // recover stream observability (the upfront HEAD short-
+    // circuits without writing a new ref).
     persist(result)
 
 case errors.Is(err, context.Canceled),
@@ -705,6 +711,47 @@ The single most useful thing to do is **always pass
 `WithIdempotencyToken`**: it collapses every "did it actually
 commit?" branch on retry to one upfront HEAD, regardless of which
 step failed.
+
+`RestampRef` itself can return `ErrCommitAfterTimeout` when the
+ref PUT is slow. The recovery is the same primitive again: each
+call writes a fresh ref at a new `refMicroTs`, so a retry whose
+PUT happens to land within `CommitTimeout` restores stream
+observability. Pass the original `WriteResult` (not the timed-out
+restamp's) — RestampRef only consumes `(token, attemptID,
+hiveKey, DataPath, InsertedAt, RowCount)` from `prior`, all of
+which are identical between the original and any restamp.
+
+```go
+const maxRestamps = 4
+for attempt := 0; attempt < maxRestamps; attempt++ {
+    _, rerr := w.RestampRef(ctx, original)
+    if rerr == nil {
+        break // restamp landed inside the SettleWindow
+    }
+    if !errors.Is(rerr, s3store.ErrCommitAfterTimeout) {
+        return rerr // genuine PUT failure — no ref landed
+    }
+    // Each ErrCommitAfterTimeout means a ref DID land but past
+    // CommitTimeout; backoff and try again. Earlier refs stay on
+    // S3 and contribute duplicates that EntityKeyOf+VersionOf
+    // dedup collapses.
+    time.Sleep(backoff(attempt))
+}
+```
+
+Two things worth knowing:
+
+1. **Each retry adds a stream emission.** Without
+   `EntityKeyOf+VersionOf`, a consumer past the original offset
+   sees one record per landed ref. The cost of optimistic retry
+   is paid in dedup work.
+2. **Repeated `ErrCommitAfterTimeout` from both `WriteWithKey`
+   and `RestampRef` is a signal, not noise.** Both errors share
+   a root cause (backend slower than `CommitTimeout` for
+   ref→gate-visibility). After exhausting retries, the data is
+   still durable for snapshot reads; the fix for stream
+   observability is config (raise `CommitTimeout` + matching
+   `SettleWindow`) or capacity, not more retries.
 
 ### Stream — refs only
 

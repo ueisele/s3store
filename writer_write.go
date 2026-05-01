@@ -53,16 +53,22 @@ type WriteResult struct {
 // (captured just before the ref PUT) to token-commit-PUT
 // completion exceeded the configured CommitTimeout. The write IS
 // durable — data file, ref, and `<token>.commit` are all in S3,
-// and both snapshot and stream read paths see it — but a stream
-// reader's SettleWindow (= CommitTimeout + MaxClockSkew) may
-// already have advanced past refMicroTs by the time the commit
-// became observable, so a stream reader could miss it. The
-// returned *WriteResult is non-nil and reflects the durable
+// and snapshot reads (Read / ReadIter / ReadPartitionIter /
+// ProjectionReader.Lookup / BackfillProjection) see it — but a
+// stream reader's SettleWindow (= CommitTimeout + MaxClockSkew)
+// may already have advanced past refMicroTs by the time the
+// commit became observable, so a stream reader past that offset
+// will never re-visit it.
+//
+// The returned *WriteResult is non-nil and reflects the durable
 // commit; snapshot consumers can ignore the error. Stream
 // consumers that need observability inside the SettleWindow
-// should idempotent-retry under the same WithIdempotencyToken —
-// the upfront HEAD finds the prior commit and returns its
-// WriteResult unchanged.
+// should call RestampRef with the returned WriteResult — that
+// writes an additional ref with a fresh refMicroTs so the next
+// poll picks it up. Same-token retry of WriteWithKey does NOT
+// recover stream observability: its upfront HEAD finds the prior
+// commit and returns the original WriteResult unchanged without
+// writing any new ref.
 //
 // Use errors.Is(err, ErrCommitAfterTimeout) to distinguish from
 // transient PUT failures (which return a nil *WriteResult).
@@ -118,6 +124,142 @@ func (w *Writer[T]) LookupCommit(
 	}
 	return reconstructWriteResult(w.dataPath, w.refPath,
 		partition, token, meta), true, nil
+}
+
+// RestampRef writes an additional ref for an already-committed
+// write, with a fresh writer wall-clock refMicroTs. The data file
+// and `<token>.commit` marker are reused unchanged — the only S3
+// op is a single zero-byte PUT at a new ref key. Use this to
+// recover from ErrCommitAfterTimeout when stream consumers need
+// the write inside their SettleWindow: the new ref's refMicroTs
+// is current, so the next poll past now+SettleWindow is guaranteed
+// to see it with the commit gate already satisfied.
+//
+// The same-token-retry path is NOT a recovery for stream
+// observability — its upfront HEAD finds the prior commit and
+// returns the prior WriteResult unchanged without writing any new
+// ref, so the original refMicroTs is unchanged and a stream
+// consumer past that offset still misses it. RestampRef is the
+// only primitive that brings a timed-out commit back into the
+// SettleWindow.
+//
+// The returned WriteResult differs from prior only in Offset /
+// RefPath (the new ref's key, with a fresh refMicroTs). DataPath,
+// InsertedAt, and RowCount are unchanged. The original ref is
+// left in place, so stream readers see two emissions for the same
+// data: the consumer is responsible for tolerating the duplicate,
+// either by configuring EntityKeyOf+VersionOf dedup (which
+// collapses to a single record per (entity, version)) or by
+// accepting at-least-once at the consumer.
+//
+// Constraints:
+//   - prior must be the WriteResult of a commit produced by THIS
+//     Writer's store: prior.RefPath and prior.DataPath must lie
+//     under the Writer's _ref / data prefixes. A cross-Writer
+//     call surfaces an error rather than silently writing a ref
+//     that no reader can resolve through this Writer's commit
+//     gate.
+//   - prior must reflect a real commit. RestampRef does not HEAD
+//     `<token>.commit` first — it trusts that prior came from a
+//     successful Write/WriteWithKey/LookupCommit return. If the
+//     commit was manually deleted out-of-band, the new ref will
+//     be filtered as an orphan by readers (no harm, just no
+//     effect).
+//
+// Idempotency: each call writes a fresh ref at a new
+// `<refMicroTs>-<token>-<attemptID>` key, so multiple calls
+// produce multiple stream emissions. The token / attemptID are
+// reused from prior unchanged — the canonical-attempt check in
+// reader_poll.go gates ref→data lookup on attemptID matching
+// `<token>.commit`'s metadata, so a fresh attemptID would render
+// the new ref invisible.
+//
+// Like Write/WriteWithKey, RestampRef can return a non-nil
+// WriteResult alongside an ErrCommitAfterTimeout error: the new
+// ref IS durable, but elapsed wall-clock from refMicroTs to
+// ref-PUT-completion exceeded CommitTimeout, so a stream reader's
+// SettleWindow may already have advanced past the new refMicroTs
+// by the time the ref becomes LIST-visible. Recovery: call
+// RestampRef again with the same prior. Detect via
+// errors.Is(err, ErrCommitAfterTimeout).
+//
+// The ref PUT runs under context.WithoutCancel(ctx): the body is
+// a single zero-byte PUT, so caller-prompt cancellation isn't
+// worth the cost of a partially-completed PUT (response in flight,
+// ref already on S3) returning err to a caller who'd retry and
+// double up the duplicate. Caller cancellation is observed only
+// at the boundaries (parameter validation, paths-prefix check,
+// parseRefKey).
+func (w *Writer[T]) RestampRef(
+	ctx context.Context, prior *WriteResult,
+) (result *WriteResult, err error) {
+	scope := w.cfg.Target.metrics.methodScope(ctx, methodRestampRef)
+	defer scope.end(&err)
+	if prior == nil {
+		return nil, errors.New("RestampRef: prior must be non-nil")
+	}
+	if !strings.HasPrefix(prior.RefPath, w.refPath+"/") {
+		return nil, fmt.Errorf(
+			"RestampRef: ref path %q does not lie under this "+
+				"Writer's ref prefix %q (cross-Writer call?)",
+			prior.RefPath, w.refPath)
+	}
+	if !strings.HasPrefix(prior.DataPath, w.dataPath+"/") {
+		return nil, fmt.Errorf(
+			"RestampRef: data path %q does not lie under this "+
+				"Writer's data prefix %q (cross-Writer call?)",
+			prior.DataPath, w.dataPath)
+	}
+	hiveKey, _, token, attemptID, err := parseRefKey(prior.RefPath)
+	if err != nil {
+		return nil, fmt.Errorf("RestampRef: parse ref path: %w", err)
+	}
+
+	// Detached context: a mid-PUT caller cancel that the SDK had
+	// already turned into a successful backend write would otherwise
+	// surface as (nil, ctx.Err()) to the caller, who'd RestampRef
+	// again and double the duplicate. Bounded by retryMaxAttempts
+	// plus per-request SDK timeouts.
+	putCtx := context.WithoutCancel(ctx)
+
+	refMicroTs := time.Now().UnixMicro()
+	refKey := encodeRefKey(w.refPath, refMicroTs, token, attemptID, hiveKey)
+	if err := w.cfg.Target.put(putCtx, refKey, []byte{},
+		"application/octet-stream"); err != nil {
+		return nil, fmt.Errorf("RestampRef: put ref: %w", err)
+	}
+
+	result = &WriteResult{
+		Offset:     Offset(refKey),
+		DataPath:   prior.DataPath,
+		RefPath:    refKey,
+		InsertedAt: prior.InsertedAt,
+		RowCount:   prior.RowCount,
+	}
+
+	// SettleWindow risk check, symmetric with writeEncodedPayload's
+	// Step 8 but measured to ref-PUT-completion (not commit-PUT-
+	// completion): the commit gate is already satisfied by the
+	// original write's `<token>.commit` marker, so the only
+	// contract-relevant interval here is refMicroTs →
+	// ref-LIST-visibility. Past CommitTimeout, the reader's
+	// cutoff (= now - SettleWindow) may have advanced past
+	// refMicroTs by the time the ref becomes LIST-visible — a
+	// stream consumer past that offset still misses the restamp.
+	// The ref IS durable; the WriteResult is returned alongside
+	// the error so the caller retains the offset for journaling
+	// and a follow-up RestampRef call.
+	commitTimeout := w.cfg.Target.CommitTimeout()
+	if elapsed := time.Since(time.UnixMicro(refMicroTs)); elapsed > commitTimeout {
+		w.cfg.Target.metrics.recordCommitAfterTimeout(putCtx)
+		return result, fmt.Errorf(
+			"%w (elapsed %v > %v from ref PUT) — stream "+
+				"reader's SettleWindow may not include this "+
+				"restamp; ref is durable at %s, call "+
+				"RestampRef again to bring it back into the window",
+			ErrCommitAfterTimeout, elapsed, commitTimeout, refKey)
+	}
+	return result, nil
 }
 
 // Write extracts the key from each record via PartitionKeyOf,
