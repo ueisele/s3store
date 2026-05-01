@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
@@ -3431,6 +3432,167 @@ func TestWriteWithOptimisticCommit(t *testing.T) {
 	if got[0].Value != 99 {
 		t.Errorf("got Value=%d, want 99", got[0].Value)
 	}
+}
+
+// TestWriteWithOptimisticCommit_BucketPolicy403 covers the
+// alternative collision-detection path documented in the README
+// for backends without conditional-PUT support: a bucket policy
+// denying s3:PutOverwriteObject on the `<prefix>/data/*/*.commit`
+// subtree returns 403 AccessDenied instead of 412
+// PreconditionFailed. MinIO doesn't enforce s3:PutOverwriteObject
+// the way StorageGRID does, so the test injects a smithy
+// middleware that intercepts every commit-marker PUT and returns
+// a 403 ResponseError — equivalent to what a deny policy would
+// produce on retry.
+//
+// Sequence:
+//
+//  1. First write with WithOptimisticCommit through the unmodified
+//     client. The conditional PUT succeeds because no prior
+//     marker exists; the canonical commit lands.
+//  2. Second write with the SAME token through a client whose
+//     middleware fails every commit PUT with 403. The data PUT
+//     and ref PUT land (different attempt-id ⇒ different paths),
+//     then the commit PUT is rejected with 403. The writer's
+//     isCommitAlreadyExistsErr accepts both 412 and 403 and
+//     routes either to the same recovery branch (HEAD on
+//     `<token>.commit`, reconstruct prior WriteResult).
+//
+// Asserts the same shape as the 412 test: retry returns the
+// original DataPath / RefPath / Offset; Read sees one record;
+// the orphan parquet from the second attempt is invisible via
+// the commit gate.
+func TestWriteWithOptimisticCommit_BucketPolicy403(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+
+	cfg := StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+		EntityKeyOf: func(r Rec) string { return r.Customer + "|" + r.SKU },
+		VersionOf:   func(r Rec) int64 { return r.Value },
+	}
+	first, err := New[Rec](ctx, cfg)
+	if err != nil {
+		t.Fatalf("New (clean client): %v", err)
+	}
+
+	key := "period=2026-04-22/customer=dave"
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "dave",
+		SKU: "sku1", Value: 17, Ts: time.UnixMilli(1),
+	}}
+	const token = "2026-04-22T12:00:00Z-bucket-policy"
+
+	firstRes, err := first.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token), WithOptimisticCommit())
+	if err != nil {
+		t.Fatalf("clean fresh write: %v", err)
+	}
+
+	// Build a second store whose S3 client converts every commit
+	// PUT into 403 AccessDenied (post-build, before the request is
+	// signed). Mimics what the bucket-policy deny would surface
+	// to the SDK on retry.
+	deniedClient := newCommitPUTDenyingClient(t, f)
+	cfg.S3Client = deniedClient
+	second, err := New[Rec](ctx, cfg)
+	if err != nil {
+		t.Fatalf("New (denying client): %v", err)
+	}
+
+	secondRes, err := second.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token), WithOptimisticCommit())
+	if err != nil {
+		t.Fatalf("retry with bucket-policy 403: %v", err)
+	}
+	if secondRes == nil {
+		t.Fatal("retry with bucket-policy 403: nil result")
+	}
+	if secondRes.DataPath != firstRes.DataPath {
+		t.Errorf("retry DataPath drift: fresh=%q retry=%q",
+			firstRes.DataPath, secondRes.DataPath)
+	}
+	if secondRes.RefPath != firstRes.RefPath {
+		t.Errorf("retry RefPath drift: fresh=%q retry=%q",
+			firstRes.RefPath, secondRes.RefPath)
+	}
+	if secondRes.Offset != firstRes.Offset {
+		t.Errorf("retry Offset drift: fresh=%q retry=%q",
+			firstRes.Offset, secondRes.Offset)
+	}
+
+	// Read against the clean client surfaces only the canonical
+	// attempt — the orphan parquet from the second attempt has a
+	// different attempt-id than what the commit metadata names.
+	got, err := first.Read(ctx, []string{key})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if got[0].Value != 17 {
+		t.Errorf("got Value=%d, want 17", got[0].Value)
+	}
+}
+
+// newCommitPUTDenyingClient returns an *s3.Client wired against
+// the same MinIO endpoint as f.S3Client but with a smithy
+// middleware that intercepts every PUT whose path ends with
+// `.commit` and returns a 403 AccessDenied ResponseError —
+// equivalent to a bucket policy denying s3:PutOverwriteObject on
+// the commit subtree. Other PUTs (data, ref, markers) and all
+// non-PUT operations flow through unchanged so the writer's data
+// + ref PUTs and the recovery HEAD still hit MinIO.
+func newCommitPUTDenyingClient(t *testing.T, f *fixture) *s3.Client {
+	t.Helper()
+	return s3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: f.S3Client.Options().Credentials,
+	}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String("http://" + f.HostPort)
+		o.UsePathStyle = true
+		o.APIOptions = append(o.APIOptions,
+			func(stack *middleware.Stack) error {
+				return stack.Build.Add(
+					middleware.BuildMiddlewareFunc(
+						"s3store-test.denyCommitPUTs",
+						func(
+							ctx context.Context,
+							in middleware.BuildInput,
+							next middleware.BuildHandler,
+						) (middleware.BuildOutput, middleware.Metadata, error) {
+							req, ok := in.Request.(*smithyhttp.Request)
+							if ok && req.Method == "PUT" &&
+								strings.HasSuffix(req.URL.Path, ".commit") {
+								return middleware.BuildOutput{},
+									middleware.Metadata{},
+									&smithyhttp.ResponseError{
+										Response: &smithyhttp.Response{
+											Response: &http.Response{StatusCode: 403},
+										},
+										Err: &smithy.GenericAPIError{
+											Code:    "AccessDenied",
+											Message: "test: bucket policy denies overwrite of commit marker",
+										},
+									}
+							}
+							return next.HandleBuild(ctx, in)
+						}),
+					middleware.After)
+			})
+	})
 }
 
 // TestWriteWithIdempotencyToken_RetryAfterFailedAttempt simulates
