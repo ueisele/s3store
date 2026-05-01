@@ -250,8 +250,9 @@ follows:
 - **LIST** — partition LIST (snapshot reads, captures both
   `.parquet` and `.commit` siblings in one walk);
   projection-marker LIST (`ProjectionReader.Lookup`); ref-stream
-  LIST (`Poll` / `PollRecords` / `ReadRangeIter`); all funnel
-  through `listEach` ([target.go](target.go)).
+  LIST (`Poll` / `PollRecords` / `ReadRangeIter` /
+  `ReadPartitionRangeIter`); all funnel through `listEach`
+  ([target.go](target.go)).
 
 ### Why LIST is the load-bearing operation
 
@@ -287,20 +288,21 @@ s3store relies on LIST seeing recent PUTs in three places.
 moved to a single HEAD on `<token>.commit`, which lives under
 the HEAD-with-ladder guarantee even on `read-after-new-write`.)
 
-1. **`Reader.Read` / `ReadIter`** — partition LIST surfaces
-   freshly-written data files plus their `<token>.commit`
-   siblings in one walk; the gate drops uncommitted parquets
-   before any GET.
+1. **`Reader.Read` / `ReadIter` / `ReadPartitionIter`** —
+   partition LIST surfaces freshly-written data files plus their
+   `<token>.commit` siblings in one walk; the gate drops
+   uncommitted parquets before any GET.
 2. **`ProjectionReader.Lookup`** — LIST under `_projection/{col}={value}/`
    surfaces the marker emitted by the latest write.
-3. **`Poll` / `PollRecords` / `ReadRangeIter`** — ref-stream LIST
-   advances the consumer's cutoff. Per-ref HEAD on
-   `<token>.commit` then gates visibility. Without `strong-*`,
-   `SettleWindow` would have to be sized as pure LIST-propagation
-   slack; with it, `SettleWindow = CommitTimeout + MaxClockSkew`
-   only has to cover the writer's elapsed budget plus
-   writer↔reader clock-skew (refs encode `refMicroTs`, so the
-   skew bound is writer↔reader, not reader↔server).
+3. **`Poll` / `PollRecords` / `ReadRangeIter` /
+   `ReadPartitionRangeIter`** — ref-stream LIST advances the
+   consumer's cutoff. Per-ref HEAD on `<token>.commit` then
+   gates visibility. Without `strong-*`, `SettleWindow` would
+   have to be sized as pure LIST-propagation slack; with it,
+   `SettleWindow = CommitTimeout + MaxClockSkew` only has to
+   cover the writer's elapsed budget plus writer↔reader
+   clock-skew (refs encode `refMicroTs`, so the skew bound is
+   writer↔reader, not reader↔server).
 
 HEAD and GET are *not* the bottleneck — they would be safe on
 their own under default thanks to the documented ladder. We send
@@ -373,9 +375,10 @@ More generally, asymmetric setups can't help s3store: both
 halves of the library issue LISTs that need list-after-write
 (partition LIST on the snapshot read path,
 projection-marker LIST in `ProjectionReader.Lookup`, ref-stream
-LIST in `Poll`/`PollRecords`/`ReadRangeIter`). Whichever side
-you weaken to a non-strong level loses list-after-write on its
-own LISTs — independently of any PUT/GET pairing concern.
+LIST in `Poll`/`PollRecords`/`ReadRangeIter`/
+`ReadPartitionRangeIter`). Whichever side you weaken to a
+non-strong level loses list-after-write on its own LISTs —
+independently of any PUT/GET pairing concern.
 
 ### Why per-attempt-paths replaced the `s3:PutOverwriteObject` deny
 
@@ -591,10 +594,10 @@ are now:
 - **List-after-write at the strong levels.** Partition LIST
   on the snapshot read path, projection-marker LIST in
   `ProjectionReader.Lookup`, and ref-stream LIST in
-  `Poll`/`PollRecords`/`ReadRangeIter` all need it. Strong-*
-  is documented to provide list-after-write within its scope
-  (within a site for `strong-site`, across all sites for
-  `strong-global`).
+  `Poll`/`PollRecords`/`ReadRangeIter`/`ReadPartitionRangeIter`
+  all need it. Strong-* is documented to provide
+  list-after-write within its scope (within a site for
+  `strong-site`, across all sites for `strong-global`).
 - **Read-after-new-write on every PUT key.** Data files,
   refs, projection markers, and `<token>.commit` markers all
   rely on it. Data and ref PUTs use per-attempt paths and

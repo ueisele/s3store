@@ -37,16 +37,18 @@ contract follows from that:
   duplicate window at storage; reader dedup catches whatever
   slips through.
 - **Read-after-write on snapshot reads.** `Read` / `ReadIter` /
-  `ProjectionReader.Lookup` / `BackfillProjection` see new records the moment
-  `Write` returns. The change-stream APIs (`Poll`, `PollRecords`,
-  `ReadRangeIter`) intentionally lag the tip by `SettleWindow` to
-  tolerate S3 LIST propagation skew.
+  `ReadPartitionIter` / `ProjectionReader.Lookup` /
+  `BackfillProjection` see new records the moment `Write`
+  returns. The change-stream APIs (`Poll`, `PollRecords`,
+  `ReadRangeIter`, `ReadPartitionRangeIter`) intentionally lag
+  the tip by `SettleWindow` to tolerate S3 LIST propagation skew.
 - **Read stability.** Two consecutive snapshot reads with no
   intervening writes return the same records — the library never
   deletes or rewrites data on its own.
 - **Stream replay stability.** Refs (the change-stream offsets)
   are immutable: once a record is observed at offset N by `Poll`
-  / `PollRecords` / `ReadRangeIter`, replaying from offset 0 sees
+  / `PollRecords` / `ReadRangeIter` / `ReadPartitionRangeIter`,
+  replaying from offset 0 sees
   that same record at the same offset N, every time. Load-bearing
   for checkpointed pipelines — a consumer that processed up to
   offset 100 can crash, restart from offset 100, and resume
@@ -61,10 +63,12 @@ contract follows from that:
   Every `Write` lands a single `<token>.commit` zero-byte object
   *after* the data and ref PUTs. Both read paths gate on its
   presence: snapshot reads (`Read` / `ReadIter` /
-  `ProjectionReader.Lookup`) drop parquets without a sibling
-  commit; the change-stream APIs (`Poll` / `PollRecords` /
-  `ReadRangeIter`) HEAD `<token>.commit` for each ref before
-  yielding. A writer that crashes mid-sequence leaves an orphan
+  `ReadPartitionIter` / `ProjectionReader.Lookup`) drop parquets
+  without a sibling commit; the change-stream APIs (`Poll` /
+  `PollRecords` / `ReadRangeIter` / `ReadPartitionRangeIter` /
+  `ReadEntriesIter` / `ReadPartitionEntriesIter`) HEAD
+  `<token>.commit` for each ref before yielding. A writer that
+  crashes mid-sequence leaves an orphan
   parquet/ref pair that stays invisible to every read path — no
   in-flight states leak. A multi-partition `Write` is still not
   atomic *across* partitions; partition commits become visible one
@@ -72,9 +76,9 @@ contract follows from that:
   read-modify-write under `WithIdempotencyToken`) that's
   sufficient. **For workloads that compute deltas across
   partitions in one logical step**, treat each partition's commit
-  independently — read each via `PollRecords` / `ReadRangeIter` so
-  the read boundary lines up with committed refs, and checkpoint
-  by offset rather than wall-clock.
+  independently — read each via `PollRecords` / `ReadRangeIter` /
+  `ReadPartitionRangeIter` so the read boundary lines up with
+  committed refs, and checkpoint by offset rather than wall-clock.
 
 **Corollary: once a data file is in S3, it stays forever — even if
 the `Write` call returned an error.** A crashed write can leave an
@@ -146,8 +150,8 @@ writer and reader agree on the values by construction:
   cutoff; the writer doesn't read it.
 
 `SettleWindow = CommitTimeout + MaxClockSkew` is **derived**, not
-persisted; it's the cutoff `Poll` / `PollRecords` / `ReadRangeIter`
-apply to the live tip.
+persisted; it's the cutoff `Poll` / `PollRecords` /
+`ReadRangeIter` / `ReadPartitionRangeIter` apply to the live tip.
 
 Operators seed both objects once when provisioning a new prefix;
 `NewS3Target` (and `New(StoreConfig)`) GET them at construction time
@@ -718,9 +722,11 @@ recs, _ := store.Read(ctx, []string{"*"})
 // recs[i].InsertedAt is the writer's wall-clock at write-start.
 ```
 
-Works on every read path (`Read`, `ReadIter`, `PollRecords`) —
-the column round-trips like any other parquet field. The reader
-has no special handling. Zero reflection cost when unset.
+Works on every read path (`Read`, `ReadIter`, `ReadPartitionIter`,
+`ReadRangeIter`, `ReadPartitionRangeIter`, `ReadEntriesIter`,
+`ReadPartitionEntriesIter`, `PollRecords`) — the column
+round-trips like any other parquet field. The reader has no
+special handling. Zero reflection cost when unset.
 
 To use the writer-stamped time as the dedup version, reference
 the field from `VersionOf`:
@@ -915,8 +921,10 @@ partitions from joining the buffer.
 
 **Per-partition dedup contract — uniform across every read path**:
 `Read` / `ReadIter` / `ReadPartitionIter` / `ReadRangeIter` /
-`ReadPartitionRangeIter` / `PollRecords` all dedup within one Hive
-partition at a time. **Correct only when the partition key strictly
+`ReadPartitionRangeIter` / `ReadEntriesIter` /
+`ReadPartitionEntriesIter` / `PollRecords` all dedup within one
+Hive partition at a time. **Correct only when the partition key
+strictly
 determines every component of `EntityKeyOf`** — i.e. no entity ever
 spans two partitions. For layouts where entities can move between
 partitions over time (e.g. a customer that switches region), pass
@@ -1316,7 +1324,8 @@ customer=def)` but *not* the off-diagonal combinations), pass them
 as additional elements of the same `[]string` patterns slice.
 Every read entry point already takes `[]string`:
 
-Every read entry point — `Read`, `ReadIter`, `ProjectionReader.Lookup`,
+Every read entry point that takes patterns — `Read`, `ReadIter`,
+`ReadPartitionIter`, `ProjectionReader.Lookup`,
 `BackfillProjection` — accepts the same `[]string` shape:
 
 ```go
@@ -1621,9 +1630,10 @@ motivates the `ConsistencyControl` default.
 ## Durability guarantees
 
 The contract is **at-least-once** on both sides of the wire, plus
-**read-after-write** on every operation except `Poll` / `PollRecords`
-/ `ReadRangeIter` (which deliberately lag the live tip by
-`SettleWindow` to tolerate S3 LIST propagation skew — see
+**read-after-write** on every operation except `Poll` /
+`PollRecords` / `ReadRangeIter` / `ReadPartitionRangeIter`
+(which deliberately lag the live tip by `SettleWindow` to
+tolerate S3 LIST propagation skew — see
 [Settle window](#settle-window)).
 
 ### Read-after-write
@@ -1633,15 +1643,16 @@ following operations issued from any process against the same
 bucket sees the new records immediately — no sleep, no settle
 delay:
 
-- `Reader.Read` / `ReadIter`
+- `Reader.Read` / `ReadIter` / `ReadPartitionIter`
 - `ProjectionReader.Lookup`
 - `BackfillProjection`
 
-`Poll` / `PollRecords` / `ReadRangeIter` are the intentional
-exceptions: they apply the `SettleWindow` cutoff so near-tip refs
-stay hidden until S3 LIST propagation has had time to settle. A
-ref that's written inside the window will be returned by a
-subsequent poll issued after one `SettleWindow` has elapsed.
+`Poll` / `PollRecords` / `ReadRangeIter` /
+`ReadPartitionRangeIter` are the intentional exceptions: they
+apply the `SettleWindow` cutoff so near-tip refs stay hidden
+until S3 LIST propagation has had time to settle. A ref that's
+written inside the window will be returned by a subsequent poll
+issued after one `SettleWindow` has elapsed.
 
 #### What you need to configure
 
@@ -1718,20 +1729,23 @@ A data-file GET that returns S3 `NoSuchKey` is operator-driven
 itself never deletes data it has written). The library splits the
 response by path:
 
-- **Strict — fail loudly.** `Read` and `ReadIter` propagate the
-  `NoSuchKey` as a wrapped error. These paths LIST the partition
-  tree first, so a missing file is genuinely a LIST-to-GET race
-  (the file vanished in the millisecond window between LIST and
-  GET); a caller retry resolves it because the next LIST won't
-  include the deleted key.
+- **Strict — fail loudly.** `Read`, `ReadIter`, and
+  `ReadPartitionIter` propagate the `NoSuchKey` as a wrapped
+  error. These paths LIST the partition tree first, so a missing
+  file is genuinely a LIST-to-GET race (the file vanished in the
+  millisecond window between LIST and GET); a caller retry
+  resolves it because the next LIST won't include the deleted key.
 - **Tolerant — skip and signal.** `PollRecords`, `ReadRangeIter`,
-  and `BackfillProjection` walk the ref stream / data tree on a
-  long-running shape where a single missing file shouldn't poison
-  the whole job. They log via `slog.Warn` (level WARN, key=path,
-  method=poll_records / read_range_iter / backfill) and increment
-  the `s3store.read.missing_data` counter, then continue. The
-  caller's slog handler decides what to do with the warning;
-  metrics are picked up by any OTel-configured backend.
+  `ReadPartitionRangeIter`, `ReadEntriesIter`,
+  `ReadPartitionEntriesIter`, and `BackfillProjection` walk the
+  ref stream / data tree on a long-running shape where a single
+  missing file shouldn't poison the whole job. They log via
+  `slog.Warn` (level WARN, key=path, method=poll_records /
+  read_range_iter / read_partition_range_iter / read_entries_iter
+  / read_partition_entries_iter / backfill) and increment the
+  `s3store.read.missing_data` counter, then continue. The caller's
+  slog handler decides what to do with the warning; metrics are
+  picked up by any OTel-configured backend.
 
 Every *other* GET error (throttle, network, auth, timeout) is
 still fatal on every path — silently dropping records on
@@ -1752,7 +1766,9 @@ type StoreConfig[T any] struct {
     // Required for Write
     PartitionKeyOf func(T) string  // derive key from record (Write)
 
-    // Read-side dedup (used by Read / ReadIter / PollRecords).
+    // Read-side dedup (used by every read path: Read / ReadIter /
+    // ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter /
+    // ReadEntriesIter / ReadPartitionEntriesIter / PollRecords).
     // Both or neither — explicit opt-in, no default. New rejects
     // partial config.
     EntityKeyOf func(T) string  // identifies a unique entity
@@ -1843,9 +1859,10 @@ on non-success. `s3store.s3.request.attempts` carries only
 not terminal error class — keeping cardinality bounded).
 
 **Library methods** (recorded at the public entry point of `Write`,
-`WriteWithKey`, `LookupCommit`, `Read`, `ReadIter`, `ReadRangeIter`,
-`Poll`, `PollRecords`, `ProjectionReader.Lookup`,
-`BackfillProjection`):
+`WriteWithKey`, `LookupCommit`, `Read`, `ReadIter`,
+`ReadPartitionIter`, `ReadRangeIter`, `ReadPartitionRangeIter`,
+`ReadEntriesIter`, `ReadPartitionEntriesIter`, `Poll`,
+`PollRecords`, `ProjectionReader.Lookup`, `BackfillProjection`):
 
 | Name | Kind | Unit |
 |---|---|---|
@@ -1858,6 +1875,7 @@ not terminal error class — keeping cardinality bounded).
 | `s3store.read.records` | histogram | 1 |
 | `s3store.read.bytes` | histogram | By |
 | `s3store.read.files` | histogram | 1 |
+| `s3store.read.partitions` | histogram | 1 |
 | `s3store.read.missing_data` | counter | 1 |
 | `s3store.read.malformed_refs` | counter | 1 |
 | `s3store.read.commit_head` | counter | 1 |
@@ -1884,9 +1902,11 @@ from the per-poll cache instead.
 
 `s3store.read.missing_data` increments on `NoSuchKey` skips along
 the tolerant read paths (`PollRecords`, `ReadRangeIter`,
-`BackfillProjection`). Carries `s3store.method` so dashboards can
-split by which path produced the skip. Strict paths (`Read`,
-`ReadIter`) fail instead of recording.
+`ReadPartitionRangeIter`, `ReadEntriesIter`,
+`ReadPartitionEntriesIter`, `BackfillProjection`). Carries
+`s3store.method` so dashboards can split by which path produced
+the skip. Strict paths (`Read`, `ReadIter`, `ReadPartitionIter`)
+fail instead of recording.
 
 `s3store.read.malformed_refs` increments when a ref object's
 filename fails to parse during a LIST on the ref stream. Skipped
@@ -1894,7 +1914,16 @@ after a `slog.Warn` so consumers don't crash on a future schema or
 externally-written object — the counter makes the drift visible.
 Surfaced under `s3store.method = poll` because the LIST that hit
 it always runs in `Poll`, even when invoked indirectly by
-`PollRecords` or `ReadRangeIter`.
+`PollRecords` / `ReadRangeIter` / `ReadPartitionRangeIter`.
+
+`s3store.read.partitions` records the distinct Hive partitions
+touched per call on every method that funnels through the iter
+pipeline: `Read` / `ReadIter` / `ReadPartitionIter` /
+`ReadRangeIter` / `ReadPartitionRangeIter` / `ReadEntriesIter` /
+`ReadPartitionEntriesIter` / `PollRecords`. Not recorded for
+`Poll` (refs only — no decode), `ProjectionReader.Lookup`,
+`Writer.LookupCommit`, or `BackfillProjection`. Mirrors
+`s3store.write.partitions` on the write side.
 
 `Write` and `WriteWithKey` show up as distinct `s3store.method`
 values; `Write`'s per-partition dispatch is internal and does not
@@ -2093,9 +2122,12 @@ rush it.
 ## Limitations
 
 - **No SQL engine.** Reads are typed Go (`Read` / `ReadIter` /
-  `PollRecords`) — no aggregation, no joins. For SQL workloads,
-  point DuckDB at the same bucket via its `httpfs` extension and
-  `read_parquet()` over the data path.
+  `ReadPartitionIter` / `ReadRangeIter` /
+  `ReadPartitionRangeIter` / `ReadEntriesIter` /
+  `ReadPartitionEntriesIter` / `PollRecords`) — no aggregation,
+  no joins. For SQL workloads, point DuckDB at the same bucket
+  via its `httpfs` extension and `read_parquet()` over the data
+  path.
 - **S3 key limit: 1024 bytes.** Long partition values reduce the budget.
 - **Stream latency = poll interval + settle window.** Not real-time.
 - **Upsert-only compacted mode.** There is no tombstone / key-delete
@@ -2158,7 +2190,9 @@ error.
 
 ### Snapshot read
 
-`Read` / `ReadIter` / `ReadRangeIter` (snapshot half) /
+`Read` / `ReadIter` / `ReadPartitionIter` / `ReadRangeIter`
+(snapshot half) / `ReadPartitionRangeIter` (snapshot half) /
+`ReadEntriesIter` / `ReadPartitionEntriesIter` /
 `BackfillProjection` share the same listing-and-gating skeleton:
 
 | Op   | Count   | Key                                                           |
@@ -2170,11 +2204,19 @@ error.
 `Read` materializes records into a slice; `ReadIter` /
 `ReadRangeIter` stream them via iterator with bounded memory
 (`WithReadAheadPartitions` / `WithReadAheadBytes`).
+`ReadPartitionIter` / `ReadPartitionRangeIter` yield one
+`HivePartition[T]` per partition (same LIST + GET shape;
+the partition is the unit of yield).
+`ReadEntriesIter` / `ReadPartitionEntriesIter` skip the LIST
+stage entirely — the caller passes a pre-resolved
+`[]StreamEntry` (typically from `Poll`), so the GET stage runs
+directly.
 `BackfillProjection` adds **1 PUT per derived marker per parquet**
 (deduped within the parquet) on top of the GETs.
 
-`ReadRangeIter` walks the ref stream first (see Stream read
-below) to collect data-file paths, then runs the GET stage above.
+`ReadRangeIter` / `ReadPartitionRangeIter` walk the ref stream
+first (see Stream read below) to collect data-file paths, then
+run the GET stage above.
 
 ### Snapshot read — `ProjectionReader.Lookup`
 
@@ -2201,9 +2243,15 @@ No GETs. Returns refs only.
 file body (decoded via the same byte-budget pipeline as
 `ReadIter`).
 
-`ReadRangeIter` = one or more `Poll` cycles to walk the
-`[since, until)` window into a flat ref list, then **1 GET per
-data file** through the iter pipeline.
+`ReadRangeIter` / `ReadPartitionRangeIter` = one or more `Poll`
+cycles to walk the `[since, until)` window into a flat ref list,
+then **1 GET per data file** through the iter pipeline.
+
+`ReadEntriesIter` / `ReadPartitionEntriesIter` skip the ref-LIST
+walk entirely: the caller hands in `[]StreamEntry` directly
+(typically from a prior `Poll`), so the only S3 ops are **1 GET
+per entry** (plus the per-poll commit-cache HEADs, which the
+caller's earlier `Poll` already paid for).
 
 ## License
 
