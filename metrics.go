@@ -128,6 +128,7 @@ type metrics struct {
 	writePartitions    metric.Int64Histogram
 	writeBytes         metric.Int64Histogram
 	readRecords        metric.Int64Histogram
+	readPartitions     metric.Int64Histogram
 	readBytes          metric.Int64Histogram
 	readFiles          metric.Int64Histogram
 	readMissingData    metric.Int64Counter
@@ -278,6 +279,10 @@ func newMetrics(
 		"s3store.read.records",
 		"Records returned per read-side method call",
 		"{record}")
+	m.readPartitions = mustHistInt(
+		"s3store.read.partitions",
+		"Distinct Hive partitions touched per read-side method call (every method that funnels through the iter pipeline: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Not recorded for Poll / Lookup / LookupCommit / BackfillProjection.",
+		"{partition}")
 	m.readBytes = mustHistInt(
 		"s3store.read.bytes",
 		"Total parquet body bytes downloaded per read-side method call",
@@ -662,8 +667,9 @@ func (s *methodScope) addRecords(n int64) {
 }
 
 // addPartitions increments the count of distinct partition keys
-// touched by a Write call. WriteWithKey adds 1 on commit; Write
-// adds 1 per successful partition.
+// touched by the call. WriteWithKey adds 1 on commit; Write adds
+// 1 per successful partition. Read paths going through the iter
+// pipeline (downloadAndDecodeIter) add len(parts) once at start.
 func (s *methodScope) addPartitions(n int64) {
 	if s.m == nil || n <= 0 {
 		return
@@ -816,6 +822,9 @@ func (s *methodScope) end(errPtr *error) {
 		methodLookupCommit, methodBackfill:
 		if records > 0 {
 			s.m.readRecords.Record(s.ctx, records, mcs, mvs)
+		}
+		if partitions > 0 {
+			s.m.readPartitions.Record(s.ctx, partitions, mcs, mvs)
 		}
 		if bytesN > 0 {
 			s.m.readBytes.Record(s.ctx, bytesN, mcs, mvs)

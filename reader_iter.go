@@ -376,6 +376,10 @@ func (s *Reader[T]) downloadAndDecodeIter(
 		return
 	}
 
+	// Pre-dedup partition count: distinct Hive partitions in the
+	// LIST. Surfaced as s3store.read.partitions on the scope.
+	scope.addPartitions(int64(len(parts)))
+
 	// Records / bytes / files counters threaded through the
 	// pipeline; flushed onto the caller's scope before return so
 	// the deferred end sees totals. Each counter reflects work
