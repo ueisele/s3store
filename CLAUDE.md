@@ -9,10 +9,11 @@ must preserve them — even when the change appears unrelated.
   PUT leaves an orphan data file. The library never deletes
   data, refs, or markers it has written.
 - **Read-after-write on snapshot reads** — once Write returns
-  success, Read / ReadIter / ProjectionReader.Lookup / BackfillProjection
-  see the new records immediately. The settle window applies
-  only to the change stream (Poll / PollRecords /
-  ReadRangeIter).
+  success, Read / ReadIter / ReadPartitionIter /
+  ProjectionReader.Lookup / BackfillProjection see the new
+  records immediately. The settle window applies only to the
+  change stream (Poll / PollRecords / ReadRangeIter /
+  ReadPartitionRangeIter).
 - **Read stability — no library-driven deletion** — two
   consecutive snapshot reads with no intervening writes return
   the same records. Without transactional metadata, the library
@@ -59,14 +60,15 @@ must preserve them — even when the change appears unrelated.
   short-circuits before any second commit PUT lands.
 - **Atomic per-file visibility via `<token>.commit`** — both
   read paths gate on the marker. Snapshot reads
-  (`Read` / `ReadIter` / `ProjectionReader.Lookup` /
-  `BackfillProjection`) drop parquets without a paired commit;
-  the change-stream APIs (`Poll` / `PollRecords` /
-  `ReadRangeIter`) HEAD `<token>.commit` per ref before yielding
-  (per-poll cache collapses repeat tokens). A writer that
-  crashes mid-sequence leaves an orphan parquet/ref pair
-  invisible to every read path. Refactors must not introduce
-  read paths that bypass the gate.
+  (`Read` / `ReadIter` / `ReadPartitionIter` /
+  `ProjectionReader.Lookup` / `BackfillProjection`) drop parquets
+  without a paired commit; the change-stream APIs (`Poll` /
+  `PollRecords` / `ReadRangeIter` / `ReadPartitionRangeIter`)
+  HEAD `<token>.commit` per ref before yielding (per-poll cache
+  collapses repeat tokens). A writer that crashes mid-sequence
+  leaves an orphan parquet/ref pair invisible to every read
+  path. Refactors must not introduce read paths that bypass the
+  gate.
 - **Deterministic parquet encoding** — same records + same codec
   produce byte-identical bytes. `WithIdempotencyToken` retries
   depend on this; refactors must not introduce non-determinism
@@ -76,10 +78,49 @@ must preserve them — even when the change appears unrelated.
   (NetApp's "same consistency for paired operations" rule,
   enforced by construction). Refactors must not introduce
   per-call overrides.
-- **Per-partition dedup on ReadIter** — dedup runs within one
-  partition at a time, so `EntityKeyOf` must be fully determined
-  by the partition key. `Read` does global dedup and pays the
-  memory cost.
+- **Per-partition dedup on every read path** — dedup runs within
+  one Hive partition at a time across `Read` / `ReadIter` /
+  `ReadPartitionIter` / `ReadRangeIter` / `ReadPartitionRangeIter`
+  / `PollRecords`. `EntityKeyOf` must be fully determined by the
+  partition key so no entity ever spans partitions; otherwise an
+  entity surfaces with a separate "latest" pick per partition.
+  No global-dedup escape hatch — refactors must not reintroduce
+  one (the union-slice memory cost was real, and per-partition
+  dedup is correctness-equivalent under the precondition).
+- **Deterministic emission order across read paths** — every
+  read path (`Read` / `ReadIter` / `ReadPartitionIter` /
+  `ReadRangeIter` / `ReadPartitionRangeIter` / `PollRecords`)
+  emits partitions in **lex order of the Hive partition-key
+  string**, with per-partition records in **`(entity, version)`
+  ascending order** when dedup is configured (decode/insertion
+  order without it, file-lex then parquet-row). Same input on
+  the same data produces byte-identical output every time.
+
+  Three load-bearing pieces back this:
+
+  1. `preparePartitions` collects the `byPartition` map keys
+     and `slices.Sort`s them before constructing the per-
+     partition state — collapses Go's randomized map iteration
+     to deterministic lex order.
+  2. `sortKeyMetasByKey` sorts each partition's files by S3
+     key — deterministic decode order within a partition.
+  3. `decodePartition` runs `sortAndDedup`, a stable
+     `(entity, version)` sort followed by in-place dedup —
+     deterministic record order within a partition's output.
+
+  Refactors must not introduce non-deterministic partition
+  iteration (e.g., emitting from the `byPartition` map directly
+  without sorting), parallel-decode pipelines that race
+  `decodedBatch` sends to the channel out of order, or
+  non-stable record sorts inside a partition. Consumers may
+  rely on byte-for-byte stable output across calls — diffing,
+  hashing, replay-equality, and golden-file tests all depend
+  on it.
+
+  `PollRecords` consumers needing wall-clock ordering across
+  partitions must re-sort by their own timestamp field — its
+  `nextOffset` advancement (the "don't miss records"
+  property) is unaffected.
 
 # Backend assumptions
 

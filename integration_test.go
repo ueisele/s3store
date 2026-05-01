@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -2414,6 +2415,44 @@ func TestReadIter_PerPartitionDedup(t *testing.T) {
 	}
 	if got[0].Value != 99 {
 		t.Errorf("got Value=%d, want 99 (newer Ts wins)", got[0].Value)
+	}
+}
+
+// TestReadIter_PartitionLexOrder pins the public contract that
+// records yielded by ReadIter span partitions in lex-ascending
+// order of the Hive partition key, regardless of the order in
+// which the partitions were written. Guards the
+// "Deterministic emission order across read paths" invariant in
+// CLAUDE.md — a future refactor that drops the slices.Sort in
+// preparePartitions (or otherwise surfaces Go's randomized map
+// iteration order) would silently break consumer expectations
+// of byte-for-byte stable output.
+func TestReadIter_PartitionLexOrder(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, storeOpts{})
+
+	// Write partitions in reverse-lex order so any accidental
+	// insertion-order emission would produce c, b, a instead.
+	for _, c := range []string{"c", "b", "a"} {
+		key := fmt.Sprintf("period=2026-03-17/customer=%s", c)
+		if _, err := store.WriteWithKey(ctx, key, []Rec{
+			{Period: "2026-03-17", Customer: c, SKU: "s1", Value: 1},
+		}); err != nil {
+			t.Fatalf("WriteWithKey %s: %v", c, err)
+		}
+	}
+
+	var got []string
+	for r, err := range store.ReadIter(ctx, []string{"*"}) {
+		if err != nil {
+			t.Fatalf("ReadIter: %v", err)
+		}
+		got = append(got, r.Customer)
+	}
+	want := []string{"a", "b", "c"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got partition order %v, want %v (lex)",
+			got, want)
 	}
 }
 

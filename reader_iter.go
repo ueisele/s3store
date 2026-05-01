@@ -8,6 +8,7 @@ import (
 	"iter"
 	"log/slog"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,12 +21,20 @@ import (
 // at a time, streaming partition-by-partition. Use when Read's
 // O(records) memory is a problem.
 //
-// Dedup is per-partition (not global like Read): correct only
-// when the partition key strictly determines every component of
-// EntityKeyOf so no entity ever spans partitions. For layouts
-// that don't satisfy this invariant, use Read or pass WithHistory
-// and dedup yourself. Partitions emit in lex order; within a
-// partition, records emit in lex/insertion order.
+// Dedup is per-partition (uniform across every read path now):
+// correct only when the partition key strictly determines every
+// component of EntityKeyOf so no entity ever spans partitions.
+// For layouts that don't satisfy this invariant, pass WithHistory
+// and dedup yourself.
+//
+// Partitions emit in lex order. Within a partition, record order
+// depends on dedup configuration: when EntityKeyOf is set,
+// records are in (entity, version) ascending order — last-wins
+// on tied versions for default dedup, first-wins per
+// (entity, version) group for WithHistory replica dedup. When
+// EntityKeyOf is nil (no dedup configured), records emit in
+// decode order: file lex order, then parquet row order within
+// each file.
 //
 // Memory: O(one partition's records) by default. Tune with
 // WithReadAheadPartitions (default 1; overlap decode of N+1 with
@@ -58,7 +67,8 @@ func (s *Reader[T]) ReadIter(
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, scope, yield, &iterErr)
+		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+			s.recordEmit(yield, &iterErr))
 	}
 }
 
@@ -94,25 +104,9 @@ func (s *Reader[T]) ReadRangeIter(
 	opts ...ReadOption,
 ) iter.Seq2[T, error] {
 	// Resolve time bounds outside the closure so the live-tip
-	// snapshot freezes at call entry, not at first iteration:
-	// without this, a busy writer could keep the walk running
-	// indefinitely as the now-SettleWindow cutoff advances.
-	var sinceOffset Offset
-	if !since.IsZero() {
-		sinceOffset = s.OffsetAt(since)
-	}
-	var untilOffset Offset
-	if until.IsZero() {
-		settleAt := time.Now().Add(
-			-s.cfg.Target.SettleWindow())
-		untilOffset = s.OffsetAt(settleAt)
-	} else {
-		untilOffset = s.OffsetAt(until)
-	}
-	// Poll only honours WithUntilOffset; the snapshot-side opts
-	// (WithHistory, WithReadAhead*) flow into the snapshot-style
-	// decode pipeline below, not into Poll.
-	pollOpts := []PollOption{WithUntilOffset(untilOffset)}
+	// snapshot freezes at call entry, not at first iteration —
+	// see resolveRangeBounds.
+	sinceOffset, untilOffset := s.resolveRangeBounds(since, until)
 
 	return func(yield func(T, error) bool) {
 		scope := s.cfg.Target.metrics.methodScope(ctx, methodReadRangeIter)
@@ -121,42 +115,109 @@ func (s *Reader[T]) ReadRangeIter(
 		var o readOpts
 		o.apply(opts...)
 
-		// Walk the ref stream into a flat KeyMeta slice. LIST-only
-		// (no parquet bodies fetched), so this phase is cheap. Use
-		// the LIST page max as the per-Poll cap to minimize round
-		// trips — the slice growth here is bounded metadata, not
-		// decoded record memory.
-		var keys []KeyMeta
-		cur := sinceOffset
-		for {
-			entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, pollOpts...)
-			if err != nil {
-				iterErr = err
-				yield(*new(T), err)
-				return
-			}
-			if len(entries) == 0 {
-				break
-			}
-			for _, e := range entries {
-				keys = append(keys, KeyMeta{
-					Key:        e.DataPath,
-					InsertedAt: e.InsertedAt,
-				})
-			}
-			cur = next
+		keys, err := s.walkRangeKeys(ctx, sinceOffset, untilOffset)
+		if err != nil {
+			iterErr = err
+			yield(*new(T), err)
+			return
 		}
 		if len(keys) == 0 {
 			return
 		}
 
-		s.downloadAndDecodeIter(ctx, keys, &o, scope, yield, &iterErr)
+		s.downloadAndDecodeIter(ctx, keys, &o, scope,
+			s.recordEmit(yield, &iterErr))
+	}
+}
+
+// resolveRangeBounds converts a [since, until) wall-clock window
+// into stream Offset bounds. Pure computation — no I/O. Captures
+// the live-tip snapshot at call time when until is zero, freezing
+// the upper bound so a busy writer can't keep extending the walk
+// as time advances.
+//
+// Called outside the iter closure by ReadRangeIter /
+// ReadPartitionRangeIter so the freeze happens at iter-construction
+// time, not at iter-start time. Pair with walkRangeKeys, which
+// performs the actual ref LIST.
+func (s *Reader[T]) resolveRangeBounds(
+	since, until time.Time,
+) (sinceOffset, untilOffset Offset) {
+	if !since.IsZero() {
+		sinceOffset = s.OffsetAt(since)
+	}
+	if until.IsZero() {
+		settleAt := time.Now().Add(
+			-s.cfg.Target.SettleWindow())
+		untilOffset = s.OffsetAt(settleAt)
+	} else {
+		untilOffset = s.OffsetAt(until)
+	}
+	return sinceOffset, untilOffset
+}
+
+// walkRangeKeys walks the ref stream between sinceOffset and
+// untilOffset (resolved upfront by resolveRangeBounds) into a
+// flat list of data-file KeyMetas. LIST-only — no parquet bodies
+// fetched, so this phase is cheap. Uses the LIST page max as the
+// per-Poll cap to minimize round trips. Slice growth here is
+// bounded metadata, not decoded record memory.
+//
+// Used by ReadRangeIter / ReadPartitionRangeIter. Caller is
+// responsible for setting iterErr and yielding the error to the
+// consumer on a non-nil return.
+func (s *Reader[T]) walkRangeKeys(
+	ctx context.Context, sinceOffset, untilOffset Offset,
+) ([]KeyMeta, error) {
+	pollOpts := []PollOption{WithUntilOffset(untilOffset)}
+	var keys []KeyMeta
+	cur := sinceOffset
+	for {
+		entries, next, err := s.Poll(ctx, cur, s3ListMaxKeys, pollOpts...)
+		if err != nil {
+			return nil, err
+		}
+		if len(entries) == 0 {
+			break
+		}
+		for _, e := range entries {
+			keys = append(keys, KeyMeta{
+				Key:        e.DataPath,
+				InsertedAt: e.InsertedAt,
+			})
+		}
+		cur = next
+	}
+	return keys, nil
+}
+
+// recordEmit returns the per-batch emit callback that flattens
+// each partition's already-dedup'd records into the consumer's
+// iter.Seq2[T, error] yield. Used by ReadIter / ReadRangeIter —
+// paths that surface records one at a time.
+//
+// On a hard pipeline error: sets *iterErr, yields (zero T, err)
+// once, returns (0, false) so the emit loop terminates and
+// scope.end picks up iterErr for outcome classification.
+//
+// On success: delegates to emitPartition for the record-at-a-
+// time yield + early-break handling.
+func (s *Reader[T]) recordEmit(
+	yield func(T, error) bool, iterErr *error,
+) func(string, []T, error) (int64, bool) {
+	return func(_ string, recs []T, err error) (int64, bool) {
+		if err != nil {
+			*iterErr = err
+			yield(*new(T), err)
+			return 0, false
+		}
+		return s.emitPartition(recs, yield)
 	}
 }
 
 // downloadAndDecodeIter is the byte-budget-aware streaming pipeline backing
-// ReadIter and ReadRangeIter. Three concurrent stages plus the
-// caller's yield loop:
+// ReadIter / ReadRangeIter / ReadPartitionIter / ReadPartitionRangeIter.
+// Three concurrent stages plus the caller's emit loop:
 //
 //  1. Producer goroutine: walks partitions in lex order and
 //     pushes (partIdx, fileIdx) jobs into a download queue.
@@ -171,13 +232,23 @@ func (s *Reader[T]) ReadRangeIter(
 //     waits until all files are downloaded, parses each parquet
 //     footer to compute the partition's exact uncompressed total,
 //     gates on (ReadAheadPartitions, ReadAheadBytes), decodes
-//     into versionedRecord[T], and pushes a decodedBatch to the
-//     yielder.
+//     records, sort+dedup's them in-place, and pushes a
+//     decodedBatch to the emitter.
 //
-//  4. Yield loop (this goroutine): pulls decoded partitions in
-//     order, runs sortAndDedup, and forwards records via yield.
-//     Frees the partition's reserved bytes on completion so the
-//     decoder can proceed.
+//  4. Emit loop (this goroutine): pulls decoded partitions in
+//     order and forwards each to the per-method emit callback —
+//     record-by-record yield (ReadIter / ReadRangeIter) or one
+//     HivePartition[T] per partition (ReadPartitionIter /
+//     ReadPartitionRangeIter). Frees the partition's reserved
+//     bytes on completion so the decoder can proceed.
+//
+// emit is invoked once per decodedBatch; the callback owns the
+// caller-side iter.Seq2 yield + iterErr bookkeeping. On a hard
+// pipeline error, decoder sends decodedBatch{err: err} and the
+// emit callback receives (partKey="", recs=nil, err=non-nil) —
+// it should yield the error to the consumer, set iterErr, and
+// return (0, false). On success, emit returns (records-yielded,
+// keep-going); a false ok aborts the loop.
 //
 // Downloads are continuously in flight regardless of decode pace,
 // the budget gate uses exact uncompressed sizes from parquet
@@ -187,7 +258,7 @@ func (s *Reader[T]) ReadRangeIter(
 func (s *Reader[T]) downloadAndDecodeIter(
 	ctx context.Context, keys []KeyMeta,
 	opts *readOpts, scope *methodScope,
-	yield func(T, error) bool, iterErr *error,
+	emit func(partKey string, recs []T, err error) (int64, bool),
 ) {
 	if len(keys) == 0 {
 		return
@@ -295,17 +366,12 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	decodedCh := make(chan decodedBatch[T], readAheadParts)
 	wg.Go(func() { s.runDecoder(ctx, state, opts, decodedCh) })
 
-	// Stage 4: yield loop. Drains decodedCh, signals on each
-	// completed partition so the decoder can release the
-	// byte-budget reservation.
+	// Stage 4: emit loop. Drains decodedCh, hands each batch to
+	// the per-method emit callback (record-by-record yield or
+	// HivePartition[T] yield), signals on each completed partition
+	// so the decoder can release the byte-budget reservation.
 	for batch := range decodedCh {
-		if batch.err != nil {
-			*iterErr = batch.err
-			yield(*new(T), batch.err)
-			return
-		}
-		emitted, ok := s.emitPartition(
-			batch.recs, opts.includeHistory, yield)
+		emitted, ok := emit(batch.partitionKey, batch.recs, batch.err)
 		recordsYielded += emitted
 		state.releaseBytes(batch.uncompBytes)
 		if !ok {
@@ -314,26 +380,38 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	}
 }
 
-// emitPartition yields one partition's records to the consumer
-// through sortAndIterate, so the iter paths observe the same
-// order / replica-collapse / latest-per-entity semantics as the
-// materialised Read paths. Returns the count of records actually
-// yielded plus a continue flag — false when the consumer asked
-// to stop (yield returned false), so the outer loop can break
-// cleanly. Counted records flow into the s3store.read.records
-// histogram on the caller's methodScope.
+// emitPartition yields one partition's already-dedup'd records
+// to the consumer. Sort+dedup runs upstream in decodePartition
+// so the iter paths observe the same order / replica-collapse /
+// latest-per-entity semantics as the materialised Read paths
+// without paying for it on the yield-loop hot path. Returns the
+// count of records actually yielded plus a continue flag — false
+// when the consumer asked to stop (yield returned false), so the
+// outer loop can break cleanly. Counted records flow into the
+// s3store.read.records histogram on the caller's methodScope.
 func (s *Reader[T]) emitPartition(
-	recs []T, includeHistory bool,
+	recs []T,
 	yield func(T, error) bool,
 ) (int64, bool) {
 	var emitted int64
-	for r := range s.sortAndIterate(recs, includeHistory) {
+	for _, r := range recs {
 		if !yield(r, nil) {
 			return emitted, false
 		}
 		emitted++
 	}
 	return emitted, true
+}
+
+// sortKeyMetasByKey orders a partition's files by their S3 key
+// for deterministic download order. Used by preparePartitions to
+// pick a stable in-partition ordering before the pipeline fetches
+// bodies; user-visible emission order is then decided by
+// decodePartition's sortAndDedup on record content.
+func sortKeyMetasByKey(files []KeyMeta) {
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Key < files[j].Key
+	})
 }
 
 // preparePartitions groups the LIST result by Hive partition,
@@ -351,15 +429,24 @@ func (s *Reader[T]) preparePartitions(
 	for k := range byPartition {
 		partitionKeys = append(partitionKeys, k)
 	}
+	// Public contract: partition emission is lex-ordered. Every
+	// read path (Read / ReadIter / ReadPartitionIter /
+	// ReadRangeIter / ReadPartitionRangeIter / PollRecords) flows
+	// through this sort. Removing it surfaces Go's randomized
+	// map iteration order to the consumer and breaks
+	// byte-for-byte stable output across calls — see
+	// "Deterministic emission order across read paths" in
+	// CLAUDE.md.
 	slices.Sort(partitionKeys)
 	parts := make([]*partState, len(partitionKeys))
 	for i, p := range partitionKeys {
 		files := byPartition[p]
 		sortKeyMetasByKey(files)
 		parts[i] = &partState{
-			files:  files,
-			bodies: make([][]byte, len(files)),
-			errs:   make([]error, len(files)),
+			partitionKey: p,
+			files:        files,
+			bodies:       make([][]byte, len(files)),
+			errs:         make([]error, len(files)),
 		}
 	}
 	return parts
@@ -367,9 +454,10 @@ func (s *Reader[T]) preparePartitions(
 
 // groupKeysByPartition splits a flat list of data-file KeyMetas
 // into one slice per Hive partition (the path between dataPath
-// and the filename). Emission order is decided by the record-
-// level sort in emitPartition — groupKeysByPartition itself no
-// longer implies chronological-within-partition output.
+// and the filename). Within-partition emission order is decided
+// downstream by decodePartition's sortAndDedup on record content
+// — groupKeysByPartition itself does not impose any record
+// ordering.
 func (s *Reader[T]) groupKeysByPartition(
 	keys []KeyMeta,
 ) map[string][]KeyMeta {
@@ -508,7 +596,8 @@ func (s *Reader[T]) runDecoder(
 		}
 
 		decodeStart := time.Now()
-		recs, err := s.decodePartition(state, ps, totalRows)
+		recs, err := s.decodePartition(state, ps, totalRows,
+			opts.includeHistory)
 		state.m.recordIterDecodeDuration(ctx, time.Since(decodeStart))
 		// decodePartition nils each body + releases its body-pool
 		// slot per-file; just clear the errs slice here.
@@ -520,7 +609,9 @@ func (s *Reader[T]) runDecoder(
 		}
 
 		if !sendBatch(ctx, decodedCh, decodedBatch[T]{
-			recs: recs, uncompBytes: uncomp,
+			partitionKey: ps.partitionKey,
+			recs:         recs,
+			uncompBytes:  uncomp,
 		}) {
 			state.releaseBytes(uncomp)
 			return
@@ -529,21 +620,26 @@ func (s *Reader[T]) runDecoder(
 }
 
 // decodePartition parses every successfully-downloaded body in
-// ps and returns the concatenated records. Files that were
-// missing on download (body == nil, err == nil) are skipped —
-// the downloader already logged via slog.Warn and incremented
-// the s3store.read.missing_data counter.
+// ps, sort+dedup's the concatenated records, and returns the
+// final slice. Files that were missing on download (body == nil,
+// err == nil) are skipped — the downloader already logged via
+// slog.Warn and incremented the s3store.read.missing_data
+// counter.
 //
 // Each body is nil'd and its body-pool slot released as soon as
 // the file is decoded, so the compressed-byte footprint inside
 // a single partition's decode shrinks to ~one body instead of
 // holding every file's compressed bytes for the full loop.
 //
-// The output slice is pre-sized to totalRows (summed from
+// The pre-dedup slice is pre-sized to totalRows (summed from
 // row-group metadata in footerStats) so growth-doubling doesn't
-// inflate the transient allocation peak.
+// inflate the transient allocation peak. sortAndDedup compacts
+// in-place and returns out[:n] — same backing array, length
+// truncated to the survivor count. includeHistory selects
+// replica-only dedup over latest-per-entity (see sortAndDedup).
 func (s *Reader[T]) decodePartition(
 	state *streamState, ps *partState, totalRows int64,
+	includeHistory bool,
 ) ([]T, error) {
 	out := make([]T, 0, totalRows)
 	for fi, body := range ps.bodies {
@@ -561,7 +657,7 @@ func (s *Reader[T]) decodePartition(
 		}
 		out = append(out, recs...)
 	}
-	return out, nil
+	return s.sortAndDedup(out, includeHistory), nil
 }
 
 // downloadJob is one (partition, file) tuple flowing through
@@ -571,14 +667,18 @@ type downloadJob struct {
 	fileIdx int
 }
 
-// partState holds per-partition download progress. files is
-// fixed at preparePartitions time; bodies + errs + completed
-// are mutated by downloaders under streamState.mu.
+// partState holds per-partition download progress. partitionKey
+// and files are fixed at preparePartitions time; bodies + errs +
+// completed are mutated by downloaders under streamState.mu.
+// partitionKey is the Hive partition key ("period=X/customer=Y")
+// that runDecoder forwards onto decodedBatch so the emit
+// callback can surface it to partition-emitting public methods.
 type partState struct {
-	files     []KeyMeta
-	bodies    [][]byte
-	errs      []error
-	completed int
+	partitionKey string
+	files        []KeyMeta
+	bodies       [][]byte
+	errs         []error
+	completed    int
 }
 
 // firstError returns the first non-nil download error in the
@@ -775,12 +875,16 @@ func (s *streamState) releaseBytes(uncomp int64) {
 
 // decodedBatch is one partition's decoded records (or a single
 // hard error) flowing from the decoder to the yield loop.
-// uncompBytes is what the decoder reserved; the yield loop
-// returns it via releaseBytes after the records are forwarded.
+// partitionKey is the Hive partition the records came from
+// (carried so partition-emitting public methods can surface it).
+// recs is already sort+dedup'd by decodePartition. uncompBytes
+// is what the decoder reserved; the yield loop returns it via
+// releaseBytes after the records are forwarded.
 type decodedBatch[T any] struct {
-	recs        []T
-	uncompBytes int64
-	err         error
+	partitionKey string
+	recs         []T
+	uncompBytes  int64
+	err          error
 }
 
 // sendBatch pushes a batch onto decodedCh, returning false on

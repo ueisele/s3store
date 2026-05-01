@@ -198,8 +198,21 @@ func (s *Reader[T]) Poll(
 // version of the same entity. For latest-per-entity, use Read or
 // ReadRangeIter (snapshot-style).
 //
-// Records follow ref order (= timestamp order), then parquet-file
-// row order within each ref.
+// Records emit in partition-lex order, then per-partition
+// (entity, version) order within each. Cross-partition temporal
+// ordering within a batch is NOT preserved — refs are still walked
+// in time order to advance nextOffset, but record decode runs
+// through the same per-partition pipeline as ReadIter /
+// ReadRangeIter, so consumers needing wall-clock ordering across
+// partitions must re-sort by their own timestamp field. The
+// "don't miss records" property (correct nextOffset advancement)
+// is unaffected.
+//
+// Per-partition replica-dedup precondition: EntityKeyOf must be
+// fully determined by the partition key — same as ReadIter.
+// Replicas of the same (entity, version) always live in the same
+// Hive partition under the precondition, so per-partition replica
+// dedup is correctness-equivalent to global replica dedup.
 func (s *Reader[T]) PollRecords(
 	ctx context.Context,
 	since Offset,
@@ -207,10 +220,7 @@ func (s *Reader[T]) PollRecords(
 	opts ...PollOption,
 ) (out []T, nextOffset Offset, err error) {
 	scope := s.cfg.Target.metrics.methodScope(ctx, methodPollRecords)
-	defer func() {
-		scope.addRecords(int64(len(out)))
-		scope.end(&err)
-	}()
+	defer scope.end(&err)
 	entries, newOffset, err := s.Poll(ctx, since, maxEntries, opts...)
 	if err != nil {
 		return nil, since, err
@@ -231,15 +241,25 @@ func (s *Reader[T]) PollRecords(
 		}
 	}
 
-	records, bytesTotal, err := s.downloadAndDecodeAll(ctx, keys, scope)
-	if err != nil {
-		return nil, since, err
+	// includeHistory=true: replica-dedup only (no latest-per-entity
+	// version collapse). See method docstring for why latest-per-
+	// entity isn't offered on a cursor.
+	o := readOpts{includeHistory: true}
+
+	var batchErr error
+	emit := func(_ string, recs []T, e error) (int64, bool) {
+		if e != nil {
+			batchErr = e
+			return 0, false
+		}
+		out = append(out, recs...)
+		return int64(len(recs)), true
 	}
-	scope.addFiles(int64(len(keys)))
-	scope.addBytes(bytesTotal)
-	// includeHistory=true: replica-dedup only, no version collapse.
-	// See method docstring for why latest-per-entity isn't offered.
-	return s.sortAndCollect(records, true), newOffset, nil
+	s.downloadAndDecodeIter(ctx, keys, &o, scope, emit)
+	if batchErr != nil {
+		return nil, since, batchErr
+	}
+	return out, newOffset, nil
 }
 
 // OffsetAt returns the stream offset corresponding to wall-clock

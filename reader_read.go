@@ -6,11 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"sort"
-	"sync/atomic"
 
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/parquet-go/parquet-go"
 )
 
@@ -21,13 +17,23 @@ import (
 // (period=B, customer=Y) but not the off-diagonal pairs).
 //
 // When EntityKeyOf and VersionOf are configured, the result is
-// deduplicated globally to the latest version per entity across
-// the union (pass WithHistory to opt out). Overlapping patterns
-// are safe — each parquet file is fetched and decoded at most once.
+// deduplicated per Hive partition to the latest version per
+// entity (pass WithHistory to opt out). Correctness requires
+// EntityKeyOf to be fully determined by the partition key so no
+// entity ever spans partitions — same precondition as ReadIter.
+// Overlapping patterns are safe — each parquet file is fetched
+// and decoded at most once.
 //
-// All records are buffered before return — for unbounded reads,
-// use ReadIter instead. Empty patterns slice returns (nil, nil);
-// a malformed pattern fails with the offending index.
+// Records emit in partition-lex order with per-partition
+// (entity, version) order within each. All records are buffered
+// before return — for unbounded reads, use ReadIter or
+// ReadPartitionIter instead. Empty patterns slice returns
+// (nil, nil); a malformed pattern fails with the offending
+// index.
+//
+// On NoSuchKey: Read fails (LIST-to-GET race is rare enough
+// that surfacing it as an error is more honest than silently
+// skipping, and the caller's retry resolves it).
 func (s *Reader[T]) Read(
 	ctx context.Context, keyPatterns []string, opts ...ReadOption,
 ) (out []T, err error) {
@@ -45,29 +51,20 @@ func (s *Reader[T]) Read(
 		return nil, nil
 	}
 
-	// Read fails on NoSuchKey: a LIST-to-GET race is rare enough
-	// that surfacing it as an error is more honest than silently
-	// skipping, and the caller's retry resolves it (the next LIST
-	// won't include the deleted file).
-	records, bytesTotal, err := s.downloadAndDecodeAll(ctx, keys, scope)
-	if err != nil {
-		return nil, err
+	var batchErr error
+	emit := func(_ string, recs []T, e error) (int64, bool) {
+		if e != nil {
+			batchErr = e
+			return 0, false
+		}
+		out = append(out, recs...)
+		return int64(len(recs)), true
 	}
-	out = s.sortAndCollect(records, o.includeHistory)
-	scope.addRecords(int64(len(out)))
-	scope.addFiles(int64(len(keys)))
-	scope.addBytes(bytesTotal)
+	s.downloadAndDecodeIter(ctx, keys, &o, scope, emit)
+	if batchErr != nil {
+		return nil, batchErr
+	}
 	return out, nil
-}
-
-// sortKeyMetasByKey orders a partition's files by their S3 key
-// for deterministic download order. Emission order is then
-// decided by emitPartition's record-content sort, so this only
-// affects the internal download pipeline's determinism.
-func sortKeyMetasByKey(files []KeyMeta) {
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Key < files[j].Key
-	})
 }
 
 // identityKey is the keyOf function for []string fan-outs — the
@@ -75,100 +72,15 @@ func sortKeyMetasByKey(files []KeyMeta) {
 // callers that union per-pattern lookup results.
 func identityKey(s string) string { return s }
 
-// downloadAndDecodeAll fans out a bounded set of parallel
-// downloads, decodes each parquet file into []T, and returns
-// the concatenated result plus the sum of compressed body bytes
-// downloaded across every file. The input is sorted by S3 key
-// for deterministic download order; user-visible emission order
-// is set later by the caller's sortAndIterate.
-//
-// scope drives the missing-data policy via its method: tolerant
-// methods skip the file with a slog.Warn + missing-data metric;
-// strict methods surface NoSuchKey as a wrapped error so the
-// caller can retry. See methodTolerantOfMissingData for the
-// split.
-func (s *Reader[T]) downloadAndDecodeAll(
-	ctx context.Context, keys []KeyMeta, scope *methodScope,
-) ([]T, int64, error) {
-	if len(keys) == 0 {
-		return nil, 0, nil
-	}
-
-	sortKeyMetasByKey(keys)
-
-	results := make([][]T, len(keys))
-	var bytesTotal atomic.Int64
-	if err := fanOut(ctx, keys,
-		s.cfg.Target.EffectiveMaxInflightRequests(),
-		s.cfg.Target.metrics,
-		func(ctx context.Context, i int, km KeyMeta) error {
-			recs, n, err := s.downloadAndDecodeOne(ctx, km, scope)
-			if err != nil {
-				return err
-			}
-			bytesTotal.Add(n)
-			results[i] = recs
-			return nil
-		}); err != nil {
-		return nil, 0, err
-	}
-
-	// Count for preallocation.
-	total := 0
-	for _, r := range results {
-		total += len(r)
-	}
-	out := make([]T, 0, total)
-	for _, r := range results {
-		out = append(out, r...)
-	}
-	return out, bytesTotal.Load(), nil
-}
-
-// downloadAndDecodeOne is the per-file body shared by
-// downloadAndDecodeAll. Pulls one parquet object from S3 and
-// decodes it into []T. Returns the body byte count alongside
-// the records so the caller can sum bytes across the fan-out for
-// the s3store.read.bytes metric.
-//
-// On NoSuchKey: tolerant methods (PollRecords) log + record the
-// missing-data metric and return (nil, 0, nil) so the read
-// continues; strict methods (Read) return a wrapped error so the
-// caller surfaces the failure. See methodTolerantOfMissingData.
-func (s *Reader[T]) downloadAndDecodeOne(
-	ctx context.Context, km KeyMeta, scope *methodScope,
-) ([]T, int64, error) {
-	key := km.Key
-
-	data, err := s.cfg.Target.get(ctx, key)
-	if err != nil {
-		if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
-			if methodTolerantOfMissingData(scope.method) {
-				slog.Warn("s3store: data file missing, skipping",
-					"path", key, "method", string(scope.method))
-				scope.recordMissingData()
-				return nil, 0, nil
-			}
-			return nil, 0, fmt.Errorf("get %s: %w", key, err)
-		}
-		return nil, 0, fmt.Errorf("get %s: %w", key, err)
-	}
-	recs, err := decodeParquet[T](data)
-	if err != nil {
-		return nil, 0, fmt.Errorf("decode %s: %w", key, err)
-	}
-	return recs, int64(len(data)), nil
-}
-
 // methodTolerantOfMissingData reports whether a method should
 // skip-and-warn on NoSuchKey rather than fail. Tolerant: paths
 // where a single missing data file shouldn't poison the whole
 // operation and a caller retry can't easily resolve it (refs and
 // projection markers persist beyond the data file).
 //
-//   - PollRecords / ReadRangeIter walk the ref stream; an
-//     operator-driven prune can leave a ref pointing at nothing
-//     and the consumer must keep advancing.
+//   - PollRecords / ReadRangeIter / ReadPartitionRangeIter walk
+//     the ref stream; an operator-driven prune can leave a ref
+//     pointing at nothing and the consumer must keep advancing.
 //   - BackfillProjection is a long-running operator job; failing on
 //     one race-deleted file would force a full restart.
 //
@@ -176,11 +88,13 @@ func (s *Reader[T]) downloadAndDecodeOne(
 // race, narrow in practice, and a caller retry resolves it (the
 // next LIST won't include the deleted file).
 //
-//   - Read / ReadIter are user-facing single-shot snapshot reads;
-//     loud failure is more honest than silent skip.
+//   - Read / ReadIter / ReadPartitionIter are user-facing
+//     single-shot snapshot reads; loud failure is more honest
+//     than silent skip.
 func methodTolerantOfMissingData(m methodKind) bool {
 	switch m {
-	case methodPollRecords, methodReadRangeIter, methodBackfill:
+	case methodPollRecords, methodReadRangeIter,
+		methodReadPartitionRangeIter, methodBackfill:
 		return true
 	default:
 		return false

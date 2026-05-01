@@ -670,7 +670,7 @@ same entity key — common on an at-least-once retry that replays a
 batch with the same domain timestamp — the **lex-later filename
 wins**. Input is sorted by `(entityKey, versionOf)` stable on
 ties; files feed in lex order, so within a tied group the lex-
-later file's record is the last one and dedupLatestSeq's
+later file's record is the last one and dedupLatest's
 `pending` advances onto it.
 
 For the auto-token path the basename is `<UUIDv7>-<UUIDv7>` —
@@ -844,15 +844,18 @@ Available on both `Store[T]` and the underlying `Reader[T]`.
 
 **Memory profile**: `O(one partition's records)`. The pipeline
 processes one partition at a time: files inside the partition
-download in parallel, the decoded batch is deduped (or passed through
-on `WithHistory()`), records are yielded in lex/insertion order, then
-the batch is dropped before the next partition starts. Month-scale
-reads go from O(month) to O(partition) peak memory, which is usually
-small enough for hourly/daily partitioning. If a single partition is
-large enough that even one pre-dedup batch is a problem, file an
-issue — we can follow up with a streaming fold that trades the code
-simplicity for peak memory proportional to unique entities rather
-than total records.
+download in parallel, the decoded batch is sort+dedup'd
+(latest-per-entity by default; replica-only on `WithHistory()`),
+records are yielded in `(entity, version)` ascending order, then
+the batch is dropped before the next partition starts. With
+`EntityKeyOf` unset the sort is skipped entirely and records emit
+in decode order (file lex order, then parquet row order).
+Month-scale reads go from O(month) to O(partition) peak memory,
+which is usually small enough for hourly/daily partitioning. If a
+single partition is large enough that even one pre-dedup batch is
+a problem, file an issue — we can follow up with a streaming fold
+that trades the code simplicity for peak memory proportional to
+unique entities rather than total records.
 
 **Pipeline shape**: downloads are continuous and not partition-bound.
 A worker pool of `MaxInflightRequests` goroutines pulls files in
@@ -910,19 +913,21 @@ flows (the cap can't bind below partition granularity without
 row-group-level streaming). The cap only prevents *additional*
 partitions from joining the buffer.
 
-**Per-partition dedup contract on `s3store.Reader.ReadIter`**: differs
-from `Read`'s global dedup. The iter path buffers one partition at a
-time, dedups within that partition, yields, then drops it. **Correct
-only when the partition key strictly determines every component of
-`EntityKeyOf`** — i.e. no entity ever spans two partitions. For layouts
-where entities can move between partitions over time (e.g. a customer
-that switches region), use `Read` (and pay the memory cost) or
-`ReadIter(WithHistory())` and dedup yourself.
+**Per-partition dedup contract — uniform across every read path**:
+`Read` / `ReadIter` / `ReadPartitionIter` / `ReadRangeIter` /
+`ReadPartitionRangeIter` / `PollRecords` all dedup within one Hive
+partition at a time. **Correct only when the partition key strictly
+determines every component of `EntityKeyOf`** — i.e. no entity ever
+spans two partitions. For layouts where entities can move between
+partitions over time (e.g. a customer that switches region), pass
+`WithHistory()` and dedup yourself.
 
 For typical time-series shapes (`charge_period_start` leads both
-`PartitionKeyParts` and the entity key) the contract holds and
-`ReadIter` produces the same records as `Read`, just with bounded peak
-memory.
+`PartitionKeyParts` and the entity key) the contract holds. There is
+no global-dedup escape hatch: every snapshot read returns the same
+records (the per-partition pipeline is the single decode path), and
+peak memory stays bounded by `WithReadAheadBytes` /
+`WithReadAheadPartitions`.
 
 **Order**: `ReadIter` visits partitions in lex order and downloads
 files within a partition in lex order. Within a partition the user-
@@ -1336,9 +1341,12 @@ stats, _ := s3store.BackfillProjection(ctx, target, def,
 **Execution model:** LIST calls fan out across patterns with the
 Target's `MaxInflightRequests` cap, overlapping patterns are
 deduplicated at the key level, the GET+decode pool runs over the
-unioned set, and dedup (if configured) applies globally — an
-entity appearing under two patterns is kept as the latest version
-across the union, not per-pattern.
+unioned set, and dedup (if configured) applies per Hive partition
+— an entity is kept as the latest version within its partition.
+Under the per-partition dedup precondition (`EntityKeyOf` fully
+determined by the partition key), an entity never spans two
+partitions, so multi-pattern unions still surface one latest pick
+per entity.
 
 A single-element slice is the common case; the multi-pattern API
 simply lets the caller add more when they need a non-Cartesian

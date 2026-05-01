@@ -39,8 +39,8 @@ type Reader[T any] struct {
 	// path: sort by (entityKey, versionOf) ascending, so each
 	// entity's records land grouped and the latest-version record
 	// of each entity is the one that survives dedup. Nil when
-	// EntityKeyOf is unset — in that case sortAndIterate skips
-	// the sort entirely and yields records in input (decode)
+	// EntityKeyOf is unset — in that case sortAndDedup skips
+	// the sort entirely and returns records in input (decode)
 	// order.
 	sortCmp func(a, b T) int
 }
@@ -74,12 +74,12 @@ func NewReader[T any](cfg ReaderConfig[T]) (*Reader[T], error) {
 	}, nil
 }
 
-// resolveSortCmp returns the comparator sortAndIterate uses on
+// resolveSortCmp returns the comparator sortAndDedup uses on
 // the dedup path: records sort by (entityKey, versionOf)
 // ascending so each entity's records land grouped and the
 // latest-version record per entity is last in the group. Returns
-// nil when EntityKeyOf is unset — sortAndIterate then skips the
-// sort and emits records in input (decode) order.
+// nil when EntityKeyOf is unset — sortAndDedup then skips the
+// sort and returns records in input (decode) order.
 func resolveSortCmp[T any](
 	entityKeyOf func(T) string,
 	versionOf func(T) int64,

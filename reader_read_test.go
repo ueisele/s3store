@@ -1,7 +1,6 @@
 package s3store
 
 import (
-	"slices"
 	"sort"
 	"testing"
 
@@ -35,7 +34,7 @@ func dedupRecCmp(a, b dedupRec) int {
 }
 
 // sortDedup sorts in-place by (entity, ver) ascending — the same
-// preconditioning sortAndIterate applies before invoking the
+// preconditioning sortAndDedup applies before invoking the
 // dedup helpers in production.
 func sortDedup(recs []dedupRec) {
 	sort.SliceStable(recs, func(i, j int) bool {
@@ -43,12 +42,12 @@ func sortDedup(recs []dedupRec) {
 	})
 }
 
-// TestDedupLatestSeq_PicksMaxVersionPerEntity feeds an unsorted
+// TestDedupLatest_PicksMaxVersionPerEntity feeds an unsorted
 // slice through the same sort+dedup the production pipeline runs
-// (sort by (entity, ver) ascending, then dedupLatestSeq picks the
+// (sort by (entity, ver) ascending, then dedupLatest picks the
 // last record of each entity group). Verifies output is one
 // record per entity, in entity-sort order, with the max version.
-func TestDedupLatestSeq_PicksMaxVersionPerEntity(t *testing.T) {
+func TestDedupLatest_PicksMaxVersionPerEntity(t *testing.T) {
 	recs := []dedupRec{
 		{"a", 1, "a-1"},
 		{"b", 5, "b-5"},
@@ -57,8 +56,8 @@ func TestDedupLatestSeq_PicksMaxVersionPerEntity(t *testing.T) {
 		{"c", 0, "c-0"},
 	}
 	sortDedup(recs)
-	got := slices.Collect(dedupLatestSeq(recs,
-		func(r dedupRec) string { return r.entity }))
+	got := dedupLatest(recs,
+		func(r dedupRec) string { return r.entity })
 
 	if len(got) != 3 {
 		t.Fatalf("got %d records, want 3", len(got))
@@ -74,17 +73,17 @@ func TestDedupLatestSeq_PicksMaxVersionPerEntity(t *testing.T) {
 	}
 }
 
-// TestDedupLatestSeq_EmptyInput guards the nil/empty-slice fast
+// TestDedupLatest_EmptyInput guards the nil/empty-slice fast
 // path.
-func TestDedupLatestSeq_EmptyInput(t *testing.T) {
-	got := slices.Collect(dedupLatestSeq[dedupRec](nil,
-		func(r dedupRec) string { return r.entity }))
+func TestDedupLatest_EmptyInput(t *testing.T) {
+	got := dedupLatest[dedupRec](nil,
+		func(r dedupRec) string { return r.entity })
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %d", len(got))
 	}
 }
 
-// TestDedupLatestSeq_TieKeepsFirst documents the
+// TestDedupLatest_TieKeepsLast documents the
 // stability-on-tie invariant: when two records share (entity,
 // version), the first one (in sorted input order) wins. With
 // stable sort + the one-pass walker, that ends up being the
@@ -94,14 +93,14 @@ func TestDedupLatestSeq_EmptyInput(t *testing.T) {
 // Note: with stable sort, ties stay in input order. The walker
 // updates `pending` on every iteration, so the "winner" of a
 // tie is the LAST record in the tied group. Document that.
-func TestDedupLatestSeq_TieKeepsLast(t *testing.T) {
+func TestDedupLatest_TieKeepsLast(t *testing.T) {
 	// Already sorted by (entity, ver); two records tie on (a, 5).
 	recs := []dedupRec{
 		{"a", 5, "first"},
 		{"a", 5, "second"},
 	}
-	got := slices.Collect(dedupLatestSeq(recs,
-		func(r dedupRec) string { return r.entity }))
+	got := dedupLatest(recs,
+		func(r dedupRec) string { return r.entity })
 	if len(got) != 1 {
 		t.Fatalf("got %d records, want 1", len(got))
 	}
@@ -199,11 +198,11 @@ func TestDedupePatterns(t *testing.T) {
 	}
 }
 
-// TestDedupReplicasSeq_CollapsesIdenticalEntityVersion covers
+// TestDedupReplicas_CollapsesIdenticalEntityVersion covers
 // the primary case: two records with the same (entity, version)
 // collapse to the first occurrence per (entity, version) group;
 // distinct versions of the same entity are preserved.
-func TestDedupReplicasSeq_CollapsesIdenticalEntityVersion(t *testing.T) {
+func TestDedupReplicas_CollapsesIdenticalEntityVersion(t *testing.T) {
 	recs := []dedupRec{
 		{"a", 1, "a-1-first"},
 		{"a", 1, "a-1-dup"},
@@ -212,9 +211,9 @@ func TestDedupReplicasSeq_CollapsesIdenticalEntityVersion(t *testing.T) {
 		{"b", 1, "b-1-dup"},
 	}
 	sortDedup(recs)
-	got := slices.Collect(dedupReplicasSeq(recs,
+	got := dedupReplicas(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver }))
+		func(r dedupRec) int64 { return r.ver })
 
 	if len(got) != 3 {
 		t.Fatalf("got %d records, want 3", len(got))
@@ -228,21 +227,21 @@ func TestDedupReplicasSeq_CollapsesIdenticalEntityVersion(t *testing.T) {
 	}
 }
 
-// TestDedupReplicasSeq_EmptyInput guards the nil/empty-slice
+// TestDedupReplicas_EmptyInput guards the nil/empty-slice
 // fast path.
-func TestDedupReplicasSeq_EmptyInput(t *testing.T) {
-	got := slices.Collect(dedupReplicasSeq[dedupRec](nil,
+func TestDedupReplicas_EmptyInput(t *testing.T) {
+	got := dedupReplicas[dedupRec](nil,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver }))
+		func(r dedupRec) int64 { return r.ver })
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %d", len(got))
 	}
 }
 
-// TestDedupReplicasSeq_NoOpOnDistinctVersions confirms that when
-// every (entity, version) pair is unique, dedupReplicasSeq emits
+// TestDedupReplicas_NoOpOnDistinctVersions confirms that when
+// every (entity, version) pair is unique, dedupReplicas emits
 // every input record — only true replicas collapse.
-func TestDedupReplicasSeq_NoOpOnDistinctVersions(t *testing.T) {
+func TestDedupReplicas_NoOpOnDistinctVersions(t *testing.T) {
 	recs := []dedupRec{
 		{"a", 1, "a-1"},
 		{"a", 2, "a-2"},
@@ -250,9 +249,9 @@ func TestDedupReplicasSeq_NoOpOnDistinctVersions(t *testing.T) {
 		{"b", 1, "b-1"},
 	}
 	sortDedup(recs)
-	got := slices.Collect(dedupReplicasSeq(recs,
+	got := dedupReplicas(recs,
 		func(r dedupRec) string { return r.entity },
-		func(r dedupRec) int64 { return r.ver }))
+		func(r dedupRec) int64 { return r.ver })
 	if len(got) != 4 {
 		t.Fatalf("got %d records, want 4 (no collapse)", len(got))
 	}
@@ -286,8 +285,8 @@ func TestResolveSortCmp_EntityAndExplicitVersion(t *testing.T) {
 }
 
 // TestResolveSortCmp_NilWhenNoDedup pins the contract that
-// EntityKeyOf == nil produces a nil comparator — sortAndIterate
-// uses that signal to skip the sort entirely and emit records in
+// EntityKeyOf == nil produces a nil comparator — sortAndDedup
+// uses that signal to skip the sort entirely and return records in
 // input (decode) order.
 func TestResolveSortCmp_NilWhenNoDedup(t *testing.T) {
 	if cmp := resolveSortCmp[dedupRec](nil, nil); cmp != nil {
