@@ -10,13 +10,10 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// keyMeta pairs an S3 object key with an insertedAt timestamp
-// — the file's write time as best the caller can derive it —
-// and the compressed object size from the LIST response.
+// keyMeta pairs an S3 object key with an insertedAt timestamp —
+// the file's write time as best the caller can derive it.
 // Threaded through the read path so downstream consumers can
-// stamp versionedRecord.insertedAt without re-consulting S3,
-// and so byte-budget read-ahead can decide whether to pre-fetch
-// without an extra HEAD.
+// stamp versionedRecord.insertedAt without re-consulting S3.
 //
 // Source of InsertedAt depends on the call site:
 //   - listDataFiles (snapshot reads): S3 LastModified from the
@@ -28,17 +25,9 @@ import (
 //
 // Both are monotonic; consumed by the no-dedup sort cascade
 // (sort by insertedAt asc) when EntityKeyOf isn't configured.
-//
-// Size is the compressed object size from the LIST response
-// (S3's Contents.Size). Zero when the call site doesn't have
-// access to a LIST result (e.g. PollRecords assembles keyMetas
-// from ref filenames). Used by ReadIter as the download-stage
-// memory estimate; the uncompressed size used by the byte-budget
-// gate is read from each parquet file's footer after download.
 type keyMeta struct {
 	Key        string
 	InsertedAt time.Time
-	Size       int64
 }
 
 // unionKeys flattens a set of per-plan LIST results into a
@@ -183,7 +172,6 @@ func listDataFiles(
 						pr.Parquets = append(pr.Parquets, keyMeta{
 							Key:        objKey,
 							InsertedAt: aws.ToTime(obj.LastModified),
-							Size:       aws.ToInt64(obj.Size),
 						})
 						return true, nil
 					}

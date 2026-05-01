@@ -2,7 +2,6 @@ package s3store
 
 import (
 	"context"
-	"fmt"
 	"iter"
 	"time"
 )
@@ -72,14 +71,11 @@ func (s *Reader[T]) ReadPartitionIter(
 		var o readOpts
 		o.apply(opts...)
 
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
 		keys, err := resolvePatterns(
 			ctx, s.cfg.Target, keyPatterns, methodReadPartitionIter)
 		if err != nil {
-			iterErr = fmt.Errorf("ReadPartitionIter: %w", err)
-			yield(HivePartition[T]{}, iterErr)
+			iterErr = err
+			yield(HivePartition[T]{}, err)
 			return
 		}
 		if len(keys) == 0 {

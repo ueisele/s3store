@@ -54,14 +54,11 @@ func (s *Reader[T]) ReadIter(
 		var o readOpts
 		o.apply(opts...)
 
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
 		keys, err := resolvePatterns(
 			ctx, s.cfg.Target, keyPatterns, methodReadIter)
 		if err != nil {
-			iterErr = fmt.Errorf("ReadIter: %w", err)
-			yield(*new(T), iterErr)
+			iterErr = err
+			yield(*new(T), err)
 			return
 		}
 		if len(keys) == 0 {
@@ -557,7 +554,6 @@ func (s *Reader[T]) preparePartitions(
 			partitionKey: p,
 			files:        files,
 			bodies:       make([][]byte, len(files)),
-			errs:         make([]error, len(files)),
 		}
 	}
 	return parts
@@ -569,6 +565,14 @@ func (s *Reader[T]) preparePartitions(
 // downstream by decodePartition's sortAndDedup on record content
 // — groupKeysByPartition itself does not impose any record
 // ordering.
+//
+// Panics if a key doesn't parse as a data file. Every callsite
+// upstream (listDataFiles + gateByCommit, walkRangeKeys via the
+// ref stream, entriesToKeys + validateEntriesBelongHere) has
+// already verified the .parquet suffix, the dataPath prefix, and
+// the partition slash, so a non-parseable key here would be a
+// library invariant violation — fail loudly rather than drop the
+// records into an empty-string partition bucket.
 func (s *Reader[T]) groupKeysByPartition(
 	keys []keyMeta,
 ) map[string][]keyMeta {
@@ -576,10 +580,10 @@ func (s *Reader[T]) groupKeysByPartition(
 	for _, k := range keys {
 		hk, ok := hiveKeyOfDataFile(k.Key, s.dataPath)
 		if !ok {
-			// Defensively skip keys that don't parse. List paths
-			// already filtered to .parquet, so reaching here means
-			// a layout corruption — drop, don't error.
-			continue
+			panic(fmt.Sprintf(
+				"s3store: groupKeysByPartition: key %q is not a "+
+					"data file under %q — upstream filter chain "+
+					"violated", k.Key, s.dataPath))
 		}
 		out[hk] = append(out[hk], k)
 	}
@@ -634,7 +638,12 @@ func (s *Reader[T]) runDownloader(
 ) {
 	for job := range jobsCh {
 		if !state.acquireBodySlot(ctx, bodyCap) {
-			state.markComplete(job.partIdx, job.fileIdx, nil, ctx.Err())
+			// Cascade ctx.Err() — not a hard error, just shutdown.
+			// markComplete with nil body keeps the partition's
+			// completed counter advancing so waitForPartition can
+			// observe full completion (and the decoder, in turn,
+			// can consult firstHardErr for the real cause).
+			state.markComplete(job.partIdx, job.fileIdx, nil)
 			continue
 		}
 		key := state.parts[job.partIdx].files[job.fileIdx].Key
@@ -648,16 +657,18 @@ func (s *Reader[T]) runDownloader(
 						"path", key, "method", string(scope.method))
 					scope.recordMissingData()
 					filesDownloaded.Add(1)
-					state.markComplete(job.partIdx, job.fileIdx, nil, nil)
+					state.markComplete(job.partIdx, job.fileIdx, nil)
 					continue
 				}
-				state.markComplete(job.partIdx, job.fileIdx, nil,
-					fmt.Errorf("get %s: %w", key, err))
+				wrapped := fmt.Errorf("get %s: %w", key, err)
+				state.recordHardErr(wrapped)
+				state.markComplete(job.partIdx, job.fileIdx, nil)
 				cancel()
 				continue
 			}
-			state.markComplete(job.partIdx, job.fileIdx, nil,
-				fmt.Errorf("get %s: %w", key, err))
+			wrapped := fmt.Errorf("get %s: %w", key, err)
+			state.recordHardErr(wrapped)
+			state.markComplete(job.partIdx, job.fileIdx, nil)
 			cancel()
 			continue
 		}
@@ -665,28 +676,56 @@ func (s *Reader[T]) runDownloader(
 		// Slot stays held; decoder releases it when bodies are
 		// nil'd in decodePartition.
 		bytesDownloaded.Add(int64(len(body)))
-		state.markComplete(job.partIdx, job.fileIdx, body, nil)
+		state.markComplete(job.partIdx, job.fileIdx, body)
 	}
 }
 
 // runDecoder walks partitions in order; for each it waits on
 // download completion, parses footers for the exact uncompressed
 // total, gates on the byte budget, and decodes. Sends each
-// completed partition's records (or first hard error) to
-// decodedCh.
+// completed partition's records — or any hard error captured
+// anywhere in the pipeline — to decodedCh.
+//
+// Error precedence: streamState.hardErr() is the single source of
+// truth for hard download errors. The decoder checks it at every
+// partition boundary and on every cancel-aware exit (waitForPartition
+// / reserveBytes returning false). Per-file errs in partState are
+// not consulted directly — they include cascade ctx.Canceled from
+// acquire-cancel which would mask the real first error captured in
+// hardErr.
 func (s *Reader[T]) runDecoder(
 	ctx context.Context, state *streamState,
 	opts *readOpts, decodedCh chan<- decodedBatch[T],
 ) {
 	defer close(decodedCh)
 	for pi := range state.parts {
+		// Check before each partition: a worker on an already-
+		// completed partition may have recorded a hard error while
+		// we were decoding the previous one. Surface it before
+		// touching pi.
+		if err := state.hardErr(); err != nil {
+			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
+			return
+		}
+
 		if !state.waitForPartition(ctx, pi) {
+			// ctx fired before pi finished — either a worker
+			// recorded a hard error and called cancel (forward it)
+			// or the consumer cancelled (exit cleanly).
+			if err := state.hardErr(); err != nil {
+				sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
+			}
 			return
 		}
 		ps := state.parts[pi]
 
-		// Surface first hard download error.
-		if err := ps.firstError(); err != nil {
+		// Re-check: a concurrent worker may have hit a hard error
+		// during the wait. Without this check the decoder would
+		// proceed to footerStats / decode of a partition whose
+		// per-file errs may include the cascade ctx.Canceled from
+		// our own cancel(), and the consumer would never see the
+		// real error.
+		if err := state.hardErr(); err != nil {
 			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
 			return
 		}
@@ -704,6 +743,9 @@ func (s *Reader[T]) runDecoder(
 		// partition still flows once the buffer is empty —
 		// otherwise the pipeline would deadlock.
 		if !state.reserveBytes(ctx, uncomp, opts.readAheadBytes) {
+			if err := state.hardErr(); err != nil {
+				sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
+			}
 			return
 		}
 
@@ -712,8 +754,8 @@ func (s *Reader[T]) runDecoder(
 			opts.includeHistory)
 		state.m.recordIterDecodeDuration(ctx, time.Since(decodeStart))
 		// decodePartition nils each body + releases its body-pool
-		// slot per-file; just clear the errs slice here.
-		ps.errs = nil
+		// slot per-file; nothing else to clean up at the partition
+		// level.
 		if err != nil {
 			state.releaseBytes(uncomp)
 			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
@@ -780,29 +822,23 @@ type downloadJob struct {
 }
 
 // partState holds per-partition download progress. partitionKey
-// and files are fixed at preparePartitions time; bodies + errs +
+// and files are fixed at preparePartitions time; bodies +
 // completed are mutated by downloaders under streamState.mu.
 // partitionKey is the Hive partition key ("period=X/customer=Y")
 // that runDecoder forwards onto decodedBatch so the emit
 // callback can surface it to partition-emitting public methods.
+//
+// No per-file errors slice — runDownloader records hard errors on
+// streamState.firstHardErr (single source of truth for the
+// decoder); tolerated NoSuchKey leaves a nil body that
+// decodePartition skips; cascade ctx.Canceled from acquire-cancel
+// is intentionally swallowed (it's not a "real" error, just the
+// pipeline shutting down).
 type partState struct {
 	partitionKey string
 	files        []keyMeta
 	bodies       [][]byte
-	errs         []error
 	completed    int
-}
-
-// firstError returns the first non-nil download error in the
-// partition, if any. Caller has already filtered NoSuchKey to
-// nil + nil-body, so any error here is hard.
-func (p *partState) firstError() error {
-	for _, e := range p.errs {
-		if e != nil {
-			return e
-		}
-	}
-	return nil
 }
 
 // streamState carries the shared mutable state of the pipeline:
@@ -810,6 +846,14 @@ func (p *partState) firstError() error {
 // the in-memory compressed-body counter, and the cond var used
 // to signal across stages (download completion, body slot
 // release, decoded-byte release, ctx cancellation).
+//
+// firstHardErr holds the first non-cancellation error a downloader
+// hit (strict NoSuchKey, hard transport). Set once via
+// recordHardErr just before cancel() fires so the decoder can
+// surface it on its way out — without it, the decoder's
+// waitForPartition / reserveBytes returning false on ctx.Done
+// would terminate the pipeline silently and the caller would
+// observe (partial records, nil error).
 //
 // m is the optional metrics handle. acquireBodySlot and
 // reserveBytes report wait duration via metrics.recordIterBodySlotWait
@@ -822,7 +866,34 @@ type streamState struct {
 	parts             []*partState
 	bufferedBytes     int64
 	outstandingBodies int
+	firstHardErr      error
 	m                 *metrics
+}
+
+// recordHardErr stores the first non-cancellation download error
+// the pipeline hit so the decoder can forward it before exiting
+// on ctx.Done. Subsequent calls are no-ops — the first error wins.
+// Caller is responsible for invoking cancel() afterwards to halt
+// the rest of the pipeline.
+func (s *streamState) recordHardErr(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.firstHardErr == nil {
+		s.firstHardErr = err
+	}
+	s.mu.Unlock()
+}
+
+// hardErr returns the first hard download error recorded via
+// recordHardErr, or nil if none. Read by the decoder on cancel
+// paths so a strict NoSuchKey or hard transport error surfaces
+// even when ctx fired before the decoder reached its partition.
+func (s *streamState) hardErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.firstHardErr
 }
 
 // acquireBodySlot reserves one slot in the compressed-body pool
@@ -896,15 +967,18 @@ func (s *streamState) releaseBodySlots(n int) {
 	s.mu.Unlock()
 }
 
-// markComplete is the downloader-side update: store the result
-// into the partition's slot, increment completed, and wake the
-// decoder if it's waiting on this partition.
+// markComplete is the downloader-side update: store the body in
+// the partition's slot, increment completed, and wake the decoder
+// if it's waiting on this partition. body is nil for tolerated
+// NoSuchKey, hard errors, and acquire-cancel — the decoder skips
+// nil bodies in decodePartition and surfaces hard errors via
+// streamState.firstHardErr (recorded by runDownloader before its
+// cancel() call).
 func (s *streamState) markComplete(
-	partIdx, fileIdx int, body []byte, err error,
+	partIdx, fileIdx int, body []byte,
 ) {
 	s.mu.Lock()
 	s.parts[partIdx].bodies[fileIdx] = body
-	s.parts[partIdx].errs[fileIdx] = err
 	s.parts[partIdx].completed++
 	s.cond.Broadcast()
 	s.mu.Unlock()
@@ -912,7 +986,14 @@ func (s *streamState) markComplete(
 
 // waitForPartition blocks until every file in partition pi has
 // been downloaded (success or error) or ctx is cancelled. Returns
-// true on completion, false on cancellation.
+// true if the partition fully completed; false only when ctx
+// fired before completion.
+//
+// Note the asymmetry with ctx: a partition that finishes after
+// ctx fires still returns true so the decoder can inspect
+// streamState.firstHardErr and surface a hard error that
+// triggered our own cancel(). Without this, a strict-NoSuchKey
+// race could close decodedCh without forwarding the error.
 func (s *streamState) waitForPartition(
 	ctx context.Context, pi int,
 ) bool {
@@ -924,7 +1005,7 @@ func (s *streamState) waitForPartition(
 		}
 		s.cond.Wait()
 	}
-	return ctx.Err() == nil
+	return true
 }
 
 // reserveBytes accounts uncomp bytes against the cap. Blocks
@@ -1002,10 +1083,25 @@ type decodedBatch[T any] struct {
 // sendBatch pushes a batch onto decodedCh, returning false on
 // ctx cancellation so the caller can clean up the byte
 // reservation it might have just made.
+//
+// Best-effort delivery: try the non-blocking send first. Without
+// this the select below would race ctx.Done against a ready send,
+// and Go's non-deterministic select could drop an error batch
+// when the buffer has capacity AND ctx is already cancelled — a
+// silent-drop hole on the strict-NoSuchKey path where the
+// downloader's cancel() runs before the decoder's send arrives.
+// Only fall back to the racing select when the buffer is full
+// (consumer abandoned the iter and the deferred cancel keeps the
+// pipeline from deadlocking).
 func sendBatch[T any](
 	ctx context.Context, decodedCh chan<- decodedBatch[T],
 	b decodedBatch[T],
 ) bool {
+	select {
+	case decodedCh <- b:
+		return true
+	default:
+	}
 	select {
 	case decodedCh <- b:
 		return true

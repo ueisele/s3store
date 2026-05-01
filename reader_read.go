@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 
 	"github.com/parquet-go/parquet-go"
@@ -45,7 +44,7 @@ func (s *Reader[T]) Read(
 	keys, err := resolvePatterns(
 		ctx, s.cfg.Target, keyPatterns, methodRead)
 	if err != nil {
-		return nil, fmt.Errorf("Read: %w", err)
+		return nil, err
 	}
 	if len(keys) == 0 {
 		return nil, nil

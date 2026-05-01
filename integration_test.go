@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"path"
 	"reflect"
 	"slices"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
@@ -746,6 +748,149 @@ func TestMissingData_PollSkipsReadIsLISTConsistent(t *testing.T) {
 		t.Errorf("PollRecords: got %+v, want single record with "+
 			"Value=2", pollGot)
 	}
+}
+
+// TestRead_StrictNoSuchKeyOnGETSurfacesError covers the
+// LIST-to-GET race the strict snapshot path is supposed to fail
+// loudly on: the LIST sees a parquet file but the subsequent GET
+// returns NoSuchKey because something deleted it in the millisecond
+// in between. Read must surface the error rather than return
+// (partial records, nil) — a caller retry resolves it because the
+// next LIST won't include the deleted key.
+//
+// Mechanism: a smithy middleware that pretends a specific data
+// file no longer exists by returning a 404 ResponseError wrapping
+// *s3types.NoSuchKey on its GetObject. The same middleware-backed
+// client also drives the LIST, which sees both files (the
+// middleware only intercepts GETs against the chosen path), so
+// the read plan gets all parquets and the strict-NoSuchKey path
+// fires inside runDownloader.
+//
+// Pre-fix this test would observe (≤1 record, nil error): the
+// downloader's cancel() raced runDecoder's waitForPartition →
+// ctx.Err() check, the decoder exited without forwarding the
+// recorded error, and the public method completed cleanly. Post-
+// fix the wrapped NoSuchKey is recorded on streamState.firstHardErr
+// before cancel() fires and the decoder surfaces it on every
+// cancel-aware exit.
+func TestRead_StrictNoSuchKeyOnGETSurfacesError(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+
+	store, err := New(ctx, StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           f.S3Client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	r1, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=abc", []Rec{
+			{Period: "2026-03-17", Customer: "abc", SKU: "s1",
+				Value: 1, Ts: time.UnixMilli(100)},
+		})
+	if err != nil {
+		t.Fatalf("Write r1: %v", err)
+	}
+	if _, err := store.WriteWithKey(ctx,
+		"period=2026-03-17/customer=def", []Rec{
+			{Period: "2026-03-17", Customer: "def", SKU: "s1",
+				Value: 2, Ts: time.UnixMilli(200)},
+		}); err != nil {
+		t.Fatalf("Write r2: %v", err)
+	}
+
+	// Build a client whose GetObject for r1.DataPath returns a
+	// 404 / NoSuchKey response error. LIST and other GETs flow
+	// through unchanged, so the read plan still sees both files.
+	failClient := newGETNoSuchKeyClient(t, f, r1.DataPath)
+	store2, err := New(ctx, StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           failClient,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+	})
+	if err != nil {
+		t.Fatalf("New2: %v", err)
+	}
+
+	got, err := store2.Read(ctx, []string{"*"})
+	if err == nil {
+		t.Fatalf("Read with strict NoSuchKey on GET: got "+
+			"(%d records, nil error); want NoSuchKey error",
+			len(got))
+	}
+	if _, ok := errors.AsType[*s3types.NoSuchKey](err); !ok {
+		t.Errorf("Read error: got %v; want chain to contain "+
+			"*s3types.NoSuchKey", err)
+	}
+}
+
+// newGETNoSuchKeyClient returns an *s3.Client wired against the
+// same MinIO endpoint as f.S3Client but with a smithy middleware
+// that intercepts GetObject for failKey and returns a 404
+// ResponseError wrapping *s3types.NoSuchKey. Used by
+// TestRead_StrictNoSuchKeyOnGETSurfacesError to simulate the
+// LIST-to-GET race without modifying actual bucket state.
+//
+// The 404 status flows through isTransientS3Error (target.go) as
+// non-transient (status < 500, ≠ 429) so the request resolves on
+// the first attempt instead of triggering the 1.4s retry envelope.
+func newGETNoSuchKeyClient(
+	t *testing.T, f *fixture, failKey string,
+) *s3.Client {
+	t.Helper()
+	return s3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: f.S3Client.Options().Credentials,
+	}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String("http://" + f.HostPort)
+		o.UsePathStyle = true
+		o.APIOptions = append(o.APIOptions,
+			func(stack *middleware.Stack) error {
+				return stack.Build.Add(
+					middleware.BuildMiddlewareFunc(
+						"s3store-test.noSuchKeyOnGet",
+						func(
+							ctx context.Context,
+							in middleware.BuildInput,
+							next middleware.BuildHandler,
+						) (middleware.BuildOutput, middleware.Metadata, error) {
+							req, ok := in.Request.(*smithyhttp.Request)
+							if ok && req.Method == "GET" &&
+								strings.HasSuffix(req.URL.Path, "/"+failKey) {
+								return middleware.BuildOutput{},
+									middleware.Metadata{},
+									&smithyhttp.ResponseError{
+										Response: &smithyhttp.Response{
+											Response: &http.Response{StatusCode: 404},
+										},
+										Err: &s3types.NoSuchKey{},
+									}
+							}
+							return next.HandleBuild(ctx, in)
+						}),
+					middleware.After)
+			})
+	})
 }
 
 // TestPoll_SkipsMalformedRefs simulates an external tool — or a

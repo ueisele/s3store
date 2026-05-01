@@ -223,7 +223,6 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 		{
 			files:  make([]keyMeta, 3), // only len matters
 			bodies: make([][]byte, 3),
-			errs:   make([]error, 3),
 		},
 	}
 
@@ -241,7 +240,7 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 
 	// Mark all three files complete.
 	for fi := range 3 {
-		s.markComplete(0, fi, []byte("x"), nil)
+		s.markComplete(0, fi, []byte("x"))
 	}
 
 	select {
