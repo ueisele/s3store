@@ -902,6 +902,23 @@
       ],
       "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never"}, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}}, "overrides": []},
       "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 9004,
+      "type": "timeseries",
+      "title": "Optimistic-commit collisions rate",
+      "description": "WithOptimisticCommit writes whose conditional `<token>.commit` PUT was rejected because a prior commit already existed (412 PreconditionFailed, or 403 AccessDenied from a bucket-policy s3:PutOverwriteObject deny). The write recovers via a HEAD round-trip and returns the prior WriteResult; the parquet+ref from this attempt become orphans (invisible to readers via the commit gate). Sustained > 0 quantifies the orphan-rate cost the option trades for skipping the upfront HEAD — expected to be near-zero for fresh writes, non-trivial only on retried tokens.",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 183},
+      "targets": [
+        {
+          "expr": "sum(rate(s3store_write_optimistic_commit_collisions_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "legendFormat": "collisions/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never"}, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
     }
   ],
   "refresh": "30s",
