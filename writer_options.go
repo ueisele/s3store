@@ -72,6 +72,16 @@ type writeOpts struct {
 	// falls back to time.Now() captured immediately before parquet
 	// encode. Set via WithInsertedAt.
 	insertedAt time.Time
+
+	// optimisticCommit, when true, skips the upfront HEAD on
+	// `<token>.commit` and instead detects prior commits via a
+	// conditional PUT on the commit marker (`If-None-Match: *`)
+	// or a backend bucket policy denying s3:PutOverwriteObject.
+	// Trades one HEAD per write for "if a retry happens to find a
+	// prior commit, we leave an orphan parquet+ref behind." Set
+	// via WithOptimisticCommit. See the option's docstring for
+	// the trade-off and backend-support requirements.
+	optimisticCommit bool
 }
 
 // apply runs every option against the receiver.
@@ -212,6 +222,65 @@ func WithIdempotencyTokenOf[T any](
 func WithInsertedAt(t time.Time) WriteOption {
 	return func(o *writeOpts) {
 		o.insertedAt = t
+	}
+}
+
+// WithOptimisticCommit skips the per-write upfront HEAD on
+// `<token>.commit` and detects prior commits via the commit PUT
+// itself: the writer attaches `If-None-Match: *` so a backend
+// that supports conditional PUT returns 412 PreconditionFailed
+// when the commit already exists, or — on a backend with a bucket
+// policy denying s3:PutOverwriteObject on the commit subtree —
+// returns 403 AccessDenied. Either signal triggers a HEAD
+// round-trip to recover the prior commit's metadata, and the
+// caller receives the original WriteResult unchanged.
+//
+// Trade-off:
+//
+//   - **Save** one HEAD per write (5–15ms on AWS, ~1× the request
+//     budget for that operation) on the steady-state path. At
+//     scale this is the dominant savings — a Write fanning out
+//     across N partitions is N HEADs lighter, ~20% fewer S3
+//     requests per Write.
+//   - **Pay** a multi-MB orphan parquet + orphan ref per
+//     retry-found-prior-commit (every same-token retry that lands
+//     after a successful commit). The orphans are invisible to
+//     readers via the commit gate (their attempt-id ≠ canonical),
+//     and operator-driven cleanup reclaims them (S3 lifecycle
+//     rule, manual prune).
+//
+// Break-even sits around a 5% retry-found-prior rate: below that,
+// the HEAD savings dominate; above that, the orphan + bandwidth
+// cost outweighs the savings. Healthy CDC pipelines retry well
+// under 1%, so the option is a clear win for high-throughput
+// workloads near the request-rate ceiling. Bulk migrations with
+// frequent orchestrator restarts may not benefit.
+//
+// **Backend requirement.** The detection mechanism needs ONE of:
+//
+//   - Conditional PUT (`If-None-Match: *`) — atomic server-side
+//     precondition. Supported on AWS S3 since November 2024,
+//     MinIO recent versions, and StorageGRID 12.0+. Returns 412.
+//   - Bucket policy denying `s3:PutOverwriteObject` on the
+//     `<prefix>/data/*/*.commit` subtree. Used on older
+//     StorageGRID versions where conditional PUT isn't available.
+//     Returns 403. The s3store README documents the policy + a
+//     boto3 setup snippet under "Optimistic commit setup".
+//
+// On a backend that supports neither, the second commit PUT
+// silently overwrites — the WriteResult returned to the caller
+// will be the *new* attempt's, not the prior commit's, breaking
+// the same-token-retry-returns-same-WriteResult contract. The
+// option does not detect this at construction time; verify
+// support before enabling.
+//
+// Mutually compatible with WithIdempotencyToken / WithIdempotencyTokenOf.
+// Has no effect on the auto-token (no-token) path: a freshly-
+// generated UUIDv7 is guaranteed to 404 by construction, so the
+// upfront HEAD is already skipped there regardless of this option.
+func WithOptimisticCommit() WriteOption {
+	return func(o *writeOpts) {
+		o.optimisticCommit = true
 	}
 }
 

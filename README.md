@@ -1021,6 +1021,146 @@ returned from the closure are validated per partition via the
 same rules as the static option (non-empty, no `/`, no `..`,
 printable ASCII, ≤200 chars).
 
+### Optimistic commit (skip the upfront HEAD)
+
+Every idempotent write does an upfront `HEAD` on `<token>.commit`
+to detect a same-token retry. For workloads near the S3 request-
+rate ceiling — typically large per-call partition fan-outs at
+high frequency — that HEAD is the per-write cost worth optimising
+away. Pass `WithOptimisticCommit()` to swap the *upfront* HEAD
+for an *on-collision* HEAD: the writer skips the HEAD on the
+fresh path and detects a prior commit by the conditional commit
+PUT itself failing.
+
+```go
+store.Write(ctx, records,
+    s3store.WithIdempotencyToken(token),
+    s3store.WithOptimisticCommit())
+```
+
+**Mechanism.** The token-commit PUT carries `If-None-Match: *`
+(modern S3 conditional-write semantics). When a prior commit
+exists:
+
+- Backends supporting conditional PUT (AWS S3 since November 2024,
+  recent MinIO, StorageGRID 12.0+) return **412 Precondition
+  Failed**.
+- Backends behind a bucket policy denying `s3:PutOverwriteObject`
+  on the commit subtree (older StorageGRID) return **403 Access
+  Denied**.
+
+The writer recognises both, runs one HEAD on `<token>.commit` to
+recover the canonical attempt's metadata, and returns the prior
+commit's `WriteResult` unchanged — same `DataPath`, `RefPath`,
+`Offset`, `InsertedAt`, `RowCount` the caller would have got
+from the legacy upfront-HEAD path.
+
+**Trade-off.** The fresh path saves one `HEAD` per write
+(5–15ms on AWS, ~20% of the per-Write request budget for a
+3-PUT marker-less write). The retry-found-prior path leaves an
+**orphan parquet + ref** behind for every same-token retry —
+the data and ref PUTs from this attempt never get garbage-
+collected unless the operator runs a cleanup. Both orphans are
+invisible to readers via the commit gate (their attempt-id is
+not the canonical one named in `<token>.commit` metadata).
+
+The break-even sits around a 5% retry-found-prior rate. Below
+that, the HEAD savings dominate; above that, the orphan and
+bandwidth cost outweighs the savings. Healthy CDC pipelines
+retry well under 1%, so the option is a clear win for high-
+throughput workloads near the request-rate ceiling. Bulk
+migrations with frequent orchestrator restarts (or any workload
+where retries are routine) probably don't benefit.
+
+The companion metric is `s3store.write.optimistic_commit.collisions`
+— a counter incremented on each on-collision recovery. Chart it
+against `s3store.method.calls{method="write"}` to see your
+collision rate in production and confirm the option is paying off.
+
+**Mutual compatibility.** `WithOptimisticCommit` composes with
+`WithIdempotencyToken` and `WithIdempotencyTokenOf`. It has no
+effect on auto-token writes (no caller-supplied token): the
+upfront HEAD is already skipped there because a freshly-generated
+UUIDv7 is guaranteed to 404 by construction.
+
+#### Backend setup
+
+The mechanism is portable across backends, but each one needs
+support for *some* form of "fail this PUT if the object already
+exists." Pick whichever path your backend supports.
+
+**AWS S3 / MinIO / StorageGRID 12.0+: conditional PUT (preferred).**
+No setup. The library sends `If-None-Match: *` on every
+`<token>.commit` PUT under `WithOptimisticCommit`. Modern S3 APIs
+honour the precondition atomically server-side, returning 412
+when the object exists. Verify your backend version supports it
+before enabling the option in production.
+
+**StorageGRID (legacy versions): bucket policy denying
+`s3:PutOverwriteObject` on the commit subtree.** This works by
+rejecting any PUT that would overwrite an existing object whose
+key matches `<prefix>/data/*/*.commit`. Concurrent same-token
+writes (out of contract) are unaffected — the deny is post-
+completion, not a mutex — but for sequential retries the second
+PUT lands as 403 AccessDenied, which the library recognises and
+routes to the same recovery path.
+
+The boto3 snippet below installs the deny on a single
+`<prefix>` (run it once per prefix you intend to use with
+`WithOptimisticCommit` against a deny-policy backend):
+
+```python
+import json
+
+import boto3
+
+s3 = boto3.client("s3", endpoint_url="https://storagegrid.example.com")
+
+bucket = "my-bucket"
+prefix = "my-prefix"  # matches StoreConfig.Prefix
+
+policy = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "DenyOverwriteOfTokenCommit",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutOverwriteObject",
+            "Resource": (
+                f"arn:aws:s3:::{bucket}/{prefix}/data/*/*.commit"
+            ),
+        }
+    ],
+}
+
+s3.put_bucket_policy(
+    Bucket=bucket,
+    Policy=json.dumps(policy),
+)
+```
+
+The deny scopes to `<prefix>/data/*/*.commit` — only the commit
+markers are protected. Data files (`<token>-<UUIDv7>.parquet`)
+and refs land under fresh per-attempt paths and never overwrite
+by construction, so they don't need the deny. Markers under
+`<prefix>/_projection/...` are intentionally overwriteable
+(byte-equivalent zero-byte content), so excluding them keeps
+projection writes working.
+
+If you have multiple `Prefix` values on the same bucket, repeat
+the `Statement` entry per prefix or widen the `Resource` glob
+accordingly.
+
+**Backends without either mechanism.** If the conditional PUT is
+silently ignored *and* no deny policy is in place, the library
+cannot detect a prior commit on the optimistic path. The second
+commit PUT would silently overwrite, and the caller would receive
+the *new* attempt's `WriteResult` instead of the prior commit's —
+breaking the same-token-retry-returns-same-result contract. The
+library does not detect this at construction time. **Verify
+backend support before enabling `WithOptimisticCommit`.**
+
 ### Idempotency and reader dedup are complementary
 
 Reader dedup (`EntityKeyOf` + `VersionOf`) and idempotency
@@ -1872,6 +2012,7 @@ not terminal error class — keeping cardinality bounded).
 | `s3store.write.partitions` | histogram | 1 |
 | `s3store.write.bytes` | histogram | By |
 | `s3store.write.commit_after_timeout` | counter | 1 |
+| `s3store.write.optimistic_commit.collisions` | counter | 1 |
 | `s3store.read.records` | histogram | 1 |
 | `s3store.read.bytes` | histogram | By |
 | `s3store.read.files` | histogram | 1 |
@@ -1889,6 +2030,17 @@ stream reader's `SettleWindow` may already have advanced past
 `refMicroTs` — a same-token retry recovers via the upfront HEAD).
 Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside
 the budget by design.
+
+`s3store.write.optimistic_commit.collisions` increments on each
+`WithOptimisticCommit` write where the conditional commit PUT
+was rejected because a prior `<token>.commit` already existed
+(412 PreconditionFailed under conditional PUT, or 403 AccessDenied
+under bucket-policy deny). The write recovers via a HEAD on the
+commit marker and returns the prior `WriteResult` unchanged; the
+orphan parquet + ref this attempt left behind are invisible to
+readers via the commit gate. Chart against `s3store.method.calls{
+method="write"}` to see the collision rate — past ~5% the option
+is a net loss vs. the upfront-HEAD path.
 
 `s3store.read.commit_head` increments on every commit-marker
 HEAD that the read paths issue: snapshot reads HEAD only when

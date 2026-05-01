@@ -3333,6 +3333,106 @@ func TestWriteWithIdempotencyToken_FreshAndRetry(t *testing.T) {
 	}
 }
 
+// TestWriteWithOptimisticCommit covers the WithOptimisticCommit
+// option's two paths against MinIO (which supports
+// `If-None-Match: *`):
+//
+//   - Fresh write: skips the upfront HEAD, writes data + ref, and
+//     the conditional commit PUT succeeds. Returned WriteResult is
+//     this attempt's own paths.
+//   - Retry-found-prior-commit: the conditional commit PUT
+//     surfaces 412 PreconditionFailed; the writer recovers via a
+//     HEAD on `<token>.commit` and returns the prior commit's
+//     WriteResult unchanged. The retry's data + ref are orphans
+//     on S3 (different attempt-id than the canonical one),
+//     invisible to the read paths via the commit gate.
+//
+// Asserts:
+//   - Retry returns the original DataPath/RefPath/Offset.
+//   - Two parquet files exist under the partition prefix (canonical
+//   - orphan); Read returns one record (the canonical attempt).
+func TestWriteWithOptimisticCommit(t *testing.T) {
+	ctx := context.Background()
+	store := newIdempotentStore(t)
+	target := store.Target()
+
+	key := "period=2026-04-22/customer=carol"
+	rec := []Rec{{
+		Period: "2026-04-22", Customer: "carol",
+		SKU: "sku1", Value: 99, Ts: time.UnixMilli(1),
+	}}
+	const token = "2026-04-22T11:30:00Z-batch1"
+
+	// Fresh write under WithOptimisticCommit. No upfront HEAD; the
+	// commit PUT carries If-None-Match:*, succeeds because no prior
+	// commit exists.
+	first, err := store.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token), WithOptimisticCommit())
+	if err != nil {
+		t.Fatalf("optimistic fresh write: %v", err)
+	}
+	if first == nil {
+		t.Fatal("optimistic fresh write: nil result")
+	}
+
+	// Retry with the same token. Optimistic commit PUT fires 412;
+	// recovery HEAD reconstructs the prior WriteResult.
+	second, err := store.WriteWithKey(ctx, key, rec,
+		WithIdempotencyToken(token), WithOptimisticCommit())
+	if err != nil {
+		t.Fatalf("optimistic retry write: %v", err)
+	}
+	if second == nil {
+		t.Fatal("optimistic retry write: nil result")
+	}
+	if second.DataPath != first.DataPath {
+		t.Errorf("retry DataPath drift: fresh=%q retry=%q "+
+			"(412-recovery should reconstruct the same path)",
+			first.DataPath, second.DataPath)
+	}
+	if second.RefPath != first.RefPath {
+		t.Errorf("retry RefPath drift: fresh=%q retry=%q",
+			first.RefPath, second.RefPath)
+	}
+	if second.Offset != first.Offset {
+		t.Errorf("retry Offset drift: fresh=%q retry=%q",
+			first.Offset, second.Offset)
+	}
+
+	// Two parquets in S3: canonical + orphan from the second
+	// attempt's data PUT.
+	dataPrefix := "store/data/" + key + "/"
+	parquets := 0
+	if err := target.listEach(ctx, dataPrefix, "", 0,
+		func(obj s3types.Object) (bool, error) {
+			if strings.HasSuffix(*obj.Key, ".parquet") {
+				parquets++
+			}
+			return true, nil
+		}); err != nil {
+		t.Fatalf("list parquets: %v", err)
+	}
+	if parquets != 2 {
+		t.Errorf("expected 2 parquets (canonical + orphan), got %d",
+			parquets)
+	}
+
+	// Read returns one record — the canonical attempt only. The
+	// orphan parquet has a different attempt-id than the commit
+	// metadata names, so the commit gate filters it out.
+	got, err := store.Read(ctx, []string{key})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1 (orphan should not surface)",
+			len(got))
+	}
+	if got[0].Value != 99 {
+		t.Errorf("got Value=%d, want 99", got[0].Value)
+	}
+}
+
 // TestWriteWithIdempotencyToken_RetryAfterFailedAttempt simulates
 // a failed prior attempt (data + ref landed but the token-commit
 // got externally deleted, mimicking "token-commit PUT failed" or

@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Token-commit primitives.
@@ -430,18 +432,51 @@ func (c *commitCache) lookupOrFetch(
 // round-tripping, and the row count of the canonical parquet).
 // Single point of metadata shape so writer and any future test
 // fixture build the same headers.
+//
+// failIfExists=true attaches `If-None-Match: *` so the PUT
+// surfaces a prior commit as 412 PreconditionFailed (or a
+// backend's bucket-policy 403 AccessDenied) instead of overwriting.
+// Used by the optimistic-commit path; the default (false) preserves
+// the legacy overwrite-tolerated behavior for the upfront-HEAD path.
 func putTokenCommit(
 	ctx context.Context, target S3Target,
 	dataPath, partition, token, attemptID string,
 	refMicroTs, insertedAtUs, rowCount int64,
+	failIfExists bool,
 ) error {
 	key := tokenCommitKey(dataPath, partition, token)
-	return target.putWithMeta(ctx, key, []byte{},
+	return target.putWithMetaCond(ctx, key, []byte{},
 		"application/octet-stream",
 		map[string]string{
 			attemptIDMetaKey:  attemptID,
 			refMicroTsMetaKey: strconv.FormatInt(refMicroTs, 10),
 			insertedAtMetaKey: strconv.FormatInt(insertedAtUs, 10),
 			rowCountMetaKey:   strconv.FormatInt(rowCount, 10),
-		})
+		},
+		failIfExists)
+}
+
+// isCommitAlreadyExistsErr reports whether err is a server-side
+// "object already exists" rejection from the optimistic-commit
+// PUT. Two backends, one detection point:
+//
+//   - 412 PreconditionFailed: AWS S3 (since Nov 2024), MinIO,
+//     and recent StorageGRID return this when If-None-Match: *
+//     fails because the object already exists.
+//   - 403 AccessDenied: returned when the bucket policy denies
+//     s3:PutOverwriteObject — the StorageGRID-friendly fallback
+//     for backends without conditional-PUT support. 403 from
+//     other causes (signature mismatch, bucket policy unrelated
+//     to overwrite) is handled the same way; the caller's
+//     subsequent HEAD round-trip distinguishes "prior commit"
+//     from "permission misconfig" — a missing prior commit there
+//     surfaces the original 403 unchanged.
+func isCommitAlreadyExistsErr(err error) bool {
+	respErr, ok := errors.AsType[*smithyhttp.ResponseError](err)
+	if !ok {
+		return false
+	}
+	status := respErr.HTTPStatusCode()
+	return status == http.StatusPreconditionFailed ||
+		status == http.StatusForbidden
 }

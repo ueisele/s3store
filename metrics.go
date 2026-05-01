@@ -122,20 +122,21 @@ type metrics struct {
 	s3RespBytes metric.Int64Histogram
 
 	// Library method level.
-	methodDuration     metric.Float64Histogram
-	methodCalls        metric.Int64Counter
-	writeRecords       metric.Int64Histogram
-	writePartitions    metric.Int64Histogram
-	writeBytes         metric.Int64Histogram
-	readRecords        metric.Int64Histogram
-	readPartitions     metric.Int64Histogram
-	readBytes          metric.Int64Histogram
-	readFiles          metric.Int64Histogram
-	readMissingData    metric.Int64Counter
-	readMalformedRefs  metric.Int64Counter
-	readCommitHead     metric.Int64Counter
-	readCommitHeadHit  metric.Int64Counter
-	writeCommitAfterTO metric.Int64Counter
+	methodDuration            metric.Float64Histogram
+	methodCalls               metric.Int64Counter
+	writeRecords              metric.Int64Histogram
+	writePartitions           metric.Int64Histogram
+	writeBytes                metric.Int64Histogram
+	readRecords               metric.Int64Histogram
+	readPartitions            metric.Int64Histogram
+	readBytes                 metric.Int64Histogram
+	readFiles                 metric.Int64Histogram
+	readMissingData           metric.Int64Counter
+	readMalformedRefs         metric.Int64Counter
+	readCommitHead            metric.Int64Counter
+	readCommitHeadHit         metric.Int64Counter
+	writeCommitAfterTO        metric.Int64Counter
+	writeOptimisticCollisions metric.Int64Counter
 
 	// Iter pipeline internals (downloadAndDecodeIter): bottleneck
 	// signals for the streamState's body-slot pool and byte-budget
@@ -392,6 +393,10 @@ func newMetrics(
 	m.writeCommitAfterTO = mustCounter(
 		"s3store.write.commit_after_timeout",
 		"Writes whose elapsed time from refMicroTs (just before the ref PUT) to token-commit-PUT completion exceeded CommitTimeout. The commit landed; signals that a SettleWindow tuned for this CommitTimeout may not yet have included this write in the stream window. Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside the budget by design.",
+		"{event}")
+	m.writeOptimisticCollisions = mustCounter(
+		"s3store.write.optimistic_commit.collisions",
+		"WithOptimisticCommit writes whose conditional commit PUT was rejected because a prior <token>.commit already existed (412 PreconditionFailed or 403 AccessDenied from a bucket-policy deny). The write recovers via a HEAD round-trip and returns the prior WriteResult; the orphan parquet+ref from this attempt are invisible to readers via the commit gate. Increments on the retry-found-prior-commit path that the option trades extra orphans for skipping the upfront HEAD on every fresh write.",
 		"{event}")
 	m.readCommitHead = mustCounter(
 		"s3store.read.commit_head",
@@ -856,6 +861,26 @@ func (m *metrics) recordCommitAfterTimeout(ctx context.Context) {
 		return
 	}
 	m.writeCommitAfterTO.Add(ctx, 1, m.constSetOpt)
+}
+
+// recordOptimisticCommitCollision increments the
+// optimistic_commit.collisions counter for one
+// WithOptimisticCommit write whose conditional commit PUT was
+// rejected because a prior <token>.commit already existed (412
+// PreconditionFailed, or 403 AccessDenied on bucket-policy
+// backends). The write recovers via a HEAD round-trip on the
+// commit marker and returns the prior WriteResult — the orphan
+// parquet + ref this attempt left behind are invisible to readers
+// via the commit gate. Operators can chart this counter to see
+// how often optimistic-commit's "trade upfront HEAD for orphan-
+// on-collision" trade actually fires; if the rate climbs past
+// ~5% the option becomes a net loss vs. the upfront-HEAD path.
+// No scope dimension — only the write path emits.
+func (m *metrics) recordOptimisticCommitCollision(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.writeOptimisticCollisions.Add(ctx, 1, m.constSetOpt)
 }
 
 // end records the scope's terminal observations: duration,

@@ -321,8 +321,15 @@ func (s *Writer[T]) writeWithKeyResolved(
 	// into records via reflection; encodeParquet builds bytes that
 	// won't be PUT on retry-found-prior-commit. Lifting the HEAD
 	// here keeps the caller's slice untouched on the dedup path.
+	//
+	// Optimistic-commit (WithOptimisticCommit): skip the upfront
+	// HEAD entirely. Prior-commit detection moves to the commit
+	// PUT itself, which fires `If-None-Match: *` and surfaces 412
+	// (or 403 on bucket-policy backends) when the prior commit
+	// exists. Recovery is via a HEAD on the commit marker after
+	// the failed PUT — see the writeEncodedPayload tail.
 	token, autoToken, prior, err := s.resolveTokenAndCheckCommit(
-		ctx, key, o.idempotencyToken)
+		ctx, key, o.idempotencyToken, o.optimisticCommit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -364,7 +371,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 	}
 	r, err := s.writeEncodedPayload(
 		ctx, key, records, parquetBytes, writeStartTime,
-		token, autoToken)
+		token, autoToken, o.optimisticCommit)
 	if r != nil {
 		// Commit semantics: writeEncodedPayload returned a non-nil
 		// WriteResult ⇒ data is durable, markers are written, ref
@@ -400,10 +407,15 @@ func (s *Writer[T]) writeWithKeyResolved(
 //     any further work.
 //   - err: HEAD failure or auto-token generation failure.
 //
-// The auto-token path skips the HEAD entirely — a freshly-generated
-// UUIDv7 is guaranteed to 404 by construction.
+// Two paths skip the upfront HEAD:
+//   - auto-token: a freshly-generated UUIDv7 is guaranteed to 404
+//     by construction, so the HEAD would always miss.
+//   - optimistic: the caller opted in via WithOptimisticCommit;
+//     prior-commit detection moves to the commit PUT itself
+//     (conditional `If-None-Match: *` / bucket-policy 403). The
+//     trade is documented on the option.
 func (s *Writer[T]) resolveTokenAndCheckCommit(
-	ctx context.Context, key, callerToken string,
+	ctx context.Context, key, callerToken string, optimistic bool,
 ) (token string, autoToken bool, prior *WriteResult, err error) {
 	if callerToken == "" {
 		auto, err := newAttemptID()
@@ -411,6 +423,11 @@ func (s *Writer[T]) resolveTokenAndCheckCommit(
 			return "", false, nil, fmt.Errorf("generate auto-token: %w", err)
 		}
 		return auto, true, nil, nil
+	}
+	if optimistic {
+		// Skip the upfront HEAD — collision is detected on the
+		// commit PUT (see writeEncodedPayload's tail).
+		return callerToken, false, nil, nil
 	}
 	meta, exists, err := headTokenCommit(ctx, s.cfg.Target,
 		s.dataPath, key, callerToken)
@@ -494,9 +511,19 @@ func (s *Writer[T]) resolveTokenAndCheckCommit(
 // prior-commit without touching caller state. autoToken=true
 // signals "writer generated this token, use it as the attempt-id
 // too" (uniform path layout: <token>-<attemptID>).
+//
+// optimisticCommit=true (set when WithOptimisticCommit was passed
+// AND the token is non-empty) routes the commit PUT through
+// `If-None-Match: *`. A 412 PreconditionFailed (or 403 from a
+// bucket-policy-based deny) triggers a HEAD recovery that returns
+// the prior commit's WriteResult instead of failing the call. The
+// data + ref PUTs from this attempt become orphans — invisible to
+// readers via the commit gate, reclaimed by operator-driven
+// cleanup.
 func (s *Writer[T]) writeEncodedPayload(
 	ctx context.Context, key string, records []T, parquetBytes []byte,
 	writeStartTime time.Time, token string, autoToken bool,
+	optimisticCommit bool,
 ) (*WriteResult, error) {
 	// Compute marker paths up-front so a bad ProjectionDef.Of
 	// fails the whole Write before we touch S3, matching how
@@ -562,11 +589,46 @@ func (s *Writer[T]) writeEncodedPayload(
 	// the parquet's row count (so LookupCommit / retry-recovery /
 	// Poll surface RowCount without a parquet GET). The single
 	// atomic event that flips visibility for both read paths.
+	//
+	// On the optimistic-commit path the PUT carries an
+	// `If-None-Match: *` precondition; an existing prior commit
+	// surfaces as 412 PreconditionFailed (or 403 AccessDenied
+	// from a bucket-policy deny) which we route to the recovery
+	// branch below — the prior commit's metadata becomes the
+	// returned WriteResult, and this attempt's data + ref PUTs
+	// stay on S3 as orphans (invisible via the commit gate).
 	rowCount := int64(len(records))
-	if err := putTokenCommit(commitCtx, s.cfg.Target,
+	commitErr := putTokenCommit(commitCtx, s.cfg.Target,
 		s.dataPath, key, token, attemptID,
-		refMicroTs, writeStartTime.UnixMicro(), rowCount); err != nil {
-		return nil, fmt.Errorf("put token-commit: %w", err)
+		refMicroTs, writeStartTime.UnixMicro(), rowCount,
+		optimisticCommit)
+	if commitErr != nil {
+		if optimisticCommit && isCommitAlreadyExistsErr(commitErr) {
+			s.cfg.Target.metrics.recordOptimisticCommitCollision(commitCtx)
+			meta, exists, hErr := headTokenCommit(commitCtx,
+				s.cfg.Target, s.dataPath, key, token)
+			if hErr != nil {
+				return nil, fmt.Errorf(
+					"optimistic-commit recovery HEAD on "+
+						"<token>.commit after %v: %w",
+					commitErr, hErr)
+			}
+			if !exists {
+				// Server claimed the marker existed (412/403) but
+				// the immediate HEAD doesn't see it. On any
+				// realistic backend this shouldn't happen — surface
+				// the original error so the caller sees what we
+				// actually got from the PUT.
+				return nil, fmt.Errorf(
+					"optimistic-commit: PUT rejected as "+
+						"existing-object but HEAD finds no "+
+						"<token>.commit: %w", commitErr)
+			}
+			wr := reconstructWriteResult(s.dataPath, s.refPath,
+				key, token, meta)
+			return &wr, nil
+		}
+		return nil, fmt.Errorf("put token-commit: %w", commitErr)
 	}
 
 	// Step 8: writer-local contract enforcement. Past

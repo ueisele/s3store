@@ -648,6 +648,28 @@ func (t S3Target) putWithMeta(
 	ctx context.Context, key string, data []byte,
 	contentType string, meta map[string]string,
 ) (err error) {
+	return t.putWithMetaCond(ctx, key, data, contentType, meta, false)
+}
+
+// putWithMetaCond is putWithMeta with an optional
+// "fail-if-exists" precondition (`If-None-Match: *`). Used by the
+// optimistic-commit write path to surface "prior commit landed"
+// as a 412 PreconditionFailed (or a backend's bucket-policy 403)
+// without an upfront HEAD round-trip.
+//
+// On AWS S3 (since Nov 2024) and recent MinIO, the precondition
+// is enforced atomically server-side. On StorageGRID a bucket
+// policy denying s3:PutOverwriteObject on the data/<...>.commit
+// subtree gives the same effect (post-completion deny — fine for
+// our use case where concurrent same-token writes are out of
+// contract). On older backends that ignore both, the PUT
+// overwrites silently — the optimistic-commit option documents
+// this requirement.
+func (t S3Target) putWithMetaCond(
+	ctx context.Context, key string, data []byte,
+	contentType string, meta map[string]string,
+	failIfExists bool,
+) (err error) {
 	scope := t.metrics.s3OpScope(ctx, s3OpPut)
 	scope.setReqBytes(int64(len(data)))
 	defer scope.end(&err)
@@ -656,17 +678,22 @@ func (t S3Target) putWithMeta(
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(t.cfg.Bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(contentType),
+		Metadata:    meta,
+	}
+	if failIfExists {
+		input.IfNoneMatch = aws.String("*")
+	}
 	err = retry(ctx, func() error {
 		scope.incAttempts()
-		_, err := t.cfg.S3Client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:      aws.String(t.cfg.Bucket),
-			Key:         aws.String(key),
-			Body:        bytes.NewReader(data),
-			ContentType: aws.String(contentType),
-			Metadata:    meta,
-		}, func(o *s3.Options) {
-			o.APIOptions = append(o.APIOptions, apiOpts...)
-		})
+		_, err := t.cfg.S3Client.PutObject(ctx, input,
+			func(o *s3.Options) {
+				o.APIOptions = append(o.APIOptions, apiOpts...)
+			})
 		return err
 	})
 	return err
