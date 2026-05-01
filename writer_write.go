@@ -48,6 +48,27 @@ type WriteResult struct {
 	RowCount int64
 }
 
+// ErrCommitAfterTimeout is wrapped into the error returned by
+// WriteWithKey / Write when the elapsed wall-clock from refMicroTs
+// (captured just before the ref PUT) to token-commit-PUT
+// completion exceeded the configured CommitTimeout. The write IS
+// durable — data file, ref, and `<token>.commit` are all in S3,
+// and both snapshot and stream read paths see it — but a stream
+// reader's SettleWindow (= CommitTimeout + MaxClockSkew) may
+// already have advanced past refMicroTs by the time the commit
+// became observable, so a stream reader could miss it. The
+// returned *WriteResult is non-nil and reflects the durable
+// commit; snapshot consumers can ignore the error. Stream
+// consumers that need observability inside the SettleWindow
+// should idempotent-retry under the same WithIdempotencyToken —
+// the upfront HEAD finds the prior commit and returns its
+// WriteResult unchanged.
+//
+// Use errors.Is(err, ErrCommitAfterTimeout) to distinguish from
+// transient PUT failures (which return a nil *WriteResult).
+var ErrCommitAfterTimeout = errors.New(
+	"write committed after CommitTimeout")
+
 // LookupCommit returns the WriteResult of the canonical write
 // committed under (partition, token), if any. One HEAD against
 // `<dataPath>/<partition>/<token>.commit`; no LIST, no parquet
@@ -668,12 +689,13 @@ func (s *Writer[T]) writeEncodedPayload(
 		// that this write committed past CommitTimeout.
 		s.cfg.Target.metrics.recordCommitAfterTimeout(commitCtx)
 		return result, fmt.Errorf(
-			"write committed after CommitTimeout "+
-				"(elapsed %v > %v from ref PUT) — stream reader's "+
-				"SettleWindow may not include this write; data is "+
-				"durable at %s, ref at %s, retry with the same "+
-				"WithIdempotencyToken recovers via upfront-HEAD",
-			elapsed, commitTimeout, dataKey, refKey)
+			"%w (elapsed %v > %v from ref PUT) — stream "+
+				"reader's SettleWindow may not include this "+
+				"write; data is durable at %s, ref at %s, retry "+
+				"with the same WithIdempotencyToken recovers via "+
+				"upfront-HEAD",
+			ErrCommitAfterTimeout, elapsed, commitTimeout,
+			dataKey, refKey)
 	}
 
 	return result, nil

@@ -640,6 +640,72 @@ the ones that succeeded.
 > (or excess requests queue at the transport instead of running
 > in parallel).
 
+#### Error handling
+
+The shape of `(result, err)` tells you what's durable, not just
+whether the call succeeded:
+
+| `result`  | `err`                       | Meaning                                                                                                                                                                          |
+|-----------|-----------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| non-nil   | `nil`                       | Committed normally.                                                                                                                                                              |
+| non-nil   | `ErrCommitAfterTimeout`     | Committed, but ref→commit elapsed exceeded `CommitTimeout`. Data is durable for snapshot reads; a stream reader's `SettleWindow` may already have advanced past `refMicroTs`.    |
+| `nil`     | non-nil                     | Nothing reached commit. Per-attempt orphans (data, possibly ref) may remain on S3 — operator-cleaned, invisible to readers via the commit gate.                                  |
+
+For `Write` (multi-partition), `err != nil` with `len(results) > 0`
+is **partial success**: every entry in `results` is durable; the
+missing partitions are not. Retry only the missing ones via
+`WriteWithKey`. The `err` itself can be `ErrCommitAfterTimeout` (one
+of the partitions in `results` committed late — caller can't tell
+which from the err alone, and doesn't need to: all are durable) or
+`context.Canceled` (caller-cancellation aborted some partitions while
+others had already passed the data PUT and pushed their commit
+through under `context.WithoutCancel` — those landed durably and are
+in `results`).
+
+`ErrCommitAfterTimeout` is the only exported sentinel. The library
+deliberately doesn't split transient vs persistent errors — a 403
+may be IAM propagation or a permanent policy bug, and the
+classification isn't reliably knowable from one call. Validation
+and wiring errors (`PartitionKeyOf is required`, `WithIdempotencyToken
+and WithIdempotencyTokenOf are mutually exclusive`, parquet-encode
+type mismatches) surface immediately and don't need a sentinel to
+be recognized.
+
+The recommended call-site pattern:
+
+```go
+result, err := w.WriteWithKey(ctx, key, recs,
+    s3store.WithIdempotencyToken(token))
+switch {
+case err == nil:
+    persist(result) // committed normally
+
+case errors.Is(err, s3store.ErrCommitAfterTimeout):
+    // Data is durable. Persist the result like a success.
+    // Optionally same-token retry to pull commit observability
+    // back inside the SettleWindow for stream consumers.
+    persist(result)
+
+case errors.Is(err, context.Canceled),
+     errors.Is(err, context.DeadlineExceeded):
+    return err
+
+default:
+    // Transient PUT failure. With WithIdempotencyToken the retry's
+    // upfront HEAD finds the prior commit if it actually landed
+    // and returns its WriteResult unchanged; otherwise a fresh
+    // attempt-id is used. Without the token, a retry produces a
+    // duplicate parquet (correctness-safe via the commit gate,
+    // but accumulates as orphans).
+    return retryLater(token, recs)
+}
+```
+
+The single most useful thing to do is **always pass
+`WithIdempotencyToken`**: it collapses every "did it actually
+commit?" branch on retry to one upfront HEAD, regardless of which
+step failed.
+
 ### Stream — refs only
 
 ```go
