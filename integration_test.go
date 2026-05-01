@@ -3532,6 +3532,28 @@ func TestWriteWithOptimisticCommit_BucketPolicy403(t *testing.T) {
 			firstRes.Offset, secondRes.Offset)
 	}
 
+	// Two parquets in S3: canonical from the first write + orphan
+	// from the second attempt's data PUT (the data and ref PUTs
+	// hit MinIO before the commit PUT was intercepted, so they
+	// landed despite the deny). Confirms the deny didn't somehow
+	// short-circuit the rest of the write sequence.
+	target := first.Target()
+	dataPrefix := "store/data/" + key + "/"
+	parquets := 0
+	if err := target.listEach(ctx, dataPrefix, "", 0,
+		func(obj s3types.Object) (bool, error) {
+			if strings.HasSuffix(*obj.Key, ".parquet") {
+				parquets++
+			}
+			return true, nil
+		}); err != nil {
+		t.Fatalf("list parquets: %v", err)
+	}
+	if parquets != 2 {
+		t.Errorf("expected 2 parquets (canonical + orphan), got %d",
+			parquets)
+	}
+
 	// Read against the clean client surfaces only the canonical
 	// attempt — the orphan parquet from the second attempt has a
 	// different attempt-id than what the commit metadata names.
