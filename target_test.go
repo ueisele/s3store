@@ -1,11 +1,13 @@
 package s3store
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" //nolint:gosec // test mirrors target.go's integrity check
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -155,7 +158,7 @@ func stubBackoff(t *testing.T) {
 func TestRetry_SuccessFirstAttempt(t *testing.T) {
 	stubBackoff(t)
 	var calls atomic.Int32
-	err := retry(context.Background(), func() error {
+	err := retry(context.Background(), "test", func() error {
 		calls.Add(1)
 		return nil
 	})
@@ -175,7 +178,7 @@ func TestRetry_TransientThenSuccess(t *testing.T) {
 			Response: &http.Response{StatusCode: 503},
 		},
 	}
-	err := retry(context.Background(), func() error {
+	err := retry(context.Background(), "test", func() error {
 		if calls.Add(1) < 3 {
 			return transient
 		}
@@ -197,7 +200,7 @@ func TestRetry_NonTransientNoRetry(t *testing.T) {
 			Response: &http.Response{StatusCode: 404},
 		},
 	}
-	err := retry(context.Background(), func() error {
+	err := retry(context.Background(), "test", func() error {
 		calls.Add(1)
 		return notFound
 	})
@@ -217,7 +220,7 @@ func TestRetry_ExhaustsBudget(t *testing.T) {
 			Response: &http.Response{StatusCode: 500},
 		},
 	}
-	err := retry(context.Background(), func() error {
+	err := retry(context.Background(), "test", func() error {
 		calls.Add(1)
 		return transient
 	})
@@ -244,7 +247,7 @@ func TestRetry_ContextCancelledBetweenAttempts(t *testing.T) {
 			Response: &http.Response{StatusCode: 500},
 		},
 	}
-	err := retry(ctx, func() error {
+	err := retry(ctx, "test", func() error {
 		calls.Add(1)
 		// Cancel after the first attempt fails; the retry helper
 		// should observe the cancellation during its backoff
@@ -258,6 +261,111 @@ func TestRetry_ContextCancelledBetweenAttempts(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Errorf("want 1 call (cancelled before retry), got %d", got)
 	}
+}
+
+// TestRetry_LogsTransientThatRetries asserts the WARN log fires
+// for transient errors that have remaining retry budget but stays
+// silent on the terminal attempt (the caller surfaces the final
+// error). Pins the contract that "single-retry" failures — masked
+// from the caller's terminal err but recorded by the attempts
+// label on s3.request.count — are also visible in the log stream
+// so operators can correlate retry-rate spikes with the actual
+// underlying cause.
+func TestRetry_LogsTransientThatRetries(t *testing.T) {
+	stubBackoff(t)
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	transient := &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{
+			Response: &http.Response{StatusCode: 503},
+		},
+		Err: &smithy.GenericAPIError{
+			Code: "ServiceUnavailable", Message: "rare-flake",
+		},
+	}
+
+	// 2 transient → 1 success: expect 2 log lines (attempts 1 and 2),
+	// none on the success.
+	t.Run("transient-then-success-logs-each-retry", func(t *testing.T) {
+		buf.Reset()
+		var calls atomic.Int32
+		err := retry(context.Background(), "put", func() error {
+			if calls.Add(1) < 3 {
+				return transient
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		got := strings.Count(buf.String(),
+			"s3store: transient error, retrying")
+		if got != 2 {
+			t.Errorf("want 2 retry log lines (attempts 1+2), got %d\n%s",
+				got, buf.String())
+		}
+		if !strings.Contains(buf.String(), `op=put`) {
+			t.Errorf("missing op=put in log: %s", buf.String())
+		}
+		if !strings.Contains(buf.String(), `attempt=1`) ||
+			!strings.Contains(buf.String(), `attempt=2`) {
+			t.Errorf("missing attempt= in log: %s", buf.String())
+		}
+	})
+
+	// All attempts transient: expect retryMaxAttempts-1 log lines
+	// (one per retried attempt). The terminal attempt is NOT logged
+	// — the caller's error surface handles surfacing.
+	t.Run("exhausted-budget-skips-final-log", func(t *testing.T) {
+		buf.Reset()
+		var calls atomic.Int32
+		err := retry(context.Background(), "get", func() error {
+			calls.Add(1)
+			return transient
+		})
+		if err == nil {
+			t.Fatal("want error from exhausted budget, got nil")
+		}
+		if int(calls.Load()) != retryMaxAttempts {
+			t.Fatalf("want %d calls, got %d",
+				retryMaxAttempts, calls.Load())
+		}
+		got := strings.Count(buf.String(),
+			"s3store: transient error, retrying")
+		want := retryMaxAttempts - 1
+		if got != want {
+			t.Errorf("want %d retry log lines (final attempt unlogged), "+
+				"got %d\n%s", want, got, buf.String())
+		}
+	})
+
+	// Non-transient error: caller decides retry budget, helper does
+	// not log.
+	t.Run("non-transient-no-log", func(t *testing.T) {
+		buf.Reset()
+		notFound := &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{
+				Response: &http.Response{StatusCode: 404},
+			},
+		}
+		err := retry(context.Background(), "head", func() error {
+			return notFound
+		})
+		if err == nil {
+			t.Fatal("want error")
+		}
+		if strings.Contains(buf.String(),
+			"s3store: transient error, retrying") {
+			t.Errorf("non-transient should not log retry: %s",
+				buf.String())
+		}
+	})
 }
 
 func TestIsTransientS3Error(t *testing.T) {

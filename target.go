@@ -39,7 +39,23 @@ var retryBackoff = [retryMaxAttempts - 1]time.Duration{
 // failures, sleeping retryBackoff[i] before retry i+1. Returns
 // as soon as fn succeeds, returns a non-retryable error, or
 // ctx is cancelled.
-func retry(ctx context.Context, fn func() error) error {
+//
+// op labels the wrapping S3 operation ("get" / "put" / "head" /
+// "list") for log lines; same string the caller's s3OpScope
+// carries on the metric side.
+//
+// Transient errors that will be retried are logged at WARN. A
+// transient error that succeeds on the next attempt is otherwise
+// invisible to operators — the call returns nil and the only
+// trace is s3store.s3.request.count{attempts!="1"}, which says
+// "a retry happened" but not what actually failed. Logging the
+// err on the masked attempts surfaces the underlying cause
+// (timeout, 5xx body, ETag-integrity-check mismatch) so log
+// search and dashboards agree on what's happening. The terminal
+// transient error (final attempt failed transient too) is NOT
+// logged here — the caller receives the error and handles
+// surfacing.
+func retry(ctx context.Context, op string, fn func() error) error {
 	var err error
 	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
 		if attempt > 0 {
@@ -55,6 +71,17 @@ func retry(ctx context.Context, fn func() error) error {
 		}
 		if !isTransientS3Error(err) {
 			return err
+		}
+		// Transient failure. Log only when budget remains so the
+		// caller's terminal error surface isn't duplicated by a
+		// log line; final-attempt failures are the caller's to
+		// report.
+		if attempt < retryMaxAttempts-1 {
+			slog.Warn("s3store: transient error, retrying",
+				"op", op,
+				"attempt", attempt+1,
+				"max_attempts", retryMaxAttempts,
+				"err", err)
 		}
 	}
 	return err
@@ -606,7 +633,7 @@ func (t S3Target) get(
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var data []byte
-	err = retry(ctx, func() error {
+	err = retry(ctx, string(s3OpGet), func() error {
 		scope.incAttempts()
 		resp, err := t.cfg.S3Client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
@@ -690,7 +717,7 @@ func (t S3Target) putWithMetaCond(
 	// truncated bytes, backend lost bytes).
 	expectedMD5 := md5.Sum(data) //nolint:gosec // integrity-only
 	expectedETagHex := hex.EncodeToString(expectedMD5[:])
-	err = retry(ctx, func() error {
+	err = retry(ctx, string(s3OpPut), func() error {
 		scope.incAttempts()
 		// Build a fresh PutObjectInput every iteration so each
 		// attempt's Body is a *bytes.Reader at position 0. Reusing
@@ -801,7 +828,7 @@ func (t S3Target) head(
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	err = retry(ctx, func() error {
+	err = retry(ctx, string(s3OpHead), func() error {
 		scope.incAttempts()
 		resp, err := t.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
@@ -837,7 +864,7 @@ func (t S3Target) listPage(
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var out *s3.ListObjectsV2Output
-	err = retry(ctx, func() error {
+	err = retry(ctx, string(s3OpList), func() error {
 		scope.incAttempts()
 		var err error
 		out, err = p.NextPage(ctx, func(o *s3.Options) {
