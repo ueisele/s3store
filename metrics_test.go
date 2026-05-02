@@ -36,8 +36,12 @@ func collectMetrics(t *testing.T, reader *metric.ManualReader) metricdata.Resour
 }
 
 // findMetric returns the named metric from the s3store scope, or
-// nil if it wasn't recorded yet (zero observations don't appear
-// in the export).
+// nil if it wasn't registered. Note: prewarm() materialises rare-
+// event counter series at value 0 during newMetrics, so a metric
+// returned here may already have data points before any test
+// observation runs. Use findCounterDP / findHistDPInt /
+// findHistDPFloat to pick the data point that matches a specific
+// attribute filter rather than relying on DataPoints[0].
 func findMetric(rm metricdata.ResourceMetrics, name string) *metricdata.Metrics {
 	for _, sm := range rm.ScopeMetrics {
 		if sm.Scope.Name != instrumentationName {
@@ -56,6 +60,84 @@ func findMetric(rm metricdata.ResourceMetrics, name string) *metricdata.Metrics 
 func hasAttr(set attribute.Set, key, value string) bool {
 	v, ok := set.Value(attribute.Key(key))
 	return ok && v.AsString() == value
+}
+
+// matchAttrs reports whether every key=value pair in want is
+// present on set. Used by find*DP helpers to pick the right data
+// point out of the (possibly prewarmed) export.
+func matchAttrs(set attribute.Set, want map[string]string) bool {
+	for k, v := range want {
+		if !hasAttr(set, k, v) {
+			return false
+		}
+	}
+	return true
+}
+
+// findCounterDP returns the data point on the named counter whose
+// attributes match every key=value pair in want, or nil if no such
+// point exists (or the metric isn't a counter). Use this instead
+// of DataPoints[0] anywhere prewarm could have left zero-valued
+// shadow series that would otherwise come first in the export.
+func findCounterDP(
+	rm metricdata.ResourceMetrics, name string, want map[string]string,
+) *metricdata.DataPoint[int64] {
+	mt := findMetric(rm, name)
+	if mt == nil {
+		return nil
+	}
+	sum, ok := mt.Data.(metricdata.Sum[int64])
+	if !ok {
+		return nil
+	}
+	for i := range sum.DataPoints {
+		if matchAttrs(sum.DataPoints[i].Attributes, want) {
+			return &sum.DataPoints[i]
+		}
+	}
+	return nil
+}
+
+// findHistDPInt returns the int64 histogram data point matching
+// every key=value pair in want.
+func findHistDPInt(
+	rm metricdata.ResourceMetrics, name string, want map[string]string,
+) *metricdata.HistogramDataPoint[int64] {
+	mt := findMetric(rm, name)
+	if mt == nil {
+		return nil
+	}
+	hist, ok := mt.Data.(metricdata.Histogram[int64])
+	if !ok {
+		return nil
+	}
+	for i := range hist.DataPoints {
+		if matchAttrs(hist.DataPoints[i].Attributes, want) {
+			return &hist.DataPoints[i]
+		}
+	}
+	return nil
+}
+
+// findHistDPFloat returns the float64 histogram data point
+// matching every key=value pair in want.
+func findHistDPFloat(
+	rm metricdata.ResourceMetrics, name string, want map[string]string,
+) *metricdata.HistogramDataPoint[float64] {
+	mt := findMetric(rm, name)
+	if mt == nil {
+		return nil
+	}
+	hist, ok := mt.Data.(metricdata.Histogram[float64])
+	if !ok {
+		return nil
+	}
+	for i := range hist.DataPoints {
+		if matchAttrs(hist.DataPoints[i].Attributes, want) {
+			return &hist.DataPoints[i]
+		}
+	}
+	return nil
 }
 
 func TestClassifyError(t *testing.T) {
@@ -143,18 +225,15 @@ func TestMetrics_ConstantAttributes(t *testing.T) {
 
 	rm := collectMetrics(t, reader)
 
-	acquires := findMetric(rm, "s3store.target.semaphore.acquires")
-	if acquires == nil {
-		t.Fatal("acquires metric not recorded")
+	// Pick the success-outcome data point explicitly — the
+	// canceled-outcome series is also present (prewarm()) but
+	// at value 0; only success carries the "we drove a cycle"
+	// observation under test.
+	dp := findCounterDP(rm, "s3store.target.semaphore.acquires",
+		map[string]string{attrKeyOutcome: outcomeSuccess})
+	if dp == nil {
+		t.Fatal("acquires metric not recorded for outcome=success")
 	}
-	sum, ok := acquires.Data.(metricdata.Sum[int64])
-	if !ok {
-		t.Fatalf("expected Sum[int64], got %T", acquires.Data)
-	}
-	if len(sum.DataPoints) == 0 {
-		t.Fatal("no datapoints recorded")
-	}
-	dp := sum.DataPoints[0]
 	for _, want := range [][2]string{
 		{attrKeyBucket, "b"},
 		{attrKeyPrefix, "p"},
@@ -201,36 +280,39 @@ func TestMetrics_S3OpScope_RecordsRequestBytes(t *testing.T) {
 
 	rm := collectMetrics(t, reader)
 
-	dur := findMetric(rm, "s3store.s3.request.duration")
-	if dur == nil {
-		t.Fatal("duration not recorded")
+	durDP := findHistDPFloat(rm, "s3store.s3.request.duration",
+		map[string]string{
+			attrKeyOperation: "put",
+			attrKeyOutcome:   outcomeSuccess,
+		})
+	if durDP == nil {
+		t.Fatal("duration not recorded for put/success")
 	}
-	hist := dur.Data.(metricdata.Histogram[float64])
-	if got := hist.DataPoints[0].Count; got != 1 {
+	if got := durDP.Count; got != 1 {
 		t.Errorf("duration count: got %d, want 1", got)
 	}
-	if !hasAttr(hist.DataPoints[0].Attributes, attrKeyOperation, "put") {
-		t.Error("missing operation=put on duration")
+
+	// s3.request.count carries the attempts label now (one combo
+	// pre-warmed at 0 plus our +1 → value=1 on the matching series).
+	countDP := findCounterDP(rm, "s3store.s3.request.count",
+		map[string]string{
+			attrKeyOperation: "put",
+			attrKeyOutcome:   outcomeSuccess,
+			attrKeyAttempts:  "2",
+		})
+	if countDP == nil {
+		t.Fatal("count not recorded for put/success/attempts=2")
 	}
-	if !hasAttr(hist.DataPoints[0].Attributes, attrKeyOutcome, outcomeSuccess) {
-		t.Error("missing outcome=success on duration")
+	if got := countDP.Value; got != 1 {
+		t.Errorf("count value for attempts=2: got %d, want 1", got)
 	}
 
-	attempts := findMetric(rm, "s3store.s3.request.attempts")
-	if attempts == nil {
-		t.Fatal("attempts not recorded")
+	bytesDP := findHistDPInt(rm, "s3store.s3.request.body.size",
+		map[string]string{attrKeyOperation: "put"})
+	if bytesDP == nil {
+		t.Fatal("body size not recorded for put")
 	}
-	attHist := attempts.Data.(metricdata.Histogram[int64])
-	if got := attHist.DataPoints[0].Sum; got != 2 {
-		t.Errorf("attempts sum: got %d, want 2", got)
-	}
-
-	bodyBytes := findMetric(rm, "s3store.s3.request.body.size")
-	if bodyBytes == nil {
-		t.Fatal("body size not recorded")
-	}
-	bytesHist := bodyBytes.Data.(metricdata.Histogram[int64])
-	if got := bytesHist.DataPoints[0].Sum; got != 1024 {
+	if got := bytesDP.Sum; got != 1024 {
 		t.Errorf("body size: got %d, want 1024", got)
 	}
 }
@@ -252,18 +334,20 @@ func TestMetrics_S3OpScope_ErrorClassification(t *testing.T) {
 	scope.end(&err)
 
 	rm := collectMetrics(t, reader)
-	count := findMetric(rm, "s3store.s3.request.count")
-	if count == nil {
-		t.Fatal("count not recorded")
+	dp := findCounterDP(rm, "s3store.s3.request.count",
+		map[string]string{
+			attrKeyOperation: "put",
+			attrKeyOutcome:   outcomeError,
+			attrKeyErrorType: errTypePreconditionFail,
+			// attempts="0" — the scope ended without entering the
+			// retry loop in this test (no incAttempts).
+			attrKeyAttempts: "0",
+		})
+	if dp == nil {
+		t.Fatal("count not recorded for put/error/precondition_failed/attempts=0")
 	}
-	sum := count.Data.(metricdata.Sum[int64])
-	dp := sum.DataPoints[0]
-	if !hasAttr(dp.Attributes, attrKeyOutcome, outcomeError) {
-		t.Error("expected outcome=error")
-	}
-	if !hasAttr(dp.Attributes, attrKeyErrorType, errTypePreconditionFail) {
-		t.Errorf("expected error.type=precondition_failed; got %v",
-			dp.Attributes.ToSlice())
+	if dp.Value != 1 {
+		t.Errorf("count value: got %d, want 1", dp.Value)
 	}
 }
 
@@ -524,4 +608,79 @@ func TestFanOut_RecordsThroughItself(t *testing.T) {
 	if workersSum != 2 {
 		t.Errorf("workers: got %d, want 2", workersSum)
 	}
+}
+
+// TestMetrics_Prewarm pins the prewarm coverage so a future
+// refactor can't silently drop a series and re-introduce the
+// "first occurrence absorbed by rate()" blind spot. Asserts that
+// every series prewarm is supposed to materialise is present at
+// value 0 immediately after newMetrics, before any real
+// observation runs.
+func TestMetrics_Prewarm(t *testing.T) {
+	_, reader := newTestMetrics(t, "")
+	rm := collectMetrics(t, reader)
+
+	// Incident counters: single series each, attributes = constSet
+	// only (bucket+prefix). Pick any constant attribute to confirm
+	// the prewarmed series is the right one.
+	incidents := []string{
+		"s3store.write.commit_after_timeout",
+		"s3store.write.optimistic_commit.collisions",
+		"s3store.read.missing_data",
+		"s3store.read.malformed_refs",
+		"s3store.read.iter.body_slot.exhausted",
+		"s3store.read.iter.byte_budget.exhausted",
+	}
+	for _, name := range incidents {
+		dp := findCounterDP(rm, name,
+			map[string]string{attrKeyBucket: "b"})
+		if dp == nil {
+			t.Errorf("%s: not prewarmed", name)
+			continue
+		}
+		if dp.Value != 0 {
+			t.Errorf("%s: prewarm value: got %d, want 0",
+				name, dp.Value)
+		}
+	}
+
+	// s3.request.count: every (op × outcome=success × attempts).
+	for _, op := range []s3OpKind{s3OpGet, s3OpPut, s3OpHead, s3OpList} {
+		for a := 1; a <= retryMaxAttempts; a++ {
+			dp := findCounterDP(rm, "s3store.s3.request.count",
+				map[string]string{
+					attrKeyOperation: string(op),
+					attrKeyOutcome:   outcomeSuccess,
+					attrKeyAttempts:  itoaSmall(a),
+				})
+			if dp == nil {
+				t.Errorf("s3_count not prewarmed for op=%s attempts=%d",
+					op, a)
+				continue
+			}
+			if dp.Value != 0 {
+				t.Errorf("s3_count[op=%s,attempts=%d]: got %d, want 0",
+					op, a, dp.Value)
+			}
+		}
+	}
+
+	// semAcquires: outcome=canceled side prewarmed; success side
+	// is left to materialise on the first real acquire.
+	dp := findCounterDP(rm, "s3store.target.semaphore.acquires",
+		map[string]string{attrKeyOutcome: outcomeCanceled})
+	if dp == nil {
+		t.Fatal("semAcquires outcome=canceled not prewarmed")
+	}
+	if dp.Value != 0 {
+		t.Errorf("semAcquires[canceled] prewarm value: got %d, want 0",
+			dp.Value)
+	}
+}
+
+// itoaSmall is a test-local stand-in for strconv.Itoa scoped to
+// the small attempts range so the test file doesn't have to
+// import strconv just for one site.
+func itoaSmall(n int) string {
+	return string(rune('0' + n))
 }

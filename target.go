@@ -3,6 +3,8 @@ package s3store
 import (
 	"bytes"
 	"context"
+	"crypto/md5" //nolint:gosec // ETag integrity check, not a cryptographic primitive
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -678,25 +680,105 @@ func (t S3Target) putWithMetaCond(
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	input := &s3.PutObjectInput{
-		Bucket:      aws.String(t.cfg.Bucket),
-		Key:         aws.String(key),
-		Body:        bytes.NewReader(data),
-		ContentType: aws.String(contentType),
-		Metadata:    meta,
-	}
-	if failIfExists {
-		input.IfNoneMatch = aws.String("*")
-	}
+	// Compute the expected MD5 once outside the retry loop —
+	// every iteration uploads the same byte slice. Used by
+	// verifyPutObjectETag to detect "PUT reported success but the
+	// body that reached S3 is not the body we asked the SDK to
+	// send." Defense-in-depth against the EOF-body bug fixed in
+	// this same function (and against any future shape with the
+	// same observable: caller-side reader state corrupted, proxy
+	// truncated bytes, backend lost bytes).
+	expectedMD5 := md5.Sum(data) //nolint:gosec // integrity-only
+	expectedETagHex := hex.EncodeToString(expectedMD5[:])
 	err = retry(ctx, func() error {
 		scope.incAttempts()
-		_, err := t.cfg.S3Client.PutObject(ctx, input,
+		// Build a fresh PutObjectInput every iteration so each
+		// attempt's Body is a *bytes.Reader at position 0. Reusing
+		// one input across the outer retry loop is unsafe: the
+		// previous attempt's HTTP transport read the underlying
+		// reader to EOF, the SDK does not seek seekable bodies back
+		// to 0 across top-level invocations (it only rewinds
+		// between attempts within one PutObject's own retry), and
+		// the SDK's content-length middleware reads Body.Len() at
+		// the start of the next invocation — which is 0 once at
+		// EOF. The result is a successful PUT that ships zero bytes
+		// over the wire and overwrites a prior good upload with an
+		// empty object (ETag d41d8cd9...). Per-iteration
+		// construction keeps the data slice captured in the
+		// closure but rebuilds a fresh reader on every attempt.
+		input := &s3.PutObjectInput{
+			Bucket:      aws.String(t.cfg.Bucket),
+			Key:         aws.String(key),
+			Body:        bytes.NewReader(data),
+			ContentType: aws.String(contentType),
+			Metadata:    meta,
+		}
+		if failIfExists {
+			input.IfNoneMatch = aws.String("*")
+		}
+		out, err := t.cfg.S3Client.PutObject(ctx, input,
 			func(o *s3.Options) {
 				o.APIOptions = append(o.APIOptions, apiOpts...)
 			})
-		return err
+		if err != nil {
+			return err
+		}
+		return verifyPutObjectETag(out, expectedETagHex)
 	})
 	return err
+}
+
+// verifyPutObjectETag compares the PutObject response's ETag to the
+// MD5 of the body s3store asked the SDK to send. They match for
+// every PUT s3store issues today (single-part PutObject, no SSE-C,
+// no SSE-KMS — SSE-S3 / AES256 still ETags as MD5(plaintext)), so a
+// mismatch means the body that landed on S3 is not the body we
+// passed in.
+//
+// Skips the comparison whenever the response carries a marker that
+// breaks the ETag-equals-MD5 equality:
+//
+//   - SSE-KMS / SSE-KMS-DSSE: ETag is opaque, not MD5.
+//   - SSE-C: ETag depends on the customer key.
+//   - Multipart ETag (`<hex>-<N>`): hash-of-part-hashes, not MD5.
+//   - Backend returned no ETag: nothing to compare against.
+//
+// Returns a plain error on mismatch (no smithyhttp.Response wrapped)
+// so isTransientS3Error treats it as a transport-layer failure and
+// the outer retry() re-uploads with a fresh *bytes.Reader. That
+// recovers automatically from the EOF-body shape; for a persistent
+// mismatch (proxy / backend bug) the retry budget is bounded and
+// the final error surfaces to the caller with full diagnostics.
+func verifyPutObjectETag(
+	out *s3.PutObjectOutput, expectedETagHex string,
+) error {
+	if out == nil {
+		return nil
+	}
+	switch out.ServerSideEncryption {
+	case s3types.ServerSideEncryptionAwsKms,
+		s3types.ServerSideEncryptionAwsKmsDsse:
+		return nil
+	}
+	if aws.ToString(out.SSECustomerAlgorithm) != "" {
+		return nil
+	}
+	gotETag := strings.Trim(aws.ToString(out.ETag), `"`)
+	if gotETag == "" {
+		return nil
+	}
+	if strings.Contains(gotETag, "-") {
+		return nil
+	}
+	if !strings.EqualFold(gotETag, expectedETagHex) {
+		return fmt.Errorf(
+			"PUT body integrity check failed: response ETag %q "+
+				"!= expected MD5 %q (body bytes did not reach S3 "+
+				"intact — possible client-side reader corruption, "+
+				"proxy truncation, or backend data loss)",
+			gotETag, expectedETagHex)
+	}
+	return nil
 }
 
 // head HEADs key and returns its user-defined metadata (the

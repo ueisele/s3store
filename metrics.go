@@ -3,6 +3,7 @@ package s3store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -68,6 +69,7 @@ const (
 	attrKeyMethod           = "s3store.method"
 	attrKeyOutcome          = "s3store.outcome"
 	attrKeyErrorType        = "error.type"
+	attrKeyAttempts         = "s3store.attempts"
 	outcomeSuccess          = "success"
 	outcomeError            = "error"
 	outcomeCanceled         = "canceled"
@@ -115,10 +117,15 @@ type metrics struct {
 	fanoutWorkers metric.Int64Histogram
 	fanoutItems   metric.Int64Histogram
 
-	// S3 op level.
+	// S3 op level. Retry visibility lives on s3Count via the
+	// attempts label (1..retryMaxAttempts) — see prewarm() for
+	// why a counter beats a histogram for "did this call retry":
+	// rate() on a labelled counter detects single retry events,
+	// whereas a histogram bucketed at [1,2,3,4] interpolates P95
+	// of mostly-1 observations to ~0.95 (meaningless to operators)
+	// and makes the rare retry-success case invisible.
 	s3Duration  metric.Float64Histogram
 	s3Count     metric.Int64Counter
-	s3Attempts  metric.Int64Histogram
 	s3ReqBytes  metric.Int64Histogram
 	s3RespBytes metric.Int64Histogram
 
@@ -311,19 +318,12 @@ func newMetrics(
 		metric.WithExplicitBucketBoundaries(durationBuckets...))
 	m.s3Count = mustCounter(
 		"s3store.s3.request.count",
-		"Total S3 wrapper calls, labelled by operation and outcome",
+		"Total S3 wrapper calls, labelled by operation, outcome, "+
+			"error.type (when applicable), and attempts (the outer "+
+			"retry() iteration count, 0..retryMaxAttempts; 0 means "+
+			"the call exited before the retry loop ran, e.g. "+
+			"semaphore acquire failed)",
 		"{request}")
-	m.s3Attempts = mustHistInt(
-		"s3store.s3.request.attempts",
-		"Outer retry() attempts per S3 wrapper call (1..retryMaxAttempts)",
-		"{attempt}",
-		// Values are integers in [1, retryMaxAttempts=4]. Without
-		// these boundaries the OTel default first bucket [0, 5]
-		// catches every observation and Prometheus's
-		// histogram_quantile interpolates uniformly within it,
-		// returning ~4.75 for P95 even when every call succeeded
-		// on the first attempt.
-		metric.WithExplicitBucketBoundaries(1, 2, 3, 4))
 	m.s3ReqBytes = mustHistInt(
 		"s3store.s3.request.body.size",
 		"Request body size for outbound S3 PUTs",
@@ -433,6 +433,12 @@ func newMetrics(
 		"s",
 		metric.WithExplicitBucketBoundaries(durationBuckets...))
 
+	// Materialise rare-event counter series at zero so rate() can
+	// catch their first non-zero observation. context.Background is
+	// fine here — the pre-warm Add(0, ...) calls are not bound to
+	// any caller's lifetime and the noop provider's Add is a no-op.
+	m.prewarm(context.Background())
+
 	return m
 }
 
@@ -447,6 +453,94 @@ func newMetrics(
 // but it's now a small set (≤ 3 entries) instead of constants+vars.
 func (m *metrics) callOpts(extras ...attribute.KeyValue) (metric.MeasurementOption, metric.MeasurementOption) {
 	return m.constSetOpt, metric.WithAttributes(extras...)
+}
+
+// prewarm materialises rare-event counter series at value 0 so
+// rate-based queries can detect their first non-zero observation.
+//
+// Without prewarm, a counter series only appears in the scrape
+// after its first Add() call. Prometheus's rate() / increase()
+// treat the first-ever sample as the baseline — so the very
+// first commit-after-timeout, the very first retry-success, the
+// very first malformed-ref are silently absorbed into "rate from
+// zero" rather than reported. Cheap defence: each Add(0, ...)
+// emits the series at the next scrape and does not alter
+// downstream histograms (which can't be pre-warmed at all since
+// recording any value bumps a bucket).
+//
+// Called once per Target during construction. nil-safe so the
+// noop provider path stays a no-op.
+//
+// Coverage:
+//
+//   - Incident counters (commit_after_timeout, optimistic
+//     collisions, missing data, malformed refs, body-slot
+//     exhaustion, byte-budget exhaustion). Single series each
+//     under the Target's constant attribute set.
+//   - s3.request.count for (operation × outcome=success ×
+//     attempts ∈ "1..retryMaxAttempts"). Pre-warming the rare
+//     retry-success combos (attempts > 1) is the headline win;
+//     pre-warming attempts="1" is harmless and keeps the loop
+//     uniform.
+//   - target.semaphore.acquires for outcome=canceled — the rare
+//     side of acquire (the success side fires on every call and
+//     pre-warms naturally).
+//
+// Skipped on purpose:
+//
+//   - Histograms — Record(0, ...) bumps a bucket, so there's no
+//     way to materialise an empty histogram bucket series.
+//   - error.type-bearing combos (s3.request.count outcome=error,
+//     method.calls outcome=error). error.type is dynamic across
+//     8 declared values; pre-warming a no-error.type variant
+//     creates a different label set than real observations carry.
+//     Aggregate queries (sum without error.type) still work; per
+//     error.type queries lose only their first sample, matching
+//     pre-existing behaviour.
+//   - method.calls success/canceled — methodCalls fires often
+//     enough on real workloads that pre-warm doesn't pay; the
+//     failure modes that do pay (errors) are blocked by the
+//     error.type concern above.
+func (m *metrics) prewarm(ctx context.Context) {
+	if m == nil {
+		return
+	}
+
+	// Incident counters — single series per Target (constSet only).
+	incidents := []metric.Int64Counter{
+		m.writeCommitAfterTO,
+		m.writeOptimisticCollisions,
+		m.readMissingData,
+		m.readMalformedRefs,
+		m.iterBodySlotExhausted,
+		m.iterByteBudgetExhausted,
+	}
+	for _, c := range incidents {
+		c.Add(ctx, 0, m.constSetOpt)
+	}
+
+	// s3.request.count — every (op × outcome=success × attempts).
+	// retryMaxAttempts lives in target.go; same package, accessed
+	// directly. The 1..N range covers happy-path (attempts="1")
+	// and the rare retry-success combos (attempts="2..N") that
+	// are the actual reason this method exists.
+	for _, op := range []s3OpKind{s3OpGet, s3OpPut, s3OpHead, s3OpList} {
+		for a := 1; a <= retryMaxAttempts; a++ {
+			cs, vs := m.callOpts(
+				attribute.String(attrKeyOperation, string(op)),
+				attribute.String(attrKeyOutcome, outcomeSuccess),
+				attribute.String(attrKeyAttempts, strconv.Itoa(a)),
+			)
+			m.s3Count.Add(ctx, 0, cs, vs)
+		}
+	}
+
+	// target.semaphore.acquires — outcome=canceled. The success
+	// side fires on every acquire and pre-warms itself.
+	cs, vs := m.callOpts(
+		attribute.String(attrKeyOutcome, outcomeCanceled),
+	)
+	m.semAcquires.Add(ctx, 0, cs, vs)
 }
 
 // semaphoreScope tracks one acquire-side observation cycle: from
@@ -682,22 +776,38 @@ func (s *s3OpScope) end(errPtr *error) {
 	outcome, errType := classifyError(err)
 	opAttr := attribute.String(attrKeyOperation, string(s.op))
 	outcomeAttr := attribute.String(attrKeyOutcome, outcome)
-	var cs, vs metric.MeasurementOption
+	// Duration carries (op, outcome [, errType]) — distribution
+	// per terminal classification. Attempts breakdown lives on
+	// s3Count instead so retry rate is queryable as
+	// rate(s3_count{attempts!="1"}) / rate(s3_count[...]).
+	var dcs, dvs metric.MeasurementOption
 	if errType != "" {
-		cs, vs = s.m.callOpts(opAttr, outcomeAttr,
+		dcs, dvs = s.m.callOpts(opAttr, outcomeAttr,
 			attribute.String(attrKeyErrorType, errType))
 	} else {
-		cs, vs = s.m.callOpts(opAttr, outcomeAttr)
+		dcs, dvs = s.m.callOpts(opAttr, outcomeAttr)
 	}
-	s.m.s3Duration.Record(s.ctx, time.Since(s.start).Seconds(), cs, vs)
-	s.m.s3Count.Add(s.ctx, 1, cs, vs)
-	if s.attempts > 0 {
-		// Attempts measures retry behavior, not terminal outcome —
-		// drop error.type so the histogram stays low-cardinality
-		// (operation × outcome only, no per-error-type explosion).
-		acs, avs := s.m.callOpts(opAttr, outcomeAttr)
-		s.m.s3Attempts.Record(s.ctx, int64(s.attempts), acs, avs)
+	s.m.s3Duration.Record(
+		s.ctx, time.Since(s.start).Seconds(), dcs, dvs)
+
+	// Count carries the same labels plus attempts. attempts="0"
+	// means the retry loop never ran (acquire failed before fn
+	// could fire); attempts ∈ "1..retryMaxAttempts" otherwise.
+	// prewarm() materialises the (op × outcome=success ×
+	// attempts ∈ "1..retryMaxAttempts") combos at zero so the
+	// rare retry-success series exist before their first real
+	// observation.
+	attemptsAttr := attribute.String(
+		attrKeyAttempts, strconv.Itoa(s.attempts))
+	var ccs, cvs metric.MeasurementOption
+	if errType != "" {
+		ccs, cvs = s.m.callOpts(opAttr, outcomeAttr, attemptsAttr,
+			attribute.String(attrKeyErrorType, errType))
+	} else {
+		ccs, cvs = s.m.callOpts(opAttr, outcomeAttr, attemptsAttr)
 	}
+	s.m.s3Count.Add(s.ctx, 1, ccs, cvs)
+
 	if s.reqBytes > 0 {
 		// Body-size histograms are tagged only by operation — they
 		// describe payload distribution per op, not per-outcome.

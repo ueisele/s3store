@@ -6,12 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -370,6 +372,211 @@ func newDataPUTFailingClient(t *testing.T, f *fixture) *s3.Client {
 					middleware.After)
 			})
 	})
+}
+
+// oneShotFailingDataPUTTransport wraps an http.RoundTripper to make
+// the FIRST PUT against `/data/...*.parquet` look like a real "S3
+// returned 500 after the body was streamed to the wire." Drains the
+// request body (so the underlying *bytes.Reader on the caller's
+// PutObjectInput.Body advances to EOF, mirroring a real successful
+// upload) and then synthesizes an http.Response with StatusCode=500
+// instead of forwarding to MinIO. Subsequent calls pass through to
+// the wrapped transport.
+//
+// Operates below the SDK middleware stack on purpose: returning a
+// 500 from middleware doesn't work because the SDK wraps the error
+// in an outer *smithyhttp.ResponseError carrying the actual wire
+// response (200 from MinIO), and isTransientS3Error (target.go)
+// reads the outer wrapper's status and refuses to retry. Returning
+// a real 500 at the transport layer leaves the SDK with a single,
+// genuine ResponseError whose HTTPStatusCode() is 500, which the
+// outer retry recognises as transient.
+type oneShotFailingDataPUTTransport struct {
+	inner   http.RoundTripper
+	counter *atomic.Int32
+}
+
+func (t *oneShotFailingDataPUTTransport) RoundTrip(
+	req *http.Request,
+) (*http.Response, error) {
+	isDataPUT := req.Method == "PUT" &&
+		strings.Contains(req.URL.Path, "/data/") &&
+		strings.HasSuffix(req.URL.Path, ".parquet")
+	if !isDataPUT || t.counter.Add(1) != 1 {
+		return t.inner.RoundTrip(req)
+	}
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+	}
+	body := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<Error><Code>InternalError</Code>` +
+		`<Message>test: synthetic 500 after body sent</Message>` +
+		`<Resource>` + req.URL.Path + `</Resource></Error>`
+	return &http.Response{
+		Status:        "500 Internal Server Error",
+		StatusCode:    500,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{"Content-Type": []string{"application/xml"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}, nil
+}
+
+// newOnceFailingDataPUTAfterSendClient returns an *s3.Client whose
+// HTTP transport is a oneShotFailingDataPUTTransport — the FIRST
+// data PUT has its body fully drained and gets a synthetic 500
+// response back; subsequent PUTs flow through.
+//
+// Configured with RetryMaxAttempts=1 (no SDK-internal retry) so the
+// 500 surfaces directly to s3store's outer retry() — the scenario
+// in production where the SDK exhausts its retry budget (or sees a
+// non-rewindable transport error mid-response) and hands control
+// back to the outer retry with the body's *bytes.Reader already at
+// EOF.
+//
+// The atomic counter must be supplied by the caller so the test can
+// assert how many data PUTs were issued (regression guard against a
+// future SDK bump silently rewinding the body across invocations
+// and hiding the bug).
+func newOnceFailingDataPUTAfterSendClient(
+	t *testing.T, f *fixture, counter *atomic.Int32,
+) *s3.Client {
+	t.Helper()
+	httpClient := &http.Client{
+		Transport: &oneShotFailingDataPUTTransport{
+			inner:   http.DefaultTransport,
+			counter: counter,
+		},
+	}
+	return s3.NewFromConfig(aws.Config{
+		Region:           "us-east-1",
+		Credentials:      f.S3Client.Options().Credentials,
+		RetryMaxAttempts: 1,
+		HTTPClient:       httpClient,
+	}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String("http://" + f.HostPort)
+		o.UsePathStyle = true
+	})
+}
+
+// TestWriteWithKey_OuterRetryPreservesParquetBody is a regression
+// test for the "0-byte parquet on outer retry" bug.
+//
+// Mechanism the test exercises:
+//
+//  1. The first data PUT streams its body to MinIO successfully
+//     (full parquet bytes land at the data path).
+//  2. A smithy Deserialize middleware then synthesizes a 500
+//     InternalError, masking the success. The *bytes.Reader on the
+//     PutObjectInput.Body is now at EOF (the HTTP transport read it
+//     to the wire).
+//  3. SDK retries are disabled (RetryMaxAttempts=1), so the 500
+//     surfaces directly to s3store's outer retry() in target.go.
+//  4. The outer retry re-invokes S3Client.PutObject with the SAME
+//     PutObjectInput — and therefore the SAME *bytes.Reader, which
+//     is at EOF.
+//
+// On the buggy code the second PutObject sends 0 bytes (the SDK's
+// ContentLength middleware reads Body.Len() at the start of the
+// fresh invocation, gets 0, sets Content-Length: 0, and the HTTP
+// transport ships an empty body that overwrites MinIO's first
+// successful upload). The data file ends at 0 bytes, the commit
+// marker still claims rowcount=N, and reads return parse failures.
+//
+// On the fix the second PutObject re-creates the *bytes.Reader
+// inside the retry callback so each attempt starts from position 0;
+// the second upload re-PUTs the full parquet body and the
+// successful first upload is overwritten with byte-identical
+// content (deterministic encoding ⇒ same bytes), so the data file
+// stays whole.
+//
+// Asserts: HEAD on the resolved DataPath returns ContentLength
+// matching what the writer encoded, and Read deserializes the
+// records back. Also asserts that the data PUT was attempted at
+// least twice — guards against a future SDK bump that silently
+// rewinds the body across invocations and hides the bug.
+func TestWriteWithKey_OuterRetryPreservesParquetBody(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.SeedTimingConfig(t, "store", testCommitTimeout, testMaxClockSkew)
+
+	var dataPUTs atomic.Int32
+	client := newOnceFailingDataPUTAfterSendClient(t, f, &dataPUTs)
+
+	store, err := New(ctx, StoreConfig[Rec]{
+		S3TargetConfig: S3TargetConfig{
+			Bucket:             f.Bucket,
+			Prefix:             "store",
+			S3Client:           client,
+			PartitionKeyParts:  []string{"period", "customer"},
+			ConsistencyControl: ConsistencyStrongGlobal,
+		},
+		PartitionKeyOf: func(r Rec) string {
+			return fmt.Sprintf("period=%s/customer=%s",
+				r.Period, r.Customer)
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	recs := []Rec{
+		{Period: "2026-04-22", Customer: "alice", SKU: "s1", Value: 1, Ts: time.UnixMilli(1)},
+		{Period: "2026-04-22", Customer: "alice", SKU: "s2", Value: 2, Ts: time.UnixMilli(2)},
+		{Period: "2026-04-22", Customer: "alice", SKU: "s3", Value: 3, Ts: time.UnixMilli(3)},
+	}
+	res, err := store.WriteWithKey(ctx,
+		"period=2026-04-22/customer=alice", recs)
+	if err != nil {
+		t.Fatalf("WriteWithKey: %v", err)
+	}
+	if res == nil {
+		t.Fatal("WriteWithKey: nil result")
+	}
+
+	// Sanity: the outer retry actually fired (≥2 data PUTs).
+	// If this is 1 the test isn't exercising the bug path
+	// (e.g. SDK silently masked the synthetic 500), so the
+	// downstream assertion below is meaningless.
+	if got := dataPUTs.Load(); got < 2 {
+		t.Fatalf("data PUT was attempted %d times; expected ≥2 "+
+			"(first synthetic-500, second outer-retry) — test is "+
+			"not exercising the outer-retry-with-EOF-body path",
+			got)
+	}
+
+	// Core assertion: the data file at res.DataPath must contain
+	// the encoded parquet bytes, not the empty body the buggy
+	// retry would land.
+	head, err := f.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(f.Bucket),
+		Key:    aws.String(res.DataPath),
+	})
+	if err != nil {
+		t.Fatalf("HEAD %s: %v", res.DataPath, err)
+	}
+	if cl := aws.ToInt64(head.ContentLength); cl == 0 {
+		t.Fatalf("data file %s landed at 0 bytes after outer "+
+			"retry; expected non-zero parquet body. ETag=%s "+
+			"(d41d8cd98f00b204e9800998ecf8427e is MD5 of empty "+
+			"body — confirms 0 bytes were uploaded)",
+			res.DataPath, aws.ToString(head.ETag))
+	}
+
+	// Functional assertion: reader can decode the records.
+	got, err := store.Read(ctx,
+		[]string{"period=2026-04-22/customer=alice"})
+	if err != nil {
+		t.Fatalf("Read after outer-retry: %v", err)
+	}
+	if len(got) != len(recs) {
+		t.Fatalf("Read: got %d records, want %d (records lost "+
+			"to 0-byte parquet?)", len(got), len(recs))
+	}
 }
 
 // TestBackfillProjection covers the relief-valve path: records

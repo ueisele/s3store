@@ -2,11 +2,14 @@ package s3store
 
 import (
 	"context"
+	"crypto/md5" //nolint:gosec // test mirrors target.go's integrity check
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -383,6 +387,118 @@ func TestTarget_PutNoRetryOn404(t *testing.T) {
 	}
 	if got := count.Load(); got != 1 {
 		t.Errorf("want 1 request (no retry on 404), got %d", got)
+	}
+}
+
+// TestVerifyPutObjectETag pins the branch table for the
+// post-PUT integrity check: equal/unequal MD5, multipart marker,
+// SSE-KMS / SSE-KMS-DSSE / SSE-C, missing ETag, nil response. The
+// integration-tagged TestWriteWithKey_OuterRetryPreservesParquetBody
+// covers the end-to-end "happy path produces matching ETag" case
+// against MinIO; this unit test exercises the skip rules in
+// isolation so a future refactor of the SSE handling can't silently
+// turn the check off.
+func TestVerifyPutObjectETag(t *testing.T) {
+	body := []byte("the body that was supposed to land at S3")
+	sum := md5.Sum(body) //nolint:gosec // mirrors target.go integrity check
+	expectedHex := hex.EncodeToString(sum[:])
+	wrongHex := hex.EncodeToString(make([]byte, 16)) // 32 zeros
+
+	cases := []struct {
+		name    string
+		out     *s3.PutObjectOutput
+		wantErr bool
+	}{
+		{
+			name:    "nil response",
+			out:     nil,
+			wantErr: false,
+		},
+		{
+			name:    "matching ETag",
+			out:     &s3.PutObjectOutput{ETag: aws.String(`"` + expectedHex + `"`)},
+			wantErr: false,
+		},
+		{
+			name:    "matching ETag without quotes (some backends)",
+			out:     &s3.PutObjectOutput{ETag: aws.String(expectedHex)},
+			wantErr: false,
+		},
+		{
+			name:    "matching ETag uppercase hex (case-insensitive compare)",
+			out:     &s3.PutObjectOutput{ETag: aws.String(`"` + strings.ToUpper(expectedHex) + `"`)},
+			wantErr: false,
+		},
+		{
+			name:    "mismatched ETag — body did not land intact",
+			out:     &s3.PutObjectOutput{ETag: aws.String(`"` + wrongHex + `"`)},
+			wantErr: true,
+		},
+		{
+			name:    "0-byte upload (the EOF-body bug shape)",
+			out:     &s3.PutObjectOutput{ETag: aws.String(`"d41d8cd98f00b204e9800998ecf8427e"`)},
+			wantErr: true,
+		},
+		{
+			name: "SSE-KMS — skip (ETag opaque)",
+			out: &s3.PutObjectOutput{
+				ETag:                 aws.String(`"` + wrongHex + `"`),
+				ServerSideEncryption: s3types.ServerSideEncryptionAwsKms,
+			},
+			wantErr: false,
+		},
+		{
+			name: "SSE-KMS-DSSE — skip",
+			out: &s3.PutObjectOutput{
+				ETag:                 aws.String(`"` + wrongHex + `"`),
+				ServerSideEncryption: s3types.ServerSideEncryptionAwsKmsDsse,
+			},
+			wantErr: false,
+		},
+		{
+			name: "SSE-S3 (AES256) — verify (ETag is MD5 of plaintext)",
+			out: &s3.PutObjectOutput{
+				ETag:                 aws.String(`"` + expectedHex + `"`),
+				ServerSideEncryption: s3types.ServerSideEncryptionAes256,
+			},
+			wantErr: false,
+		},
+		{
+			name: "SSE-C — skip (ETag depends on customer key)",
+			out: &s3.PutObjectOutput{
+				ETag:                 aws.String(`"` + wrongHex + `"`),
+				SSECustomerAlgorithm: aws.String("AES256"),
+			},
+			wantErr: false,
+		},
+		{
+			name: "multipart ETag — skip",
+			out: &s3.PutObjectOutput{
+				ETag: aws.String(`"abcdef0123456789abcdef0123456789-3"`),
+			},
+			wantErr: false,
+		},
+		{
+			name:    "empty ETag — skip (backend returned no ETag)",
+			out:     &s3.PutObjectOutput{ETag: aws.String("")},
+			wantErr: false,
+		},
+		{
+			name:    "nil ETag string — skip",
+			out:     &s3.PutObjectOutput{},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyPutObjectETag(tc.out, expectedHex)
+			gotErr := err != nil
+			if gotErr != tc.wantErr {
+				t.Fatalf("verifyPutObjectETag err=%v, wantErr=%v",
+					err, tc.wantErr)
+			}
+		})
 	}
 }
 
