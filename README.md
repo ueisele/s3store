@@ -261,6 +261,80 @@ operators see a clear signal when their configured budget is
 below the worst-case retry envelope of the two SettleWindow-
 relevant PUTs.
 
+### Tuning the AWS SDK retryer for SlowDown
+
+The library's retry layer (`retryMaxAttempts = 5`, jittered
+backoffs) is the **outer** envelope; the AWS SDK runs its own
+retryer underneath every S3 call. The SDK default
+(`RetryMode: standard`) uses a fixed 500-token retry quota that
+drains under sustained throttling — at that point the
+`retry quota exceeded, 0 available, 5 requested` lines appear
+in the library's masked-retry logs, and each SDK-denied retry
+surfaces the underlying 503 to the outer layer instead of
+absorbing it silently.
+
+For workloads with sustained SlowDown pressure on a saturated
+prefix, switch the SDK to **adaptive** mode. The cleanest place
+is on the `aws.Config` you pass to `s3.NewFromConfig` — it then
+propagates to every client built from it:
+
+```go
+import (
+    "github.com/aws/aws-sdk-go-v2/aws"
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+cfg, err := config.LoadDefaultConfig(ctx,
+    config.WithRetryMode(aws.RetryModeAdaptive),
+)
+if err != nil { /* ... */ }
+cli := s3.NewFromConfig(cfg)
+```
+
+Or override per-client when the `aws.Config` comes from
+elsewhere:
+
+```go
+cli := s3.NewFromConfig(cfg, func(o *s3.Options) {
+    o.RetryMode = aws.RetryModeAdaptive
+})
+```
+
+Adaptive mode adds a client-side token-bucket rate-limiter on
+top of the standard retryer's quota: when the SDK observes
+throttle responses (5xx, 429 SlowDown) on a connection, it
+preemptively delays new requests **before** they hit the wire,
+smoothing bursts into the prefix's actual throughput. This is
+AWS's recommended configuration for sustained-SlowDown
+scenarios.
+
+The library never wraps or replaces your `*s3.Client`, so the
+mode you set on it carries through every PUT/GET/HEAD/LIST.
+Diagnose whether the switch helped via the new
+`s3store.s3.transient_error.count` metric and the *Transient
+retry causes (% of requests by error.type)* dashboard panel: a
+drop in `error.type="slowdown"` after the change is the
+rate-limiter doing its job.
+
+Trade-offs:
+
+- **Latency variance grows under throttling.** That is the
+  intended behaviour — the rate-limiter adds delay so new
+  requests don't pile onto a saturated prefix. If callers have
+  tight per-call deadlines, raise them with the new floor in
+  mind.
+- **AWS marks adaptive as experimental** (`aws.RetryModeAdaptive`
+  carries a "subject to change" note in the SDK godoc). The
+  semantics — preemptive client-side throttling on observed
+  503/429 — have been stable across recent SDK releases, but
+  pin your `aws-sdk-go-v2` version if you depend on the
+  specific behaviour.
+- **Setting matters per `*s3.Client`.** If your process builds
+  multiple clients (uncommon), set the mode on each — the
+  library shares one client per `S3Target` but doesn't dictate
+  how callers compose them.
+
 ## Quick start
 
 ```go
