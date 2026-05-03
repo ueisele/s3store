@@ -604,7 +604,7 @@
       "title": "S3 retry attempts breakdown by operation",
       "description": "Per-second rate of S3 wrapper calls bucketed by their final attempt count (s3store.attempts label). attempts=\"1\" is the happy path (no retry); attempts=\"2\" through retryMaxAttempts are calls that needed N-1 retries before succeeding (or that exhausted the retry budget on outcome=error). attempts=\"0\" (call exited before the retry loop ran — semaphore acquire was canceled) is omitted here. Pre-warmed by metrics.prewarm so every (operation × attempts) series exists at zero before its first observation, letting rate() detect single retry events.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 115},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 115},
       "targets": [
         {
           "expr": "sum by (s3store_operation, s3store_attempts) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
@@ -613,6 +613,23 @@
         }
       ],
       "fieldConfig": {"defaults": {"unit": "reqps", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never", "stacking": {"mode": "normal"}}}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 5008,
+      "type": "timeseries",
+      "title": "Transient retry causes (% of requests by error.type)",
+      "description": "Share of S3 wrapper calls that hit a transient cause inside retry(), broken down by operation × error.type. Numerator is rate(s3store_s3_transient_error_count_total) — fires once per failed attempt (whether followed by another retry or the terminal one). Denominator is rate(s3store_s3_request_count_total{attempts!=\"0\"}) — total wrapper calls, excluding the rare semaphore-cancelled exit. Ratio can exceed 100% when calls retry multiple times per call (every retry is one transient event against one call) — that's a sustained-pressure signal worth investigating. Closes the visibility gap on s3store.s3.request.count, which only carries error.type for terminal errors and so leaves the cause of masked-by-retry failures invisible. Companion to the retry-attempts breakdown to its left: that one shows how often calls retry, this one shows why.",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 115},
+      "targets": [
+        {
+          "expr": "sum by (s3store_operation, error_type) (rate(s3store_s3_transient_error_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) / on (s3store_operation) group_left sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
+          "legendFormat": "{{s3store_operation}} · {{error_type}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never", "stacking": {"mode": "normal"}}}, "overrides": []},
       "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
     },
 

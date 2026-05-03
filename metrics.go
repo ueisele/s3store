@@ -70,6 +70,7 @@ const (
 	attrKeyOutcome          = "s3store.outcome"
 	attrKeyErrorType        = "error.type"
 	attrKeyAttempts         = "s3store.attempts"
+	attrKeyAttempt          = "s3store.attempt"
 	outcomeSuccess          = "success"
 	outcomeError            = "error"
 	outcomeCanceled         = "canceled"
@@ -121,13 +122,15 @@ type metrics struct {
 	// attempts label (1..retryMaxAttempts) — see prewarm() for
 	// why a counter beats a histogram for "did this call retry":
 	// rate() on a labelled counter detects single retry events,
-	// whereas a histogram bucketed at [1,2,3,4] interpolates P95
-	// of mostly-1 observations to ~0.95 (meaningless to operators)
-	// and makes the rare retry-success case invisible.
-	s3Duration  metric.Float64Histogram
-	s3Count     metric.Int64Counter
-	s3ReqBytes  metric.Int64Histogram
-	s3RespBytes metric.Int64Histogram
+	// whereas a histogram bucketed at [1..retryMaxAttempts]
+	// interpolates P95 of mostly-1 observations to ~0.95
+	// (meaningless to operators) and makes the rare
+	// retry-success case invisible.
+	s3Duration       metric.Float64Histogram
+	s3Count          metric.Int64Counter
+	s3TransientCount metric.Int64Counter
+	s3ReqBytes       metric.Int64Histogram
+	s3RespBytes      metric.Int64Histogram
 
 	// Library method level.
 	methodDuration            metric.Float64Histogram
@@ -324,6 +327,23 @@ func newMetrics(
 			"the call exited before the retry loop ran, e.g. "+
 			"semaphore acquire failed)",
 		"{request}")
+	m.s3TransientCount = mustCounter(
+		"s3store.s3.transient_error.count",
+		"Total transient S3 errors observed inside retry() — HTTP "+
+			"5xx, 429 SlowDown, and transport-layer failures (DNS / "+
+			"TCP / TLS / connection reset). Incremented on every "+
+			"transient failure regardless of whether a retry follows "+
+			"or it's the final attempt that exhausted the budget. "+
+			"Closes the visibility gap on s3.request.count, which "+
+			"only carries error.type for terminal errors — masked "+
+			"retries (call eventually succeeded) showed up only as "+
+			"attempts>1 with no clue about the underlying cause. "+
+			"Labels: operation, error.type (slowdown / server / "+
+			"client / transport / ...), attempt (1..retryMaxAttempts, "+
+			"the index of the failed attempt — not the call's final "+
+			"attempt count, which is what s3store.attempts on "+
+			"s3.request.count carries).",
+		"{event}")
 	m.s3ReqBytes = mustHistInt(
 		"s3store.s3.request.body.size",
 		"Request body size for outbound S3 PUTs",
@@ -734,6 +754,32 @@ func (s *s3OpScope) incAttempts() {
 		return
 	}
 	s.attempts++
+}
+
+// recordTransient increments s3TransientCount for the failed
+// attempt currently being unwound. Called by retry() right
+// after isTransientS3Error(err) returns true — both for
+// non-terminal failures (next retry coming) and the terminal
+// transient (budget exhausted). Bookkeeping for non-transient
+// errors stays on s3Count alone; recording them here would
+// double-count, since classifyError would surface the same
+// error.type on the call's terminal s3Count observation.
+//
+// nil-safe on the receiver and on s.m so retry()'s test calls
+// (which pass scope=nil) are no-ops.
+func (s *s3OpScope) recordTransient(err error) {
+	if s == nil || s.m == nil || err == nil {
+		return
+	}
+	_, errType := classifyError(err)
+	if errType == "" {
+		return
+	}
+	cs, vs := s.m.callOpts(
+		attribute.String(attrKeyOperation, string(s.op)),
+		attribute.String(attrKeyErrorType, errType),
+		attribute.String(attrKeyAttempt, strconv.Itoa(s.attempts)))
+	s.m.s3TransientCount.Add(s.ctx, 1, cs, vs)
 }
 
 // setReqBytes records the size of the outgoing request body.

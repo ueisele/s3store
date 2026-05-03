@@ -165,13 +165,15 @@ with a hint at the seeding step. Floors:
 `commit-timeout ≥ 1ms` (`CommitTimeoutFloor` — strictly positive;
 zero would cause every write to exceed the timeout); construction
 additionally emits a `slog.Warn` at level WARN when the configured
-value is below `CommitTimeoutAdvisory` (6s — see *Tuning
+value is below `CommitTimeoutAdvisory` (8s — see *Tuning
 CommitTimeout* below). `max-clock-skew ≥ 0` (zero is valid on
 tightly-clocked deployments, negative is incoherent). The boto3
-snippet below ships `10s` / `1s` as sensible starting values for a
-typical deployment with NTP-synced nodes; tune higher when you
-can't rule out larger skew, lower (down to ~6s) when you want a
-tighter stream-reader cutoff.
+snippet below ships `15s` / `1s` as sensible starting values for a
+typical deployment with NTP-synced nodes — comfortably above the
+advisory floor with headroom for both transient retries and
+actual request latency. Tune higher when you can't rule out
+larger skew or sustained S3 SlowDown bursts; values below the
+advisory still pass construction but trigger the warn.
 
 Once seeded, both values are **immutable** — changing either
 silently rewrites history (decreasing `commit-timeout` makes valid
@@ -191,7 +193,7 @@ s3 = boto3.client("s3", endpoint_url="https://s3.example.com")
 s3.put_object(
     Bucket="my-bucket",
     Key="my-prefix/_config/commit-timeout",
-    Body=b"10s",
+    Body=b"15s",
     ContentType="text/plain",
 )
 s3.put_object(
@@ -212,24 +214,33 @@ per test.
 (captured just before the ref PUT) to token-commit-PUT
 completion. Two PUTs participate in that window. Each S3 call is
 wrapped by the library's transient-error retry policy:
-`retryMaxAttempts = 4` (1 initial + 3 retries) with
-`retryBackoff = [200ms, 400ms, 800ms]` — total **1.4s of backoff
-sleep** per call in the worst case, plus the per-attempt request
-time. Across the two PUTs, the worst-case retry-sleep envelope is
-**~2.8s**, again before counting actual request time.
+`retryMaxAttempts = 5` (1 initial + 4 retries) with jittered
+backoffs drawn from `[100ms, 300ms) / [300ms, 500ms) / [500ms,
+800ms) / [500ms, 800ms)` — worst-case **2.4s of backoff sleep**
+per call (best case 1.4s, average 1.9s), plus the per-attempt
+request time. The jitter decorrelates concurrently failing
+callers so a burst of `503 SlowDown` responses from one prefix
+doesn't translate into a synchronised retry storm against the
+same prefix on the next round; the plateau at the fourth retry
+caps per-attempt sleep so the cumulative envelope stays
+manageable while the wider attempt count lowers the probability
+that a sustained SlowDown burst leaves an orphan parquet (data
+PUT succeeded but ref or token-commit failed terminally).
+Across the two PUTs, the worst-case retry-sleep envelope is
+**~4.8s**, again before counting actual request time.
 
-`CommitTimeoutAdvisory` is set to **6s** — roughly 2× the worst-
-case retry envelope, with headroom for actual request latency.
-Values below this still pass construction (the hard floor is
-`CommitTimeoutFloor = 1ms`), but `NewS3Target` emits a
+`CommitTimeoutAdvisory` is set to **8s** — roughly 1.67× the
+worst-case retry envelope, with headroom for actual request
+latency. Values below this still pass construction (the hard
+floor is `CommitTimeoutFloor = 1ms`), but `NewS3Target` emits a
 `slog.Warn` at level WARN naming the configured value and the
 advisory floor:
 
 | Configured value | Behaviour                                                |
 |------------------|----------------------------------------------------------|
 | `< 1ms` or `≤ 0` | Construction fails — "below the floor".                  |
-| `1ms` … `< 6s`   | Construction succeeds with a `slog.Warn`. Acceptable on tightly-clocked dev/test deployments where you control retry behaviour and want a tight `SettleWindow`. |
-| `≥ 6s`           | No warning. Recommended for production.                  |
+| `1ms` … `< 8s`   | Construction succeeds with a `slog.Warn`. Acceptable on tightly-clocked dev/test deployments where you control retry behaviour and want a tight `SettleWindow`. |
+| `≥ 8s`           | No warning. Recommended for production.                  |
 
 Sizing guidance:
 
@@ -241,7 +252,7 @@ Sizing guidance:
   cross-site replication adds visible latency to PUT
   acknowledgement at `strong-global`.
 - **Dev/test loops where you want sub-second `SettleWindow`**:
-  pick `< 6s`, accept the warning, run on a backend where retries
+  pick `< 8s`, accept the warning, run on a backend where retries
   are unlikely (local MinIO).
 
 The advisory floor is a recommendation, not a contract — the
@@ -1968,9 +1979,9 @@ commit PUT would leave the most expensive form of orphan: a
 multi-megabyte parquet that's invisible-but-durable when the
 work to make it visible was two zero-byte PUTs away. Both PUTs
 are bounded by the library's retry policy
-(`retryMaxAttempts = 4` with cumulative ~1.4s backoff per call)
-plus the AWS SDK's per-request timeouts; in practice they
-complete in milliseconds. A caller that genuinely needs to
+(`retryMaxAttempts = 5` with cumulative worst-case ~2.4s of
+jittered backoff per call) plus the AWS SDK's per-request
+timeouts; in practice they complete in milliseconds. A caller that genuinely needs to
 abort must do so before the data PUT returns; once `Write`
 returns success, the cancellation that may have arrived during
 the no-cancel window is moot — the records are committed.
@@ -2100,6 +2111,7 @@ attributes are added per call — cardinality stays bounded.
 |---|---|---|
 | `s3store.s3.request.duration` | histogram | s |
 | `s3store.s3.request.count` | counter | 1 |
+| `s3store.s3.transient_error.count` | counter | 1 |
 | `s3store.s3.request.attempts` | histogram | 1 |
 | `s3store.s3.request.body.size` | histogram | By |
 | `s3store.s3.response.body.size` | histogram | By |
@@ -2110,6 +2122,21 @@ Per-op attributes: `s3store.operation` ∈ `put|get|head|list`,
 on non-success. `s3store.s3.request.attempts` carries only
 `s3store.operation` + `s3store.outcome` (it measures retry behavior,
 not terminal error class — keeping cardinality bounded).
+
+`s3store.s3.transient_error.count` fires **inside** `retry()` on
+every transient failure (HTTP 5xx, 429 SlowDown, transport-layer)
+regardless of whether a retry follows or it's the terminal
+attempt. It closes the visibility gap on `s3store.s3.request.count`,
+which only carries `error.type` for terminal errors — so a
+2-attempt success used to record only `outcome=success, attempts=2`
+with no clue about *what* the failed attempt 1 saw. Labels on
+this counter: `s3store.operation`, `error.type`, and
+`s3store.attempt` (the index of the failed attempt — note
+the singular `s3store.attempt` here vs. the plural
+`s3store.attempts` on `s3store.s3.request.count` which carries
+the call's final attempt count). Query "share of requests
+hitting a transient cause X" as
+`rate(s3store_s3_transient_error_count_total{error_type="slowdown"}) / rate(s3store_s3_request_count_total{s3store_attempts!="0"})`.
 
 **Library methods** (recorded at the public entry point of `Write`,
 `WriteWithKey`, `LookupCommit`, `Read`, `ReadIter`,
@@ -2414,7 +2441,8 @@ pattern / multi-partition variants fan out independently and
 deduplicate at the key level. All ops route through the per-
 target `MaxInflightRequests` semaphore, carry the configured
 `ConsistencyControl` header, and have their own retry budget
-(`retryMaxAttempts = 4` with backoffs 200ms / 400ms / 800ms).
+(`retryMaxAttempts = 5` with jittered backoffs drawn from
+100-300 / 300-500 / 500-800 / 500-800 ms).
 
 ### Write
 

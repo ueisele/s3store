@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // headServer returns an httptest server that distinguishes PUT
@@ -145,20 +147,23 @@ func TestConsistencyControl_HeaderSentOnGET(t *testing.T) {
 	}
 }
 
-// stubBackoff replaces retryBackoff with zero-length sleeps so
-// the tests don't wait 1.4s for an exhaustion case. Restored on
-// cleanup so parallel tests don't observe the stub.
+// stubBackoff replaces retryBackoff with zero-length sleep
+// windows so the tests don't wait the production retry envelope
+// for an exhaustion case. Restored on cleanup so parallel tests
+// don't observe the stub.
 func stubBackoff(t *testing.T) {
 	t.Helper()
 	old := retryBackoff
-	retryBackoff = [retryMaxAttempts - 1]time.Duration{0, 0, 0}
+	retryBackoff = [retryMaxAttempts - 1]retryBackoffRange{
+		{0, 0}, {0, 0}, {0, 0}, {0, 0},
+	}
 	t.Cleanup(func() { retryBackoff = old })
 }
 
 func TestRetry_SuccessFirstAttempt(t *testing.T) {
 	stubBackoff(t)
 	var calls atomic.Int32
-	err := retry(context.Background(), "test", func() error {
+	err := retry(context.Background(), "test", nil, func() error {
 		calls.Add(1)
 		return nil
 	})
@@ -178,7 +183,7 @@ func TestRetry_TransientThenSuccess(t *testing.T) {
 			Response: &http.Response{StatusCode: 503},
 		},
 	}
-	err := retry(context.Background(), "test", func() error {
+	err := retry(context.Background(), "test", nil, func() error {
 		if calls.Add(1) < 3 {
 			return transient
 		}
@@ -200,7 +205,7 @@ func TestRetry_NonTransientNoRetry(t *testing.T) {
 			Response: &http.Response{StatusCode: 404},
 		},
 	}
-	err := retry(context.Background(), "test", func() error {
+	err := retry(context.Background(), "test", nil, func() error {
 		calls.Add(1)
 		return notFound
 	})
@@ -220,7 +225,7 @@ func TestRetry_ExhaustsBudget(t *testing.T) {
 			Response: &http.Response{StatusCode: 500},
 		},
 	}
-	err := retry(context.Background(), "test", func() error {
+	err := retry(context.Background(), "test", nil, func() error {
 		calls.Add(1)
 		return transient
 	})
@@ -235,8 +240,9 @@ func TestRetry_ExhaustsBudget(t *testing.T) {
 func TestRetry_ContextCancelledBetweenAttempts(t *testing.T) {
 	// Real backoff here so the ctx-check in the sleep path fires.
 	old := retryBackoff
-	retryBackoff = [retryMaxAttempts - 1]time.Duration{
-		50 * time.Millisecond, 0, 0,
+	retryBackoff = [retryMaxAttempts - 1]retryBackoffRange{
+		{50 * time.Millisecond, 50 * time.Millisecond},
+		{0, 0}, {0, 0}, {0, 0},
 	}
 	t.Cleanup(func() { retryBackoff = old })
 
@@ -247,7 +253,7 @@ func TestRetry_ContextCancelledBetweenAttempts(t *testing.T) {
 			Response: &http.Response{StatusCode: 500},
 		},
 	}
-	err := retry(ctx, "test", func() error {
+	err := retry(ctx, "test", nil, func() error {
 		calls.Add(1)
 		// Cancel after the first attempt fails; the retry helper
 		// should observe the cancellation during its backoff
@@ -295,7 +301,7 @@ func TestRetry_LogsTransientThatRetries(t *testing.T) {
 	t.Run("transient-then-success-logs-each-retry", func(t *testing.T) {
 		buf.Reset()
 		var calls atomic.Int32
-		err := retry(context.Background(), "put", func() error {
+		err := retry(context.Background(), "put", nil, func() error {
 			if calls.Add(1) < 3 {
 				return transient
 			}
@@ -325,7 +331,7 @@ func TestRetry_LogsTransientThatRetries(t *testing.T) {
 	t.Run("exhausted-budget-skips-final-log", func(t *testing.T) {
 		buf.Reset()
 		var calls atomic.Int32
-		err := retry(context.Background(), "get", func() error {
+		err := retry(context.Background(), "get", nil, func() error {
 			calls.Add(1)
 			return transient
 		})
@@ -354,7 +360,7 @@ func TestRetry_LogsTransientThatRetries(t *testing.T) {
 				Response: &http.Response{StatusCode: 404},
 			},
 		}
-		err := retry(context.Background(), "head", func() error {
+		err := retry(context.Background(), "head", nil, func() error {
 			return notFound
 		})
 		if err == nil {
@@ -364,6 +370,139 @@ func TestRetry_LogsTransientThatRetries(t *testing.T) {
 			"s3store: transient error, retrying") {
 			t.Errorf("non-transient should not log retry: %s",
 				buf.String())
+		}
+	})
+}
+
+// TestRetry_RecordsTransientOnScope pins the integration between
+// retry() and s3OpScope.recordTransient: every transient failure
+// (whether followed by another attempt or the terminal one) shows
+// up on s3store.s3.transient_error.count with the failed
+// attempt's index. Non-transient errors stay off this metric —
+// they're already classified on s3store.s3.request.count.
+func TestRetry_RecordsTransientOnScope(t *testing.T) {
+	stubBackoff(t)
+
+	t.Run("transient-then-success-records-each-failure", func(t *testing.T) {
+		m, reader := newTestMetrics(t, "")
+		scope := m.s3OpScope(context.Background(), s3OpPut)
+		slowDown := &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{
+				Response: &http.Response{StatusCode: 429},
+			},
+			Err: &smithy.GenericAPIError{Code: "SlowDown"},
+		}
+
+		var calls atomic.Int32
+		err := retry(context.Background(), "put", scope, func() error {
+			scope.incAttempts()
+			if calls.Add(1) < 3 {
+				return slowDown
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+
+		rm := collectMetrics(t, reader)
+		// Two failed attempts (1 and 2) should each carry a
+		// transient_error observation with their own attempt index.
+		for _, attempt := range []string{"1", "2"} {
+			dp := findCounterDP(rm,
+				"s3store.s3.transient_error.count",
+				map[string]string{
+					attrKeyOperation: "put",
+					attrKeyErrorType: errTypeSlowDown,
+					attrKeyAttempt:   attempt,
+				})
+			if dp == nil {
+				t.Fatalf("transient_error.count missing for "+
+					"put/slowdown/attempt=%s", attempt)
+			}
+			if dp.Value != 1 {
+				t.Errorf("attempt=%s: got %d, want 1",
+					attempt, dp.Value)
+			}
+		}
+		// Successful attempt 3 must NOT show up here.
+		if dp := findCounterDP(rm,
+			"s3store.s3.transient_error.count",
+			map[string]string{
+				attrKeyOperation: "put",
+				attrKeyAttempt:   "3",
+			}); dp != nil && dp.Value > 0 {
+			t.Errorf("attempt=3 (success) should not record "+
+				"on transient_error.count, got %d", dp.Value)
+		}
+	})
+
+	t.Run("exhausted-budget-records-every-attempt", func(t *testing.T) {
+		m, reader := newTestMetrics(t, "")
+		scope := m.s3OpScope(context.Background(), s3OpGet)
+		serverErr := &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{
+				Response: &http.Response{StatusCode: 503},
+			},
+			Err: &smithy.GenericAPIError{Code: "InternalError"},
+		}
+
+		err := retry(context.Background(), "get", scope, func() error {
+			scope.incAttempts()
+			return serverErr
+		})
+		if err == nil {
+			t.Fatal("want terminal error after exhausted budget")
+		}
+
+		rm := collectMetrics(t, reader)
+		for i := 1; i <= retryMaxAttempts; i++ {
+			dp := findCounterDP(rm,
+				"s3store.s3.transient_error.count",
+				map[string]string{
+					attrKeyOperation: "get",
+					attrKeyErrorType: errTypeServer,
+					attrKeyAttempt:   strconv.Itoa(i),
+				})
+			if dp == nil {
+				t.Fatalf("transient_error.count missing for "+
+					"get/server/attempt=%d", i)
+			}
+			if dp.Value != 1 {
+				t.Errorf("attempt=%d: got %d, want 1", i, dp.Value)
+			}
+		}
+	})
+
+	t.Run("non-transient-not-recorded", func(t *testing.T) {
+		m, reader := newTestMetrics(t, "")
+		scope := m.s3OpScope(context.Background(), s3OpHead)
+		notFound := &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{
+				Response: &http.Response{StatusCode: 404},
+			},
+		}
+
+		err := retry(context.Background(), "head", scope, func() error {
+			scope.incAttempts()
+			return notFound
+		})
+		if err == nil {
+			t.Fatal("want non-transient err to bubble up")
+		}
+
+		rm := collectMetrics(t, reader)
+		if mt := findMetric(rm,
+			"s3store.s3.transient_error.count"); mt != nil {
+			sum := mt.Data.(metricdata.Sum[int64])
+			for _, dp := range sum.DataPoints {
+				if hasAttr(dp.Attributes, attrKeyOperation, "head") &&
+					dp.Value > 0 {
+					t.Errorf("non-transient 404 must not record on "+
+						"transient_error.count, got value=%d",
+						dp.Value)
+				}
+			}
 		}
 	})
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -25,20 +26,54 @@ import (
 // AWS SDK runs its own retryer under us; this is an outer layer
 // that survives an exhausted SDK budget and keeps behaviour
 // predictable when callers plug in aws.NopRetryer or a custom
-// retryer. Budget is deliberately small — four attempts over
-// ~1.4s — so one flaky call doesn't delay a Write by minutes.
-const retryMaxAttempts = 4 // 1 initial + 3 retries
+// retryer. Budget is sized to keep flaky calls bounded — five
+// attempts over 1.4-2.4 s of randomised backoff sleep — without
+// blowing the SettleWindow contract for the two PUTs that
+// participate in it (ref + token-commit, the orphan-creating
+// pair). The retry count is the orphan-rate hedge: at typical
+// per-attempt failure rates a single retry suffices, but
+// sustained SlowDown bursts during the no-cancel commit window
+// benefit from the wider envelope.
+const retryMaxAttempts = 5 // 1 initial + 4 retries
 
-var retryBackoff = [retryMaxAttempts - 1]time.Duration{
-	200 * time.Millisecond,
-	400 * time.Millisecond,
-	800 * time.Millisecond,
+// retryBackoffRange is the [min, max) sleep window for the i-th
+// retry. Each retry samples uniformly within the range, which
+// breaks correlation between concurrently failing callers: a
+// burst of SlowDowns from the same prefix no longer translates
+// into a synchronised retry storm against that same prefix on
+// the next round. The schedule grows from 100-300 ms through
+// 500-800 ms across the first three retries, then plateaus at
+// 500-800 ms for the fourth — capping per-attempt sleep keeps
+// the cumulative envelope manageable while still leaving each
+// retry on its own random offset.
+type retryBackoffRange struct {
+	min, max time.Duration
+}
+
+// pick returns a uniformly-random duration in [min, max).
+// Falls back to min when the range is empty (test stubs use
+// {0, 0} to skip the sleep entirely).
+func (r retryBackoffRange) pick() time.Duration {
+	span := r.max - r.min
+	if span <= 0 {
+		return r.min
+	}
+	return r.min + time.Duration(rand.Int64N(int64(span)))
+}
+
+var retryBackoff = [retryMaxAttempts - 1]retryBackoffRange{
+	{100 * time.Millisecond, 300 * time.Millisecond},
+	{300 * time.Millisecond, 500 * time.Millisecond},
+	{500 * time.Millisecond, 800 * time.Millisecond},
+	{500 * time.Millisecond, 800 * time.Millisecond},
 }
 
 // retry runs fn up to retryMaxAttempts times on transient S3
-// failures, sleeping retryBackoff[i] before retry i+1. Returns
-// as soon as fn succeeds, returns a non-retryable error, or
-// ctx is cancelled.
+// failures, sleeping retryBackoff[i].pick() before retry i+1
+// (a uniformly-random duration drawn from the i-th window —
+// see retryBackoffRange's jitter rationale). Returns as soon as
+// fn succeeds, returns a non-retryable error, or ctx is
+// cancelled.
 //
 // op labels the wrapping S3 operation ("get" / "put" / "head" /
 // "list") for log lines; same string the caller's s3OpScope
@@ -55,14 +90,17 @@ var retryBackoff = [retryMaxAttempts - 1]time.Duration{
 // transient error (final attempt failed transient too) is NOT
 // logged here — the caller receives the error and handles
 // surfacing.
-func retry(ctx context.Context, op string, fn func() error) error {
+func retry(
+	ctx context.Context, op string, scope *s3OpScope,
+	fn func() error,
+) error {
 	var err error
 	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(retryBackoff[attempt-1]):
+			case <-time.After(retryBackoff[attempt-1].pick()):
 			}
 		}
 		err = fn()
@@ -72,10 +110,19 @@ func retry(ctx context.Context, op string, fn func() error) error {
 		if !isTransientS3Error(err) {
 			return err
 		}
-		// Transient failure. Log only when budget remains so the
-		// caller's terminal error surface isn't duplicated by a
-		// log line; final-attempt failures are the caller's to
-		// report.
+		// Transient failure. Record it on s3TransientCount so
+		// dashboards see masked retry causes (the call may still
+		// succeed below, in which case s3Count's terminal
+		// outcome=success would otherwise hide the cause). Fires
+		// for both non-terminal and terminal transients — the
+		// terminal one isn't double-counted because s3Count's
+		// terminal observation classifies it once on its own
+		// outcome=error label, while this metric counts the
+		// underlying transient events directly.
+		scope.recordTransient(err)
+		// Log only when budget remains so the caller's terminal
+		// error surface isn't duplicated by a log line; final-
+		// attempt failures are the caller's to report.
 		if attempt < retryMaxAttempts-1 {
 			slog.Warn("s3store: transient error, retrying",
 				"op", op,
@@ -292,15 +339,16 @@ const CommitTimeoutFloor = time.Millisecond
 // loadTimingConfig emits a slog.Warn at construction. It bounds
 // the retry envelope for the two PUTs that participate in the
 // SettleWindow contract (ref + token-commit): each PUT can retry
-// up to retryMaxAttempts (4) with backoffs 200ms / 400ms / 800ms
-// (sum 1.4 s sleep per call), so two PUTs in worst case spend
-// ~2.8 s in retry sleep alone, plus actual request time. 6 s
-// gives ~2× safety on that retry envelope. Operators on
-// tightly-clocked dev/test deployments can set CommitTimeout
-// below this and ignore the warning; production deployments
-// should size CommitTimeout above the advisory so transient S3
-// retries cannot cause the SettleWindow contract to be missed.
-const CommitTimeoutAdvisory = 6 * time.Second
+// up to retryMaxAttempts (5) with jittered backoffs drawn from
+// 100-300 / 300-500 / 500-800 / 500-800 ms (worst-case sum
+// 2.4 s sleep per call), so two PUTs in worst case spend ~4.8 s
+// in retry sleep alone, plus actual request time. 8 s gives
+// ~1.67× safety on that retry envelope. Operators on tightly-
+// clocked dev/test deployments can set CommitTimeout below this
+// and ignore the warning; production deployments should size
+// CommitTimeout above the advisory so transient S3 retries
+// cannot cause the SettleWindow contract to be missed.
+const CommitTimeoutAdvisory = 8 * time.Second
 
 // MaxClockSkewFloor is the minimum MaxClockSkew value the library
 // accepts. Zero is a valid claim on tightly-clocked deployments
@@ -447,11 +495,11 @@ func newS3TargetSkipConfig(cfg S3TargetConfig) S3Target {
 // <Prefix>/_config/max-clock-skew, parses each body as a Go
 // time.Duration string, and rejects values below their floors.
 // CommitTimeoutFloor (1 ms) is the strict-positive floor that
-// keeps zero out of the protocol; CommitTimeoutAdvisory (6 s) is
-// a soft floor — values below it pass construction but emit a
-// slog.Warn so operators see when a configured CommitTimeout is
-// below the retry envelope of the two SettleWindow-relevant PUTs
-// (ref + token-commit). Surfaces a hint at the operator's
+// keeps zero out of the protocol; CommitTimeoutAdvisory (8 s)
+// is a soft floor — values below it pass construction but emit
+// a slog.Warn so operators see when a configured CommitTimeout
+// is below the retry envelope of the two SettleWindow-relevant
+// PUTs (ref + token-commit). Surfaces a hint at the operator's
 // seeding step when either object is missing.
 func loadTimingConfig(
 	ctx context.Context, t S3Target,
@@ -467,11 +515,12 @@ func loadTimingConfig(
 				"transient S3 retries on the ref-PUT or "+
 				"token-commit-PUT could exceed CommitTimeout and "+
 				"cause stream readers to skip the write; the "+
-				"advisory floor leaves ~2× safety on the worst-"+
-				"case retry envelope of the two PUTs (~2.8 s of "+
-				"backoff sleep across 4 attempts each). Acceptable "+
-				"for tightly-clocked dev/test deployments; "+
-				"production should size above the advisory.",
+				"advisory floor leaves ~1.67× safety on the worst-"+
+				"case retry envelope of the two PUTs (~4.8 s of "+
+				"jittered backoff sleep across 5 attempts each). "+
+				"Acceptable for tightly-clocked dev/test "+
+				"deployments; production should size above the "+
+				"advisory.",
 			"bucket", t.cfg.Bucket,
 			"prefix", t.cfg.Prefix,
 			"commitTimeout", commitTimeout,
@@ -633,7 +682,7 @@ func (t S3Target) get(
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var data []byte
-	err = retry(ctx, string(s3OpGet), func() error {
+	err = retry(ctx, string(s3OpGet), scope, func() error {
 		scope.incAttempts()
 		resp, err := t.cfg.S3Client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
@@ -717,7 +766,7 @@ func (t S3Target) putWithMetaCond(
 	// truncated bytes, backend lost bytes).
 	expectedMD5 := md5.Sum(data) //nolint:gosec // integrity-only
 	expectedETagHex := hex.EncodeToString(expectedMD5[:])
-	err = retry(ctx, string(s3OpPut), func() error {
+	err = retry(ctx, string(s3OpPut), scope, func() error {
 		scope.incAttempts()
 		// Build a fresh PutObjectInput every iteration so each
 		// attempt's Body is a *bytes.Reader at position 0. Reusing
@@ -828,7 +877,7 @@ func (t S3Target) head(
 	}
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
-	err = retry(ctx, string(s3OpHead), func() error {
+	err = retry(ctx, string(s3OpHead), scope, func() error {
 		scope.incAttempts()
 		resp, err := t.cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(t.cfg.Bucket),
@@ -864,7 +913,7 @@ func (t S3Target) listPage(
 	defer t.release()
 	apiOpts := consistencyAPIOpts(t.cfg.ConsistencyControl)
 	var out *s3.ListObjectsV2Output
-	err = retry(ctx, string(s3OpList), func() error {
+	err = retry(ctx, string(s3OpList), scope, func() error {
 		scope.incAttempts()
 		var err error
 		out, err = p.NextPage(ctx, func(o *s3.Options) {

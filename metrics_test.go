@@ -351,6 +351,79 @@ func TestMetrics_S3OpScope_ErrorClassification(t *testing.T) {
 	}
 }
 
+// TestMetrics_S3OpScope_RecordTransient pins the per-attempt
+// transient-error counter that retry() drives. Verifies (a) the
+// classification routes through to error.type, (b) the failed-
+// attempt index propagates to the s3store.attempt label, and
+// (c) nil errors / non-classifiable inputs are no-ops.
+func TestMetrics_S3OpScope_RecordTransient(t *testing.T) {
+	m, reader := newTestMetrics(t, "")
+	ctx := context.Background()
+
+	slowDownErr := &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{
+			Response: &http.Response{StatusCode: 429},
+		},
+		Err: &smithy.GenericAPIError{Code: "SlowDown"},
+	}
+	serverErr := &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{
+			Response: &http.Response{StatusCode: 503},
+		},
+		Err: &smithy.GenericAPIError{Code: "InternalError"},
+	}
+
+	sc := m.s3OpScope(ctx, s3OpPut)
+	sc.attempts = 1
+	sc.recordTransient(slowDownErr)
+	sc.attempts = 2
+	sc.recordTransient(serverErr)
+	sc.attempts = 2
+	sc.recordTransient(slowDownErr)
+	// Nil err is a no-op — recordTransient is called from retry's
+	// transient-only branch but defensive against accidental misuse.
+	sc.recordTransient(nil)
+
+	rm := collectMetrics(t, reader)
+	cases := []struct {
+		errType string
+		attempt string
+		want    int64
+	}{
+		{errTypeSlowDown, "1", 1},
+		{errTypeServer, "2", 1},
+		{errTypeSlowDown, "2", 1},
+	}
+	for _, c := range cases {
+		dp := findCounterDP(rm, "s3store.s3.transient_error.count",
+			map[string]string{
+				attrKeyOperation: "put",
+				attrKeyErrorType: c.errType,
+				attrKeyAttempt:   c.attempt,
+			})
+		if dp == nil {
+			t.Fatalf("transient_error.count not recorded "+
+				"for put/%s/attempt=%s", c.errType, c.attempt)
+		}
+		if dp.Value != c.want {
+			t.Errorf("transient_error.count{put,%s,attempt=%s}: "+
+				"got %d, want %d",
+				c.errType, c.attempt, dp.Value, c.want)
+		}
+	}
+}
+
+// TestMetrics_S3OpScope_RecordTransient_NilSafe ensures
+// recordTransient is safe on a nil receiver and a zero-value
+// scope (no metrics tree). retry()'s test calls pass scope=nil.
+func TestMetrics_S3OpScope_RecordTransient_NilSafe(t *testing.T) {
+	var sc *s3OpScope
+	sc.recordTransient(errors.New("anything"))
+
+	zeroScope := &s3OpScope{}
+	zeroScope.recordTransient(errors.New("anything"))
+}
+
 func TestMetrics_MethodScope_RecordsAggregates(t *testing.T) {
 	m, reader := newTestMetrics(t, "")
 	ctx := context.Background()
