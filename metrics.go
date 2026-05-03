@@ -8,6 +8,7 @@ import (
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -1131,6 +1132,19 @@ func classifyError(err error) (outcome, errType string) {
 		return outcomeError, errTypeNotFound
 	}
 	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
+		// API error code takes precedence over HTTP status. AWS S3
+		// can return SlowDown as HTTP 503 (not always 429), so a
+		// status-only switch buckets the throttle as
+		// errTypeServer and dashboards lose the actual cause. The
+		// SDK exposes the protocol-level error code via
+		// smithy.APIError; check it first when a smithy ResponseError
+		// is in the chain.
+		if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+			switch apiErr.ErrorCode() {
+			case "SlowDown":
+				return outcomeError, errTypeSlowDown
+			}
+		}
 		status := respErr.HTTPStatusCode()
 		switch {
 		case status == 412:

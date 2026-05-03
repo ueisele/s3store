@@ -153,6 +153,19 @@ func TestClassifyError(t *testing.T) {
 		},
 		Err: &smithy.GenericAPIError{Code: "SlowDown"},
 	}
+	// AWS S3 in production returns SlowDown as HTTP 503 (not 429).
+	// Status-only classification would bucket it as errTypeServer
+	// and lose the actual throttle cause on dashboards — pin the
+	// API-code-takes-precedence behaviour.
+	slowDown503Err := &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{
+			Response: &http.Response{StatusCode: 503},
+		},
+		Err: &smithy.GenericAPIError{
+			Code:    "SlowDown",
+			Message: "Quota exceeded. Reduce your request rate.",
+		},
+	}
 	serverErr := &smithyhttp.ResponseError{
 		Response: &smithyhttp.Response{
 			Response: &http.Response{StatusCode: 503},
@@ -179,6 +192,8 @@ func TestClassifyError(t *testing.T) {
 		{"NotFound", &s3types.NotFound{}, outcomeError, errTypeNotFound},
 		{"412 precondition", preconditionErr, outcomeError, errTypePreconditionFail},
 		{"429 slowdown", slowDownErr, outcomeError, errTypeSlowDown},
+		{"503 slowdown (API code overrides status)",
+			slowDown503Err, outcomeError, errTypeSlowDown},
 		{"5xx server", serverErr, outcomeError, errTypeServer},
 		{"4xx client", clientErr, outcomeError, errTypeClient},
 		{"transport", errors.New("dial tcp: i/o timeout"), outcomeError, errTypeTransport},
