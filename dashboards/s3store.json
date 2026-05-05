@@ -55,6 +55,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval]))",
+          "interval": "1m",
           "refId": "A"
         }
       ],
@@ -71,6 +72,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_outcome=\"error\"}[$__rate_interval])) / sum(rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval]))",
+          "interval": "1m",
           "refId": "A"
         }
       ],
@@ -102,6 +104,7 @@
       "targets": [
         {
           "expr": "topk(10, sum by (s3store_bucket, s3store_prefix) (rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "{{s3store_bucket}} / {{s3store_prefix}}",
           "refId": "A"
         }
@@ -118,6 +121,7 @@
       "targets": [
         {
           "expr": "topk(10, sum by (s3store_bucket, s3store_prefix) (rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_outcome=\"error\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "{{s3store_bucket}} / {{s3store_prefix}}",
           "refId": "A"
         }
@@ -134,6 +138,7 @@
       "targets": [
         {
           "expr": "topk(10, sum by (s3store_bucket, s3store_prefix) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "{{s3store_bucket}} / {{s3store_prefix}}",
           "refId": "A"
         }
@@ -175,6 +180,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_method) (rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_method}}",
           "refId": "A"
         }
@@ -191,6 +197,7 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "A"
         }
@@ -207,6 +214,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_outcome) (rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_outcome}}",
           "refId": "A"
         }
@@ -223,6 +231,7 @@
       "targets": [
         {
           "expr": "sum by (error_type, s3store_method) (rate(s3store_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_outcome=\"error\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_method}} · {{error_type}}",
           "refId": "A"
         }
@@ -249,11 +258,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50 {{s3store_method}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
         }
@@ -271,11 +282,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_write_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50 {{s3store_method}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_write_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
         }
@@ -293,11 +306,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50 {{s3store_method}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
         }
@@ -315,11 +330,13 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_write_records_sum{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "records/s",
           "refId": "A"
         },
         {
           "expr": "sum(rate(s3store_write_bytes_sum{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "bytes/s",
           "refId": "B"
         }
@@ -346,11 +363,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50 {{s3store_method}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_read_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
         }
@@ -367,11 +386,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50 {{s3store_method}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_read_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
         }
@@ -388,11 +409,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_files_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50 {{s3store_method}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_read_files_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
         }
@@ -409,16 +432,19 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_read_records_sum{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "records/s",
           "refId": "A"
         },
         {
           "expr": "sum(rate(s3store_read_bytes_sum{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "bytes/s",
           "refId": "B"
         },
         {
           "expr": "sum(rate(s3store_read_files_sum{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "files/s",
           "refId": "C"
         }
@@ -436,6 +462,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_method) (rate(s3store_read_missing_data_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_method}}",
           "refId": "A"
         }
@@ -453,6 +480,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_read_malformed_refs_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "malformed/s",
           "refId": "A"
         }
@@ -470,11 +498,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50 {{s3store_method}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_method) (rate(s3store_read_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
         }
@@ -500,6 +530,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_operation}}",
           "refId": "A"
         }
@@ -516,6 +547,7 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_operation) (rate(s3store_s3_request_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_operation}}",
           "refId": "A"
         }
@@ -533,6 +565,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!~\"0|1\"}[$__rate_interval])) / sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_operation}}",
           "refId": "A"
         }
@@ -549,6 +582,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_operation, error_type) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_outcome=\"error\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_operation}} · {{error_type}}",
           "refId": "A"
         }
@@ -565,11 +599,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_operation) (rate(s3store_s3_request_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_operation}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.99, sum by (le, s3store_operation) (rate(s3store_s3_request_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P99 {{s3store_operation}}",
           "refId": "B"
         }
@@ -586,11 +622,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_operation) (rate(s3store_s3_response_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95 {{s3store_operation}}",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.99, sum by (le, s3store_operation) (rate(s3store_s3_response_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P99 {{s3store_operation}}",
           "refId": "B"
         }
@@ -608,6 +646,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_operation, s3store_attempts) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_operation}} · attempts={{s3store_attempts}}",
           "refId": "A"
         }
@@ -625,6 +664,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_operation, error_type) (rate(s3store_s3_transient_error_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) / on (s3store_operation) group_left sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_operation}} · {{error_type}}",
           "refId": "A"
         }
@@ -684,11 +724,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_target_semaphore_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.99, sum by (le) (rate(s3store_target_semaphore_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P99",
           "refId": "B"
         }
@@ -705,6 +747,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_outcome) (rate(s3store_target_semaphore_acquires_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_outcome}}",
           "refId": "A"
         }
@@ -731,11 +774,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(s3store_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95",
           "refId": "B"
         }
@@ -753,11 +798,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(s3store_fanout_workers_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_fanout_workers_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95",
           "refId": "B"
         }
@@ -784,6 +831,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_read_iter_body_slot_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "events/s",
           "refId": "A"
         }
@@ -800,11 +848,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_read_iter_body_slot_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.99, sum by (le) (rate(s3store_read_iter_body_slot_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P99",
           "refId": "B"
         }
@@ -822,6 +872,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_read_iter_byte_budget_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "events/s",
           "refId": "A"
         }
@@ -838,11 +889,13 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_read_iter_byte_budget_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.99, sum by (le) (rate(s3store_read_iter_byte_budget_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P99",
           "refId": "B"
         }
@@ -860,16 +913,19 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(s3store_read_iter_partition_decode_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P50",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_read_iter_partition_decode_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P95",
           "refId": "B"
         },
         {
           "expr": "histogram_quantile(0.99, sum by (le) (rate(s3store_read_iter_partition_decode_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "P99",
           "refId": "C"
         }
@@ -896,6 +952,7 @@
       "targets": [
         {
           "expr": "sum by (s3store_method) (rate(s3store_read_commit_head_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "{{s3store_method}}",
           "refId": "A"
         }
@@ -913,6 +970,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_read_commit_head_cache_hit_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) / (sum(rate(s3store_read_commit_head_cache_hit_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) + sum(rate(s3store_read_commit_head_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_method=\"poll\"}[$__rate_interval])))",
+          "interval": "1m",
           "legendFormat": "hit ratio",
           "refId": "A"
         }
@@ -930,6 +988,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_write_commit_after_timeout_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "commit-after-timeout/s",
           "refId": "A"
         }
@@ -947,6 +1006,7 @@
       "targets": [
         {
           "expr": "sum(rate(s3store_write_optimistic_commit_collisions_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
           "legendFormat": "collisions/s",
           "refId": "A"
         }
