@@ -136,6 +136,7 @@ type metrics struct {
 	// Library method level.
 	methodDuration            metric.Float64Histogram
 	methodCalls               metric.Int64Counter
+	methodInFlight            metric.Int64UpDownCounter
 	writeRecords              metric.Int64Histogram
 	writePartitions           metric.Int64Histogram
 	writeBytes                metric.Int64Histogram
@@ -366,6 +367,10 @@ func newMetrics(
 	m.methodCalls = mustCounter(
 		"s3store.method.calls",
 		"Total library method calls, labelled by method and outcome",
+		"{call}")
+	m.methodInFlight = mustUpDown(
+		"s3store.method.in_flight",
+		"Currently-running public library method calls, labelled by method. Operators alert on max_over_time exceeding their normal call duration to surface stuck reads/writes (deadlocks, slow consumers, hung S3 ops, ctx-without-deadline misuse).",
 		"{call}")
 	m.writeRecords = mustHistInt(
 		"s3store.write.records",
@@ -923,12 +928,18 @@ type methodScope struct {
 }
 
 // methodScope begins observing one library method call. Returns a
-// scope; defer scope.end(&err) at the call site.
+// scope; defer scope.end(&err) at the call site. Increments the
+// s3store.method.in_flight gauge so operators can see live calls
+// — paired with a decrement in scope.end. The pair is
+// idempotent because end guards on s.done.
 func (m *metrics) methodScope(ctx context.Context, method methodKind) *methodScope {
 	if m == nil {
 		return &methodScope{}
 	}
-	return &methodScope{m: m, ctx: ctx, method: method, start: time.Now()}
+	scope := &methodScope{m: m, ctx: ctx, method: method, start: time.Now()}
+	cs, vs := m.callOpts(attribute.String(attrKeyMethod, string(method)))
+	m.methodInFlight.Add(ctx, 1, cs, vs)
+	return scope
 }
 
 // addRecords increments the count of records that the method
@@ -1087,6 +1098,11 @@ func (s *methodScope) end(errPtr *error) {
 	outcome, errType := classifyError(err)
 	methodAttr := attribute.String(attrKeyMethod, string(s.method))
 	outcomeAttr := attribute.String(attrKeyOutcome, outcome)
+	// Decrement in_flight counterpart to the increment in
+	// methodScope. Paired even on the error path so the gauge
+	// converges to zero when no calls are running.
+	icsM, ivsM := s.m.callOpts(methodAttr)
+	s.m.methodInFlight.Add(s.ctx, -1, icsM, ivsM)
 	var cs, vs metric.MeasurementOption
 	if errType != "" {
 		cs, vs = s.m.callOpts(methodAttr, outcomeAttr,

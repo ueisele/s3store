@@ -98,6 +98,19 @@ func findCounterDP(
 	return nil
 }
 
+// findUpDownDP returns the data point on a named UpDownCounter
+// whose attributes match every key=value pair in want, or nil if
+// no such point exists. UpDownCounters export as
+// metricdata.Sum[int64] with IsMonotonic=false, so the read shape
+// is identical to a regular Counter — this helper exists for
+// callsite clarity, so test code asserting on a gauge reads as
+// "find the gauge value" rather than "find the counter value."
+func findUpDownDP(
+	rm metricdata.ResourceMetrics, name string, want map[string]string,
+) *metricdata.DataPoint[int64] {
+	return findCounterDP(rm, name, want)
+}
+
 // findHistDPInt returns the int64 histogram data point matching
 // every key=value pair in want.
 func findHistDPInt(
@@ -562,6 +575,62 @@ func TestMetrics_MethodScope_AddXIsAdditive(t *testing.T) {
 	h := mt.Data.(metricdata.Histogram[int64])
 	if got := h.DataPoints[0].Sum; got != 350 {
 		t.Errorf("write.records sum: got %d, want 350", got)
+	}
+}
+
+// TestMetrics_MethodScope_InFlightGauge verifies the
+// in-flight UpDownCounter increments on methodScope() and
+// decrements on end(), labelled by method. Operators alert on
+// max_over_time of this gauge to surface stuck calls (deadlocks,
+// hung S3 ops, ctx-without-deadline misuse).
+func TestMetrics_MethodScope_InFlightGauge(t *testing.T) {
+	m, reader := newTestMetrics(t, "")
+	ctx := context.Background()
+
+	want := map[string]string{attrKeyMethod: string(methodRead)}
+
+	scA := m.methodScope(ctx, methodRead)
+	scB := m.methodScope(ctx, methodRead)
+
+	rm := collectMetrics(t, reader)
+	dp := findUpDownDP(rm, "s3store.method.in_flight", want)
+	if dp == nil {
+		t.Fatal("in_flight has no data point for method=read after 2 starts")
+	}
+	if dp.Value != 2 {
+		t.Errorf("in_flight after 2 starts: got %d, want 2", dp.Value)
+	}
+
+	var err error
+	scA.end(&err)
+	rm = collectMetrics(t, reader)
+	dp = findUpDownDP(rm, "s3store.method.in_flight", want)
+	if dp == nil || dp.Value != 1 {
+		var v int64
+		if dp != nil {
+			v = dp.Value
+		}
+		t.Errorf("in_flight after 1 end: got %d, want 1", v)
+	}
+
+	scB.end(&err)
+	rm = collectMetrics(t, reader)
+	dp = findUpDownDP(rm, "s3store.method.in_flight", want)
+	if dp == nil || dp.Value != 0 {
+		var v int64
+		if dp != nil {
+			v = dp.Value
+		}
+		t.Errorf("in_flight after both ends: got %d, want 0", v)
+	}
+
+	// Idempotent end: calling end() again must not double-decrement.
+	scB.end(&err)
+	rm = collectMetrics(t, reader)
+	dp = findUpDownDP(rm, "s3store.method.in_flight", want)
+	if dp != nil && dp.Value < 0 {
+		t.Errorf("in_flight after idempotent end: got %d, want 0 (no double-decrement)",
+			dp.Value)
 	}
 }
 
