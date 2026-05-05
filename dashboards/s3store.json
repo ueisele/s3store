@@ -239,10 +239,27 @@
       "fieldConfig": {"defaults": {"unit": "reqps", "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": {"mode": "normal"}}}, "overrides": []},
       "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
     },
+    {
+      "id": 2005,
+      "type": "timeseries",
+      "title": "Method calls in flight by method",
+      "description": "Currently-running public library method calls. UpDownCounter — incremented at scope entry, decremented at scope exit, so a value > 0 means a call is in flight. Operators alert on max_over_time exceeding the normal call duration to surface stuck calls (deadlocks, hung S3 ops, ctx-without-deadline misuse, slow consumers). Generalises s3store.read.iter.stall.count beyond the iter pipeline — covers writes, projection ops, and non-iter reads as well.",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 40},
+      "targets": [
+        {
+          "expr": "sum by (s3store_method) (s3store_method_in_flight{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"})",
+          "legendFormat": "{{s3store_method}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
 
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 48},
       "id": 3000,
       "panels": [],
       "title": "Write volumes — selected bucket / prefix",
@@ -254,7 +271,7 @@
       "title": "Records / Write call (P50 / P95)",
       "description": "Distribution of records committed per Write or WriteWithKey call.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -278,7 +295,7 @@
       "title": "Partitions / Write call (P50 / P95)",
       "description": "Distinct partition keys touched by Write (always 1 for WriteWithKey).",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_write_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -302,7 +319,7 @@
       "title": "Bytes / Write call (P50 / P95)",
       "description": "Total parquet body bytes uploaded per Write or WriteWithKey call.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 57},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -326,7 +343,7 @@
       "title": "Write throughput (records/s, bytes/s)",
       "description": "Sustained write throughput derived from histogram _sum.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 57},
       "targets": [
         {
           "expr": "sum(rate(s3store_write_records_sum{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -347,7 +364,7 @@
 
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 57},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 65},
       "id": 4000,
       "panels": [],
       "title": "Read volumes — selected bucket / prefix",
@@ -359,7 +376,7 @@
       "title": "Records / read call (P50 / P95)",
       "description": "Records returned per read-side method call. Covers every read entry point that records s3store.read.records: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / Poll / PollRecords / Lookup / LookupCommit / BackfillProjection.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 58},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 66},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -382,7 +399,7 @@
       "type": "timeseries",
       "title": "Bytes / read call (P50 / P95)",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 66},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -405,7 +422,7 @@
       "type": "timeseries",
       "title": "Files materialised / read call (P50 / P95)",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 66},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 74},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_files_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -428,7 +445,7 @@
       "type": "timeseries",
       "title": "Read throughput (records/s, bytes/s, files/s)",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 66},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 74},
       "targets": [
         {
           "expr": "sum(rate(s3store_read_records_sum{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -458,7 +475,7 @@
       "title": "Read missing data — NoSuchKey skips on tolerant paths",
       "description": "NoSuchKey skips per second on tolerant read paths (PollRecords / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / BackfillProjection). Strict paths (Read / ReadIter / ReadPartitionIter) fail instead, so this panel never includes them. A non-zero rate means data files have been pruned out from under live refs/markers — typically operator-driven pruning, or a LIST-to-GET race (the file vanished between LIST and GET).",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 74},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 82},
       "targets": [
         {
           "expr": "sum by (s3store_method) (rate(s3store_read_missing_data_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -476,7 +493,7 @@
       "title": "Read malformed refs — unparseable ref filenames",
       "description": "Ref objects whose filename failed to parse during a LIST on the ref stream. Skipped after a slog.Warn so consumers don't crash on a future schema or externally-written object. Always attributed to s3store_method=poll because the LIST runs in Poll, even when invoked indirectly by PollRecords / ReadRangeIter / ReadPartitionRangeIter / PollRange. (ReadEntriesIter / ReadPartitionEntriesIter take pre-resolved entries and don't LIST refs, so they never contribute here.) A sustained non-zero rate means an external writer or future binary is producing refs this binary can't decode.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 74},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 82},
       "targets": [
         {
           "expr": "sum(rate(s3store_read_malformed_refs_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -494,7 +511,7 @@
       "title": "Partitions / read call (P50 / P95)",
       "description": "Distinct Hive partitions touched per read-side method call. Recorded by every read entry point that funnels through the iter pipeline (Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Poll / Lookup / LookupCommit / BackfillProjection do not contribute. Pre-dedup count: this is the partition cardinality of the LIST result, before per-partition record dedup runs.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 82},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 90},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, s3store_method) (rate(s3store_read_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -515,7 +532,7 @@
 
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 90},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 98},
       "id": 5000,
       "panels": [],
       "title": "S3 operations — selected bucket / prefix",
@@ -526,7 +543,7 @@
       "type": "timeseries",
       "title": "S3 request rate by operation",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 91},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 99},
       "targets": [
         {
           "expr": "sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -543,7 +560,7 @@
       "type": "timeseries",
       "title": "S3 request duration P95 by operation",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 91},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 99},
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_operation) (rate(s3store_s3_request_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -561,7 +578,7 @@
       "title": "S3 retry rate by operation",
       "description": "Fraction of S3 wrapper calls that needed at least one outer retry (s3store.attempts > 1). Denominator excludes attempts=\"0\" (call exited before the retry loop ran, e.g. semaphore acquire was canceled — not an attempt to retry). Replaces the older histogram-bucketed P95 attempts panel: the new counter materialises every (operation × attempts) series via prewarm, so a single retry shows up immediately and rate() can't lose the first-ever observation.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 99},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 107},
       "targets": [
         {
           "expr": "sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!~\"0|1\"}[$__rate_interval])) / sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
@@ -578,7 +595,7 @@
       "type": "timeseries",
       "title": "S3 errors by operation × error.type",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 99},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 107},
       "targets": [
         {
           "expr": "sum by (s3store_operation, error_type) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_outcome=\"error\"}[$__rate_interval]))",
@@ -595,7 +612,7 @@
       "type": "timeseries",
       "title": "PUT request body size P95 / P99",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 107},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 115},
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_operation) (rate(s3store_s3_request_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -618,7 +635,7 @@
       "type": "timeseries",
       "title": "GET response body size P95 / P99",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 107},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 115},
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, s3store_operation) (rate(s3store_s3_response_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -642,7 +659,7 @@
       "title": "S3 retry attempts breakdown by operation",
       "description": "Per-second rate of S3 wrapper calls bucketed by their final attempt count (s3store.attempts label). attempts=\"1\" is the happy path (no retry); attempts=\"2\" through retryMaxAttempts are calls that needed N-1 retries before succeeding (or that exhausted the retry budget on outcome=error). attempts=\"0\" (call exited before the retry loop ran — semaphore acquire was canceled) is omitted here. Pre-warmed by metrics.prewarm so every (operation × attempts) series exists at zero before its first observation, letting rate() detect single retry events.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 115},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 123},
       "targets": [
         {
           "expr": "sum by (s3store_operation, s3store_attempts) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
@@ -660,7 +677,7 @@
       "title": "Transient retry causes (% of requests by error.type)",
       "description": "Share of S3 wrapper calls that hit a transient cause inside retry(), broken down by operation × error.type. Numerator is rate(s3store_s3_transient_error_count_total) — fires once per failed attempt (whether followed by another retry or the terminal one). Denominator is rate(s3store_s3_request_count_total{attempts!=\"0\"}) — total wrapper calls, excluding the rare semaphore-cancelled exit. Ratio can exceed 100% when calls retry multiple times per call (every retry is one transient event against one call) — that's a sustained-pressure signal worth investigating. Closes the visibility gap on s3store.s3.request.count, which only carries error.type for terminal errors and so leaves the cause of masked-by-retry failures invisible. Companion to the retry-attempts breakdown to its left: that one shows how often calls retry, this one shows why.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 115},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 123},
       "targets": [
         {
           "expr": "sum by (s3store_operation, error_type) (rate(s3store_s3_transient_error_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) / on (s3store_operation) group_left sum by (s3store_operation) (rate(s3store_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_attempts!=\"0\"}[$__rate_interval]))",
@@ -675,7 +692,7 @@
 
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 123},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 131},
       "id": 6000,
       "panels": [],
       "title": "Target saturation — selected bucket / prefix",
@@ -687,7 +704,7 @@
       "title": "S3 inflight (gauge)",
       "description": "Current S3 requests holding a Target semaphore slot.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 124},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 132},
       "targets": [
         {
           "expr": "sum by (s3store_bucket, s3store_prefix) (s3store_target_inflight{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"})",
@@ -704,7 +721,7 @@
       "title": "S3 acquire waiters (gauge)",
       "description": "Goroutines currently blocked on the Target semaphore. Sustained > 0 = saturation, increase MaxInflightRequests.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 124},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 132},
       "targets": [
         {
           "expr": "sum by (s3store_bucket, s3store_prefix) (s3store_target_waiting{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"})",
@@ -720,7 +737,7 @@
       "type": "timeseries",
       "title": "Semaphore wait duration P95 / P99",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 132},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 140},
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_target_semaphore_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -743,7 +760,7 @@
       "type": "timeseries",
       "title": "Semaphore acquires by outcome",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 132},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 140},
       "targets": [
         {
           "expr": "sum by (s3store_outcome) (rate(s3store_target_semaphore_acquires_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -758,7 +775,7 @@
 
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 140},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 148},
       "id": 7000,
       "panels": [],
       "title": "Fan-out — selected bucket / prefix",
@@ -770,7 +787,7 @@
       "title": "Items per fan-out call (P50 / P95)",
       "description": "Distribution of items dispatched per fan-out call (s3store internal concurrency primitive).",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 141},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 149},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(s3store_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -794,7 +811,7 @@
       "title": "Workers per fan-out call (P50 / P95)",
       "description": "Worker goroutines actually spawned per fan-out call (capped at min(concurrency, items)).",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 141},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 149},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(s3store_fanout_workers_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -815,7 +832,7 @@
 
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 149},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 157},
       "id": 8000,
       "panels": [],
       "title": "Iter pipeline saturation — selected bucket / prefix",
@@ -827,7 +844,7 @@
       "title": "Body-slot exhausted rate",
       "description": "Times the iter pipeline's body-slot pool was full and a downloader had to wait. Recurring > 0 means MaxInflightDownloads is the bottleneck.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 150},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 158},
       "targets": [
         {
           "expr": "sum(rate(s3store_read_iter_body_slot_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -844,7 +861,7 @@
       "type": "timeseries",
       "title": "Body-slot wait duration P95 / P99",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 150},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 158},
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_read_iter_body_slot_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -868,7 +885,7 @@
       "title": "Byte-budget exhausted rate",
       "description": "Times the iter pipeline's byte budget was full and the decoder had to wait. Recurring > 0 means ReadAheadBytes is too small for the workload.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 158},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 166},
       "targets": [
         {
           "expr": "sum(rate(s3store_read_iter_byte_budget_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -885,7 +902,7 @@
       "type": "timeseries",
       "title": "Byte-budget wait duration P95 / P99",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 158},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 166},
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(s3store_read_iter_byte_budget_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -909,7 +926,7 @@
       "title": "Partition decode duration P50 / P95 / P99",
       "description": "Wall-clock parquet decode time per partition (excludes byte-budget wait).",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 166},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 174},
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(s3store_read_iter_partition_decode_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
@@ -933,10 +950,28 @@
       "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
       "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
     },
+    {
+      "id": 8006,
+      "type": "timeseries",
+      "title": "Iter pipeline stall rate by method",
+      "description": "Watchdog increments this every 30s when the iter pipeline (any of Read / ReadIter / ReadRangeIter / ReadEntriesIter / ReadPartitionIter / ReadPartitionRangeIter / ReadPartitionEntriesIter / PollRecords) makes no forward progress for 60s. Pure observer — does NOT cancel the pipeline. Recurring > 0 means a deadlock (library bug — file an issue) or a slow consumer (heavy yield-side processing). Pair with the 'Method in-flight' gauge to confirm: stall + in-flight > 0 → pipeline is parked, not idle.",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 174},
+      "targets": [
+        {
+          "expr": "sum by (s3store_method) (rate(s3store_read_iter_stall_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
+          "legendFormat": "{{s3store_method}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never"}, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.05}]}}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
 
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 174},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 182},
       "id": 9000,
       "panels": [],
       "title": "Commit-marker gate — selected bucket / prefix",
@@ -948,7 +983,7 @@
       "title": "Commit-marker HEAD rate by method",
       "description": "HEAD requests issued against `<token>.commit` to gate visibility. Snapshot reads (read / read_iter / read_partition_iter / lookup / lookup_commit / backfill) HEAD per multi-attempt token, tagged with the entry-point method. Stream reads (poll / poll_records / read_range_iter / read_partition_range_iter) HEAD per ref on per-poll cache misses; these are always tagged s3store_method=poll because the inner Poll function owns the HEAD regardless of the outer caller. Sustained high rate on the poll series at low cache hit ratio means tokens rarely repeat within a poll cycle (each ref pays a HEAD).",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 175},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 183},
       "targets": [
         {
           "expr": "sum by (s3store_method) (rate(s3store_read_commit_head_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -966,7 +1001,7 @@
       "title": "Stream-read commit-cache hit ratio",
       "description": "Per-poll (partition, token) cache hit ratio on the stream-read commit gate. Each repeat-token ref within one poll cycle hits the cache instead of issuing a fresh HEAD. Ratio = hits / (hits + HEADs). All stream-read paths (poll / poll_records / read_range_iter / read_partition_range_iter) tag their HEADs with s3store_method=poll because the inner Poll function owns the gate, so this panel filters the denominator to s3store_method=poll. High ratio means many refs share tokens within one cycle — the cache pays off, especially on backends that charge per HEAD. Snapshot reads have no cache and are excluded.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 175},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 183},
       "targets": [
         {
           "expr": "sum(rate(s3store_read_commit_head_cache_hit_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) / (sum(rate(s3store_read_commit_head_cache_hit_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])) + sum(rate(s3store_read_commit_head_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\", s3store_method=\"poll\"}[$__rate_interval])))",
@@ -984,7 +1019,7 @@
       "title": "Write commit-after-timeout rate",
       "description": "Writes whose elapsed time from refMicroTs (just before the ref PUT) to token-commit-PUT completion exceeded CommitTimeout. The commit landed — this is not a Write failure — but a SettleWindow tuned to the configured CommitTimeout may not yet include this Write in the stream window when a Poll fires. Sustained > 0 means SettleWindow risks under-counting recent writes; either tighten CommitTimeout (and surface failures earlier) or raise SettleWindow. Pre-ref work (parquet encoding, marker PUTs, data PUT) is outside the budget by design.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 183},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 191},
       "targets": [
         {
           "expr": "sum(rate(s3store_write_commit_after_timeout_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
@@ -1002,7 +1037,7 @@
       "title": "Optimistic-commit collisions rate",
       "description": "WithOptimisticCommit writes whose conditional `<token>.commit` PUT was rejected because a prior commit already existed (412 PreconditionFailed, or 403 AccessDenied from a bucket-policy s3:PutOverwriteObject deny). The write recovers via a HEAD round-trip and returns the prior WriteResult; the parquet+ref from this attempt become orphans (invisible to readers via the commit gate). Sustained > 0 quantifies the orphan-rate cost the option trades for skipping the upfront HEAD — expected to be near-zero for fresh writes, non-trivial only on retried tokens.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 191},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 199},
       "targets": [
         {
           "expr": "sum(rate(s3store_write_optimistic_commit_collisions_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
