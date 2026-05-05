@@ -479,6 +479,15 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	decodedCh := make(chan decodedBatch[T], readAheadParts)
 	wg.Go(func() { s.runDecoder(ctx, state, opts, decodedCh) })
 
+	// Stall watchdog. Pure observer — surfaces deadlocks (library
+	// regressions) and slow consumers via slog.Warn +
+	// s3store.read.iter.stall.count, never cancels. See
+	// runDeadlockObserver for the rationale.
+	wg.Go(func() {
+		state.runDeadlockObserver(ctx, scope,
+			stallTickInterval, stallThreshold)
+	})
+
 	// Stage 4: emit loop. Drains decodedCh, hands each batch to
 	// the per-method emit callback (record-by-record yield or
 	// HivePartition[T] yield), signals on each completed partition
@@ -704,6 +713,9 @@ func (s *Reader[T]) runDecoder(
 ) {
 	defer close(decodedCh)
 	for pi := range state.parts {
+		// Surface decoder position to the observer so a stalled
+		// pipeline's slog.Warn points at the right partition.
+		state.decoderPi.Store(int64(pi))
 		// Check before each partition: a worker on an already-
 		// completed partition may have recorded a hard error while
 		// we were decoding the previous one. Surface it before
@@ -889,6 +901,20 @@ type streamState struct {
 	slotCh        chan struct{}
 	firstHardErr  error
 	m             *metrics
+
+	// lastProgressNs is the wall-clock timestamp (UnixNano) of the
+	// most recent forward-progress event in the pipeline:
+	// markComplete (a download landed) or releaseBodySlots (the
+	// decoder advanced through a file). Read by runDeadlockObserver
+	// to surface pipelines that have parked indefinitely. Atomic
+	// so the observer reads lock-free; staleness from a recent
+	// progress event between the load and the threshold check is
+	// fine — the observer fires at most every tick anyway.
+	lastProgressNs atomic.Int64
+	// decoderPi is the partition index the decoder is currently
+	// processing (waiting for / decoding / sending). Surfaced by
+	// the observer to point operators at the stuck partition.
+	decoderPi atomic.Int64
 }
 
 // recordHardErr stores the first non-cancellation download error
@@ -964,7 +990,9 @@ func (s *streamState) acquireBodySlot(ctx context.Context) bool {
 
 // releaseBodySlots returns n slots to the pool. Each receive on
 // slotCh wakes the FIFO-earliest blocked downloader (per Go's
-// channel sendq).
+// channel sendq). Also bumps lastProgressNs so
+// runDeadlockObserver sees decoder-side progress (slots being
+// freed = the decoder is making its way through partitions).
 func (s *streamState) releaseBodySlots(n int) {
 	if n <= 0 || s.slotCh == nil {
 		return
@@ -972,6 +1000,7 @@ func (s *streamState) releaseBodySlots(n int) {
 	for range n {
 		<-s.slotCh
 	}
+	s.lastProgressNs.Store(time.Now().UnixNano())
 }
 
 // markComplete is the downloader-side update: store the body in
@@ -981,6 +1010,10 @@ func (s *streamState) releaseBodySlots(n int) {
 // nil bodies in decodePartition and surfaces hard errors via
 // streamState.firstHardErr (recorded by runDownloader before its
 // cancel() call).
+//
+// Bumps lastProgressNs after the mutex is released so
+// runDeadlockObserver observes a fresh timestamp on every
+// downloaded file, lock-free.
 func (s *streamState) markComplete(
 	partIdx, fileIdx int, body []byte,
 ) {
@@ -989,6 +1022,7 @@ func (s *streamState) markComplete(
 	s.parts[partIdx].completed++
 	s.cond.Broadcast()
 	s.mu.Unlock()
+	s.lastProgressNs.Store(time.Now().UnixNano())
 }
 
 // waitForPartition blocks until every file in partition pi has
@@ -1071,6 +1105,92 @@ func (s *streamState) releaseBytes(uncomp int64) {
 	s.bufferedBytes -= uncomp
 	s.cond.Broadcast()
 	s.mu.Unlock()
+}
+
+// Stall watchdog defaults. Production downloadAndDecodeIter wires
+// these via runDeadlockObserver; tests override with shorter
+// intervals so a stall signal fires within milliseconds rather
+// than minutes.
+//
+// stallTickInterval is generous: the observer is a background
+// safety net, not a hot-path metric. A 30s tick on a stuck
+// pipeline means at most 30s of latency between the stall
+// starting and the first slog.Warn — operators see it long
+// before SIGQUIT-debugging is needed.
+//
+// stallThreshold is double the tick: a single missed tick is
+// not a stall (that would just be timing noise on a slow
+// consumer that's about to pull the next batch). Two missed
+// ticks signals a real lack of forward progress.
+const (
+	stallTickInterval = 30 * time.Second
+	stallThreshold    = 60 * time.Second
+)
+
+// runDeadlockObserver is the iter pipeline's stall watchdog —
+// pure observer, never cancels. Periodically wakes and emits a
+// slog.Warn + s3store.read.iter.stall.count increment if the
+// pipeline made no forward progress (markComplete or
+// releaseBodySlots) within the threshold window. Call sites in
+// downloadAndDecodeIter spawn one observer per pipeline alongside
+// the producer / downloader / decoder goroutines.
+//
+// The observer is a regression detector: the FIFO channel-based
+// slot semaphore makes the cond+counter starvation deadlock
+// unreachable, but a future change introducing a different stall
+// would otherwise be silent. Operators set an alert on a
+// non-zero rate of s3store.read.iter.stall.count to surface
+// deadlocks (real bugs) and slow consumers (heavy yield-side
+// processing) — both worth seeing.
+//
+// Pure-observer rationale: auto-canceling on stall would mask
+// information needed to diagnose the underlying issue (goroutine
+// state for SIGQUIT, channel occupancy, decoder partition) and
+// risk false-positive aborts of legitimately slow consumers.
+// Users who want a hard ceiling pass ctx.WithTimeout at the call
+// site — that propagates through every layer uniformly. A
+// circuit-breaker at the iter layer is straightforward to add in
+// caller code on top of this metric if a specific operational
+// scenario needs it.
+func (s *streamState) runDeadlockObserver(
+	ctx context.Context, scope *methodScope,
+	tickInterval, threshold time.Duration,
+) {
+	t := time.NewTicker(tickInterval)
+	defer t.Stop()
+	thresholdNs := threshold.Nanoseconds()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			last := s.lastProgressNs.Load()
+			if last == 0 {
+				// Pipeline hasn't logged any progress yet; either
+				// the very-first iter 1 download is still in flight
+				// (a single GET that exceeds the threshold is a
+				// legitimate reason to skip the alert) or the
+				// pipeline is empty and about to exit.
+				continue
+			}
+			staleNs := now.UnixNano() - last
+			if staleNs < thresholdNs {
+				continue
+			}
+			method := methodKind("")
+			if scope != nil {
+				method = scope.method
+			}
+			slog.Warn(
+				"s3store: iter pipeline made no forward progress within watchdog window",
+				"method", string(method),
+				"stale_seconds", time.Duration(staleNs).Seconds(),
+				"decoder_partition", s.decoderPi.Load(),
+				"slot_occupancy", len(s.slotCh),
+				"slot_capacity", cap(s.slotCh))
+			s.m.recordIterStall(ctx, method)
+		}
+	}
 }
 
 // decodedBatch is one partition's decoded records (or a single

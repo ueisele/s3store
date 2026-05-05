@@ -160,6 +160,7 @@ type metrics struct {
 	iterByteBudgetWait      metric.Float64Histogram
 	iterByteBudgetExhausted metric.Int64Counter
 	iterDecodeDuration      metric.Float64Histogram
+	iterStallCount          metric.Int64Counter
 }
 
 // newMetrics constructs all instruments under the OTel meter
@@ -453,6 +454,10 @@ func newMetrics(
 		"Wall-clock parquet decode time per partition (excludes byte-budget wait)",
 		"s",
 		metric.WithExplicitBucketBoundaries(durationBuckets...))
+	m.iterStallCount = mustCounter(
+		"s3store.read.iter.stall.count",
+		"Times the iter pipeline made no forward progress (markComplete or slot release) within the watchdog window — pure observer, the watchdog does not cancel the pipeline. Indicates a deadlock (library bug) or a slow consumer (heavy yield-side processing).",
+		"{event}")
 
 	// Materialise rare-event counter series at zero so rate() can
 	// catch their first non-zero observation. context.Background is
@@ -713,6 +718,23 @@ func (m *metrics) recordIterDecodeDuration(ctx context.Context, dur time.Duratio
 		return
 	}
 	m.iterDecodeDuration.Record(ctx, dur.Seconds(), m.constSetOpt)
+}
+
+// recordIterStall reports one watchdog tick that observed a
+// pipeline with no forward progress (markComplete or slot
+// release) within the threshold window. Carries the public
+// method as an attribute so operators can attribute stalls to a
+// specific entry point (Read / ReadIter / ReadPartitionIter /
+// PollRecords / etc.).
+//
+// Pure observer — the caller logs a slog.Warn alongside the
+// counter increment but does not cancel the pipeline.
+func (m *metrics) recordIterStall(ctx context.Context, method methodKind) {
+	if m == nil {
+		return
+	}
+	cs, vs := m.callOpts(attribute.String(attrKeyMethod, string(method)))
+	m.iterStallCount.Add(ctx, 1, cs, vs)
 }
 
 // s3OpScope tracks one outer S3 wrapper call. Created via
