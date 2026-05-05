@@ -422,11 +422,16 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	}
 
 	// Shared state: per-partition download progress + buffered
-	// uncompressed byte total + metrics handle for the wait-time
-	// observations that acquireBodySlot / reserveBytes emit.
+	// uncompressed byte total + body-slot semaphore + metrics
+	// handle for the wait-time observations that acquireBodySlot /
+	// reserveBytes emit. slotCh's buffered capacity is bodyCap;
+	// senders that find it full park in the channel's sendq, which
+	// drains FIFO on every receive — see streamState.slotCh for
+	// the fairness reasoning.
 	state := &streamState{
-		parts: parts,
-		m:     s.cfg.Target.metrics,
+		parts:  parts,
+		slotCh: make(chan struct{}, bodyCap),
+		m:      s.cfg.Target.metrics,
 	}
 	state.cond = sync.NewCond(&state.mu)
 
@@ -445,7 +450,7 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	wg.Go(func() { s.runProducer(ctx, jobsCh, parts) })
 	for range concurrency {
 		wg.Go(func() {
-			s.runDownloader(ctx, jobsCh, state, bodyCap, scope, cancel,
+			s.runDownloader(ctx, jobsCh, state, scope, cancel,
 				tolerantOfMissingData, &bytesDownloaded, &filesDownloaded)
 		})
 	}
@@ -631,13 +636,13 @@ func (s *Reader[T]) runProducer(
 // the scope.
 func (s *Reader[T]) runDownloader(
 	ctx context.Context, jobsCh <-chan downloadJob,
-	state *streamState, bodyCap int, scope *methodScope,
+	state *streamState, scope *methodScope,
 	cancel context.CancelFunc,
 	tolerantOfMissingData bool,
 	bytesDownloaded, filesDownloaded *atomic.Int64,
 ) {
 	for job := range jobsCh {
-		if !state.acquireBodySlot(ctx, bodyCap) {
+		if !state.acquireBodySlot(ctx) {
 			// Cascade ctx.Err() — not a hard error, just shutdown.
 			// markComplete with nil body keeps the partition's
 			// completed counter advancing so waitForPartition can
@@ -843,9 +848,25 @@ type partState struct {
 
 // streamState carries the shared mutable state of the pipeline:
 // per-partition download counters, the decoded-bytes reservation,
-// the in-memory compressed-body counter, and the cond var used
-// to signal across stages (download completion, body slot
-// release, decoded-byte release, ctx cancellation).
+// the body-slot semaphore, and the cond var used to signal across
+// stages (download completion, decoded-byte release, ctx
+// cancellation).
+//
+// slotCh is the body-slot semaphore, a buffered channel with
+// cap = bodyCap. Senders that find the buffer full park in the
+// channel's sendq, which the Go runtime drains FIFO on every
+// receive — so a release always wakes the longest-waiting
+// downloader. Replaces an earlier cond + counter design that
+// allowed scheduler-biased starvation: with cond.Broadcast all
+// waiters race for the mutex after wake, and whichever the
+// scheduler picked first incremented the counter, with the rest
+// re-Waiting. On a busy pipeline the same worker could
+// consistently win the race, leaving one specific worker's
+// pending pull permanently unmarked — and once the decoder
+// reached that pull's partition, the pipeline deadlocked.
+// Channel-based acquire is strictly FIFO and removes the
+// fairness window. Nil slotCh disables the semaphore (test
+// helper paths only; production always sets cap > 0).
 //
 // firstHardErr holds the first non-cancellation error a downloader
 // hit (strict NoSuchKey, hard transport). Set once via
@@ -861,13 +882,13 @@ type partState struct {
 // success, so operators can see body-slot pool / byte-budget
 // contention. Cancel-during-wait is not recorded (shutdown noise).
 type streamState struct {
-	mu                sync.Mutex
-	cond              *sync.Cond
-	parts             []*partState
-	bufferedBytes     int64
-	outstandingBodies int
-	firstHardErr      error
-	m                 *metrics
+	mu            sync.Mutex
+	cond          *sync.Cond
+	parts         []*partState
+	bufferedBytes int64
+	slotCh        chan struct{}
+	firstHardErr  error
+	m             *metrics
 }
 
 // recordHardErr stores the first non-cancellation download error
@@ -896,75 +917,61 @@ func (s *streamState) hardErr() error {
 	return s.firstHardErr
 }
 
-// acquireBodySlot reserves one slot in the compressed-body pool
-// against cap. Blocks while the pool is full and ctx is alive.
-// Returns false if ctx is cancelled while waiting. cap == 0
-// disables the cap (no back-pressure).
+// acquireBodySlot reserves one slot in the compressed-body pool.
+// Blocks while the pool is full and ctx is alive. Returns false
+// if ctx is cancelled while waiting. Nil slotCh disables the
+// semaphore (no back-pressure) — only used by tests.
 //
 // The pool counts compressed parquet bodies that downloaders
 // have stored into per-partition slots and the decoder has not
 // yet cleared. It bounds the worst-case compressed-byte
 // footprint of the pipeline to roughly cap × largest_compressed_size.
 //
-// Records to metrics.recordIterBodySlotWait only when the wait
-// fired (cond.Wait at least once) AND the slot was eventually
-// acquired — cancel-during-wait is intentionally not recorded
+// Implemented as a buffered channel `send`. The Go runtime drains
+// blocked senders FIFO on every receive, so releaseBodySlots
+// always wakes the earliest-parked downloader. This is the
+// load-bearing piece for the deterministic-deadlock fix: an
+// earlier cond + counter shape allowed scheduler-biased
+// starvation (Broadcast wakes everyone, the scheduler picks an
+// arbitrary winner, the rest re-Wait), which on busy pipelines
+// could leave one specific worker's pending pull permanently
+// unmarked.
+//
+// Records to metrics.recordIterBodySlotWait only when the slot
+// wasn't immediately available AND the acquire eventually
+// succeeded — cancel-during-wait is intentionally not recorded
 // (shutdown noise, near-zero duration would drown out the
 // saturation signal).
-//
-// The wait duration spans all wait iterations, so a thrashing
-// path records one cumulative observation rather than many
-// fragments. The metric record fires after s.mu is unlocked
-// (defer LIFO ordering) to keep the pipeline's hot-path lock
-// free of OTel work.
-func (s *streamState) acquireBodySlot(
-	ctx context.Context, cap int,
-) bool {
-	if cap <= 0 {
+func (s *streamState) acquireBodySlot(ctx context.Context) bool {
+	if s.slotCh == nil {
 		return ctx.Err() == nil
 	}
-	var waitDur time.Duration
-	s.mu.Lock()
-	defer func() {
-		// Runs after the s.mu.Unlock below (LIFO defers) so the
-		// metric record happens lock-free.
-		if waitDur > 0 {
-			s.m.recordIterBodySlotWait(ctx, waitDur)
-		}
-	}()
-	defer s.mu.Unlock()
-
-	var waitStart time.Time
-	waited := false
-	for s.outstandingBodies >= cap {
-		if ctx.Err() != nil {
-			// Cancel path: do NOT set waitDur — we only record
-			// successful acquires.
-			return false
-		}
-		if !waited {
-			waitStart = time.Now()
-			waited = true
-		}
-		s.cond.Wait()
+	// Non-blocking fast path: slot available, no wait observation.
+	select {
+	case s.slotCh <- struct{}{}:
+		return true
+	default:
 	}
-	if waited {
-		waitDur = time.Since(waitStart)
+	waitStart := time.Now()
+	select {
+	case s.slotCh <- struct{}{}:
+		s.m.recordIterBodySlotWait(ctx, time.Since(waitStart))
+		return true
+	case <-ctx.Done():
+		return false
 	}
-	s.outstandingBodies++
-	return true
 }
 
-// releaseBodySlots returns n slots to the pool and wakes any
-// blocked downloader (or the watchdog if ctx fires concurrently).
+// releaseBodySlots returns n slots to the pool. Each receive on
+// slotCh wakes the FIFO-earliest blocked downloader (per Go's
+// channel sendq).
 func (s *streamState) releaseBodySlots(n int) {
-	if n <= 0 {
+	if n <= 0 || s.slotCh == nil {
 		return
 	}
-	s.mu.Lock()
-	s.outstandingBodies -= n
-	s.cond.Broadcast()
-	s.mu.Unlock()
+	for range n {
+		<-s.slotCh
+	}
 }
 
 // markComplete is the downloader-side update: store the body in

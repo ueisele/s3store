@@ -13,6 +13,18 @@ func newTestStreamState() *streamState {
 	return s
 }
 
+// withSlotCap attaches a body-slot semaphore of the given
+// capacity. Mirrors how downloadAndDecodeIter wires up slotCh in
+// production. cap == 0 leaves slotCh nil — the no-back-pressure
+// path that the live pipeline never takes but that test cases
+// exercise to confirm the disabled-cap branch returns immediately.
+func (s *streamState) withSlotCap(cap int) *streamState {
+	if cap > 0 {
+		s.slotCh = make(chan struct{}, cap)
+	}
+	return s
+}
+
 // TestReserveBytes_NoCap verifies the cap=0 fast path returns
 // immediately and does not touch bufferedBytes.
 func TestReserveBytes_NoCap(t *testing.T) {
@@ -136,20 +148,19 @@ func TestReserveBytes_CtxCancellation(t *testing.T) {
 // back-pressure: once cap slots are held, the next acquire blocks
 // until releaseBodySlots returns one.
 func TestAcquireBodySlot_BlocksUntilRelease(t *testing.T) {
-	s := newTestStreamState()
-	const cap = 2
+	s := newTestStreamState().withSlotCap(2)
 
-	if !s.acquireBodySlot(context.Background(), cap) {
+	if !s.acquireBodySlot(context.Background()) {
 		t.Fatal("first acquire should succeed")
 	}
-	if !s.acquireBodySlot(context.Background(), cap) {
+	if !s.acquireBodySlot(context.Background()) {
 		t.Fatal("second acquire should succeed")
 	}
 
 	// Third must block — pool is full.
 	done := make(chan struct{})
 	go func() {
-		s.acquireBodySlot(context.Background(), cap)
+		s.acquireBodySlot(context.Background())
 		close(done)
 	}()
 	select {
@@ -166,44 +177,43 @@ func TestAcquireBodySlot_BlocksUntilRelease(t *testing.T) {
 		t.Fatal("third acquire should have unblocked after release")
 	}
 
-	if s.outstandingBodies != 2 {
-		t.Errorf("outstandingBodies = %d, want 2", s.outstandingBodies)
+	if got := len(s.slotCh); got != 2 {
+		t.Errorf("slotCh occupancy = %d, want 2", got)
 	}
 }
 
-// TestAcquireBodySlot_NoCap returns true immediately and does
-// not touch the counter.
+// TestAcquireBodySlot_NoCap returns true immediately when slotCh
+// is nil (semaphore disabled — the test-helper path).
 func TestAcquireBodySlot_NoCap(t *testing.T) {
 	s := newTestStreamState()
-	if !s.acquireBodySlot(context.Background(), 0) {
-		t.Fatal("acquireBodySlot with cap=0 should return true")
+	if !s.acquireBodySlot(context.Background()) {
+		t.Fatal("acquireBodySlot with nil slotCh should return true")
 	}
-	if s.outstandingBodies != 0 {
-		t.Errorf("outstandingBodies = %d, want 0", s.outstandingBodies)
+	if s.slotCh != nil {
+		t.Errorf("slotCh = %v, want nil (no-cap path should not allocate)",
+			s.slotCh)
 	}
 }
 
 // TestAcquireBodySlot_CtxCancellation guards that a blocked
-// acquire returns false when ctx is cancelled (paired with the
-// watchdog broadcast in the live pipeline).
+// acquire returns false when ctx is cancelled. Channel-based
+// semaphore observes ctx.Done directly via select, so no watchdog
+// broadcast is needed (in contrast to reserveBytes / waitForPartition,
+// which still rely on the cond and need the watchdog wakeup).
 func TestAcquireBodySlot_CtxCancellation(t *testing.T) {
-	s := newTestStreamState()
-	const cap = 1
-	if !s.acquireBodySlot(context.Background(), cap) {
+	s := newTestStreamState().withSlotCap(1)
+	if !s.acquireBodySlot(context.Background()) {
 		t.Fatal("first acquire should succeed")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan bool, 1)
 	go func() {
-		got <- s.acquireBodySlot(ctx, cap)
+		got <- s.acquireBodySlot(ctx)
 	}()
 	time.Sleep(10 * time.Millisecond)
 
 	cancel()
-	s.mu.Lock()
-	s.cond.Broadcast()
-	s.mu.Unlock()
 
 	select {
 	case ok := <-got:
