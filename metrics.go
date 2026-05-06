@@ -219,18 +219,28 @@ func newMetrics(
 		0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5,
 	}
 	// byteBuckets covers parquet body sizes from a few KB through
-	// 1GB outliers. 4× jumps generally, with an extra boundary at
-	// 32MB to give 2× resolution around the typical workload's
-	// upper end (most data files in production land between 1KB
-	// and ~20MB) so P95 / P99 don't interpolate across a full
-	// decade of size.
+	// 1GB outliers. 4× jumps generally, with extra 2× boundaries
+	// at 8MB, 32MB, and 64MB to give finer resolution where the
+	// EncodeBufPoolMaxBytes-tuning signal lives:
+	//
+	//   - 8MB closes the 4×4MB→16MB gap so P95/P99/P100 don't
+	//     over-report when the typical write is ~5-10MB.
+	//   - 32MB sits at 2× resolution around the typical workload
+	//     upper end (most data files in production land between
+	//     1KB and ~20MB).
+	//   - 64MB closes the 4×32MB→128MB gap so a P100 reading on
+	//     the Bytes/Write call dashboard panel resolves
+	//     "bump cap to ~80MB" vs "bump cap to ~150MB" — different
+	//     operational responses, both within the realistic range
+	//     for a default 48MB cap.
 	//
 	// Zero-byte PUTs (markers, refs, token-commit) are filtered
 	// out before recording — see s3OpScope.end() — so the lower
 	// bound starts at 1KB without losing signal.
 	byteBuckets := []float64{
 		1024, 4096, 16384, 65536, 262144, 1048576,
-		4194304, 16777216, 33554432, 134217728, 1073741824,
+		4194304, 8388608, 16777216, 33554432,
+		67108864, 134217728, 1073741824,
 	}
 	// recordCountBuckets covers per-call record counts from single-
 	// row writes through million-row batches. Real per-partition
