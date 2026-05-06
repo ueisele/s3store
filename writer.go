@@ -50,6 +50,28 @@ type WriterConfig[T any] struct {
 	//
 	//	VersionOf: func(r T) int64 { return r.InsertedAt.UnixMicro() }
 	InsertedAtField string
+
+	// EncodeBufPoolMaxBytes caps the *bytes.Buffer capacity that the
+	// internal encode pool retains across writes. Buffers that grew
+	// beyond this on a single Write are dropped on Put — preventing
+	// one outlier batch from ballooning the pool's steady-state
+	// footprint, at the cost of losing reuse on the next Write of
+	// similar size.
+	//
+	// Set this slightly above the largest typical produced parquet
+	// size for the workload. If too low, large writes pay
+	// grow-from-zero plus copy-out on every Write (the encode
+	// becomes net negative vs no pool — see BenchmarkEncode_Pooled
+	// at sizes above the cap). If too high, idle pool retention
+	// grows in proportion to GOMAXPROCS, multiplied by the number
+	// of Writer instances in the process.
+	//
+	// The s3store.write.encode_buf_dropped counter increments every
+	// time a buffer is dropped due to this cap; a non-zero rate
+	// indicates the cap is undersized for the workload.
+	//
+	// Zero or negative selects the default (48 MiB).
+	EncodeBufPoolMaxBytes int64
 }
 
 // Writer is the write-side half of a Store. Owns the write path
@@ -88,19 +110,26 @@ type Writer[T any] struct {
 	pqWriterPool sync.Pool
 
 	// encodeBufPool holds *bytes.Buffer used as the parquet writer's
-	// output target. Reset() before reuse; oversized buffers
-	// (Cap above maxPooledEncodeBufCap) are dropped on Put so a
-	// single huge Write doesn't balloon the pool permanently.
+	// output target. Reset() before reuse; oversized buffers (Cap
+	// above encodeBufPoolMaxBytes) are dropped on Put so a single
+	// huge Write doesn't balloon the pool permanently.
 	encodeBufPool sync.Pool
+
+	// encodeBufPoolMaxBytes is the resolved
+	// WriterConfig.EncodeBufPoolMaxBytes — always > 0 after
+	// NewWriter. Zero/negative input is replaced with
+	// defaultEncodeBufPoolMaxBytes during construction so the
+	// hot path can compare buf.Cap() against this directly.
+	encodeBufPoolMaxBytes int64
 }
 
-// maxPooledEncodeBufCap is the upper bound on a *bytes.Buffer
-// returned to encodeBufPool. Buffers grown past this on a single
-// encode are dropped so the pool's steady-state footprint tracks
-// typical write sizes, not the worst-case batch ever observed.
-// 16 MiB comfortably covers a snappy-compressed parquet of ~50k
-// medium-width rows.
-const maxPooledEncodeBufCap = 16 << 20
+// defaultEncodeBufPoolMaxBytes is the fallback value applied when
+// WriterConfig.EncodeBufPoolMaxBytes is zero or negative. 48 MiB
+// covers parquet outputs from a few KB up to ~20 MiB with comfort,
+// which matches the common workload distribution. Workloads with
+// regular ≥ 50 MiB writes should override the field — leaving it
+// at the default makes those writes silently lose pool benefit.
+const defaultEncodeBufPoolMaxBytes int64 = 48 << 20
 
 // Target returns the untyped S3Target this Writer is bound to.
 // Use when constructing read-only tools
@@ -162,12 +191,17 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err != nil {
 		return nil, err
 	}
+	bufCap := cfg.EncodeBufPoolMaxBytes
+	if bufCap <= 0 {
+		bufCap = defaultEncodeBufPoolMaxBytes
+	}
 	return &Writer[T]{
-		cfg:                  cfg,
-		dataPath:             dataPath(cfg.Target.Prefix()),
-		refPath:              refPath(cfg.Target.Prefix()),
-		compressionCodec:     codec,
-		insertedAtFieldIndex: insertedAtIdx,
-		matviews:             matviews,
+		cfg:                   cfg,
+		dataPath:              dataPath(cfg.Target.Prefix()),
+		refPath:               refPath(cfg.Target.Prefix()),
+		compressionCodec:      codec,
+		insertedAtFieldIndex:  insertedAtIdx,
+		matviews:              matviews,
+		encodeBufPoolMaxBytes: bufCap,
 	}, nil
 }

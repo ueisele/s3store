@@ -109,6 +109,14 @@ type StoreConfig[T any] struct {
 	// for the full contract. Forwarded to WriterConfig only —
 	// readers don't emit markers.
 	MaterializedViews []MaterializedViewDef[T]
+
+	// EncodeBufPoolMaxBytes caps the encode-pool buffer capacity
+	// the Writer retains across writes. See
+	// WriterConfig.EncodeBufPoolMaxBytes for the contract.
+	// Forwarded to WriterConfig only — reader path doesn't pool
+	// encode buffers. Zero or negative selects the default
+	// (48 MiB).
+	EncodeBufPoolMaxBytes int64
 }
 
 // dedupEnabled reports whether latest-per-entity dedup applies.
@@ -182,11 +190,12 @@ func newStoreFromTarget[T any](cfg StoreConfig[T], target S3Target) (*Store[T], 
 // is easy to spot.
 func writerConfigFrom[T any](c StoreConfig[T], target S3Target) WriterConfig[T] {
 	return WriterConfig[T]{
-		Target:            target,
-		PartitionKeyOf:    c.PartitionKeyOf,
-		Compression:       c.Compression,
-		InsertedAtField:   c.InsertedAtField,
-		MaterializedViews: c.MaterializedViews,
+		Target:                target,
+		PartitionKeyOf:        c.PartitionKeyOf,
+		Compression:           c.Compression,
+		InsertedAtField:       c.InsertedAtField,
+		MaterializedViews:     c.MaterializedViews,
+		EncodeBufPoolMaxBytes: c.EncodeBufPoolMaxBytes,
 	}
 }
 

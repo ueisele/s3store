@@ -2,6 +2,7 @@ package s3store
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	"github.com/parquet-go/parquet-go"
@@ -44,13 +45,15 @@ func TestEncodeParquet_PooledMatchesFresh(t *testing.T) {
 	}
 
 	w := &Writer[rec]{
-		compressionCodec: &parquet.Snappy,
+		compressionCodec:      &parquet.Snappy,
+		encodeBufPoolMaxBytes: defaultEncodeBufPoolMaxBytes,
 	}
-	first, err := w.encodeParquet(in)
+	ctx := context.Background()
+	first, err := w.encodeParquet(ctx, in)
 	if err != nil {
 		t.Fatalf("pooled encode #1: %v", err)
 	}
-	second, err := w.encodeParquet(in)
+	second, err := w.encodeParquet(ctx, in)
 	if err != nil {
 		t.Fatalf("pooled encode #2 (after Reset): %v", err)
 	}

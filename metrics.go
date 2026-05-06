@@ -150,6 +150,7 @@ type metrics struct {
 	readCommitHeadHit         metric.Int64Counter
 	writeCommitAfterTO        metric.Int64Counter
 	writeOptimisticCollisions metric.Int64Counter
+	writeEncodeBufDropped     metric.Int64Counter
 
 	// Iter pipeline internals (downloadAndDecodeIter): bottleneck
 	// signals for the streamState's body-slot pool and byte-budget
@@ -426,6 +427,10 @@ func newMetrics(
 		"s3store.write.optimistic_commit.collisions",
 		"WithOptimisticCommit writes whose conditional commit PUT was rejected because a prior <token>.commit already existed (412 PreconditionFailed or 403 AccessDenied from a bucket-policy deny). The write recovers via a HEAD round-trip and returns the prior WriteResult; the orphan parquet+ref from this attempt are invisible to readers via the commit gate. Increments on the retry-found-prior-commit path that the option trades extra orphans for skipping the upfront HEAD on every fresh write.",
 		"{event}")
+	m.writeEncodeBufDropped = mustCounter(
+		"s3store.write.encode_buf_dropped",
+		"Pooled parquet-encode bytes.Buffer instances dropped on Put because their grown capacity exceeded WriterConfig.EncodeBufPoolMaxBytes. A non-zero rate means the cap is too low for the actual write-size distribution: the pool churns through fresh buffers on every large write (grow-from-zero plus copy-out tax) instead of reusing them. Tune EncodeBufPoolMaxBytes upward to cover the workload's peak produced parquet size.",
+		"{event}")
 	m.readCommitHead = mustCounter(
 		"s3store.read.commit_head",
 		"HEAD requests issued by the read paths against `<token>.commit` to gate visibility (snapshot reads on multi-attempt tokens; one per ref on stream reads after per-poll cache misses).",
@@ -541,6 +546,7 @@ func (m *metrics) prewarm(ctx context.Context) {
 	incidents := []metric.Int64Counter{
 		m.writeCommitAfterTO,
 		m.writeOptimisticCollisions,
+		m.writeEncodeBufDropped,
 		m.readMissingData,
 		m.readMalformedRefs,
 		m.iterBodySlotExhausted,
@@ -1072,6 +1078,21 @@ func (m *metrics) recordOptimisticCommitCollision(ctx context.Context) {
 		return
 	}
 	m.writeOptimisticCollisions.Add(ctx, 1, m.constSetOpt)
+}
+
+// recordEncodeBufDropped increments encode_buf_dropped each time
+// the pooled parquet-encode buffer's grown capacity exceeded
+// WriterConfig.EncodeBufPoolMaxBytes on Put and the buffer was
+// dropped instead of returned to the pool. Persistent non-zero
+// rate signals the cap is below the workload's typical produced
+// parquet size — every large write then pays grow-from-zero plus
+// copy-out, with no buffer-reuse benefit. No scope dimension —
+// only the write path emits.
+func (m *metrics) recordEncodeBufDropped(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.writeEncodeBufDropped.Add(ctx, 1, m.constSetOpt)
 }
 
 // end records the scope's terminal observations: duration,

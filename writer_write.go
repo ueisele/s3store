@@ -527,7 +527,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 		populateInsertedAt(records, s.insertedAtFieldIndex, writeStartTime)
 	}
 
-	parquetBytes, err := s.encodeParquet(records)
+	parquetBytes, err := s.encodeParquet(ctx, records)
 	if err != nil {
 		return nil, 0, fmt.Errorf("parquet encode: %w", err)
 	}
@@ -966,7 +966,13 @@ func encodeParquet[T any](
 // points into pooled state. Codec is constant per Writer (set at
 // NewWriter), so a pooled writer's compression config stays valid
 // across reuses.
-func (s *Writer[T]) encodeParquet(records []T) ([]byte, error) {
+//
+// Buffers grown beyond s.encodeBufPoolMaxBytes are dropped on Put
+// and the s3store.write.encode_buf_dropped counter is incremented
+// so operators can detect a cap that's undersized for the workload.
+func (s *Writer[T]) encodeParquet(
+	ctx context.Context, records []T,
+) ([]byte, error) {
 	buf, _ := s.encodeBufPool.Get().(*bytes.Buffer)
 	if buf == nil {
 		buf = &bytes.Buffer{}
@@ -992,8 +998,10 @@ func (s *Writer[T]) encodeParquet(records []T) ([]byte, error) {
 	out := append([]byte(nil), buf.Bytes()...)
 
 	s.pqWriterPool.Put(pw)
-	if buf.Cap() <= maxPooledEncodeBufCap {
+	if int64(buf.Cap()) <= s.encodeBufPoolMaxBytes {
 		s.encodeBufPool.Put(buf)
+	} else {
+		s.cfg.Target.metrics.recordEncodeBufDropped(ctx)
 	}
 	return out, nil
 }
