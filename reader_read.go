@@ -67,7 +67,7 @@ func (s *Reader[T]) Read(
 }
 
 // identityKey is the keyOf function for []string fan-outs — the
-// element is itself the dedup key. Used by projection/backfill
+// element is itself the dedup key. Used by matview/backfill
 // callers that union per-pattern lookup results.
 func identityKey(s string) string { return s }
 

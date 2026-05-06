@@ -92,7 +92,7 @@ if err != nil {
 `s3store.StoreConfig` embeds `S3TargetConfig`, so umbrella
 callers set `ConsistencyControl` once on the embedded fields and
 `New` forwards it onto the target it builds. Setting it on the
-*target* (not on `WriterConfig` / `ReaderConfig` / `ProjectionDef`)
+*target* (not on `WriterConfig` / `ReaderConfig` / `MaterializedViewDef`)
 means every S3 call routed through that target uses one and the
 same value — NetApp's "[same consistency for paired operations][sgcc]"
 rule is enforced by construction. On AWS / MinIO the header is
@@ -223,12 +223,12 @@ for what we do and don't know about the mechanism.
 These S3 operations correspond to s3store call sites as
 follows:
 
-- **PUT (new)** — data files, refs, and projection markers are
+- **PUT (new)** — data files, refs, and matview markers are
   always new-key writes. Data and ref ids are
   `{token}-{UUIDv7}` under `WithIdempotencyToken`, or
   `{UUIDv7}-{UUIDv7}` (auto-token = attempt-id) for token-less
-  writes; projection markers under
-  `_projection/{Name}/{col}={value}/m.proj` are byte-identical
+  writes; matview markers under
+  `_matview/{Name}/{col}={value}/m.matview` are byte-identical
   empty objects, so even a recurring write to the same marker
   key is semantically a "new write" (not a content change).
 - **PUT (overwrite)** — `<dataPath>/<partition>/<token>.commit`
@@ -249,7 +249,7 @@ follows:
   [reader_poll.go](reader_poll.go) / [commit.go](commit.go)).
 - **LIST** — partition LIST (snapshot reads, captures both
   `.parquet` and `.commit` siblings in one walk);
-  projection-marker LIST (`ProjectionReader.Lookup`); ref-stream
+  matview-marker LIST (`MaterializedViewReader.Lookup`); ref-stream
   LIST (`Poll` / `PollRecords` / `ReadRangeIter` /
   `ReadPartitionRangeIter`); all funnel through `listEach`
   ([target.go](target.go)).
@@ -292,7 +292,7 @@ the HEAD-with-ladder guarantee even on `read-after-new-write`.)
    partition LIST surfaces freshly-written data files plus their
    `<token>.commit` siblings in one walk; the gate drops
    uncommitted parquets before any GET.
-2. **`ProjectionReader.Lookup`** — LIST under `_projection/{col}={value}/`
+2. **`MaterializedViewReader.Lookup`** — LIST under `_matview/{col}={value}/`
    surfaces the marker emitted by the latest write.
 3. **`Poll` / `PollRecords` / `ReadRangeIter` /
    `ReadPartitionRangeIter`** — ref-stream LIST advances the
@@ -374,7 +374,7 @@ on the mechanism alone.
 More generally, asymmetric setups can't help s3store: both
 halves of the library issue LISTs that need list-after-write
 (partition LIST on the snapshot read path,
-projection-marker LIST in `ProjectionReader.Lookup`, ref-stream
+matview-marker LIST in `MaterializedViewReader.Lookup`, ref-stream
 LIST in `Poll`/`PollRecords`/`ReadRangeIter`/
 `ReadPartitionRangeIter`). Whichever side you weaken to a
 non-strong level loses list-after-write on its own LISTs —
@@ -592,14 +592,14 @@ The library's structural dependencies on docs-stated facts
 are now:
 
 - **List-after-write at the strong levels.** Partition LIST
-  on the snapshot read path, projection-marker LIST in
-  `ProjectionReader.Lookup`, and ref-stream LIST in
+  on the snapshot read path, matview-marker LIST in
+  `MaterializedViewReader.Lookup`, and ref-stream LIST in
   `Poll`/`PollRecords`/`ReadRangeIter`/`ReadPartitionRangeIter`
   all need it. Strong-* is documented to provide
   list-after-write within its scope (within a site for
   `strong-site`, across all sites for `strong-global`).
 - **Read-after-new-write on every PUT key.** Data files,
-  refs, projection markers, and `<token>.commit` markers all
+  refs, matview markers, and `<token>.commit` markers all
   rely on it. Data and ref PUTs use per-attempt paths and
   never overwrite, so they always live inside the new-key
   guarantee.

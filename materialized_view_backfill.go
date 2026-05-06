@@ -11,33 +11,32 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// BackfillStats reports the work BackfillProjection did: how many
-// parquet objects it scanned, how many records it decoded, and
-// how many marker PUTs it issued. Markers is per-object, not
-// globally deduplicated — a marker path produced by N parquet
-// files is counted N times (reflects S3 request cost, not
-// unique marker count). Useful for progress logging in a
-// migration job.
+// BackfillStats reports the work BackfillMaterializedView did:
+// how many parquet objects it scanned, how many records it
+// decoded, and how many marker PUTs it issued. Markers is
+// per-object, not globally deduplicated — a marker path produced
+// by N parquet files is counted N times (reflects S3 request
+// cost, not unique marker count). Useful for progress logging in
+// a migration job.
 type BackfillStats struct {
 	DataObjects int
 	Records     int
 	Markers     int
 }
 
-// BackfillProjection scans existing parquet data and writes
-// projection markers for every record already present. The normal
-// path is to wire projections via WriterConfig.Projections /
-// Config.Projections before the first Write; BackfillProjection is
-// the relief valve for records written before the projection
-// existed.
+// BackfillMaterializedView scans existing parquet data and writes
+// view markers for every record already present. The normal path
+// is to wire materialized views via WriterConfig.MaterializedViews
+// / Config.MaterializedViews before the first Write;
+// BackfillMaterializedView is the relief valve for records written
+// before the view existed.
 //
 // keyPatterns use the grammar from validateKeyPattern,
-// evaluated against target.PartitionKeyParts() (NOT the
-// projection's Columns) — backfill walks parquet data files,
-// which are keyed by partition. "*" covers everything; shard
-// across partitions to parallelize a migration. Overlapping
-// patterns are deduplicated, so each parquet file is scanned at
-// most once.
+// evaluated against target.PartitionKeyParts() (NOT the view's
+// Columns) — backfill walks parquet data files, which are keyed
+// by partition. "*" covers everything; shard across partitions
+// to parallelize a migration. Overlapping patterns are
+// deduplicated, so each parquet file is scanned at most once.
 //
 // until is an exclusive upper bound on data-file LastModified.
 // Typical use: until = deployTime_of_live_writer, so backfill
@@ -58,10 +57,10 @@ type BackfillStats struct {
 // idempotent) and safe to retry after a crash. Empty patterns
 // slice is a no-op: (BackfillStats{}, nil). First malformed
 // pattern fails with its index.
-func BackfillProjection[T any](
+func BackfillMaterializedView[T any](
 	ctx context.Context,
 	target S3Target,
-	def ProjectionDef[T],
+	def MaterializedViewDef[T],
 	keyPatterns []string,
 	until time.Time,
 ) (stats BackfillStats, err error) {
@@ -74,14 +73,14 @@ func BackfillProjection[T any](
 
 	// Validate target + def before the empty-patterns short-circuit
 	// so a misconfigured call surfaces deterministically regardless
-	// of the patterns slice. Full Target check — BackfillProjection
-	// LISTs partitioned data files (plan.Match consults
-	// PartitionKeyParts), so validateLookup's reduced subset isn't
-	// enough.
+	// of the patterns slice. Full Target check —
+	// BackfillMaterializedView LISTs partitioned data files
+	// (plan.Match consults PartitionKeyParts), so validateLookup's
+	// reduced subset isn't enough.
 	if err := target.Validate(); err != nil {
 		return stats, err
 	}
-	if err := validateProjectionDefShape(def.Name, def.Columns); err != nil {
+	if err := validateMatviewDefShape(def.Name, def.Columns); err != nil {
 		return stats, err
 	}
 	of, err := resolveOf(def)
@@ -94,13 +93,13 @@ func BackfillProjection[T any](
 		return stats, nil
 	}
 
-	projectionPath := projectionBasePath(target.Prefix(), def.Name)
+	matviewPath := matviewBasePath(target.Prefix(), def.Name)
 
 	dataPath := dataPath(target.Prefix())
 	plans, err := buildReadPlans(keyPatterns, dataPath, target.PartitionKeyParts())
 	if err != nil {
 		return stats, fmt.Errorf(
-			"BackfillProjection: %w", err)
+			"BackfillMaterializedView: %w", err)
 	}
 
 	keys, commits, err := listDataFiles(ctx, target, plans)
@@ -136,7 +135,7 @@ func BackfillProjection[T any](
 		func(ctx context.Context, _ int, km keyMeta) error {
 			key := km.Key
 			paths, nRecs, err := backfillMarkersForObject(
-				ctx, target, def.Name, def.Columns, of, projectionPath, key)
+				ctx, target, def.Name, def.Columns, of, matviewPath, key)
 			if err != nil {
 				// Operator-driven deletion (LIST-to-GET race,
 				// lifecycle, manual prune): a data file listed a
@@ -162,7 +161,7 @@ func BackfillProjection[T any](
 					ctx, p, nil, "application/octet-stream",
 				); err != nil {
 					return fmt.Errorf(
-						"backfill projection %q: put marker: %w",
+						"backfill matview %q: put marker: %w",
 						def.Name, err)
 				}
 			}
@@ -178,16 +177,17 @@ func BackfillProjection[T any](
 // backfillMarkersForObject decodes one parquet data object and
 // returns the deduplicated marker paths its records produce under
 // the resolved Of, plus the record count (for stats). Pulled out
-// of BackfillProjection's main loop so the dedup map doesn't leak
-// across objects — each file stands on its own, keeping memory
-// bounded by the largest file rather than the full backfill set.
+// of BackfillMaterializedView's main loop so the dedup map doesn't
+// leak across objects — each file stands on its own, keeping
+// memory bounded by the largest file rather than the full
+// backfill set.
 func backfillMarkersForObject[T any](
 	ctx context.Context,
 	target S3Target,
 	name string,
 	columns []string,
 	of func(T) ([]string, error),
-	projectionPath string,
+	matviewPath string,
 	key string,
 ) ([]string, int, error) {
 	data, err := target.get(ctx, key)
@@ -206,16 +206,16 @@ func backfillMarkersForObject[T any](
 		values, err := of(rec)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"backfill projection %q on %s: %w",
+				"backfill matview %q on %s: %w",
 				name, key, err)
 		}
 		if values == nil {
 			continue
 		}
-		p, err := markerPathFromValues(name, projectionPath, columns, values)
+		p, err := markerPathFromValues(name, matviewPath, columns, values)
 		if err != nil {
 			return nil, 0, fmt.Errorf(
-				"backfill projection %q on %s: %w",
+				"backfill matview %q on %s: %w",
 				name, key, err)
 		}
 		seen[p] = struct{}{}

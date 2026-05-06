@@ -17,20 +17,19 @@ type WriterConfig[T any] struct {
 	PartitionKeyOf func(T) string
 	Compression    CompressionCodec
 
-	// Projections lists the secondary projections the writer
-	// should maintain. Every Write iterates each entry, calls Of
-	// per record, and PUTs one empty marker per distinct
-	// (projection, column-values) tuple in the batch under
-	// <Prefix>/_projection/<Name>/. Validation runs at NewWriter:
+	// MaterializedViews lists the secondary materialized views the
+	// writer should maintain. Every Write iterates each entry,
+	// calls Of per record, and PUTs one empty marker per distinct
+	// (view, column-values) tuple in the batch under
+	// <Prefix>/_matview/<Name>/. Validation runs at NewWriter:
 	// Name non-empty + free of '/', Columns valid + unique,
 	// Of non-nil, Names unique across the slice.
 	//
 	// Constructed at writer-creation time so registration cannot
 	// race with Write and "registered after the first Write" is
-	// not a reachable state. Use BackfillProjection to
-	// retroactively cover records written before a projection
-	// existed.
-	Projections []ProjectionDef[T]
+	// not a reachable state. Use BackfillMaterializedView to
+	// retroactively cover records written before a view existed.
+	MaterializedViews []MaterializedViewDef[T]
 
 	// InsertedAtField names a time.Time field on T that the writer
 	// populates with its wall-clock time.Now() just before parquet
@@ -50,8 +49,8 @@ type WriterConfig[T any] struct {
 }
 
 // Writer is the write-side half of a Store. Owns the write path
-// (Write / WriteWithKey) and the projection list that drives
-// marker emission on Write.
+// (Write / WriteWithKey) and the materialized-view list that
+// drives marker emission on Write.
 //
 // Construct directly via NewWriter when a service only writes;
 // embed in Store when it also reads.
@@ -65,11 +64,10 @@ type Writer[T any] struct {
 	// re-switch on the string.
 	compressionCodec compress.Codec
 
-	// projections is the resolved per-projection marker emitter
-	// list, built once at NewWriter from cfg.Projections.
-	// Immutable after construction — no concurrency story needed
-	// on the write path.
-	projections []projectionWriter[T]
+	// matviews is the resolved per-view marker emitter list, built
+	// once at NewWriter from cfg.MaterializedViews. Immutable after
+	// construction — no concurrency story needed on the write path.
+	matviews []matviewWriter[T]
 
 	// insertedAtFieldIndex is the reflect struct-field path for
 	// WriterConfig.InsertedAtField, resolved once at NewWriter so
@@ -79,9 +77,10 @@ type Writer[T any] struct {
 }
 
 // Target returns the untyped S3Target this Writer is bound to.
-// Use when constructing read-only tools (NewProjectionReader,
-// BackfillProjection) against the same dataset without carrying
-// the Writer's T into their call graph.
+// Use when constructing read-only tools
+// (NewMaterializedViewReader, BackfillMaterializedView) against
+// the same dataset without carrying the Writer's T into their
+// call graph.
 func (w *Writer[T]) Target() S3Target {
 	return w.cfg.Target
 }
@@ -107,10 +106,11 @@ func (w *Writer[T]) PartitionKey(rec T) string {
 // Validation mirrors the writer-side half of New: the Target
 // must carry Bucket / Prefix / S3Client / PartitionKeyParts;
 // Compression resolves to a codec (zero value → snappy);
-// every ProjectionDef in cfg.Projections is shape-validated and
-// Of must be non-nil. Projection names must be unique across the
-// slice. PartitionKeyOf is optional at construction — Write
-// errors if called without it, but WriteWithKey works regardless.
+// every MaterializedViewDef in cfg.MaterializedViews is
+// shape-validated and Of must be non-nil. View names must be
+// unique across the slice. PartitionKeyOf is optional at
+// construction — Write errors if called without it, but
+// WriteWithKey works regardless.
 //
 // Constructor performs no S3 I/O. Idempotent retries are gated
 // by the writer's upfront HEAD on
@@ -132,7 +132,7 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 	if err != nil {
 		return nil, err
 	}
-	projections, err := buildProjectionWriters(cfg.Target, cfg.Projections)
+	matviews, err := buildMatviewWriters(cfg.Target, cfg.MaterializedViews)
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +142,6 @@ func NewWriter[T any](cfg WriterConfig[T]) (*Writer[T], error) {
 		refPath:              refPath(cfg.Target.Prefix()),
 		compressionCodec:     codec,
 		insertedAtFieldIndex: insertedAtIdx,
-		projections:          projections,
+		matviews:             matviews,
 	}, nil
 }

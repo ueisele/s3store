@@ -37,8 +37,8 @@ contract follows from that:
   duplicate window at storage; reader dedup catches whatever
   slips through.
 - **Read-after-write on snapshot reads.** `Read` / `ReadIter` /
-  `ReadPartitionIter` / `ProjectionReader.Lookup` /
-  `BackfillProjection` see new records the moment `Write`
+  `ReadPartitionIter` / `MaterializedViewReader.Lookup` /
+  `BackfillMaterializedView` see new records the moment `Write`
   returns. The change-stream APIs (`Poll`, `PollRecords`,
   `ReadRangeIter`, `ReadPartitionRangeIter`) intentionally lag
   the tip by `SettleWindow` to tolerate S3 LIST propagation skew.
@@ -63,7 +63,7 @@ contract follows from that:
   Every `Write` lands a single `<token>.commit` zero-byte object
   *after* the data and ref PUTs. Both read paths gate on its
   presence: snapshot reads (`Read` / `ReadIter` /
-  `ReadPartitionIter` / `ProjectionReader.Lookup`) drop parquets
+  `ReadPartitionIter` / `MaterializedViewReader.Lookup`) drop parquets
   without a sibling commit; the change-stream APIs (`Poll` /
   `PollRecords` / `ReadRangeIter` / `ReadPartitionRangeIter` /
   `ReadEntriesIter` / `ReadPartitionEntriesIter`) HEAD
@@ -406,7 +406,7 @@ write or only read can construct a single half with a narrower config:
 
 ```go
 // Build the shared S3 wiring once — Target is the untyped handle
-// Writer, Reader, ProjectionReader, and BackfillProjection all speak.
+// Writer, Reader, MaterializedViewReader, and BackfillMaterializedView all speak.
 // NewS3Target does two S3 GETs (commit-timeout + max-clock-skew) at
 // construction time; seed both via the snippet in "Initializing a new
 // dataset" before this call.
@@ -1342,9 +1342,9 @@ The deny scopes to `<prefix>/data/*/*.commit` — only the commit
 markers are protected. Data files (`<token>-<UUIDv7>.parquet`)
 and refs land under fresh per-attempt paths and never overwrite
 by construction, so they don't need the deny. Markers under
-`<prefix>/_projection/...` are intentionally overwriteable
+`<prefix>/_matview/...` are intentionally overwriteable
 (byte-equivalent zero-byte content), so excluding them keeps
-projection writes working.
+matview writes working.
 
 If you have multiple `Prefix` values on the same bucket, repeat
 the `Statement` entry per prefix or widen the `Resource` glob
@@ -1508,29 +1508,28 @@ unknown columns are ignored.
 Renames, splits, and row-level computed derivations still require a
 migration tool — rewrite the affected files with the new shape.
 
-## Secondary projections
+## Materialized views
 
 When a query filters on a column that isn't a partition key
 (e.g. "list every customer that had usage of SKU X in period
 P"), scanning every data file is prohibitive at scale. A
-secondary projection solves this by writing one empty S3
-*marker* per distinct tuple of the columns you want to query.
-The query is a single LIST under the marker prefix — zero
-parquet reads.
+materialized view solves this by writing one empty S3 *marker*
+per distinct tuple of the columns you want to query. The query
+is a single LIST under the marker prefix — zero parquet reads.
 
 ### Shape
 
-A projection has two halves that are wired separately:
+A materialized view has two halves that are wired separately:
 
-- **Write side (`ProjectionDef[T]`)** lives in `StoreConfig.Projections` /
-  `WriterConfig.Projections`. `Of` returns the per-record column
+- **Write side (`MaterializedViewDef[T]`)** lives in `StoreConfig.MaterializedViews` /
+  `WriterConfig.MaterializedViews`. `Of` returns the per-record column
   values as a `[]string` aligned to `Columns` (positional, in
   declared order). `Of` is optional — nil means the library
   reflects T's `parquet` tags + `Columns` once at `NewWriter` and
   emits markers without any caller code.
-- **Read side (`ProjectionLookupDef[K]`)** is consumed by
-  `s3store.NewProjectionReader(target, lookupDef)` to build a typed
-  `ProjectionReader[K]` query handle. `From` projects each marker back into
+- **Read side (`MaterializedViewLookupDef[K]`)** is consumed by
+  `s3store.NewMaterializedViewReader(target, lookupDef)` to build a typed
+  `MaterializedViewReader[K]` query handle. `From` projects each marker back into
   K. Same convention: nil means reflect K's parquet tags against
   `Columns`; a non-nil custom `From` overrides.
 
@@ -1541,7 +1540,7 @@ A projection has two halves that are wired separately:
 //   ChargePeriodStart time.Time `parquet:"charge_period_start"`
 //   ChargePeriodEnd   time.Time `parquet:"charge_period_end"`
 
-cfg.Projections = []s3store.ProjectionDef[Usage]{{
+cfg.MaterializedViews = []s3store.MaterializedViewDef[Usage]{{
     Name: "sku_period_idx",
     Columns: []string{
         "sku_id", "charge_period_start",
@@ -1566,8 +1565,8 @@ type SkuPeriodEntry struct {
     ChargePeriodEnd   time.Time `parquet:"charge_period_end"`
 }
 
-skuIdx, _ := s3store.NewProjectionReader(store.Target(),
-    s3store.ProjectionLookupDef[SkuPeriodEntry]{
+skuIdx, _ := s3store.NewMaterializedViewReader(store.Target(),
+    s3store.MaterializedViewLookupDef[SkuPeriodEntry]{
         Name: "sku_period_idx",
         Columns: []string{
             "sku_id", "charge_period_start",
@@ -1581,7 +1580,7 @@ When every `Columns` entry is already a `parquet:"..."`-tagged
 string field on T, both `Of` and `Layout` can be left zero:
 
 ```go
-cfg.Projections = []s3store.ProjectionDef[Usage]{{
+cfg.MaterializedViews = []s3store.MaterializedViewDef[Usage]{{
     Name:    "sku_customer_idx",
     Columns: []string{"sku_id", "causing_customer"},
     // Of: nil — library auto-projects from Usage's parquet tags.
@@ -1593,7 +1592,7 @@ column values come from somewhere other than parquet-tagged
 fields on T, fall back to writing `Of` explicitly:
 
 ```go
-cfg.Projections = []s3store.ProjectionDef[Usage]{{
+cfg.MaterializedViews = []s3store.MaterializedViewDef[Usage]{{
     Name:    "mixed_idx",
     Columns: []string{"sku_id", "month", "at"},
     Of: func(u Usage) ([]string, error) {
@@ -1606,18 +1605,18 @@ cfg.Projections = []s3store.ProjectionDef[Usage]{{
 }}
 ```
 
-Projections are wired at construction time, so registration
+Materialized views are wired at construction time, so registration
 cannot race with `Write` and "registered after the first Write"
-is not a reachable state. Use `BackfillProjection` (below) to
-retroactively cover records written before a projection existed.
+is not a reachable state. Use `BackfillMaterializedView` (below) to
+retroactively cover records written before a view existed.
 
-`ProjectionReader[K]` is T-free — a read-only service can build
+`MaterializedViewReader[K]` is T-free — a read-only service can build
 the handle without depending on the writer's record type.
 
-Every `Write` call iterates each registered projection, collects
+Every `Write` call iterates each registered view, collects
 a deduplicated set of marker paths across the batch, and PUTs
 one empty marker per distinct path under
-`<Prefix>/_projection/<name>/<col>=<val>/.../m.proj`. Duplicate
+`<Prefix>/_matview/<name>/<col>=<val>/.../m.matview`. Duplicate
 writes are idempotent (same S3 key, same empty body).
 
 #### Of and From: positional, aligned to Columns
@@ -1649,7 +1648,7 @@ hits, err := skuIdx.Lookup(ctx, []string{
 
 The pattern grammar is the same one `Read` accepts (exact,
 trailing-`*`, whole-segment `*`, `FROM..TO` range). Results are
-unbounded — narrow the pattern if a projection has millions of
+unbounded — narrow the pattern if a view has millions of
 matches.
 
 ### Multi-pattern reads
@@ -1663,8 +1662,8 @@ as additional elements of the same `[]string` patterns slice.
 Every read entry point already takes `[]string`:
 
 Every read entry point that takes patterns — `Read`, `ReadIter`,
-`ReadPartitionIter`, `ProjectionReader.Lookup`,
-`BackfillProjection` — accepts the same `[]string` shape:
+`ReadPartitionIter`, `MaterializedViewReader.Lookup`,
+`BackfillMaterializedView` — accepts the same `[]string` shape:
 
 ```go
 // Read across non-Cartesian tuples.
@@ -1673,14 +1672,14 @@ recs, _ := store.Read(ctx, []string{
     "period=2026-03-18/customer=def",
 })
 
-// Projection lookup over an arbitrary set of (col, col) tuples.
+// Materialized-view lookup over an arbitrary set of (col, col) tuples.
 entries, _ := idx.Lookup(ctx, []string{
     "sku=s1/customer=abc",
     "sku=s4/customer=def",
 })
 
 // One-off migration across several partitions.
-stats, _ := s3store.BackfillProjection(ctx, target, def,
+stats, _ := s3store.BackfillMaterializedView(ctx, target, def,
     []string{"period=2026-03-*/customer=*", "period=2026-04-01/customer=*"},
     until, nil)
 ```
@@ -1701,8 +1700,8 @@ set.
 
 ### What's in scope for v1
 
-- Wire projections via `StoreConfig.Projections`; auto-write on `Write` +
-  `Lookup` via the typed `ProjectionReader[K]` handle.
+- Wire materialized views via `StoreConfig.MaterializedViews`; auto-write on `Write` +
+  `Lookup` via the typed `MaterializedViewReader[K]` handle.
 - Read-after-write on Lookup: the marker PUT and the marker LIST
   both inherit `ConsistencyControl` from the shared `S3Target`,
   so a `Lookup` issued immediately after `Write` sees the new
@@ -1714,23 +1713,23 @@ set.
 
 ### Backfill
 
-The normal path is to wire a projection into `StoreConfig.Projections`
-before the first `Write` so every record produces markers. When
-that isn't possible — adding a projection to a store that
-already has data — the typical shape is:
+The normal path is to wire a materialized view into
+`StoreConfig.MaterializedViews` before the first `Write` so every
+record produces markers. When that isn't possible — adding a view
+to a store that already has data — the typical shape is:
 
-1. Deploy the live app with the projection in `StoreConfig.Projections`; every
+1. Deploy the live app with the view in `StoreConfig.MaterializedViews`; every
    new `Write` emits markers from time T0 onward.
 2. Capture `until := T0` — the watermark before which historical
    data is uncovered.
 3. Run a **one-off migration job** using the package-level
-   `s3store.BackfillProjection` that scans files with `LastModified <
+   `s3store.BackfillMaterializedView` that scans files with `LastModified <
    until` and PUTs the retroactive markers.
 
 ```go
-stats, err := s3store.BackfillProjection(ctx,
+stats, err := s3store.BackfillMaterializedView(ctx,
     store.Target(),     // or construct via s3store.NewS3Target
-    def,                // the same ProjectionDef the live app registered
+    def,                // the same MaterializedViewDef the live app registered
     []string{"*"},      // patterns (PartitionKeyParts grammar)
     until,              // exclusive upper bound on LastModified (time.Time)
     func(path string) { slog.Warn("missing data", "path", path) },
@@ -1738,18 +1737,18 @@ stats, err := s3store.BackfillProjection(ctx,
 // stats.DataObjects / Records / Markers
 ```
 
-`BackfillProjection` is deliberately standalone — no `Writer` /
+`BackfillMaterializedView` is deliberately standalone — no `Writer` /
 `Reader` argument — so the migration job doesn't need the live
 app's full config. It runs through the same `S3Target`
-abstraction used by the read-side `NewProjectionReader`, issuing both
+abstraction used by the read-side `NewMaterializedViewReader`, issuing both
 parquet GETs and marker PUTs via `target.S3Client`. Typically
 invoked from a dedicated binary (`cmd/backfill-<name>/main.go`
 in your repo): a ~30-line `main` that builds an S3 client +
-`S3Target` + the same `ProjectionDef[T]` the live app uses, then calls
-`BackfillProjection`.
+`S3Target` + the same `MaterializedViewDef[T]` the live app uses, then calls
+`BackfillMaterializedView`.
 
 The pattern is evaluated against the target's `PartitionKeyParts`
-(same grammar as `Read`), **not** against the projection's `Columns`
+(same grammar as `Read`), **not** against the view's `Columns`
 — backfill walks parquet data files, which are keyed by
 partition. A migration job can shard itself by partition
 (`period=2026-01-*` on one pod, `period=2026-02-*` on another)
@@ -1769,12 +1768,12 @@ records.
 Backfilled markers are subject to the same read-after-write
 contract as live-write markers: on a strong-consistent backend
 (AWS, MinIO, or StorageGRID with `ConsistencyControl` set on
-the target) a `Lookup` issued after `BackfillProjection` returns
+the target) a `Lookup` issued after `BackfillMaterializedView` returns
 sees every marker it just wrote.
 
 ### Not in v1 (deferred)
 
-- **Delete projection** — no general delete path on the store yet.
+- **Delete materialized view** — no general delete path on the store yet.
 - **Verification / orphan cleanup tools** — if `Of` changes
   semantically, stale markers remain. Backfill only adds
   missing markers; rebuild (delete-then-re-PUT) is a separate
@@ -1982,8 +1981,8 @@ bucket sees the new records immediately — no sleep, no settle
 delay:
 
 - `Reader.Read` / `ReadIter` / `ReadPartitionIter`
-- `ProjectionReader.Lookup`
-- `BackfillProjection`
+- `MaterializedViewReader.Lookup`
+- `BackfillMaterializedView`
 
 `Poll` / `PollRecords` / `ReadRangeIter` /
 `ReadPartitionRangeIter` are the intentional exceptions: they
@@ -2012,7 +2011,7 @@ issued after one `SettleWindow` has elapsed.
 If `Write` (or `WriteWithKey`) returns `nil`, every record in
 the batch is durably stored in S3 and will be returned by
 subsequent `Read`, `Poll`, `PollRecords`, and
-`ProjectionReader.Lookup` for the lifetime of the data. The write
+`MaterializedViewReader.Lookup` for the lifetime of the data. The write
 path commits in order: marker PUTs → data PUT → ref PUT →
 `<token>.commit` PUT, returning success only after the
 token-commit lands and the writer's ref→commit elapsed
@@ -2075,7 +2074,7 @@ response by path:
   resolves it because the next LIST won't include the deleted key.
 - **Tolerant — skip and signal.** `PollRecords`, `ReadRangeIter`,
   `ReadPartitionRangeIter`, `ReadEntriesIter`,
-  `ReadPartitionEntriesIter`, and `BackfillProjection` walk the
+  `ReadPartitionEntriesIter`, and `BackfillMaterializedView` walk the
   ref stream / data tree on a long-running shape where a single
   missing file shouldn't poison the whole job. They log via
   `slog.Warn` (level WARN, key=path, method=poll_records /
@@ -2133,8 +2132,8 @@ type StoreConfig[T any] struct {
     // Parquet compression codec (default snappy).
     Compression CompressionCodec
 
-    // Optional projections.
-    Projections []ProjectionDef[T]
+    // Optional materialized views.
+    MaterializedViews []MaterializedViewDef[T]
 }
 ```
 
@@ -2216,7 +2215,7 @@ hitting a transient cause X" as
 `WriteWithKey`, `LookupCommit`, `Read`, `ReadIter`,
 `ReadPartitionIter`, `ReadRangeIter`, `ReadPartitionRangeIter`,
 `ReadEntriesIter`, `ReadPartitionEntriesIter`, `Poll`,
-`PollRecords`, `ProjectionReader.Lookup`, `BackfillProjection`):
+`PollRecords`, `MaterializedViewReader.Lookup`, `BackfillMaterializedView`):
 
 | Name | Kind | Unit |
 |---|---|---|
@@ -2269,7 +2268,7 @@ from the per-poll cache instead.
 `s3store.read.missing_data` increments on `NoSuchKey` skips along
 the tolerant read paths (`PollRecords`, `ReadRangeIter`,
 `ReadPartitionRangeIter`, `ReadEntriesIter`,
-`ReadPartitionEntriesIter`, `BackfillProjection`). Carries
+`ReadPartitionEntriesIter`, `BackfillMaterializedView`). Carries
 `s3store.method` so dashboards can split by which path produced
 the skip. Strict paths (`Read`, `ReadIter`, `ReadPartitionIter`)
 fail instead of recording.
@@ -2287,8 +2286,8 @@ touched per call on every method that funnels through the iter
 pipeline: `Read` / `ReadIter` / `ReadPartitionIter` /
 `ReadRangeIter` / `ReadPartitionRangeIter` / `ReadEntriesIter` /
 `ReadPartitionEntriesIter` / `PollRecords`. Not recorded for
-`Poll` (refs only — no decode), `ProjectionReader.Lookup`,
-`Writer.LookupCommit`, or `BackfillProjection`. Mirrors
+`Poll` (refs only — no decode), `MaterializedViewReader.Lookup`,
+`Writer.LookupCommit`, or `BackfillMaterializedView`. Mirrors
 `s3store.write.partitions` on the write side.
 
 `Write` and `WriteWithKey` show up as distinct `s3store.method`
@@ -2304,7 +2303,7 @@ double-count.
 | `s3store.target.semaphore.wait.duration` | histogram | s | wait time before a slot was granted |
 | `s3store.target.semaphore.acquires` | counter | 1 | by `outcome` |
 
-**Fan-out** (concurrency primitive used by writer/reader/projection work):
+**Fan-out** (concurrency primitive used by writer/reader/matview work):
 
 | Name | Kind | Unit | What |
 |---|---|---|---|
@@ -2355,7 +2354,7 @@ Breaking changes in the single-package collapse:
   the S3 wiring across `StoreConfig`, `WriterConfig` (via
   `NewS3Target`), and `ReaderConfig`. Side knobs
   (`PartitionKeyOf`, `EntityKeyOf`, `VersionOf`, `Compression`,
-  `InsertedAtField`, `Projections`) stay at the top level.
+  `InsertedAtField`, `MaterializedViews`) stay at the top level.
 
   ```go
   // Before
@@ -2383,8 +2382,8 @@ Breaking changes in the single-package collapse:
   The single-package layout is the new home for everything: drop
   the `s3parquet/` import path and use `github.com/ueisele/s3store`
   directly. Every public symbol moved with the same name
-  (`Writer[T]`, `Reader[T]`, `S3Target`, `ProjectionDef[T]`,
-  `ProjectionReader[K]`, `BackfillProjection`, etc.).
+  (`Writer[T]`, `Reader[T]`, `S3Target`, `MaterializedViewDef[T]`,
+  `MaterializedViewReader[K]`, `BackfillMaterializedView`, etc.).
 - **DuckDB-only umbrella fields removed from `Config`.**
   `TableAlias`, `VersionColumn`, `EntityKeyColumns`,
   `ExtraInitSQL`, `Store.Query`, `Store.Close`, and `Store.SQL`
@@ -2405,22 +2404,22 @@ Breaking changes in the single-package collapse:
   path can drop that permission too. Retries still work
   unchanged via the token + conditional-PUT path.
 - **`OnMissingData` callback removed from `Config` and
-  `ReaderConfig`; `BackfillProjection` no longer takes an
+  `ReaderConfig`; `BackfillMaterializedView` no longer takes an
   `onMissingData` parameter.** Replaced with a built-in
   `slog.Warn` + `s3store.read.missing_data` OTel counter at the
   three tolerant call sites (`PollRecords`, `ReadRangeIter`,
-  `BackfillProjection`). The strict paths (`Read`, `ReadIter`) now
+  `BackfillMaterializedView`). The strict paths (`Read`, `ReadIter`) now
   fail with a wrapped `NoSuchKey` error instead of skip-and-
   notify — a caller retry resolves the LIST-to-GET race. Drop
   the callback from your config and the trailing argument from
-  `BackfillProjection` calls; configure your slog handler to route /
+  `BackfillMaterializedView` calls; configure your slog handler to route /
   count the warning, or alert on the counter via your metrics
   backend.
 
 For anyone upgrading across multiple releases, the older
 breaking-change history (projections-in-config, consistency-on-target,
 S3Target-as-handle, idempotent-write, bloom-filter removal,
-s3sql-as-Reader, the Projection refactor, the package split) is
+s3sql-as-Reader, the Projection refactor, the Projection→MaterializedView rename, the package split) is
 preserved in git history — `git log -- README.md`.
 
 ## Testing
@@ -2526,7 +2525,7 @@ Fresh write (auto-token, or `WithIdempotencyToken` /
 | Op   | Count | Key                                                             |
 |------|-------|-----------------------------------------------------------------|
 | HEAD | 0–1   | `<Prefix>/data/<partition>/<token>.commit` (skipped on auto-token; 1× upfront on the idempotent path, returns 404) |
-| PUT  | M     | `<Prefix>/_projection/<name>/.../m.proj` — one per distinct projection-marker key in the batch (M = 0 with no projections registered) |
+| PUT  | M     | `<Prefix>/_matview/<name>/.../m.matview` — one per distinct matview-marker key in the batch (M = 0 with no views registered) |
 | PUT  | 1     | `<Prefix>/data/<partition>/<token>-<attemptID>.parquet` (data) |
 | PUT  | 1     | `<Prefix>/_ref/<refMicroTs>-<token>-<attemptID>;<hiveEsc>.ref` (ref) |
 | PUT  | 1     | `<Prefix>/data/<partition>/<token>.commit` (token-commit, atomic visibility flip) |
@@ -2560,7 +2559,7 @@ error.
 `Read` / `ReadIter` / `ReadPartitionIter` / `ReadRangeIter`
 (snapshot half) / `ReadPartitionRangeIter` (snapshot half) /
 `ReadEntriesIter` / `ReadPartitionEntriesIter` /
-`BackfillProjection` share the same listing-and-gating skeleton:
+`BackfillMaterializedView` share the same listing-and-gating skeleton:
 
 | Op   | Count   | Key                                                           |
 |------|---------|---------------------------------------------------------------|
@@ -2578,21 +2577,21 @@ the partition is the unit of yield).
 stage entirely — the caller passes a pre-resolved
 `[]StreamEntry` (typically from `Poll`), so the GET stage runs
 directly.
-`BackfillProjection` adds **1 PUT per derived marker per parquet**
+`BackfillMaterializedView` adds **1 PUT per derived marker per parquet**
 (deduped within the parquet) on top of the GETs.
 
 `ReadRangeIter` / `ReadPartitionRangeIter` walk the ref stream
 first (see Stream read below) to collect data-file paths, then
 run the GET stage above.
 
-### Snapshot read — `ProjectionReader.Lookup`
+### Snapshot read — `MaterializedViewReader.Lookup`
 
 LIST-only. Marker objects are zero-byte; key parsing alone
-yields the projection's column values.
+yields the view's column values.
 
 | Op   | Count        | Key                                          |
 |------|--------------|----------------------------------------------|
-| LIST | ≥1 per plan  | `<Prefix>/_projection/<name>/<plan-prefix>/` |
+| LIST | ≥1 per plan  | `<Prefix>/_matview/<name>/<plan-prefix>/` |
 
 No GETs, no HEADs. The ref-stream LIST runs in `Poll`, but
 `Lookup` doesn't touch the data tree.

@@ -22,7 +22,7 @@ import (
 // Bounded goroutine count: unlike the older one-goroutine-per-item
 // shape, this caps spawned goroutines at the worker count even when
 // len(items) is large. Matters for nested fan-out (e.g. write
-// partitions × projection markers per partition) where the old shape
+// partitions × matview markers per partition) where the old shape
 // could spawn N×K goroutines that mostly parked on the per-target
 // MaxInflightRequests semaphore inside Target.put.
 //
@@ -46,7 +46,7 @@ import (
 //
 // Used as the single fan-out primitive across the package —
 // partition writes, parallel data-file downloads, multi-pattern
-// LISTs, BackfillProjection, etc. all funnel through here so the
+// LISTs, BackfillMaterializedView, etc. all funnel through here so the
 // "first error wins, parent cancel surfaces" semantics are
 // implemented once.
 func fanOut[I any](

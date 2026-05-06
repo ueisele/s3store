@@ -46,9 +46,9 @@ type Reader[T any] struct {
 }
 
 // Target returns the untyped S3Target this Reader is bound to.
-// Use when constructing a ProjectionReader[K] or running
-// BackfillProjection against the same dataset without carrying T
-// through the caller's signatures.
+// Use when constructing a MaterializedViewReader[K] or running
+// BackfillMaterializedView against the same dataset without
+// carrying T through the caller's signatures.
 func (r *Reader[T]) Target() S3Target {
 	return r.cfg.Target
 }

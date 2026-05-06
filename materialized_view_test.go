@@ -10,32 +10,32 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// testProjectionRec is the record shape the projection tests use. Two
+// testMatviewRec is the record shape the matview tests use. Two
 // partitionable fields + one "lookup-ish" one (sku).
-type testProjectionRec struct {
+type testMatviewRec struct {
 	Period   string `parquet:"period"`
 	Customer string `parquet:"customer"`
 	SKU      string `parquet:"sku"`
 }
 
-// SkuProjectionEntry is a typical projection-entry struct: all fields
+// SkuMatviewEntry is a typical matview-entry struct: all fields
 // string, one parquet tag each, no extras.
-type SkuProjectionEntry struct {
+type SkuMatviewEntry struct {
 	SKU      string `parquet:"sku"`
 	Period   string `parquet:"period"`
 	Customer string `parquet:"customer"`
 }
 
-func newProjectionTestStore(t *testing.T, projections ...ProjectionDef[testProjectionRec]) *Store[testProjectionRec] {
+func newMatviewTestStore(t *testing.T, views ...MaterializedViewDef[testMatviewRec]) *Store[testMatviewRec] {
 	t.Helper()
-	cfg := StoreConfig[testProjectionRec]{
+	cfg := StoreConfig[testMatviewRec]{
 		S3TargetConfig: S3TargetConfig{
 			Bucket:            "b",
 			Prefix:            "p",
 			S3Client:          &s3.Client{},
 			PartitionKeyParts: []string{"period", "customer"},
 		},
-		Projections: projections,
+		MaterializedViews: views,
 	}
 	s, err := newStoreFromTarget(cfg,
 		newS3TargetSkipConfig(cfg.S3TargetConfig))
@@ -45,13 +45,13 @@ func newProjectionTestStore(t *testing.T, projections ...ProjectionDef[testProje
 	return s
 }
 
-// TestBuildProjectionBinder_Valid guards the happy path: columns
+// TestBuildMatviewBinder_Valid guards the happy path: columns
 // match parquet tags on a string-only struct and the resulting
 // reflection-based binder round-trips a values slice back into
 // the typed entry.
-func TestBuildProjectionBinder_Valid(t *testing.T) {
+func TestBuildMatviewBinder_Valid(t *testing.T) {
 	cols := []string{"sku", "period", "customer"}
-	bind, err := defaultBinder[SkuProjectionEntry](cols, Layout{})
+	bind, err := defaultBinder[SkuMatviewEntry](cols, Layout{})
 	if err != nil {
 		t.Fatalf("defaultBinder: %v", err)
 	}
@@ -59,18 +59,18 @@ func TestBuildProjectionBinder_Valid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
-	want := SkuProjectionEntry{SKU: "s", Period: "p", Customer: "c"}
+	want := SkuMatviewEntry{SKU: "s", Period: "p", Customer: "c"}
 	if got != want {
 		t.Errorf("bind: got %+v, want %+v", got, want)
 	}
 }
 
-// TestBuildProjectionBinder_Rejects covers every validation branch: a
-// typo in Columns, a non-string field, an extra tagged field on
+// TestBuildMatviewBinder_Rejects covers every validation branch:
+// a typo in Columns, a non-string field, an extra tagged field on
 // the entry struct, and a non-struct type.
-func TestBuildProjectionBinder_Rejects(t *testing.T) {
+func TestBuildMatviewBinder_Rejects(t *testing.T) {
 	t.Run("missing tag on entry", func(t *testing.T) {
-		if _, err := defaultBinder[SkuProjectionEntry](
+		if _, err := defaultBinder[SkuMatviewEntry](
 			[]string{"sku", "period", "not_on_struct"},
 			Layout{},
 		); err == nil {
@@ -92,7 +92,7 @@ func TestBuildProjectionBinder_Rejects(t *testing.T) {
 	})
 
 	t.Run("extra tag on entry not in columns", func(t *testing.T) {
-		if _, err := defaultBinder[SkuProjectionEntry](
+		if _, err := defaultBinder[SkuMatviewEntry](
 			[]string{"sku", "period"}, // customer missing
 			Layout{},
 		); err == nil {
@@ -123,37 +123,37 @@ func TestBuildProjectionBinder_Rejects(t *testing.T) {
 	})
 }
 
-// TestCollectProjectionMarkerPaths_BatchDedup proves the writer
-// collects one marker per distinct (projection, column-values) tuple
+// TestCollectMatviewMarkerPaths_BatchDedup proves the writer
+// collects one marker per distinct (view, column-values) tuple
 // across a batch — duplicate records collapse to a single PUT.
-func TestCollectProjectionMarkerPaths_BatchDedup(t *testing.T) {
-	s := newProjectionTestStore(t, ProjectionDef[testProjectionRec]{
+func TestCollectMatviewMarkerPaths_BatchDedup(t *testing.T) {
+	s := newMatviewTestStore(t, MaterializedViewDef[testMatviewRec]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "period", "customer"},
-		Of: func(r testProjectionRec) ([]string, error) {
+		Of: func(r testMatviewRec) ([]string, error) {
 			return []string{r.SKU, r.Period, r.Customer}, nil
 		},
 	})
 
-	batch := []testProjectionRec{
+	batch := []testMatviewRec{
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1"},
 		{Period: "2026-03-17", Customer: "abc", SKU: "s1"}, // dup
 		{Period: "2026-03-17", Customer: "abc", SKU: "s2"},
 	}
-	got, err := s.collectProjectionMarkerPaths(batch)
+	got, err := s.collectMatviewMarkerPaths(batch)
 	if err != nil {
-		t.Fatalf("collectProjectionMarkerPaths: %v", err)
+		t.Fatalf("collectMatviewMarkerPaths: %v", err)
 	}
 	// Dedup collapses the duplicate s1 to one marker.
 	if len(got) != 2 {
 		t.Fatalf("got %d marker paths, want 2: %v", len(got), got)
 	}
 	for _, p := range got {
-		if !strings.HasPrefix(p, "p/_projection/sku_idx/") {
+		if !strings.HasPrefix(p, "p/_matview/sku_idx/") {
 			t.Errorf("marker path %q missing expected prefix", p)
 		}
-		if !strings.HasSuffix(p, "/m.proj") {
-			t.Errorf("marker path %q missing /m.proj suffix", p)
+		if !strings.HasSuffix(p, "/m.matview") {
+			t.Errorf("marker path %q missing /m.matview suffix", p)
 		}
 	}
 }
@@ -161,10 +161,10 @@ func TestCollectProjectionMarkerPaths_BatchDedup(t *testing.T) {
 // TestOf_NilSliceSkipsRecord guards that returning (nil, nil)
 // from Of skips the record entirely — no marker is emitted.
 func TestOf_NilSliceSkipsRecord(t *testing.T) {
-	s := newProjectionTestStore(t, ProjectionDef[testProjectionRec]{
+	s := newMatviewTestStore(t, MaterializedViewDef[testMatviewRec]{
 		Name:    "skip_idx",
 		Columns: []string{"sku", "period", "customer"},
-		Of: func(r testProjectionRec) ([]string, error) {
+		Of: func(r testMatviewRec) ([]string, error) {
 			if r.SKU == "skip" {
 				return nil, nil
 			}
@@ -172,12 +172,12 @@ func TestOf_NilSliceSkipsRecord(t *testing.T) {
 		},
 	})
 
-	got, err := s.collectProjectionMarkerPaths([]testProjectionRec{
+	got, err := s.collectMatviewMarkerPaths([]testMatviewRec{
 		{Period: "P", Customer: "C", SKU: "s1"},
 		{Period: "P", Customer: "C", SKU: "skip"},
 	})
 	if err != nil {
-		t.Fatalf("collectProjectionMarkerPaths: %v", err)
+		t.Fatalf("collectMatviewMarkerPaths: %v", err)
 	}
 	if len(got) != 1 {
 		t.Errorf("got %d paths, want 1 (the non-skipped record)",
@@ -188,15 +188,15 @@ func TestOf_NilSliceSkipsRecord(t *testing.T) {
 // TestOf_PropagatesError guards that an error returned by Of
 // fails the whole batch.
 func TestOf_PropagatesError(t *testing.T) {
-	s := newProjectionTestStore(t, ProjectionDef[testProjectionRec]{
+	s := newMatviewTestStore(t, MaterializedViewDef[testMatviewRec]{
 		Name:    "err_idx",
 		Columns: []string{"sku", "period", "customer"},
-		Of: func(r testProjectionRec) ([]string, error) {
+		Of: func(r testMatviewRec) ([]string, error) {
 			return nil, errors.New("of failed")
 		},
 	})
 
-	_, err := s.collectProjectionMarkerPaths([]testProjectionRec{
+	_, err := s.collectMatviewMarkerPaths([]testMatviewRec{
 		{Period: "P", Customer: "C", SKU: "s1"},
 	})
 	if err == nil {
@@ -211,16 +211,16 @@ func TestOf_PropagatesError(t *testing.T) {
 // slice whose length doesn't match Columns fails the write at
 // marker-path time.
 func TestOf_RejectsLengthMismatch(t *testing.T) {
-	s := newProjectionTestStore(t, ProjectionDef[testProjectionRec]{
+	s := newMatviewTestStore(t, MaterializedViewDef[testMatviewRec]{
 		Name:    "missing_col_idx",
 		Columns: []string{"sku", "period", "customer"},
-		Of: func(r testProjectionRec) ([]string, error) {
+		Of: func(r testMatviewRec) ([]string, error) {
 			// Only 2 values for 3 columns.
 			return []string{r.SKU, r.Period}, nil
 		},
 	})
 
-	_, err := s.collectProjectionMarkerPaths([]testProjectionRec{
+	_, err := s.collectMatviewMarkerPaths([]testMatviewRec{
 		{Period: "P", Customer: "C", SKU: "s1"},
 	})
 	if err == nil {
@@ -235,22 +235,22 @@ func TestOf_RejectsLengthMismatch(t *testing.T) {
 // unset, the library reflects T's parquet tags + Columns and
 // emits the matching marker without any caller code.
 func TestOf_AutoProjectsT(t *testing.T) {
-	s := newProjectionTestStore(t, ProjectionDef[testProjectionRec]{
+	s := newMatviewTestStore(t, MaterializedViewDef[testMatviewRec]{
 		Name:    "auto_idx",
 		Columns: []string{"sku", "customer"},
 		// Of intentionally nil.
 	})
 
-	got, err := s.collectProjectionMarkerPaths([]testProjectionRec{
+	got, err := s.collectMatviewMarkerPaths([]testMatviewRec{
 		{Period: "P", Customer: "abc", SKU: "s1"},
 	})
 	if err != nil {
-		t.Fatalf("collectProjectionMarkerPaths: %v", err)
+		t.Fatalf("collectMatviewMarkerPaths: %v", err)
 	}
 	if len(got) != 1 {
 		t.Fatalf("got %d paths, want 1", len(got))
 	}
-	want := "p/_projection/auto_idx/sku=s1/customer=abc/m.proj"
+	want := "p/_matview/auto_idx/sku=s1/customer=abc/m.matview"
 	if got[0] != want {
 		t.Errorf("marker path: got %q, want %q", got[0], want)
 	}
@@ -260,14 +260,14 @@ func TestOf_AutoProjectsT(t *testing.T) {
 // NewWriter when a Columns entry doesn't match any parquet tag
 // on T.
 func TestOf_AutoRejectsMissingTag(t *testing.T) {
-	cfg := StoreConfig[testProjectionRec]{
+	cfg := StoreConfig[testMatviewRec]{
 		S3TargetConfig: S3TargetConfig{
 			Bucket:            "b",
 			Prefix:            "p",
 			S3Client:          &s3.Client{},
 			PartitionKeyParts: []string{"period", "customer"},
 		},
-		Projections: []ProjectionDef[testProjectionRec]{{
+		MaterializedViews: []MaterializedViewDef[testMatviewRec]{{
 			Name:    "bad_idx",
 			Columns: []string{"sku", "not_on_t"},
 			// Of nil → auto-project, but "not_on_t" has no match.
@@ -298,7 +298,7 @@ func TestOf_AutoRejectsNonStringTag(t *testing.T) {
 			S3Client:          &s3.Client{},
 			PartitionKeyParts: []string{"sku"},
 		},
-		Projections: []ProjectionDef[RecWithInt]{{
+		MaterializedViews: []MaterializedViewDef[RecWithInt]{{
 			Name:    "amount_idx",
 			Columns: []string{"sku", "amount"},
 		}},
@@ -329,7 +329,7 @@ func TestOf_AutoProjectsTimeWithLayout(t *testing.T) {
 			S3Client:          &s3.Client{},
 			PartitionKeyParts: []string{"sku"},
 		},
-		Projections: []ProjectionDef[Rec]{{
+		MaterializedViews: []MaterializedViewDef[Rec]{{
 			Name:    "at_idx",
 			Columns: []string{"sku", "at"},
 			Layout:  Layout{Time: time.RFC3339},
@@ -341,13 +341,13 @@ func TestOf_AutoProjectsTimeWithLayout(t *testing.T) {
 		t.Fatalf("newStoreFromTarget: %v", err)
 	}
 
-	got, err := s.collectProjectionMarkerPaths([]Rec{
+	got, err := s.collectMatviewMarkerPaths([]Rec{
 		{SKU: "s1", At: time.Date(2026, 3, 17, 12, 0, 0, 0, time.UTC)},
 	})
 	if err != nil {
-		t.Fatalf("collectProjectionMarkerPaths: %v", err)
+		t.Fatalf("collectMatviewMarkerPaths: %v", err)
 	}
-	want := "p/_projection/at_idx/sku=s1/at=2026-03-17T12:00:00Z/m.proj"
+	want := "p/_matview/at_idx/sku=s1/at=2026-03-17T12:00:00Z/m.matview"
 	if len(got) != 1 || got[0] != want {
 		t.Errorf("marker path: got %v, want %q", got, want)
 	}
@@ -368,7 +368,7 @@ func TestOf_AutoTimeRequiresLayout(t *testing.T) {
 			S3Client:          &s3.Client{},
 			PartitionKeyParts: []string{"sku"},
 		},
-		Projections: []ProjectionDef[Rec]{{
+		MaterializedViews: []MaterializedViewDef[Rec]{{
 			Name:    "at_idx",
 			Columns: []string{"sku", "at"},
 			// Layout intentionally empty.
@@ -388,10 +388,10 @@ func TestOf_AutoTimeRequiresLayout(t *testing.T) {
 // enforce at path build time so a pathologically long entry
 // surfaces a clear error instead of an opaque S3 InvalidKey.
 func TestPathsOf_RejectsOversizedKey(t *testing.T) {
-	s := newProjectionTestStore(t, ProjectionDef[testProjectionRec]{
+	s := newMatviewTestStore(t, MaterializedViewDef[testMatviewRec]{
 		Name:    "big_idx",
 		Columns: []string{"sku", "period", "customer"},
-		Of: func(r testProjectionRec) ([]string, error) {
+		Of: func(r testMatviewRec) ([]string, error) {
 			return []string{
 				strings.Repeat("X", 500),
 				strings.Repeat("Y", 500),
@@ -400,8 +400,8 @@ func TestPathsOf_RejectsOversizedKey(t *testing.T) {
 		},
 	})
 
-	_, err := s.collectProjectionMarkerPaths(
-		[]testProjectionRec{{Period: "P", Customer: "C", SKU: "S"}})
+	_, err := s.collectMatviewMarkerPaths(
+		[]testMatviewRec{{Period: "P", Customer: "C", SKU: "S"}})
 	if err == nil {
 		t.Error("expected error for oversized marker key, got nil")
 	}
@@ -415,51 +415,51 @@ func TestPathsOf_RejectsOversizedKey(t *testing.T) {
 // can corrupt a marker path.
 func TestMarkerPathFromValues_ValidatesValues(t *testing.T) {
 	cols := []string{"sku", "period", "customer"}
-	projectionPath := "p/_projection/test"
+	matviewPath := "p/_matview/test"
 
-	if _, err := markerPathFromValues("test", projectionPath, cols,
+	if _, err := markerPathFromValues("test", matviewPath, cols,
 		[]string{"s", "2026-03-01", "a/b"},
 	); err == nil {
 		t.Error("expected error for '/' in customer, got nil")
 	}
-	if _, err := markerPathFromValues("test", projectionPath, cols,
+	if _, err := markerPathFromValues("test", matviewPath, cols,
 		[]string{"s..bad", "p", "c"},
 	); err == nil {
 		t.Error("expected error for '..' in sku, got nil")
 	}
-	if _, err := markerPathFromValues("test", projectionPath, cols,
+	if _, err := markerPathFromValues("test", matviewPath, cols,
 		[]string{"s", "", "c"},
 	); err == nil {
 		t.Error("expected error for empty period, got nil")
 	}
 }
 
-// TestWriterConfig_ProjectionValidation covers the construction-time
+// TestWriterConfig_MatviewValidation covers the construction-time
 // checks: empty name, name with '/', bad Columns, duplicate
-// projection names. Of is now optional (nil → auto-project).
-func TestWriterConfig_ProjectionValidation(t *testing.T) {
-	ofStub := func(testProjectionRec) ([]string, error) {
+// matview names. Of is now optional (nil → auto-project).
+func TestWriterConfig_MatviewValidation(t *testing.T) {
+	ofStub := func(testMatviewRec) ([]string, error) {
 		return nil, nil
 	}
 
 	cases := []struct {
 		name string
-		idx  ProjectionDef[testProjectionRec]
+		idx  MaterializedViewDef[testMatviewRec]
 	}{
-		{"empty name", ProjectionDef[testProjectionRec]{
+		{"empty name", MaterializedViewDef[testMatviewRec]{
 			Columns: []string{"sku", "period", "customer"},
 			Of:      ofStub,
 		}},
-		{"name with slash", ProjectionDef[testProjectionRec]{
+		{"name with slash", MaterializedViewDef[testMatviewRec]{
 			Name:    "bad/name",
 			Columns: []string{"sku", "period", "customer"},
 			Of:      ofStub,
 		}},
-		{"empty columns", ProjectionDef[testProjectionRec]{
+		{"empty columns", MaterializedViewDef[testMatviewRec]{
 			Name: "idx",
 			Of:   ofStub,
 		}},
-		{"duplicate column", ProjectionDef[testProjectionRec]{
+		{"duplicate column", MaterializedViewDef[testMatviewRec]{
 			Name:    "idx",
 			Columns: []string{"sku", "sku", "customer"},
 			Of:      ofStub,
@@ -467,14 +467,14 @@ func TestWriterConfig_ProjectionValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := StoreConfig[testProjectionRec]{
+			cfg := StoreConfig[testMatviewRec]{
 				S3TargetConfig: S3TargetConfig{
 					Bucket:            "b",
 					Prefix:            "p",
 					S3Client:          &s3.Client{},
 					PartitionKeyParts: []string{"period", "customer"},
 				},
-				Projections: []ProjectionDef[testProjectionRec]{tc.idx},
+				MaterializedViews: []MaterializedViewDef[testMatviewRec]{tc.idx},
 			}
 			_, err := newStoreFromTarget(cfg,
 				newS3TargetSkipConfig(cfg.S3TargetConfig))
@@ -485,19 +485,19 @@ func TestWriterConfig_ProjectionValidation(t *testing.T) {
 	}
 
 	t.Run("duplicate names", func(t *testing.T) {
-		def := ProjectionDef[testProjectionRec]{
+		def := MaterializedViewDef[testMatviewRec]{
 			Name:    "same",
 			Columns: []string{"sku", "period", "customer"},
 			Of:      ofStub,
 		}
-		cfg := StoreConfig[testProjectionRec]{
+		cfg := StoreConfig[testMatviewRec]{
 			S3TargetConfig: S3TargetConfig{
 				Bucket:            "b",
 				Prefix:            "p",
 				S3Client:          &s3.Client{},
 				PartitionKeyParts: []string{"period", "customer"},
 			},
-			Projections: []ProjectionDef[testProjectionRec]{def, def},
+			MaterializedViews: []MaterializedViewDef[testMatviewRec]{def, def},
 		}
 		_, err := newStoreFromTarget(cfg,
 			newS3TargetSkipConfig(cfg.S3TargetConfig))
@@ -507,38 +507,39 @@ func TestWriterConfig_ProjectionValidation(t *testing.T) {
 	})
 }
 
-// TestNewProjectionReader_ReadOnly proves NewProjectionReader builds a query handle
-// from a bare S3Target + ProjectionLookupDef without any Writer.
-func TestNewProjectionReader_ReadOnly(t *testing.T) {
+// TestNewMaterializedViewReader_ReadOnly proves
+// NewMaterializedViewReader builds a query handle from a bare
+// S3Target + MaterializedViewLookupDef without any Writer.
+func TestNewMaterializedViewReader_ReadOnly(t *testing.T) {
 	target := newS3TargetSkipConfig(S3TargetConfig{
 		Bucket:            "b",
 		Prefix:            "p",
 		S3Client:          &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
 	})
-	idx, err := NewProjectionReader(target, ProjectionLookupDef[SkuProjectionEntry]{
+	idx, err := NewMaterializedViewReader(target, MaterializedViewLookupDef[SkuMatviewEntry]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "period", "customer"},
 	})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 	if idx.name != "sku_idx" {
 		t.Errorf("name: got %q, want sku_idx", idx.name)
 	}
-	if idx.projectionPath != "p/_projection/sku_idx" {
-		t.Errorf("projectionPath: got %q, want p/_projection/sku_idx",
-			idx.projectionPath)
+	if idx.matviewPath != "p/_matview/sku_idx" {
+		t.Errorf("matviewPath: got %q, want p/_matview/sku_idx",
+			idx.matviewPath)
 	}
 	if idx.bind == nil {
 		t.Error("bind: got nil, want default reflection binder")
 	}
 }
 
-// TestNewProjectionReader_CustomFrom proves a non-nil From overrides the
-// default reflection binder, even for K's that have no parquet
-// tags at all.
-func TestNewProjectionReader_CustomFrom(t *testing.T) {
+// TestNewMaterializedViewReader_CustomFrom proves a non-nil From
+// overrides the default reflection binder, even for K's that have
+// no parquet tags at all.
+func TestNewMaterializedViewReader_CustomFrom(t *testing.T) {
 	type Untagged struct {
 		SKU      string
 		Customer string
@@ -547,7 +548,7 @@ func TestNewProjectionReader_CustomFrom(t *testing.T) {
 		Bucket: "b", Prefix: "p", S3Client: &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
 	})
-	idx, err := NewProjectionReader(target, ProjectionLookupDef[Untagged]{
+	idx, err := NewMaterializedViewReader(target, MaterializedViewLookupDef[Untagged]{
 		Name:    "untagged_idx",
 		Columns: []string{"sku", "customer"},
 		// values aligned to Columns: [sku, customer].
@@ -556,7 +557,7 @@ func TestNewProjectionReader_CustomFrom(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewProjectionReader with custom From: %v", err)
+		t.Fatalf("NewMaterializedViewReader with custom From: %v", err)
 	}
 	got, err := idx.bind([]string{"s1", "abc"})
 	if err != nil {
@@ -568,11 +569,11 @@ func TestNewProjectionReader_CustomFrom(t *testing.T) {
 	}
 }
 
-// TestNewProjectionReader_LayoutTime guards that Layout.Time on the
-// read side parses time.Time fields back into K via
+// TestNewMaterializedViewReader_LayoutTime guards that Layout.Time
+// on the read side parses time.Time fields back into K via
 // time.Parse(Layout.Time, ...). Mirror of the write-side
 // auto-projection rule.
-func TestNewProjectionReader_LayoutTime(t *testing.T) {
+func TestNewMaterializedViewReader_LayoutTime(t *testing.T) {
 	type SkuAtKey struct {
 		SKU string    `parquet:"sku"`
 		At  time.Time `parquet:"at"`
@@ -581,13 +582,13 @@ func TestNewProjectionReader_LayoutTime(t *testing.T) {
 		Bucket: "b", Prefix: "p", S3Client: &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
 	})
-	idx, err := NewProjectionReader(target, ProjectionLookupDef[SkuAtKey]{
+	idx, err := NewMaterializedViewReader(target, MaterializedViewLookupDef[SkuAtKey]{
 		Name:    "at_idx",
 		Columns: []string{"sku", "at"},
 		Layout:  Layout{Time: time.RFC3339},
 	})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 	got, err := idx.bind([]string{"s1", "2026-03-17T12:00:00Z"})
 	if err != nil {
@@ -602,10 +603,10 @@ func TestNewProjectionReader_LayoutTime(t *testing.T) {
 	}
 }
 
-// TestNewProjectionReader_LayoutTimeRequired guards that a time.Time
-// field on K + empty Layout.Time errors at NewProjectionReader,
-// mirroring the write-side requirement.
-func TestNewProjectionReader_LayoutTimeRequired(t *testing.T) {
+// TestNewMaterializedViewReader_LayoutTimeRequired guards that a
+// time.Time field on K + empty Layout.Time errors at
+// NewMaterializedViewReader, mirroring the write-side requirement.
+func TestNewMaterializedViewReader_LayoutTimeRequired(t *testing.T) {
 	type SkuAtKey struct {
 		SKU string    `parquet:"sku"`
 		At  time.Time `parquet:"at"`
@@ -614,7 +615,7 @@ func TestNewProjectionReader_LayoutTimeRequired(t *testing.T) {
 		Bucket: "b", Prefix: "p", S3Client: &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
 	})
-	_, err := NewProjectionReader(target, ProjectionLookupDef[SkuAtKey]{
+	_, err := NewMaterializedViewReader(target, MaterializedViewLookupDef[SkuAtKey]{
 		Name:    "at_idx",
 		Columns: []string{"sku", "at"},
 		// Layout intentionally empty.
@@ -627,10 +628,10 @@ func TestNewProjectionReader_LayoutTimeRequired(t *testing.T) {
 	}
 }
 
-// TestNewProjectionReader_LayoutTimeParseError guards that a
+// TestNewMaterializedViewReader_LayoutTimeParseError guards that a
 // malformed time string in a marker key surfaces as a Lookup
-// error (with the projection name and column wrapped in).
-func TestNewProjectionReader_LayoutTimeParseError(t *testing.T) {
+// error (with the view name and column wrapped in).
+func TestNewMaterializedViewReader_LayoutTimeParseError(t *testing.T) {
 	type SkuAtKey struct {
 		SKU string    `parquet:"sku"`
 		At  time.Time `parquet:"at"`
@@ -639,29 +640,29 @@ func TestNewProjectionReader_LayoutTimeParseError(t *testing.T) {
 		Bucket: "b", Prefix: "p", S3Client: &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
 	})
-	idx, err := NewProjectionReader(target, ProjectionLookupDef[SkuAtKey]{
+	idx, err := NewMaterializedViewReader(target, MaterializedViewLookupDef[SkuAtKey]{
 		Name:    "at_idx",
 		Columns: []string{"sku", "at"},
 		Layout:  Layout{Time: time.RFC3339},
 	})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 	if _, err := idx.bind([]string{"s1", "not-a-time"}); err == nil {
 		t.Error("expected parse error for malformed time, got nil")
 	}
 }
 
-func TestProjectionBasePath(t *testing.T) {
-	got := projectionBasePath("store", "sku_period_idx")
-	want := "store/_projection/sku_period_idx"
+func TestMatviewBasePath(t *testing.T) {
+	got := matviewBasePath("store", "sku_period_idx")
+	want := "store/_matview/sku_period_idx"
 	if got != want {
-		t.Errorf("projectionBasePath = %q, want %q", got, want)
+		t.Errorf("matviewBasePath = %q, want %q", got, want)
 	}
 }
 
-func TestBuildAndParseProjectionMarkerKey(t *testing.T) {
-	const projectionPath = "store/_projection/sku_period_idx"
+func TestBuildAndParseMatviewMarkerKey(t *testing.T) {
+	const matviewPath = "store/_matview/sku_period_idx"
 	columns := []string{
 		"sku_id", "charge_period_start",
 		"causing_customer", "charge_period_end",
@@ -671,41 +672,41 @@ func TestBuildAndParseProjectionMarkerKey(t *testing.T) {
 		"abc", "2026-04-01T00",
 	}
 
-	key := buildProjectionMarkerPath(projectionPath, columns, values)
+	key := buildMatviewMarkerPath(matviewPath, columns, values)
 
-	if !strings.HasSuffix(key, "/m.proj") {
-		t.Errorf("buildProjectionMarkerPath %q missing /m.proj suffix", key)
+	if !strings.HasSuffix(key, "/m.matview") {
+		t.Errorf("buildMatviewMarkerPath %q missing /m.matview suffix", key)
 	}
-	if !strings.HasPrefix(key, projectionPath+"/") {
-		t.Errorf("buildProjectionMarkerPath %q missing %q prefix",
-			key, projectionPath)
+	if !strings.HasPrefix(key, matviewPath+"/") {
+		t.Errorf("buildMatviewMarkerPath %q missing %q prefix",
+			key, matviewPath)
 	}
 
-	got, err := parseProjectionMarkerKey(key, projectionPath, columns)
+	got, err := parseMatviewMarkerKey(key, matviewPath, columns)
 	if err != nil {
-		t.Fatalf("parseProjectionMarkerKey: %v", err)
+		t.Fatalf("parseMatviewMarkerKey: %v", err)
 	}
 	if !reflect.DeepEqual(got, values) {
 		t.Errorf("round-trip: got %v, want %v", got, values)
 	}
 }
 
-func TestParseProjectionMarkerKey_Rejects(t *testing.T) {
-	const projectionPath = "store/_projection/idx"
+func TestParseMatviewMarkerKey_Rejects(t *testing.T) {
+	const matviewPath = "store/_matview/idx"
 	columns := []string{"a", "b"}
 
 	cases := []struct {
 		name, key string
 	}{
-		{"wrong prefix", "other/_projection/idx/a=1/b=2/m.proj"},
-		{"wrong suffix", "store/_projection/idx/a=1/b=2/other.txt"},
-		{"wrong segment count", "store/_projection/idx/a=1/m.proj"},
-		{"wrong column name", "store/_projection/idx/x=1/b=2/m.proj"},
+		{"wrong prefix", "other/_matview/idx/a=1/b=2/m.matview"},
+		{"wrong suffix", "store/_matview/idx/a=1/b=2/other.txt"},
+		{"wrong segment count", "store/_matview/idx/a=1/m.matview"},
+		{"wrong column name", "store/_matview/idx/x=1/b=2/m.matview"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := parseProjectionMarkerKey(
-				tc.key, projectionPath, columns,
+			if _, err := parseMatviewMarkerKey(
+				tc.key, matviewPath, columns,
 			); err == nil {
 				t.Errorf("expected error, got nil for %q", tc.key)
 			}

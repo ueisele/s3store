@@ -5,38 +5,37 @@ import (
 	"fmt"
 )
 
-// Projection write side: per-projection marker emission during
+// Materialized view write side: per-view marker emission during
 // Write.
 //
-// projectionWriter is the internal, K-erased per-projection
-// marker emitter the write path consumes. Given a record, pathOf
-// returns the S3 marker key the record produces under this
-// projection, or "" when ProjectionDef.Of returned (nil, nil)
-// signalling no marker.
-type projectionWriter[T any] struct {
+// matviewWriter is the internal, K-erased per-view marker emitter
+// the write path consumes. Given a record, pathOf returns the S3
+// marker key the record produces under this view, or "" when
+// MaterializedViewDef.Of returned (nil, nil) signalling no marker.
+type matviewWriter[T any] struct {
 	name   string
 	pathOf func(T) (string, error)
 }
 
-// buildProjectionWriters validates each ProjectionDef and resolves
-// it into a projectionWriter[T] closure ready for the write path.
-// Rejects duplicate Names so two projections can't silently share
-// the same _projection/<Name>/ subtree.
-func buildProjectionWriters[T any](
-	target S3Target, defs []ProjectionDef[T],
-) ([]projectionWriter[T], error) {
+// buildMatviewWriters validates each MaterializedViewDef and
+// resolves it into a matviewWriter[T] closure ready for the write
+// path. Rejects duplicate Names so two views can't silently share
+// the same _matview/<Name>/ subtree.
+func buildMatviewWriters[T any](
+	target S3Target, defs []MaterializedViewDef[T],
+) ([]matviewWriter[T], error) {
 	if len(defs) == 0 {
 		return nil, nil
 	}
 	seenNames := make(map[string]struct{}, len(defs))
-	out := make([]projectionWriter[T], 0, len(defs))
+	out := make([]matviewWriter[T], 0, len(defs))
 	for _, def := range defs {
-		if err := validateProjectionDefShape(def.Name, def.Columns); err != nil {
+		if err := validateMatviewDefShape(def.Name, def.Columns); err != nil {
 			return nil, err
 		}
 		if _, dup := seenNames[def.Name]; dup {
 			return nil, fmt.Errorf(
-				"duplicate projection name %q in WriterConfig.Projections",
+				"duplicate matview name %q in WriterConfig.MaterializedViews",
 				def.Name)
 		}
 		seenNames[def.Name] = struct{}{}
@@ -46,10 +45,10 @@ func buildProjectionWriters[T any](
 			return nil, err
 		}
 
-		projectionPath := projectionBasePath(target.Prefix(), def.Name)
+		matviewPath := matviewBasePath(target.Prefix(), def.Name)
 		name := def.Name
 		columns := def.Columns
-		out = append(out, projectionWriter[T]{
+		out = append(out, matviewWriter[T]{
 			name: name,
 			pathOf: func(rec T) (string, error) {
 				values, err := of(rec)
@@ -59,30 +58,29 @@ func buildProjectionWriters[T any](
 				if values == nil {
 					return "", nil
 				}
-				return markerPathFromValues(name, projectionPath, columns, values)
+				return markerPathFromValues(name, matviewPath, columns, values)
 			},
 		})
 	}
 	return out, nil
 }
 
-// collectProjectionMarkerPaths iterates every registered
-// projection over every record in the batch and returns the
-// deduplicated set of marker S3 keys. Dedup is via
-// map[string]struct{} on the full path, which is correct because
-// different projections live under different _projection/<name>/
-// prefixes — no cross-projection collisions.
-func (s *Writer[T]) collectProjectionMarkerPaths(records []T) ([]string, error) {
-	if len(s.projections) == 0 {
+// collectMatviewMarkerPaths iterates every registered materialized
+// view over every record in the batch and returns the deduplicated
+// set of marker S3 keys. Dedup is via map[string]struct{} on the
+// full path, which is correct because different views live under
+// different _matview/<name>/ prefixes — no cross-view collisions.
+func (s *Writer[T]) collectMatviewMarkerPaths(records []T) ([]string, error) {
+	if len(s.matviews) == 0 {
 		return nil, nil
 	}
 	seen := make(map[string]struct{})
-	for _, proj := range s.projections {
+	for _, mv := range s.matviews {
 		for _, rec := range records {
-			p, err := proj.pathOf(rec)
+			p, err := mv.pathOf(rec)
 			if err != nil {
 				return nil, fmt.Errorf(
-					"projection %q: %w", proj.name, err)
+					"matview %q: %w", mv.name, err)
 			}
 			if p == "" {
 				continue

@@ -104,11 +104,11 @@ type StoreConfig[T any] struct {
 	// the hot-path Write doesn't reparse it.
 	Compression CompressionCodec
 
-	// Projections lists the secondary projections the writer
-	// should maintain. See WriterConfig.Projections for the full
-	// contract. Forwarded to WriterConfig only — readers don't
-	// emit markers.
-	Projections []ProjectionDef[T]
+	// MaterializedViews lists the secondary materialized views the
+	// writer should maintain. See WriterConfig.MaterializedViews
+	// for the full contract. Forwarded to WriterConfig only —
+	// readers don't emit markers.
+	MaterializedViews []MaterializedViewDef[T]
 }
 
 // dedupEnabled reports whether latest-per-entity dedup applies.
@@ -182,11 +182,11 @@ func newStoreFromTarget[T any](cfg StoreConfig[T], target S3Target) (*Store[T], 
 // is easy to spot.
 func writerConfigFrom[T any](c StoreConfig[T], target S3Target) WriterConfig[T] {
 	return WriterConfig[T]{
-		Target:          target,
-		PartitionKeyOf:  c.PartitionKeyOf,
-		Compression:     c.Compression,
-		InsertedAtField: c.InsertedAtField,
-		Projections:     c.Projections,
+		Target:            target,
+		PartitionKeyOf:    c.PartitionKeyOf,
+		Compression:       c.Compression,
+		InsertedAtField:   c.InsertedAtField,
+		MaterializedViews: c.MaterializedViews,
 	}
 }
 

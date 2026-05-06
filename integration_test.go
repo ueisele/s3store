@@ -42,7 +42,7 @@ type Rec struct {
 type storeOpts struct {
 	entityKeyOf func(Rec) string
 	versionOf   func(Rec) int64
-	projections []ProjectionDef[Rec]
+	matviews    []MaterializedViewDef[Rec]
 }
 
 // testCommitTimeout is the CommitTimeout integration tests seed
@@ -87,9 +87,9 @@ func newStore(t *testing.T, opts storeOpts) *Store[Rec] {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		EntityKeyOf: opts.entityKeyOf,
-		VersionOf:   opts.versionOf,
-		Projections: opts.projections,
+		EntityKeyOf:       opts.entityKeyOf,
+		VersionOf:         opts.versionOf,
+		MaterializedViews: opts.matviews,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -97,16 +97,16 @@ func newStore(t *testing.T, opts storeOpts) *Store[Rec] {
 	return store
 }
 
-// TestProjection_WriteAndLookup covers the secondary-projection
-// feature end-to-end: register a projection, Write records,
-// Lookup by an exact partition, Lookup with a range on the first
-// projection column, and verify that a pattern with no matches
-// returns an empty slice rather than an error.
+// TestMaterializedView_WriteAndLookup covers the materialized-view
+// feature end-to-end: register a view, Write records, Lookup by
+// an exact partition, Lookup with a range on the first view
+// column, and verify that a pattern with no matches returns an
+// empty slice rather than an error.
 //
-// Projection partition: (sku, period). Lookup covers: (customer).
+// View columns: (sku, period, customer). Lookup covers: (customer).
 // Two distinct customers × one SKU × two periods ⇒ the batch
 // deduplicates to 4 markers despite 5 source records.
-func TestProjection_WriteAndLookup(t *testing.T) {
+func TestMaterializedView_WriteAndLookup(t *testing.T) {
 	ctx := context.Background()
 
 	type SkuPeriodEntry struct {
@@ -116,7 +116,7 @@ func TestProjection_WriteAndLookup(t *testing.T) {
 	}
 
 	store := newStore(t, storeOpts{
-		projections: []ProjectionDef[Rec]{{
+		matviews: []MaterializedViewDef[Rec]{{
 			Name:    "sku_period_idx",
 			Columns: []string{"sku", "period", "customer"},
 			Of: func(r Rec) ([]string, error) {
@@ -125,13 +125,13 @@ func TestProjection_WriteAndLookup(t *testing.T) {
 		}},
 	})
 
-	idx, err := NewProjectionReader(store.Target(),
-		ProjectionLookupDef[SkuPeriodEntry]{
+	idx, err := NewMaterializedViewReader(store.Target(),
+		MaterializedViewLookupDef[SkuPeriodEntry]{
 			Name:    "sku_period_idx",
 			Columns: []string{"sku", "period", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 
 	in := []Rec{
@@ -184,13 +184,13 @@ func TestProjection_WriteAndLookup(t *testing.T) {
 	}
 }
 
-// TestProjection_LookupReadAfterWrite guards the contract that
+// TestMaterializedView_LookupReadAfterWrite guards the contract that
 // Lookup is read-after-write when ConsistencyControl is strong: a
 // marker written by Write MUST be returned by the very next
 // Lookup, with no sleep and no SettleWindow filter. Together with
 // the header propagation on marker PUT and marker LIST this is
-// the whole reason Projection doesn't need a settle cutoff.
-func TestProjection_LookupReadAfterWrite(t *testing.T) {
+// the whole reason matview Lookup doesn't need a settle cutoff.
+func TestMaterializedView_LookupReadAfterWrite(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 
@@ -198,7 +198,7 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	projectionDef := ProjectionDef[Rec]{
+	matviewDef := MaterializedViewDef[Rec]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -218,19 +218,19 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		Projections: []ProjectionDef[Rec]{projectionDef},
+		MaterializedViews: []MaterializedViewDef[Rec]{matviewDef},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	idx, err := NewProjectionReader(store.Target(),
-		ProjectionLookupDef[Entry]{
+	idx, err := NewMaterializedViewReader(store.Target(),
+		MaterializedViewLookupDef[Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{
@@ -249,7 +249,7 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 }
 
 // TestWrite_MarkersFirst guards the Phase 3 ordering invariant:
-// projection markers PUT *before* the data PUT, so a forced
+// matview markers PUT *before* the data PUT, so a forced
 // data-PUT failure cannot leave a data file behind without its
 // markers. The contract is "any data file on S3 implies all R1
 // markers landed" — verifying the contrapositive (markers can
@@ -258,7 +258,7 @@ func TestProjection_LookupReadAfterWrite(t *testing.T) {
 //
 // Mechanism: a smithy middleware on the S3 client returns an
 // error for any PutObject whose key contains "/data/" and ends
-// with ".parquet". Marker PUTs (under "/_projection/") and the
+// with ".parquet". Marker PUTs (under "/_matview/") and the
 // timing-config GETs flow through unaffected.
 func TestWrite_MarkersFirst(t *testing.T) {
 	ctx := context.Background()
@@ -279,7 +279,7 @@ func TestWrite_MarkersFirst(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		Projections: []ProjectionDef[Rec]{{
+		MaterializedViews: []MaterializedViewDef[Rec]{{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
 			Of: func(r Rec) ([]string, error) {
@@ -303,7 +303,7 @@ func TestWrite_MarkersFirst(t *testing.T) {
 	}
 
 	// Marker exists: confirms markers PUT ran before data PUT.
-	markerPrefix := "store/_projection/sku_idx/"
+	markerPrefix := "store/_matview/sku_idx/"
 	mkOut, err := f.S3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: aws.String(f.Bucket),
 		Prefix: aws.String(markerPrefix),
@@ -338,8 +338,8 @@ func TestWrite_MarkersFirst(t *testing.T) {
 // same MinIO endpoint as f.S3Client but with a smithy middleware
 // that errors on any PutObject whose key contains "/data/" and
 // ends with ".parquet". Used by markers-first tests to assert
-// the projection markers PUT completes before the data PUT — a
-// data-PUT failure must leave projection markers visible (no
+// the matview markers PUT completes before the data PUT — a
+// data-PUT failure must leave matview markers visible (no
 // orphan data files), proving the order.
 func newDataPUTFailingClient(t *testing.T, f *fixture) *s3.Client {
 	t.Helper()
@@ -579,29 +579,29 @@ func TestWriteWithKey_OuterRetryPreservesParquetBody(t *testing.T) {
 	}
 }
 
-// TestBackfillProjection covers the relief-valve path: records
-// written before a projection was registered don't produce markers,
-// Lookup under-reports, and BackfillProjection brings the projection into
+// TestBackfillMaterializedView covers the relief-valve path: records
+// written before a view was registered don't produce markers,
+// Lookup under-reports, and BackfillMaterializedView brings the view into
 // sync. Also checks idempotence (a second call is semantically a
 // no-op) and that pattern scoping narrows the scan.
 //
-// BackfillProjection is a standalone package function — it takes an
+// BackfillMaterializedView is a standalone package function — it takes an
 // S3Target, so a migration job can run it without building a
 // full Writer/Store. The test mirrors that shape: it derives the
 // target from the store but passes it explicitly to the backfill
 // call.
-func TestBackfillProjection(t *testing.T) {
+func TestBackfillMaterializedView(t *testing.T) {
 	ctx := context.Background()
 
-	// Phase 1: build a store with no projection, write the "historical"
-	// records BackfillProjection will have to recover.
+	// Phase 1: build a store with no view, write the "historical"
+	// records BackfillMaterializedView will have to recover.
 	preStore := newStore(t, storeOpts{})
 
 	type Entry struct {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	def := ProjectionDef[Rec]{
+	def := MaterializedViewDef[Rec]{
 		Name:    "sku_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -619,7 +619,7 @@ func TestBackfillProjection(t *testing.T) {
 		t.Fatalf("historical Write: %v", err)
 	}
 
-	// Phase 2: build a second store wired with the projection. Reuses
+	// Phase 2: build a second store wired with the view. Reuses
 	// the same target (Bucket / Prefix) so subsequent writes share
 	// the dataset with the historical writes.
 	target := preStore.Target()
@@ -629,23 +629,23 @@ func TestBackfillProjection(t *testing.T) {
 			return fmt.Sprintf("period=%s/customer=%s",
 				r.Period, r.Customer)
 		},
-		Projections: []ProjectionDef[Rec]{def},
+		MaterializedViews: []MaterializedViewDef[Rec]{def},
 	})
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
 
-	idx, err := NewProjectionReader(target,
-		ProjectionLookupDef[Entry]{
+	idx, err := NewMaterializedViewReader(target,
+		MaterializedViewLookupDef[Entry]{
 			Name:    "sku_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 
 	// Write a post-registration record so we can verify
-	// BackfillProjection produces the same marker as the live write
+	// BackfillMaterializedView produces the same marker as the live write
 	// path (idempotent overlap).
 	if _, err := store.Write(ctx, []Rec{
 		{Period: "2026-04-01", Customer: "abc", SKU: "s3", Ts: time.UnixMilli(500)},
@@ -655,7 +655,7 @@ func TestBackfillProjection(t *testing.T) {
 
 	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
-	// Before BackfillProjection: only the post-registration record is
+	// Before BackfillMaterializedView: only the post-registration record is
 	// visible.
 	got, err := idx.Lookup(ctx, []string{"sku=*/customer=*"})
 	if err != nil {
@@ -665,11 +665,11 @@ func TestBackfillProjection(t *testing.T) {
 		t.Errorf("pre-backfill: got %v, want just {s3, abc}", got)
 	}
 
-	// BackfillProjection with empty until covers everything.
-	stats, err := BackfillProjection(
+	// BackfillMaterializedView with empty until covers everything.
+	stats, err := BackfillMaterializedView(
 		ctx, target, def, []string{"*"}, time.Time{})
 	if err != nil {
-		t.Fatalf("BackfillProjection: %v", err)
+		t.Fatalf("BackfillMaterializedView: %v", err)
 	}
 	// 5 parquet objects (4 historical writes, each its own
 	// partition-key group under PartitionKeyOf; plus the post-
@@ -690,7 +690,7 @@ func TestBackfillProjection(t *testing.T) {
 
 	time.Sleep(testSettleWindow + 100*time.Millisecond)
 
-	// After BackfillProjection: every distinct (sku, customer) is
+	// After BackfillMaterializedView: every distinct (sku, customer) is
 	// visible.
 	got, err = idx.Lookup(ctx, []string{"sku=*/customer=*"})
 	if err != nil {
@@ -708,7 +708,7 @@ func TestBackfillProjection(t *testing.T) {
 	}
 	for _, w := range want {
 		if !gotSet[w] {
-			t.Errorf("missing %+v after BackfillProjection", w)
+			t.Errorf("missing %+v after BackfillMaterializedView", w)
 		}
 	}
 	if len(got) != len(want) {
@@ -716,27 +716,27 @@ func TestBackfillProjection(t *testing.T) {
 			len(got), len(want), got)
 	}
 
-	// Idempotency: a second BackfillProjection re-scans but the PUTs
+	// Idempotency: a second BackfillMaterializedView re-scans but the PUTs
 	// are no-ops at the semantic level. We only check it doesn't
 	// error and reports the same scan volume.
-	stats2, err := BackfillProjection(
+	stats2, err := BackfillMaterializedView(
 		ctx, target, def, []string{"*"}, time.Time{})
 	if err != nil {
-		t.Fatalf("second BackfillProjection: %v", err)
+		t.Fatalf("second BackfillMaterializedView: %v", err)
 	}
 	if stats2.DataObjects != stats.DataObjects {
-		t.Errorf("second BackfillProjection DataObjects: got %d, want %d",
+		t.Errorf("second BackfillMaterializedView DataObjects: got %d, want %d",
 			stats2.DataObjects, stats.DataObjects)
 	}
 
 	// Pattern scoping: backfilling only the 2026-03-17 partition
 	// covers 2 of the 5 objects.
-	scoped, err := BackfillProjection(
+	scoped, err := BackfillMaterializedView(
 		ctx, target, def,
 		[]string{"period=2026-03-17/customer=*"},
 		time.Time{})
 	if err != nil {
-		t.Fatalf("scoped BackfillProjection: %v", err)
+		t.Fatalf("scoped BackfillMaterializedView: %v", err)
 	}
 	if scoped.DataObjects != 2 {
 		t.Errorf("scoped DataObjects: got %d, want 2",
@@ -744,13 +744,13 @@ func TestBackfillProjection(t *testing.T) {
 	}
 }
 
-// TestBackfillProjection_UntilBound verifies the typical migration
+// TestBackfillMaterializedView_UntilBound verifies the typical migration
 // shape: the live writer "starts" at time T0, backfill covers
 // only files with LastModified < T0 so the live path's markers
 // and the backfill's don't overlap. We write two files with a
 // gap between them, pass OffsetAt(midpoint) as until, and assert
 // that only the earlier file is scanned.
-func TestBackfillProjection_UntilBound(t *testing.T) {
+func TestBackfillMaterializedView_UntilBound(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -779,7 +779,7 @@ func TestBackfillProjection_UntilBound(t *testing.T) {
 		t.Fatalf("late Write: %v", err)
 	}
 
-	def := ProjectionDef[Rec]{
+	def := MaterializedViewDef[Rec]{
 		Name:    "bounded_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -789,10 +789,10 @@ func TestBackfillProjection_UntilBound(t *testing.T) {
 
 	target := store.Target()
 
-	stats, err := BackfillProjection(
+	stats, err := BackfillMaterializedView(
 		ctx, target, def, []string{"*"}, midpoint)
 	if err != nil {
-		t.Fatalf("BackfillProjection: %v", err)
+		t.Fatalf("BackfillMaterializedView: %v", err)
 	}
 	if stats.DataObjects != 1 {
 		t.Errorf("DataObjects: got %d, want 1 (only early write "+
@@ -800,9 +800,9 @@ func TestBackfillProjection_UntilBound(t *testing.T) {
 	}
 }
 
-// TestBackfillProjection_MissingDataTolerant verifies the at-least-
+// TestBackfillMaterializedView_MissingDataTolerant verifies the at-least-
 // once posture when a data file disappears before backfill: the
-// live files still get markers and BackfillProjection does NOT fail.
+// live files still get markers and BackfillMaterializedView does NOT fail.
 //
 // MinIO's LIST is strongly consistent with DELETE, so the deleted
 // file is fully absent from the subsequent LIST — the LIST-to-GET
@@ -810,7 +810,7 @@ func TestBackfillProjection_UntilBound(t *testing.T) {
 // NoSuchKey + slog.Warn + missing-data-metric path is exercised
 // by code review; what this test pins down is that backfill
 // survives the partial-delete scenario without erroring.
-func TestBackfillProjection_MissingDataTolerant(t *testing.T) {
+func TestBackfillMaterializedView_MissingDataTolerant(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
@@ -838,7 +838,7 @@ func TestBackfillProjection_MissingDataTolerant(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	def := ProjectionDef[Rec]{
+	def := MaterializedViewDef[Rec]{
 		Name:    "missing_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -846,10 +846,10 @@ func TestBackfillProjection_MissingDataTolerant(t *testing.T) {
 		},
 	}
 
-	stats, err := BackfillProjection(
+	stats, err := BackfillMaterializedView(
 		ctx, store.Target(), def, []string{"*"}, time.Time{})
 	if err != nil {
-		t.Fatalf("BackfillProjection: %v", err)
+		t.Fatalf("BackfillMaterializedView: %v", err)
 	}
 
 	// MinIO's LIST reflects the delete, so backfill sees only
@@ -1548,7 +1548,7 @@ func TestRead_WithHistory(t *testing.T) {
 }
 
 // TestLookup_EmptyAndBadPattern mirrors
-// TestRead_EmptyAndBadPattern at the Projection layer: empty
+// TestRead_EmptyAndBadPattern at the matview layer: empty
 // slice is a no-op, malformed pattern surfaces the offending
 // index.
 func TestLookup_EmptyAndBadPattern(t *testing.T) {
@@ -1559,7 +1559,7 @@ func TestLookup_EmptyAndBadPattern(t *testing.T) {
 		Customer string `parquet:"customer"`
 	}
 	store := newStore(t, storeOpts{
-		projections: []ProjectionDef[Rec]{{
+		matviews: []MaterializedViewDef[Rec]{{
 			Name:    "empty_bad_idx",
 			Columns: []string{"sku", "customer"},
 			Of: func(r Rec) ([]string, error) {
@@ -1568,13 +1568,13 @@ func TestLookup_EmptyAndBadPattern(t *testing.T) {
 		}},
 	})
 
-	idx, err := NewProjectionReader(store.Target(),
-		ProjectionLookupDef[Entry]{
+	idx, err := NewMaterializedViewReader(store.Target(),
+		MaterializedViewLookupDef[Entry]{
 			Name:    "empty_bad_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 
 	got, err := idx.Lookup(ctx, nil)
@@ -1597,13 +1597,13 @@ func TestLookup_EmptyAndBadPattern(t *testing.T) {
 	}
 }
 
-// TestBackfillProjection_EmptyAndBadPattern covers the matching
+// TestBackfillMaterializedView_EmptyAndBadPattern covers the matching
 // edge cases for the migration entry point.
-func TestBackfillProjection_EmptyAndBadPattern(t *testing.T) {
+func TestBackfillMaterializedView_EmptyAndBadPattern(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, storeOpts{})
 
-	def := ProjectionDef[Rec]{
+	def := MaterializedViewDef[Rec]{
 		Name:    "empty_bad_backfill_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -1612,17 +1612,17 @@ func TestBackfillProjection_EmptyAndBadPattern(t *testing.T) {
 	}
 	target := store.Target()
 
-	stats, err := BackfillProjection(
+	stats, err := BackfillMaterializedView(
 		ctx, target, def, nil, time.Time{})
 	if err != nil {
-		t.Errorf("BackfillProjection(nil): %v", err)
+		t.Errorf("BackfillMaterializedView(nil): %v", err)
 	}
 	if stats != (BackfillStats{}) {
-		t.Errorf("BackfillProjection(nil): got %+v, want zero stats",
+		t.Errorf("BackfillMaterializedView(nil): got %+v, want zero stats",
 			stats)
 	}
 
-	_, err = BackfillProjection(ctx, target, def, []string{
+	_, err = BackfillMaterializedView(ctx, target, def, []string{
 		"period=2026-03-17/customer=abc",
 		"not-a-valid-pattern",
 	}, time.Time{})
@@ -1635,7 +1635,7 @@ func TestBackfillProjection_EmptyAndBadPattern(t *testing.T) {
 }
 
 // TestLookup_NonCartesian mirrors TestRead_NonCartesian
-// at the projection layer: pick a non-Cartesian tuple set of
+// at the matview layer: pick a non-Cartesian tuple set of
 // (sku, customer) pairs and verify only those markers come back.
 func TestLookup_NonCartesian(t *testing.T) {
 	ctx := context.Background()
@@ -1645,7 +1645,7 @@ func TestLookup_NonCartesian(t *testing.T) {
 		Customer string `parquet:"customer"`
 	}
 	store := newStore(t, storeOpts{
-		projections: []ProjectionDef[Rec]{{
+		matviews: []MaterializedViewDef[Rec]{{
 			Name:    "sku_customer_idx",
 			Columns: []string{"sku", "customer"},
 			Of: func(r Rec) ([]string, error) {
@@ -1654,13 +1654,13 @@ func TestLookup_NonCartesian(t *testing.T) {
 		}},
 	})
 
-	idx, err := NewProjectionReader(store.Target(),
-		ProjectionLookupDef[Entry]{
+	idx, err := NewMaterializedViewReader(store.Target(),
+		MaterializedViewLookupDef[Entry]{
 			Name:    "sku_customer_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 
 	if _, err := store.Write(ctx, []Rec{
@@ -1707,19 +1707,19 @@ func TestLookup_NonCartesian(t *testing.T) {
 	}
 }
 
-// TestBackfillProjection_NonCartesian exercises the multi-pattern
+// TestBackfillMaterializedView_NonCartesian exercises the multi-pattern
 // migration shape: write records across several partitions, then
 // backfill only the partitions of interest via a patterns slice.
 // The run covers exactly the selected partitions, and the union
 // is deduplicated when patterns overlap.
-func TestBackfillProjection_NonCartesian(t *testing.T) {
+func TestBackfillMaterializedView_NonCartesian(t *testing.T) {
 	ctx := context.Background()
 
 	type Entry struct {
 		SKU      string `parquet:"sku"`
 		Customer string `parquet:"customer"`
 	}
-	def := ProjectionDef[Rec]{
+	def := MaterializedViewDef[Rec]{
 		Name:    "many_idx",
 		Columns: []string{"sku", "customer"},
 		Of: func(r Rec) ([]string, error) {
@@ -1727,7 +1727,7 @@ func TestBackfillProjection_NonCartesian(t *testing.T) {
 		},
 	}
 
-	// No-projection store for the historical writes: backfill must
+	// No-matview store for the historical writes: backfill must
 	// run from a clean state so the test pins down what the
 	// scoped patterns covered (vs. the live writer covering
 	// everything).
@@ -1743,25 +1743,25 @@ func TestBackfillProjection_NonCartesian(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	idx, err := NewProjectionReader(store.Target(),
-		ProjectionLookupDef[Entry]{
+	idx, err := NewMaterializedViewReader(store.Target(),
+		MaterializedViewLookupDef[Entry]{
 			Name:    "many_idx",
 			Columns: []string{"sku", "customer"},
 		})
 	if err != nil {
-		t.Fatalf("NewProjectionReader: %v", err)
+		t.Fatalf("NewMaterializedViewReader: %v", err)
 	}
 
 	// Backfill just the two March partitions via explicit patterns.
 	// The April partition should NOT be covered.
-	stats, err := BackfillProjection(ctx, store.Target(), def,
+	stats, err := BackfillMaterializedView(ctx, store.Target(), def,
 		[]string{
 			"period=2026-03-17/customer=*",
 			"period=2026-03-18/customer=*",
 		},
 		time.Time{})
 	if err != nil {
-		t.Fatalf("BackfillProjection: %v", err)
+		t.Fatalf("BackfillMaterializedView: %v", err)
 	}
 	if stats.DataObjects != 3 {
 		t.Errorf("DataObjects: got %d, want 3 (two March-17 + one "+

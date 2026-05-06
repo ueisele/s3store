@@ -21,7 +21,7 @@ type ParquetField struct {
 }
 
 // ParquetFields returns one entry per exported parquet-tagged
-// field on t, in field-declaration order. Used by the projection
+// field on t, in field-declaration order. Used by the matview
 // projector/binder builders so the parquet tag convention is
 // interpreted in exactly one place.
 //

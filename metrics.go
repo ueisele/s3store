@@ -88,7 +88,7 @@ const (
 // metrics owns every OTel instrument the library records into and
 // the constant attribute set baked in at construction (bucket,
 // prefix, consistency level when set). One *metrics per S3Target;
-// Writer / Reader / ProjectionReader inherit it via the Target
+// Writer / Reader / MaterializedViewReader inherit it via the Target
 // they hold.
 //
 // Internal — users configure observability by setting
@@ -395,7 +395,7 @@ func newMetrics(
 		metric.WithExplicitBucketBoundaries(recordCountBuckets...))
 	m.readPartitions = mustHistInt(
 		"s3store.read.partitions",
-		"Distinct Hive partitions touched per read-side method call (every method that funnels through the iter pipeline: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Not recorded for Poll / Lookup / LookupCommit / BackfillProjection.",
+		"Distinct Hive partitions touched per read-side method call (every method that funnels through the iter pipeline: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Not recorded for Poll / Lookup / LookupCommit / BackfillMaterializedView.",
 		"{partition}",
 		metric.WithExplicitBucketBoundaries(
 			1, 2, 5, 10, 25, 50, 100, 500))
@@ -412,7 +412,7 @@ func newMetrics(
 			1, 5, 10, 25, 50, 100, 500, 1000, 5000))
 	m.readMissingData = mustCounter(
 		"s3store.read.missing_data",
-		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / BackfillProjection). Strict paths (Read / ReadIter / ReadPartitionIter) fail instead of recording.",
+		"Data-file GETs that returned NoSuchKey on a tolerant read path (PollRecords / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / BackfillMaterializedView). Strict paths (Read / ReadIter / ReadPartitionIter) fail instead of recording.",
 		"{event}")
 	m.readMalformedRefs = mustCounter(
 		"s3store.read.malformed_refs",
@@ -988,7 +988,7 @@ func (s *methodScope) addFiles(n int64) {
 
 // recordMissingData increments the missing-data counter for one
 // NoSuchKey skip on a tolerant read path (PollRecords /
-// ReadRangeIter / BackfillProjection). Reuses the scope's method as
+// ReadRangeIter / BackfillMaterializedView). Reuses the scope's method as
 // the attribute so dashboards can split by which path produced
 // the skip — no caller plumbing.
 func (s *methodScope) recordMissingData() {

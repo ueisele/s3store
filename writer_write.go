@@ -54,11 +54,11 @@ type WriteResult struct {
 // completion exceeded the configured CommitTimeout. The write IS
 // durable — data file, ref, and `<token>.commit` are all in S3,
 // and snapshot reads (Read / ReadIter / ReadPartitionIter /
-// ProjectionReader.Lookup / BackfillProjection) see it — but a
-// stream reader's SettleWindow (= CommitTimeout + MaxClockSkew)
-// may already have advanced past refMicroTs by the time the
-// commit became observable, so a stream reader past that offset
-// will never re-visit it.
+// MaterializedViewReader.Lookup / BackfillMaterializedView) see
+// it — but a stream reader's SettleWindow (= CommitTimeout +
+// MaxClockSkew) may already have advanced past refMicroTs by the
+// time the commit became observable, so a stream reader past
+// that offset will never re-visit it.
 //
 // The returned *WriteResult is non-nil and reflects the durable
 // commit; snapshot consumers can ignore the error. Stream
@@ -623,7 +623,7 @@ func (s *Writer[T]) resolveTokenAndCheckCommit(
 //  3. Generate attempt-id. UUIDv7 hex (32 lowercase hex chars).
 //     For non-idempotent writes the auto-token doubles as the
 //     attempt-id; for idempotent writes it's freshly generated.
-//  4. Projection markers PUT (Phase 3 ordering: before data, so
+//  4. Matview markers PUT (Phase 3 ordering: before data, so
 //     any data file on S3 implies its R1 markers landed).
 //  5. Data PUT to `<dataPath>/<partition>/<token>-<attemptID>.parquet`.
 //     Unconditional; path is unique per attempt by construction.
@@ -688,10 +688,10 @@ func (s *Writer[T]) writeEncodedPayload(
 	writeStartTime time.Time, token string, autoToken bool,
 	optimisticCommit bool,
 ) (*WriteResult, error) {
-	// Compute marker paths up-front so a bad ProjectionDef.Of
+	// Compute marker paths up-front so a bad MaterializedViewDef.Of
 	// fails the whole Write before we touch S3, matching how
 	// validateKey aborts on a malformed partition key.
-	markerPaths, err := s.collectProjectionMarkerPaths(records)
+	markerPaths, err := s.collectMatviewMarkerPaths(records)
 	if err != nil {
 		return nil, err
 	}
@@ -712,9 +712,9 @@ func (s *Writer[T]) writeEncodedPayload(
 	id := makeID(token, attemptID)
 	dataKey := buildDataFilePath(s.dataPath, key, id)
 
-	// Step 4: projection markers, before data (Phase 3 ordering).
+	// Step 4: matview markers, before data (Phase 3 ordering).
 	if err := s.putMarkers(ctx, markerPaths); err != nil {
-		return nil, fmt.Errorf("put projection markers: %w", err)
+		return nil, fmt.Errorf("put matview markers: %w", err)
 	}
 
 	// Step 5: data PUT to fresh path. Unconditional (path is

@@ -258,7 +258,7 @@ func TestOffsetAt(t *testing.T) {
 	}
 }
 
-// TestWriterConfigMirroredInStoreConfig guards the projection
+// TestWriterConfigMirroredInStoreConfig guards the field-mapping
 // from the unified StoreConfig onto WriterConfig: every non-Target
 // field on WriterConfig must also appear on StoreConfig with the
 // same name and type, so writerConfigFrom can forward it. Target

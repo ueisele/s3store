@@ -196,19 +196,19 @@ func consistencyAPIOpts(level ConsistencyLevel) []func(*middleware.Stack) error 
 // S3TargetConfig is the user-facing config for an s3parquet
 // dataset — pure data, struct-literal-friendly. Convert to a
 // live S3Target via NewS3Target before passing to a Writer/Reader/
-// ProjectionReader/BackfillProjection.
+// MaterializedViewReader/BackfillMaterializedView.
 //
 // Embedded indirectly via WriterConfig.Target / ReaderConfig.Target
 // (which carry an S3Target — the live form) so the four S3-wiring
 // fields plus knobs live in exactly one place. Surfaced on
 // Writer/Reader/Store via .Target() so read-only tools
-// (NewProjectionReader, BackfillProjection) can address the same dataset
+// (NewMaterializedViewReader, BackfillMaterializedView) can address the same dataset
 // without carrying T through their call graph.
 type S3TargetConfig struct {
 	// Bucket is the S3 bucket name.
 	Bucket string
 
-	// Prefix is the key prefix under which data/ref/projection files
+	// Prefix is the key prefix under which data/ref/matview files
 	// live. Must be non-empty — a bare bucket root would collide
 	// with any other tenant of the bucket.
 	Prefix string
@@ -247,10 +247,10 @@ type S3TargetConfig struct {
 	// ConsistencyControl sets the Consistency-Control HTTP header
 	// applied to every correctness-critical S3 operation routed
 	// through this target — data PUTs (per-attempt-path, never
-	// overwriting), ref PUTs, token-commit PUTs, projection
-	// marker PUTs, data / config GETs, the upfront-dedup HEAD on
+	// overwriting), ref PUTs, token-commit PUTs, matview marker
+	// PUTs, data / config GETs, the upfront-dedup HEAD on
 	// `<token>.commit`, and every LIST (partition LIST on the
-	// read path, projection-marker LIST in ProjectionReader.Lookup,
+	// read path, matview-marker LIST in MaterializedViewReader.Lookup,
 	// ref-stream LIST in Poll/PollRecords/ReadRangeIter).
 	//
 	// Zero value (ConsistencyDefault) is substituted at
@@ -265,7 +265,7 @@ type S3TargetConfig struct {
 	// section for the full matrix.
 	//
 	// Setting the level on the target rather than on the Writer /
-	// Reader / Projection configs enforces NetApp's "same
+	// Reader / MaterializedView configs enforces NetApp's "same
 	// consistency for paired operations" rule by construction:
 	// every operation routed through this target uses one and the
 	// same value.
@@ -373,8 +373,8 @@ func (c S3TargetConfig) EffectiveMaxInflightRequests() int {
 
 // Validate runs the full check for constructors that operate on
 // partitioned data: Bucket, Prefix, S3Client, PartitionKeyParts.
-// Used by NewWriter, NewReader, BackfillProjection — anything that
-// reads/writes data files keyed by partition.
+// Used by NewWriter, NewReader, BackfillMaterializedView —
+// anything that reads/writes data files keyed by partition.
 func (c S3TargetConfig) Validate() error {
 	if err := c.ValidateLookup(); err != nil {
 		return err
@@ -384,12 +384,12 @@ func (c S3TargetConfig) Validate() error {
 
 // ValidateLookup is the reduced check for constructors that
 // only LIST / GET / PUT under a known prefix (no partition-key
-// predicates): Bucket, Prefix, S3Client. Used by NewProjectionReader
-// — Lookup walks the <Prefix>/_projection/<name>/ subtree, which is
-// keyed by the projection's own Columns, not the config's
-// PartitionKeyParts. A read-only analytics service can pass a
-// minimally-populated S3TargetConfig and still build a working
-// ProjectionReader.
+// predicates): Bucket, Prefix, S3Client. Used by
+// NewMaterializedViewReader — Lookup walks the
+// <Prefix>/_matview/<name>/ subtree, which is keyed by the view's
+// own Columns, not the config's PartitionKeyParts. A read-only
+// analytics service can pass a minimally-populated S3TargetConfig
+// and still build a working MaterializedViewReader.
 func (c S3TargetConfig) ValidateLookup() error {
 	if c.Bucket == "" {
 		return errors.New("Bucket is required")
@@ -443,7 +443,7 @@ type S3Target struct {
 //
 // Does not call Validate (PartitionKeyParts) — that's a Writer /
 // Reader concern and is checked by NewWriter / NewReader, not by
-// every Target consumer (NewProjectionReader is read-only and
+// every Target consumer (NewMaterializedViewReader is read-only and
 // doesn't need PartitionKeyParts).
 //
 // Logs a warning when ConsistencyControl is non-empty but doesn't
@@ -668,7 +668,7 @@ func (t S3Target) release() {
 }
 
 // get downloads a single object into memory. Used by the read
-// path (Read, PollRecords) and by BackfillProjection when scanning
+// path (Read, PollRecords) and by BackfillMaterializedView when scanning
 // historical parquet data. Carries the target's
 // ConsistencyControl on every call.
 func (t S3Target) get(
@@ -704,7 +704,7 @@ func (t S3Target) get(
 }
 
 // put uploads data under key. Used by the write path (parquet +
-// ref + markers) and by BackfillProjection for retroactive marker
+// ref + markers) and by BackfillMaterializedView for retroactive marker
 // emission. Carries the target's ConsistencyControl on every
 // call.
 func (t S3Target) put(
@@ -937,7 +937,7 @@ func (t S3Target) listPage(
 // single page round-trip suffices.
 //
 // Single LIST primitive across the library — partition LIST,
-// projection-marker LIST, ref-stream LIST (Poll), and the
+// matview-marker LIST, ref-stream LIST (Poll), and the
 // upfront-LIST dedup gate under {partition}/{token}- on
 // idempotent writes all funnel through here so the
 // "semaphore + retry + consistency header" wrapping is

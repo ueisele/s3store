@@ -10,9 +10,9 @@ must preserve them — even when the change appears unrelated.
   data, refs, or markers it has written.
 - **Read-after-write on snapshot reads** — once Write returns
   success, Read / ReadIter / ReadPartitionIter /
-  ProjectionReader.Lookup / BackfillProjection see the new
-  records immediately. The settle window applies only to the
-  change stream (Poll / PollRecords / ReadRangeIter /
+  MaterializedViewReader.Lookup / BackfillMaterializedView see
+  the new records immediately. The settle window applies only
+  to the change stream (Poll / PollRecords / ReadRangeIter /
   ReadPartitionRangeIter).
 - **Read stability — no library-driven deletion** — two
   consecutive snapshot reads with no intervening writes return
@@ -61,8 +61,9 @@ must preserve them — even when the change appears unrelated.
 - **Atomic per-file visibility via `<token>.commit`** — both
   read paths gate on the marker. Snapshot reads
   (`Read` / `ReadIter` / `ReadPartitionIter` /
-  `ProjectionReader.Lookup` / `BackfillProjection`) drop parquets
-  without a paired commit; the change-stream APIs (`Poll` /
+  `MaterializedViewReader.Lookup` /
+  `BackfillMaterializedView`) drop parquets without a paired
+  commit; the change-stream APIs (`Poll` /
   `PollRecords` / `ReadRangeIter` / `ReadPartitionRangeIter`)
   HEAD `<token>.commit` per ref before yielding (per-poll cache
   collapses repeat tokens). A writer that crashes mid-sequence
@@ -153,7 +154,7 @@ honoured.
   contract or remove the upfront-HEAD short-circuit.
 
 - **Read-after-new-write on every PUT key.** Data files, refs,
-  projection markers, and `<token>.commit` markers all rely on
+  matview markers, and `<token>.commit` markers all rely on
   read-after-new-write at the configured consistency level.
   AWS S3 (since 2020), MinIO, and StorageGRID at `strong-*`
   all guarantee this for new-key writes. Data and ref PUTs use
@@ -192,7 +193,7 @@ honoured.
   reintroduce a server-`LastModified` dependency on the
   ordering path break this contract and must not be introduced.
 
-  `BackfillProjection`'s `until time.Time` bound still relies
+  `BackfillMaterializedView`'s `until time.Time` bound still relies
   on `LastModified`, but only as a *relative* ordering signal
   across files written through the library — not as an
   observability proxy. It compares LMs that the same backend

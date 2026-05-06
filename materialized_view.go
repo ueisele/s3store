@@ -9,24 +9,32 @@ import (
 	"time"
 )
 
-// ProjectionLookupDef is the read-side definition of a secondary
-// projection. Build a ProjectionReader[K] from it via
-// NewProjectionReader when a service queries an existing projection
-// (dashboard, query API).
+// A materialized view in s3store stores the precomputed DISTINCT
+// projection of a configurable set of columns over the base data.
+// Each (column-values) tuple is materialised as one zero-byte
+// marker object whose S3 key encodes the values themselves —
+// `<Prefix>/_matview/<name>/col=val/.../m.matview`. The path IS
+// the data; Lookup answers "what (col1, col2, ...) tuples exist?"
+// by LIST alone, never reading base parquet.
+
+// MaterializedViewLookupDef is the read-side definition of a
+// materialized view. Build a MaterializedViewReader[K] from it via
+// NewMaterializedViewReader when a service queries an existing
+// materialized view (dashboard, query API).
 //
-// Name + Columns identify the projection in S3; From projects the
+// Name + Columns identify the view in S3; From projects the
 // per-marker column values back into a typed K. From is optional
 // — when nil, the library reflects K's parquet-tagged string
 // fields against Columns and assembles K from the values slice.
 // Provide a custom From for K's that have no parquet tags or
 // when extra validation/transformation is needed.
-type ProjectionLookupDef[K comparable] struct {
-	// Name identifies the projection under the target's
-	// <Prefix>/_projection/ subtree. Required. Must be non-empty
+type MaterializedViewLookupDef[K comparable] struct {
+	// Name identifies the view under the target's
+	// <Prefix>/_matview/ subtree. Required. Must be non-empty
 	// and free of '/'.
 	Name string
 
-	// Columns lists the projection's column names in the order
+	// Columns lists the view's column names in the order
 	// they appear in the S3 path. Earlier columns form a narrower
 	// LIST prefix when Lookup specifies them literally. Pick the
 	// order based on how queries filter: most-selective first.
@@ -44,7 +52,7 @@ type ProjectionLookupDef[K comparable] struct {
 	// From implementations may rely on positional access (e.g.
 	// values[0] for Columns[0]).
 	//
-	// Errors are propagated by Lookup with the projection name as
+	// Errors are propagated by Lookup with the view name as
 	// wrapping context.
 	From func(values []string) (K, error)
 
@@ -54,34 +62,34 @@ type ProjectionLookupDef[K comparable] struct {
 	// Layout entirely.
 	//
 	// For correctness, Layout.Time on the read side MUST match
-	// ProjectionDef.Layout.Time on the write side — drift produces
-	// silently wrong values or parse errors. Define one constant
-	// and reuse it on both sides.
+	// MaterializedViewDef.Layout.Time on the write side — drift
+	// produces silently wrong values or parse errors. Define one
+	// constant and reuse it on both sides.
 	Layout Layout
 }
 
-// ProjectionDef is the write-side definition of a secondary
-// projection. Pass a slice of these on WriterConfig.Projections /
-// Config.Projections at construction; the writer iterates each
-// registered projection per record, builds the marker S3 key from
-// Columns + Of's return, and PUTs one empty marker per distinct
-// key.
+// MaterializedViewDef is the write-side definition of a
+// materialized view. Pass a slice of these on
+// WriterConfig.MaterializedViews / Config.MaterializedViews at
+// construction; the writer iterates each registered view per
+// record, builds the marker S3 key from Columns + Of's return,
+// and PUTs one empty marker per distinct key.
 //
-// The previous late-binding RegisterProjection API is gone:
-// projections are part of the writer's construction, so
-// registration cannot race with Write and "registered after first
-// Write" is not a reachable state.
-type ProjectionDef[T any] struct {
-	// Name identifies the projection under the target's
-	// <Prefix>/_projection/ subtree. Required. Must be non-empty,
-	// free of '/', and unique across ProjectionDef[T] entries on
-	// the same writer.
+// The previous late-binding RegisterMaterializedView API is gone:
+// views are part of the writer's construction, so registration
+// cannot race with Write and "registered after first Write" is
+// not a reachable state.
+type MaterializedViewDef[T any] struct {
+	// Name identifies the view under the target's
+	// <Prefix>/_matview/ subtree. Required. Must be non-empty,
+	// free of '/', and unique across MaterializedViewDef[T] entries
+	// on the same writer.
 	Name string
 
-	// Columns lists the projection's column names in the order
-	// they appear in the S3 path. Same ordering rules as
-	// ProjectionLookupDef.Columns (most-selective first for LIST
-	// pruning).
+	// Columns lists the view's column names in the order they
+	// appear in the S3 path. Same ordering rules as
+	// MaterializedViewLookupDef.Columns (most-selective first for
+	// LIST pruning).
 	Columns []string
 
 	// Of extracts the per-record column values, in Columns order,
@@ -118,8 +126,8 @@ type ProjectionDef[T any] struct {
 //
 // Layout choices are part of the marker S3 key — once published,
 // changing the layout orphans every prior marker. Pick a stable
-// format up front (use BackfillProjection if you ever need to
-// migrate).
+// format up front (use BackfillMaterializedView if you ever need
+// to migrate).
 type Layout struct {
 	// Time is the layout string passed to time.Time.Format for
 	// any column matching a time.Time field on T. Examples:
@@ -131,19 +139,19 @@ type Layout struct {
 	Time string
 }
 
-// validateProjectionDefShape validates Name + Columns. Shared
-// between NewProjectionReader and the write-side validation in
-// NewWriter.
-func validateProjectionDefShape(name string, columns []string) error {
+// validateMatviewDefShape validates Name + Columns. Shared
+// between NewMaterializedViewReader and the write-side validation
+// in NewWriter.
+func validateMatviewDefShape(name string, columns []string) error {
 	if name == "" {
-		return errors.New("projection: Name is required")
+		return errors.New("matview: Name is required")
 	}
 	if strings.Contains(name, "/") {
 		return fmt.Errorf(
-			"projection: Name %q must not contain '/'", name)
+			"matview: Name %q must not contain '/'", name)
 	}
 	if err := validatePartitionKeyParts(columns); err != nil {
-		return fmt.Errorf("projection %q: %w", name, err)
+		return fmt.Errorf("matview %q: %w", name, err)
 	}
 	return nil
 }
@@ -168,7 +176,7 @@ type fieldPlan struct {
 //
 // requireExact rejects t carrying parquet tags not listed in
 // columns. The write side passes false (record types are
-// typically wider than the projection — extra tags ignored). The
+// typically wider than the view — extra tags ignored). The
 // read side passes true (the entry type must match Columns 1:1
 // — an extra tagged field would silently round-trip nothing).
 func buildFieldPlans(
@@ -197,7 +205,7 @@ func buildFieldPlans(
 		info, ok := tagged[col]
 		if !ok {
 			return nil, fmt.Errorf(
-				"projection column %q has no matching parquet-tagged "+
+				"matview column %q has no matching parquet-tagged "+
 					"field on %s (provide a custom %s, or add the tag)",
 				col, t, errCtx)
 		}
@@ -207,7 +215,7 @@ func buildFieldPlans(
 		case info.ftyp == timeType:
 			if layout.Time == "" {
 				return nil, fmt.Errorf(
-					"projection column %q matches a time.Time field on "+
+					"matview column %q matches a time.Time field on "+
 						"%s but Layout.Time is empty (set Layout.Time, "+
 						"or provide a custom %s)", col, t, errCtx)
 			}
@@ -218,7 +226,7 @@ func buildFieldPlans(
 			}
 		default:
 			return nil, fmt.Errorf(
-				"projection column %q matches a parquet-tagged field on "+
+				"matview column %q matches a parquet-tagged field on "+
 					"%s but it is %s, not string or time.Time "+
 					"(provide a custom %s)",
 				col, t, info.ftyp.Kind(), errCtx)
@@ -245,19 +253,19 @@ func buildFieldPlans(
 // of a supported type) runs once at resolve time so per-record
 // work is just a slice alloc + N field-projection calls.
 //
-// Used by NewWriter (to wire the write path) and BackfillProjection
-// (to walk historical data files), so both code paths share one
-// resolution rule. T may carry parquet tags not in columns —
-// those are ignored, since record types are typically wider
-// than the projection.
-func resolveOf[T any](def ProjectionDef[T]) (func(T) ([]string, error), error) {
+// Used by NewWriter (to wire the write path) and
+// BackfillMaterializedView (to walk historical data files), so
+// both code paths share one resolution rule. T may carry parquet
+// tags not in columns — those are ignored, since record types are
+// typically wider than the view.
+func resolveOf[T any](def MaterializedViewDef[T]) (func(T) ([]string, error), error) {
 	if def.Of != nil {
 		return def.Of, nil
 	}
 	plans, err := buildFieldPlans(
 		reflect.TypeFor[T](), def.Columns, def.Layout, false, "Of")
 	if err != nil {
-		return nil, fmt.Errorf("projection %q: %w", def.Name, err)
+		return nil, fmt.Errorf("matview %q: %w", def.Name, err)
 	}
 	return func(rec T) ([]string, error) {
 		v := reflect.ValueOf(rec)
@@ -274,55 +282,55 @@ func resolveOf[T any](def ProjectionDef[T]) (func(T) ([]string, error), error) {
 	}, nil
 }
 
-// projectionBasePath returns the prefix under which markers for
-// the named secondary projection are stored, relative to the
-// store's top-level Prefix. Each projection lives in its own
-// subtree so multiple projections on one store don't collide.
-func projectionBasePath(prefix, name string) string {
-	return prefix + "/_projection/" + name
+// matviewBasePath returns the prefix under which markers for the
+// named materialized view are stored, relative to the store's
+// top-level Prefix. Each view lives in its own subtree so multiple
+// views on one store don't collide.
+func matviewBasePath(prefix, name string) string {
+	return prefix + "/_matview/" + name
 }
 
-// projectionMarkerFilename is the fixed terminal filename appended
+// matviewMarkerFilename is the fixed terminal filename appended
 // to every marker S3 key. The last real path segment is always
 // "col=value"; this constant sits after it so parse code can
 // strip it uniformly and LIST paginators recognise markers.
-const projectionMarkerFilename = "m.proj"
+const matviewMarkerFilename = "m.matview"
 
-// buildProjectionMarkerPath assembles an S3 object key for a
-// projection marker. columns and values are paired by position.
-// Values must pass validateHivePartitionValue before calling;
-// this helper does not revalidate.
-func buildProjectionMarkerPath(
-	projectionPath string, columns, values []string,
+// buildMatviewMarkerPath assembles an S3 object key for a
+// materialized view marker. columns and values are paired by
+// position. Values must pass validateHivePartitionValue before
+// calling; this helper does not revalidate.
+func buildMatviewMarkerPath(
+	matviewPath string, columns, values []string,
 ) string {
 	segs := make([]string, len(columns))
 	for i := range columns {
 		segs[i] = columns[i] + "=" + values[i]
 	}
-	return projectionPath + "/" + strings.Join(segs, "/") +
-		"/" + projectionMarkerFilename
+	return matviewPath + "/" + strings.Join(segs, "/") +
+		"/" + matviewMarkerFilename
 }
 
-// parseProjectionMarkerKey is the inverse of
-// buildProjectionMarkerPath. It extracts the column values from a
-// marker key in the order they appear in columns. Fails if the
-// key doesn't match the shape (wrong prefix, wrong suffix, wrong
-// segment count, wrong column name in a segment).
-func parseProjectionMarkerKey(
-	markerKey, projectionPath string, columns []string,
+// parseMatviewMarkerKey is the inverse of buildMatviewMarkerPath.
+// It extracts the column values from a marker key in the order
+// they appear in columns. Fails if the key doesn't match the
+// shape (wrong prefix, wrong suffix, wrong segment count, wrong
+// column name in a segment).
+func parseMatviewMarkerKey(
+	markerKey, matviewPath string, columns []string,
 ) ([]string, error) {
-	prefix := projectionPath + "/"
+	prefix := matviewPath + "/"
 	if !strings.HasPrefix(markerKey, prefix) {
 		return nil, fmt.Errorf(
-			"marker key %q outside projection path %q",
-			markerKey, projectionPath)
+			"marker key %q outside matview path %q",
+			markerKey, matviewPath)
 	}
 	body := markerKey[len(prefix):]
-	tail := "/" + projectionMarkerFilename
+	tail := "/" + matviewMarkerFilename
 	if !strings.HasSuffix(body, tail) {
 		return nil, fmt.Errorf(
 			"marker key %q missing %q suffix",
-			markerKey, projectionMarkerFilename)
+			markerKey, matviewMarkerFilename)
 	}
 	body = body[:len(body)-len(tail)]
 	segs := strings.Split(body, "/")
@@ -356,23 +364,23 @@ const maxMarkerKeyLen = 1000
 // Validates length match and that values are safe for hive-
 // partition path segments. Enforces the 1000-byte cap.
 func markerPathFromValues(
-	name, projectionPath string, columns []string, values []string,
+	name, matviewPath string, columns []string, values []string,
 ) (string, error) {
 	if len(values) != len(columns) {
 		return "", fmt.Errorf(
-			"projection %q: Of returned %d values, want %d "+
+			"matview %q: Of returned %d values, want %d "+
 				"(one per Column)", name, len(values), len(columns))
 	}
 	for j, col := range columns {
 		if err := validateHivePartitionValue(values[j]); err != nil {
 			return "", fmt.Errorf(
-				"projection %q column %q: %w", name, col, err)
+				"matview %q column %q: %w", name, col, err)
 		}
 	}
-	p := buildProjectionMarkerPath(projectionPath, columns, values)
+	p := buildMatviewMarkerPath(matviewPath, columns, values)
 	if len(p) > maxMarkerKeyLen {
 		return "", fmt.Errorf(
-			"projection %q marker key is %d bytes, exceeds "+
+			"matview %q marker key is %d bytes, exceeds "+
 				"%d (S3 limit is 1024; narrow Columns or shorten "+
 				"values)", name, len(p), maxMarkerKeyLen)
 	}
