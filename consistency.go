@@ -56,11 +56,11 @@ const (
 	ConsistencyAvailable ConsistencyLevel = "available"
 )
 
-// IsKnown reports whether c is one of the named constants. Used
+// isKnown reports whether c is one of the named constants. Used
 // at NewWriter / NewReader to log a warning on typos while
 // letting forward-compatible values (newly-added StorageGRID
 // levels) still pass through.
-func (c ConsistencyLevel) IsKnown() bool {
+func (c ConsistencyLevel) isKnown() bool {
 	switch c {
 	case ConsistencyDefault,
 		ConsistencyAll,
@@ -81,7 +81,7 @@ func (c ConsistencyLevel) IsKnown() bool {
 // adding a new value) still pass through — this is just a typo
 // guard.
 func warnIfUnknownConsistency(c ConsistencyLevel, configKind string) {
-	if c == "" || c.IsKnown() {
+	if c == "" || c.isKnown() {
 		return
 	}
 	slog.Warn(
