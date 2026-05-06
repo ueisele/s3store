@@ -324,3 +324,32 @@ convention and gives meaningful p-values.
 
 For changes that don't touch the paths above, the four-gate
 suite is enough — don't bother running benchmarks.
+
+## Metrics ↔ dashboard sync
+
+Every new OTel instrument registered in `metrics.go` must also
+appear as a panel in `dashboards/s3store.json` in the same PR.
+Drift is silent — a metric that emits but isn't visualized is
+operationally invisible, and metric/dashboard PRs that land
+separately tend never to land at all.
+
+When adding a metric:
+
+1. Register it in `newMetrics` (the `mustCounter` / `mustHist` /
+   `mustHistInt` calls).
+2. If it's a rare-event single-series counter, add it to the
+   `incidents` slice in `prewarm` so `rate()` catches the first
+   non-zero sample.
+3. Add a panel to `dashboards/s3store.json` matching an existing
+   instrument of the same shape — copy the label filters
+   (`cluster`, `stage`, `k8s_namespace_name`, `s3store_bucket`,
+   `s3store_prefix`) verbatim from a sibling panel. Incident
+   counters use the yellow-at-`0.001/s`, red-at-`0.1/s`
+   threshold pattern of `commit_after_timeout` /
+   `encode_buf_dropped`.
+
+The same rule runs in reverse: removing or renaming a metric in
+`metrics.go` requires removing or updating the corresponding
+dashboard panel in the same PR. A panel querying a metric that
+no longer exists shows `No data` and erodes trust in the
+dashboard.
