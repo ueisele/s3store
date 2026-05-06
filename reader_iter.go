@@ -429,11 +429,11 @@ func (s *Reader[T]) downloadAndDecodeIter(
 	// drains FIFO on every receive — see streamState.slotCh for
 	// the fairness reasoning.
 	state := &streamState{
-		parts:  parts,
-		slotCh: make(chan struct{}, bodyCap),
-		m:      s.cfg.Target.metrics,
+		parts:    parts,
+		slotCh:   make(chan struct{}, bodyCap),
+		byteWake: make(chan struct{}, 1),
+		m:        s.cfg.Target.metrics,
 	}
-	state.cond = sync.NewCond(&state.mu)
 
 	// One WaitGroup covers every helper goroutine so the deferred
 	// cleanup below can cancel ctx and then wait for everything to
@@ -454,16 +454,10 @@ func (s *Reader[T]) downloadAndDecodeIter(
 				tolerantOfMissingData, &bytesDownloaded, &filesDownloaded)
 		})
 	}
-	// Wake up any goroutine sleeping on state.cond when ctx
-	// fires — Wait() doesn't observe context cancellation, so
-	// without this broadcast a waiting decoder would stall after
-	// the consumer breaks out of the iter loop.
-	wg.Go(func() {
-		<-ctx.Done()
-		state.mu.Lock()
-		state.cond.Broadcast()
-		state.mu.Unlock()
-	})
+	// No cancel-broadcast helper goroutine: every blocking
+	// primitive in streamState (slotCh acquire, partState.done
+	// wait, byteWake bell) selects on ctx.Done() natively. See
+	// CLAUDE.md "Concurrency invariants".
 
 	// Stage 3: decoder. Channel cap = ReadAheadPartitions so the
 	// pipeline buffers up to N decoded partitions ahead. The
@@ -564,11 +558,20 @@ func (s *Reader[T]) preparePartitions(
 	for i, p := range partitionKeys {
 		files := byPartition[p]
 		sortKeyMetasByKey(files)
-		parts[i] = &partState{
+		ps := &partState{
 			partitionKey: p,
 			files:        files,
 			bodies:       make([][]byte, len(files)),
+			done:         make(chan struct{}),
 		}
+		// Defensive: groupKeysByPartition only emits non-empty
+		// buckets, so len(files)==0 should be unreachable here.
+		// Pre-close for safety so a future caller path that
+		// constructs an empty partition can't deadlock the decoder.
+		if len(files) == 0 {
+			close(ps.done)
+		}
+		parts[i] = ps
 	}
 	return parts
 }
@@ -845,6 +848,17 @@ type downloadJob struct {
 // that runDecoder forwards onto decodedBatch so the emit
 // callback can surface it to partition-emitting public methods.
 //
+// done is a per-partition completion signal. markComplete closes
+// it under streamState.mu when the final file lands;
+// waitForPartition selects on it (plus ctx.Done) so the decoder
+// observes both completion and cancellation natively without a
+// cond.Broadcast helper. Closed exactly once: the
+// completed == len(files) edge is reached at most once because
+// each downloader marks each file at most once and the close
+// happens inside the same critical section that increments
+// completed. Empty-files partitions are pre-closed in
+// preparePartitions (markComplete never fires for them).
+//
 // No per-file errors slice — runDownloader records hard errors on
 // streamState.firstHardErr (single source of truth for the
 // decoder); tolerated NoSuchKey leaves a nil body that
@@ -856,13 +870,14 @@ type partState struct {
 	files        []keyMeta
 	bodies       [][]byte
 	completed    int
+	done         chan struct{}
 }
 
 // streamState carries the shared mutable state of the pipeline:
 // per-partition download counters, the decoded-bytes reservation,
-// the body-slot semaphore, and the cond var used to signal across
-// stages (download completion, decoded-byte release, ctx
-// cancellation).
+// the body-slot semaphore, and the per-partition / byte-budget
+// signal channels used to coordinate across stages (download
+// completion, decoded-byte release).
 //
 // slotCh is the body-slot semaphore, a buffered channel with
 // cap = bodyCap. Senders that find the buffer full park in the
@@ -880,6 +895,18 @@ type partState struct {
 // fairness window. Nil slotCh disables the semaphore (test
 // helper paths only; production always sets cap > 0).
 //
+// byteWake is the byte-budget wake bell, a chan(1) edge-trigger
+// signal. releaseBytes does a non-blocking send; reserveBytes
+// selects on byteWake / ctx.Done in the predicate loop. Coalesces
+// multiple releases between checks (single waiter — the decoder).
+// A stale signal from a previous wait round is harmless: the
+// loop always re-checks the predicate after the receive, and
+// only the decoder itself reserves, so bufferedBytes can only
+// stay the same or decrease while the decoder is parked. Replaces
+// the earlier cond.Wait shape, which couldn't observe ctx and
+// required a sibling broadcast-on-cancel goroutine — see
+// CLAUDE.md "Concurrency invariants" for the rationale.
+//
 // firstHardErr holds the first non-cancellation error a downloader
 // hit (strict NoSuchKey, hard transport). Set once via
 // recordHardErr just before cancel() fires so the decoder can
@@ -895,10 +922,10 @@ type partState struct {
 // contention. Cancel-during-wait is not recorded (shutdown noise).
 type streamState struct {
 	mu            sync.Mutex
-	cond          *sync.Cond
 	parts         []*partState
 	bufferedBytes int64
 	slotCh        chan struct{}
+	byteWake      chan struct{}
 	firstHardErr  error
 	m             *metrics
 
@@ -1004,12 +1031,17 @@ func (s *streamState) releaseBodySlots(n int) {
 }
 
 // markComplete is the downloader-side update: store the body in
-// the partition's slot, increment completed, and wake the decoder
-// if it's waiting on this partition. body is nil for tolerated
-// NoSuchKey, hard errors, and acquire-cancel — the decoder skips
-// nil bodies in decodePartition and surfaces hard errors via
-// streamState.firstHardErr (recorded by runDownloader before its
-// cancel() call).
+// the partition's slot, increment completed, and close the
+// partition's done channel when the final file lands. body is
+// nil for tolerated NoSuchKey, hard errors, and acquire-cancel —
+// the decoder skips nil bodies in decodePartition and surfaces
+// hard errors via streamState.firstHardErr (recorded by
+// runDownloader before its cancel() call).
+//
+// The close happens inside the same critical section that
+// increments completed, so the "completed == len(files)" edge
+// is reached at most once even under concurrent downloaders —
+// each file is marked exactly once by exactly one downloader.
 //
 // Bumps lastProgressNs after the mutex is released so
 // runDeadlockObserver observes a fresh timestamp on every
@@ -1017,11 +1049,15 @@ func (s *streamState) releaseBodySlots(n int) {
 func (s *streamState) markComplete(
 	partIdx, fileIdx int, body []byte,
 ) {
+	p := s.parts[partIdx]
 	s.mu.Lock()
-	s.parts[partIdx].bodies[fileIdx] = body
-	s.parts[partIdx].completed++
-	s.cond.Broadcast()
+	p.bodies[fileIdx] = body
+	p.completed++
+	finalFile := p.completed == len(p.files)
 	s.mu.Unlock()
+	if finalFile {
+		close(p.done)
+	}
 	s.lastProgressNs.Store(time.Now().UnixNano())
 }
 
@@ -1030,23 +1066,30 @@ func (s *streamState) markComplete(
 // true if the partition fully completed; false only when ctx
 // fired before completion.
 //
-// Note the asymmetry with ctx: a partition that finishes after
-// ctx fires still returns true so the decoder can inspect
-// streamState.firstHardErr and surface a hard error that
-// triggered our own cancel(). Without this, a strict-NoSuchKey
-// race could close decodedCh without forwarding the error.
+// Note the asymmetry with ctx: a partition that finishes at
+// roughly the same instant ctx fires still returns true so the
+// decoder can inspect streamState.firstHardErr and surface a
+// hard error that triggered our own cancel(). Without this, a
+// strict-NoSuchKey race could close decodedCh without forwarding
+// the error. The non-blocking precheck on p.done preserves this
+// asymmetry — Go's select among ready cases is uniform-random,
+// so the precheck pattern (same shape as sendBatch) prefers
+// completion over cancellation when both are observable.
 func (s *streamState) waitForPartition(
 	ctx context.Context, pi int,
 ) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for s.parts[pi].completed < len(s.parts[pi].files) {
-		if ctx.Err() != nil {
-			return false
-		}
-		s.cond.Wait()
+	p := s.parts[pi]
+	select {
+	case <-p.done:
+		return true
+	default:
 	}
-	return true
+	select {
+	case <-p.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // reserveBytes accounts uncomp bytes against the cap. Blocks
@@ -1054,6 +1097,14 @@ func (s *streamState) waitForPartition(
 // is non-empty; the empty-buffer escape lets a single oversized
 // partition through (otherwise the pipeline would deadlock).
 // Returns false if ctx is cancelled while waiting.
+//
+// Predicate-loop shape: lock, check, unlock, wait on byteWake or
+// ctx.Done, retry. Stale signals are harmless — only the decoder
+// reserves and the loop always re-checks the predicate after the
+// receive, so bufferedBytes can only stay the same or decrease
+// while parked. The bell coalesces multiple releases between
+// checks because the chan has cap 1 and releaseBytes uses a
+// non-blocking send.
 //
 // Records to metrics.recordIterByteBudgetWait only when the wait
 // fired AND the reservation succeeded — same shape as
@@ -1064,47 +1115,60 @@ func (s *streamState) reserveBytes(
 	if cap <= 0 || uncomp <= 0 {
 		return ctx.Err() == nil
 	}
-	var waitDur time.Duration
-	s.mu.Lock()
-	defer func() {
-		if waitDur > 0 {
-			s.m.recordIterByteBudgetWait(ctx, waitDur)
-		}
-	}()
-	defer s.mu.Unlock()
-
 	var waitStart time.Time
 	waited := false
-	for s.bufferedBytes > 0 && s.bufferedBytes+uncomp > cap {
+	for {
+		s.mu.Lock()
+		// "Fits" is the inverse of the blocking predicate
+		// "buffer non-empty AND would exceed cap": empty buffer
+		// → oversized partition escape; cap not exceeded → just
+		// fits. Either case admits the reservation.
+		fits := s.bufferedBytes <= 0 || s.bufferedBytes+uncomp <= cap
+		if fits {
+			s.bufferedBytes += uncomp
+			s.mu.Unlock()
+			if waited {
+				s.m.recordIterByteBudgetWait(ctx, time.Since(waitStart))
+			}
+			return true
+		}
+		s.mu.Unlock()
 		if ctx.Err() != nil {
-			// Cancel path: do NOT set waitDur — only successful
-			// reservations are recorded.
+			// Cancel path: do not record — only successful
+			// reservations are observed.
 			return false
 		}
 		if !waited {
 			waitStart = time.Now()
 			waited = true
 		}
-		s.cond.Wait()
+		select {
+		case <-s.byteWake:
+		case <-ctx.Done():
+			return false
+		}
 	}
-	if waited {
-		waitDur = time.Since(waitStart)
-	}
-	s.bufferedBytes += uncomp
-	return true
 }
 
 // releaseBytes is called by the yield loop after a partition's
 // records have been forwarded; frees the reservation so the
-// decoder can pick the next partition.
+// decoder can pick the next partition. The non-blocking send on
+// byteWake is the bell-ring: if a previous signal is still
+// pending (decoder hasn't consumed it), this drop is fine
+// because the decoder always re-checks the predicate after a
+// receive — a coalesced wake costs at most one extra trip
+// through the predicate loop.
 func (s *streamState) releaseBytes(uncomp int64) {
 	if uncomp <= 0 {
 		return
 	}
 	s.mu.Lock()
 	s.bufferedBytes -= uncomp
-	s.cond.Broadcast()
 	s.mu.Unlock()
+	select {
+	case s.byteWake <- struct{}{}:
+	default:
+	}
 }
 
 // Stall watchdog defaults. Production downloadAndDecodeIter wires

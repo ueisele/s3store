@@ -2,15 +2,14 @@ package s3store
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 )
 
 func newTestStreamState() *streamState {
-	s := &streamState{}
-	s.cond = sync.NewCond(&s.mu)
-	return s
+	return &streamState{
+		byteWake: make(chan struct{}, 1),
+	}
 }
 
 // withSlotCap attaches a body-slot semaphore of the given
@@ -123,16 +122,15 @@ func TestReserveBytes_CtxCancellation(t *testing.T) {
 		got <- s.reserveBytes(ctx, 500, 1000) // would block
 	}()
 
-	// Give the goroutine a moment to enter Wait().
+	// Give the goroutine a moment to enter the byteWake / ctx.Done
+	// select.
 	time.Sleep(10 * time.Millisecond)
 
-	// Cancellation alone won't wake Wait(); the cond needs a
-	// broadcast. The downloadAndDecodeIter pipeline pairs cancel() with a
-	// watchdog goroutine that broadcasts; here we do it inline.
+	// reserveBytes selects on ctx.Done() natively now — no
+	// broadcast helper needed. (The earlier cond.Wait shape
+	// required a paired broadcast; that whole class of workaround
+	// is gone — see CLAUDE.md "Concurrency invariants".)
 	cancel()
-	s.mu.Lock()
-	s.cond.Broadcast()
-	s.mu.Unlock()
 
 	select {
 	case ok := <-got:
@@ -196,10 +194,10 @@ func TestAcquireBodySlot_NoCap(t *testing.T) {
 }
 
 // TestAcquireBodySlot_CtxCancellation guards that a blocked
-// acquire returns false when ctx is cancelled. Channel-based
-// semaphore observes ctx.Done directly via select, so no watchdog
-// broadcast is needed (in contrast to reserveBytes / waitForPartition,
-// which still rely on the cond and need the watchdog wakeup).
+// acquire returns false when ctx is cancelled. Every blocking
+// primitive in streamState (slotCh acquire, partState.done wait,
+// byteWake bell) selects on ctx.Done() natively, so no broadcast
+// helper is needed — see CLAUDE.md "Concurrency invariants".
 func TestAcquireBodySlot_CtxCancellation(t *testing.T) {
 	s := newTestStreamState().withSlotCap(1)
 	if !s.acquireBodySlot(context.Background()) {
@@ -334,6 +332,7 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 		{
 			files:  make([]keyMeta, 3), // only len matters
 			bodies: make([][]byte, 3),
+			done:   make(chan struct{}),
 		},
 	}
 

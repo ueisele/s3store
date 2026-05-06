@@ -199,6 +199,49 @@ honoured.
   stamped at PUT time on new keys, which is monotonic enough
   for that use case on every supported backend.
 
+# Concurrency invariants
+
+These bound how the iter pipeline (and any future multi-goroutine
+pipeline) must coordinate. Properties recent regressions taught
+us — preserve them on every refactor.
+
+- **No `cond.Broadcast` with per-actor predicates.** When N
+  actors wait on a condition that depends on each actor's
+  individual progress (e.g., "did *my* slot land"), use a
+  buffered channel as a FIFO semaphore — Go's runtime drains a
+  channel's sendq strictly FIFO on every receive.
+  `streamState.slotCh` in `reader_iter.go` is the canonical
+  shape. The earlier cond+counter design allowed scheduler-
+  biased starvation: `Broadcast` wakes everyone, all waiters
+  race for the mutex, and the scheduler can consistently pick
+  the same winner, leaving one specific actor's predicate
+  permanently unsatisfied and deadlocking the pipeline. This
+  is not theoretical — it was reproduced deterministically on
+  a 1417-partition cost read (commit `da75ca9`). `sync.Cond` is
+  acceptable only when there is exactly one waiter AND the
+  predicate is global (not per-actor) AND a chan-based wake
+  bell would be measurably worse; in practice that combination
+  is rare enough that channels should be the default.
+
+- **Every blocking primitive must observe `ctx.Done()`
+  natively.** A primitive that requires a sibling broadcast-on-
+  cancel goroutine to unblock is a code smell — the workaround
+  adds goroutine count, lifecycle complexity, and a separate
+  synchronisation site that can drift out of sync with the
+  primitive it protects. Channel-based primitives (`<-ch`,
+  buffered semaphores, wake bells) `select` on `ctx.Done()` for
+  free. Refactors must not reintroduce primitives that need a
+  cancel-broadcast helper goroutine.
+
+- **Stall watchdogs are observers, never cancellers.** The
+  iter pipeline runs `runDeadlockObserver` to surface stalls
+  via `slog.Warn` + `s3store.read.iter.stall.count` without
+  aborting. Auto-cancelling on stall would mask the goroutine
+  state needed for SIGQUIT diagnosis and risk false-positive
+  aborts of legitimately slow consumers. Hard ceilings belong
+  at the call site via `ctx.WithTimeout`. Refactors must not
+  promote the observer into a circuit breaker.
+
 # Verification
 
 Before considering a change done, run all four:
