@@ -2321,6 +2321,167 @@ from this library's outer `retry()` retries), attach a smithy
 middleware to your `*s3.Client` directly — the wrapper-level
 metrics above sit one layer outside that.
 
+## Tuning the Go runtime (`GOMEMLIMIT` / `GOGC`)
+
+s3store is allocation-heavy on the read side: `BenchmarkDecode` in
+[`parquet_bench_test.go`](parquet_bench_test.go) shows ~32× the
+input file size in bytes allocated per decode (a 20 MiB parquet
+body produces ~620 MB of garbage during deserialisation), with
+~8 allocations per decoded record. Most of that lives inside
+`parquet-go` and isn't reachable from this library; the writer
+pool we ship cuts encode-side allocations ~70 % but doesn't move
+the decode floor.
+
+For a service that GCs frequently — visible as long p99 latency
+spikes correlated with heap growth, or `runtime/metrics`
+`/cpu/classes/gc/total:cpu-seconds` above 10 % of total CPU — the
+two highest-leverage knobs are `GOMEMLIMIT` and `GOGC`. They are
+process-level Go-runtime settings, not s3store config; we
+document them here because the library's allocation profile is
+the reason they matter.
+
+### What they do
+
+**`GOMEMLIMIT` (Go 1.19+)** — soft cap on heap. As live heap
+approaches it, GC runs more aggressively to stay under. Soft
+means Go can briefly exceed it; the cgroup OOM-killer remains
+the hard ceiling. Default is effectively unlimited
+(`math.MaxInt64`), so on a memory-constrained pod Go is
+unaware of the cgroup limit and can't pace GC against it.
+
+**`GOGC` (Go 1.5+)** — relative trigger. `GOGC=100` (default)
+means GC when heap is 2× live. `GOGC=200` means 3× live. Higher
+values reduce GC frequency at the cost of more memory; lower
+values reduce memory at the cost of more GC. With `GOMEMLIMIT`
+set, the actual trigger becomes `min(GOGC ratio, GOMEMLIMIT)`,
+so you can run with higher `GOGC` and rely on `GOMEMLIMIT` to
+prevent runaway.
+
+> Go does NOT auto-detect cgroup memory limits the way
+> Go 1.25+ auto-detects CPU quota for `GOMAXPROCS`. You must set
+> `GOMEMLIMIT` explicitly. If you want auto-detection,
+> [`KimMachineGun/automemlimit`](https://github.com/KimMachineGun/automemlimit)
+> reads the cgroup limit at startup — same shape as
+> [`automaxprocs`](https://github.com/uber-go/automaxprocs) but
+> for memory. Worth checking against current Go release notes
+> for your version before assuming the situation hasn't changed.
+
+### Suggested starting values
+
+Set `GOMEMLIMIT` to ~80 % of the pod memory limit. The 20 %
+headroom covers non-heap memory (goroutine stacks, mmap, file
+handles, AWS-SDK connection pool, sidecar state if any).
+
+| Pod memory limit | `GOMEMLIMIT` | `GOGC`  |
+|------------------|--------------|---------|
+| `1Gi`            | `800MiB`     | 100–200 |
+| `2Gi`            | `1600MiB`    | 200     |
+| `4Gi`            | `3200MiB`    | 200–400 |
+| `8Gi`            | `6400MiB`    | 400     |
+
+Lower `GOGC` (more frequent GC) for tight memory; higher for
+spacious. Tune from this baseline against measured GC CPU and
+p99 latency under your real workload.
+
+### How to set them
+
+In Kubernetes, both values are environment variables:
+
+```yaml
+spec:
+  containers:
+  - name: my-service
+    resources:
+      limits:
+        memory: "2Gi"
+    env:
+    - name: GOMEMLIMIT
+      value: "1600MiB"
+    - name: GOGC
+      value: "200"
+```
+
+Or programmatically at startup (use environment variables
+preferentially — they're tunable without rebuild):
+
+```go
+import "runtime/debug"
+
+func main() {
+    debug.SetMemoryLimit(1600 * 1024 * 1024)
+    debug.SetGCPercent(200)
+    // ...
+}
+```
+
+### Verifying the settings work
+
+Three signals to chart:
+
+1. **GC CPU fraction.** What fraction of CPU is spent in GC? Goal:
+   below 5 %; above 10 % means GC is stealing real work. With Go's
+   `runtime/metrics` package wired into your meter:
+
+   ```promql
+   rate(go_cpu_classes_gc_total_cpu_seconds_total[5m])
+     / rate(go_cpu_classes_total_cpu_seconds_total[5m])
+   ```
+
+2. **p99 latency on read paths.** GC pauses surface here. Sub-
+   millisecond pauses are the norm on Go 1.20+ when `GOMEMLIMIT`
+   is sized correctly; visible spikes that correlate with heap
+   growth indicate insufficient headroom.
+
+3. **Heap headroom.** `go_memory_classes_heap_objects_bytes`
+   should sit at 60–80 % of `GOMEMLIMIT` in steady state. If it
+   chronically pegs the limit, raise `GOMEMLIMIT` (and the pod
+   limit if needed); if it stays well under, you can be more
+   generous with `GOGC`.
+
+### Tuning loop
+
+1. Set `GOMEMLIMIT` to 80 % of pod memory limit. Always.
+2. Start with `GOGC=200`.
+3. Run under representative load. Watch GC CPU fraction and p99.
+4. **GC CPU > 10 %**: bump `GOGC` upward (less frequent GC). If
+   heap usage stays well below `GOMEMLIMIT`, also raise
+   `GOMEMLIMIT` toward 90 %.
+5. **OOM kills**: lower `GOGC`, lower `GOMEMLIMIT`. The cgroup
+   limit should never be hit.
+6. **p99 latency spiky**: that's GC pause time. Try
+   `GOGC=off` + `GOMEMLIMIT`-only — eliminates the
+   ratio-triggered GC, only memory-pressure-triggered. Risky if
+   your workload genuinely needs the ratio trigger; verify heap
+   doesn't grow unbounded under sustained load before relying on
+   this in production.
+
+### Gotchas
+
+- **Don't set `GOMEMLIMIT` ≥ cgroup limit.** Defeats the purpose;
+  the OOM-killer hits before GC reacts.
+- **Don't disable GC entirely with `GOGC=off`** unless
+  `GOMEMLIMIT` is also set. Without either trigger, the heap
+  grows until OOM.
+- **Sidecars consume the cgroup memory budget.** envoy,
+  fluent-bit, similar agents take their share. The pod limit
+  covers them; your service's `GOMEMLIMIT` should account for
+  sidecar usage, not assume the full pod limit.
+- **`GOMEMLIMIT` is per-process.** Multiple Go binaries in one
+  pod each get their own limit; the sum should still fit the
+  cgroup.
+
+### How this composes with the writer pool
+
+The writer pool (commit `214052c` and follow-ups) reduces
+allocation count and bytes per *encode* by ~50–70 %. Runtime
+tuning reduces *GC pressure for the same allocation rate*. They
+compose well: the pool produces less garbage per Write, and
+`GOMEMLIMIT` / `GOGC` let the runtime hold more between
+collections. For a write-heavy workload the pool is the bigger
+short-term lever; for a read-heavy workload, runtime tuning is
+— decode-side allocations live mostly inside `parquet-go` and
+aren't reachable from outside.
+
 ## Migration from earlier versions
 
 Breaking changes in the single-package collapse:
