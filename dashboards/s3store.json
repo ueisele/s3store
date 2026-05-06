@@ -1048,6 +1048,24 @@
       ],
       "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never"}, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}}, "overrides": []},
       "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 9005,
+      "type": "timeseries",
+      "title": "Write encode-buffer pool drop rate",
+      "description": "Pooled parquet-encode bytes.Buffer instances dropped on Put because their grown capacity exceeded WriterConfig.EncodeBufPoolMaxBytes (default 48 MiB). A non-zero rate means the cap is undersized for the workload's typical produced parquet size: every large write then pays grow-from-zero plus copy-out, with no pool-reuse benefit (and at sizes above the cap, pooled encode is measurably worse than no-pool — see BenchmarkEncode_Pooled). Sustained > 0 calls for raising EncodeBufPoolMaxBytes to cover the workload's peak produced parquet size.",
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 207},
+      "targets": [
+        {
+          "expr": "sum(rate(s3store_write_encode_buf_dropped_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval]))",
+          "interval": "1m",
+          "legendFormat": "buf-dropped/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 1, "showPoints": "never"}, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
     }
   ],
   "refresh": "30s",
