@@ -527,8 +527,7 @@ func (s *Writer[T]) writeWithKeyResolved(
 		populateInsertedAt(records, s.insertedAtFieldIndex, writeStartTime)
 	}
 
-	parquetBytes, err := encodeParquet(
-		records, s.compressionCodec)
+	parquetBytes, err := s.encodeParquet(records)
 	if err != nil {
 		return nil, 0, fmt.Errorf("parquet encode: %w", err)
 	}
@@ -933,9 +932,11 @@ func populateInsertedAt[T any](recs []T, fieldIdx []int, t time.Time) {
 	}
 }
 
-// encodeParquet writes records to a parquet byte stream using
-// the given compression codec (never nil — Store.New resolves a
-// snappy default).
+// encodeParquet writes records to a parquet byte stream using the
+// given compression codec, with no pooling. Used by tests that
+// construct parquet bytes outside of any Writer (varying codec or
+// type per call). The production write path goes through the
+// pooled Writer.encodeParquet method below.
 func encodeParquet[T any](
 	records []T,
 	codec compress.Codec,
@@ -950,4 +951,49 @@ func encodeParquet[T any](
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// encodeParquet writes records to a parquet byte stream using
+// the Writer's resolved compression codec.
+//
+// Both the *parquet.GenericWriter[T] and the *bytes.Buffer are
+// pooled across calls so a worker writing many files reuses the
+// writer's internal column buffers / dictionary builders /
+// compression scratch instead of allocating fresh per Write.
+//
+// Lifetime: the returned []byte is a copy of buf.Bytes(); the
+// pooled buffer is reset on next Get, so nothing the caller holds
+// points into pooled state. Codec is constant per Writer (set at
+// NewWriter), so a pooled writer's compression config stays valid
+// across reuses.
+func (s *Writer[T]) encodeParquet(records []T) ([]byte, error) {
+	buf, _ := s.encodeBufPool.Get().(*bytes.Buffer)
+	if buf == nil {
+		buf = &bytes.Buffer{}
+	} else {
+		buf.Reset()
+	}
+
+	pw, _ := s.pqWriterPool.Get().(*parquet.GenericWriter[T])
+	if pw == nil {
+		pw = parquet.NewGenericWriter[T](
+			buf, parquet.Compression(s.compressionCodec))
+	} else {
+		pw.Reset(buf)
+	}
+
+	if _, err := pw.Write(records); err != nil {
+		return nil, err
+	}
+	if err := pw.Close(); err != nil {
+		return nil, err
+	}
+
+	out := append([]byte(nil), buf.Bytes()...)
+
+	s.pqWriterPool.Put(pw)
+	if buf.Cap() <= maxPooledEncodeBufCap {
+		s.encodeBufPool.Put(buf)
+	}
+	return out, nil
 }

@@ -1,6 +1,10 @@
 package s3store
 
-import "github.com/parquet-go/parquet-go/compress"
+import (
+	"sync"
+
+	"github.com/parquet-go/parquet-go/compress"
+)
 
 // WriterConfig is the narrower Config form for constructing a
 // Writer directly (without a Reader). Holds the S3-wiring bundle
@@ -74,7 +78,29 @@ type Writer[T any] struct {
 	// the write hot path doesn't re-parse the type. nil when unset
 	// — populateInsertedAt is then skipped entirely.
 	insertedAtFieldIndex []int
+
+	// pqWriterPool holds *parquet.GenericWriter[T] across encode
+	// calls. Reset(buf) before reuse rebinds the writer to a fresh
+	// output buffer; the codec is fixed at first construction
+	// (compressionCodec is constant per Writer). Output bytes are
+	// copied out before Put, so nothing pinned by the caller points
+	// into pooled state.
+	pqWriterPool sync.Pool
+
+	// encodeBufPool holds *bytes.Buffer used as the parquet writer's
+	// output target. Reset() before reuse; oversized buffers
+	// (Cap above maxPooledEncodeBufCap) are dropped on Put so a
+	// single huge Write doesn't balloon the pool permanently.
+	encodeBufPool sync.Pool
 }
+
+// maxPooledEncodeBufCap is the upper bound on a *bytes.Buffer
+// returned to encodeBufPool. Buffers grown past this on a single
+// encode are dropped so the pool's steady-state footprint tracks
+// typical write sizes, not the worst-case batch ever observed.
+// 16 MiB comfortably covers a snappy-compressed parquet of ~50k
+// medium-width rows.
+const maxPooledEncodeBufCap = 16 << 20
 
 // Target returns the untyped S3Target this Writer is bound to.
 // Use when constructing read-only tools
