@@ -694,7 +694,17 @@ func (t S3Target) get(
 			return err
 		}
 		defer resp.Body.Close()
-		data, err = io.ReadAll(resp.Body)
+		// Pre-size from ContentLength when available so we skip
+		// io.ReadAll's grow-and-copy doubling (~14 reallocs for a 5MB
+		// body). S3 GetObject returns a reliable ContentLength for
+		// complete-object reads. Fall back to io.ReadAll only when
+		// the header is missing or unparsed (<= 0).
+		if resp.ContentLength != nil && *resp.ContentLength > 0 {
+			data = make([]byte, *resp.ContentLength)
+			_, err = io.ReadFull(resp.Body, data)
+		} else {
+			data, err = io.ReadAll(resp.Body)
+		}
 		return err
 	})
 	if err == nil {
