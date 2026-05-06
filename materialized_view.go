@@ -167,6 +167,74 @@ type fieldPlan struct {
 	timeLayout string
 }
 
+// parquetField pairs a parquet tag name with the struct field
+// it labels. Returned by parquetFields in declaration order so
+// callers can build per-field projection / binder plans on top
+// of one shared tag-walking rule.
+type parquetField struct {
+	// Name is the tag value with options stripped (everything
+	// before the first ',').
+	Name string
+
+	// Field is the underlying struct field. Index/Type/Tag are
+	// the fields callers most commonly read.
+	Field reflect.StructField
+}
+
+// parquetFields returns one entry per exported parquet-tagged
+// field on t, in field-declaration order. The matview projector /
+// binder builders share this so the parquet tag convention is
+// interpreted in exactly one place.
+//
+// Tag handling matches the project's convention everywhere:
+//
+//   - Tag name is everything before the first ',' — options
+//     (e.g. `parquet:"ts,timestamp(microsecond)"`) are stripped.
+//   - Empty tag names and "-" are treated as "skip".
+//   - Untagged exported fields are skipped silently.
+//   - Unexported fields are skipped silently.
+//
+// Errors:
+//
+//   - t is not a struct.
+//   - Two fields share the same parquet tag name. parquet-go's
+//     encoder would silently last-wins one of them; surfacing it
+//     as a config error here protects every downstream caller.
+func parquetFields(t reflect.Type) ([]parquetField, error) {
+	if t == nil {
+		return nil, fmt.Errorf("parquet fields: nil type")
+	}
+	if t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf(
+			"parquet fields: type %s must be a struct, got %s",
+			t, t.Kind())
+	}
+	var out []parquetField
+	seen := map[string]string{}
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag, ok := f.Tag.Lookup("parquet")
+		if !ok {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		if prev, dup := seen[name]; dup {
+			return nil, fmt.Errorf(
+				"duplicate parquet tag %q on fields %q and %q",
+				name, prev, f.Name)
+		}
+		seen[name] = f.Name
+		out = append(out, parquetField{Name: name, Field: f})
+	}
+	return out, nil
+}
+
 // buildFieldPlans walks t's parquet tags and returns one
 // fieldPlan per column. Used by both the write projector and
 // the read binder so the "string field projects directly,
@@ -183,7 +251,7 @@ func buildFieldPlans(
 	t reflect.Type, columns []string, layout Layout,
 	requireExact bool, errCtx string,
 ) ([]fieldPlan, error) {
-	fields, err := ParquetFields(t)
+	fields, err := parquetFields(t)
 	if err != nil {
 		return nil, err
 	}
