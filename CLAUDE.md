@@ -277,3 +277,50 @@ plain `go test ./...` quietly omits them.
 `golangci-lint run` covers gofmt, govet, and the project's
 configured linters in one shot. Pre-existing lint issues count —
 fix them in the same PR rather than carrying them forward.
+
+## Benchmarks (perf-sensitive changes only)
+
+The four-gate suite above does not run benchmarks — they are not
+a hard gate, intentionally. Bench numbers are noisy without
+benchstat, slow at the size tiers we care about (~100s for
+`-count=3 -benchtime=2s`), and most changes don't touch
+perf-sensitive paths. Making it a global gate would burn
+contributor time on every PR for value most PRs don't deliver.
+
+But benchmarks ARE the right verification gate for changes that
+touch:
+
+- `encodeParquet` (the `Writer[T]` method) or its pool
+  (`pqWriterPool`, `encodeBufPool`).
+- `EncodeBufPoolMaxBytes` defaults, the cap-discard logic, or
+  the surrounding `bytes.Buffer` reset/copy semantics.
+- `decodeParquet` or any caller's per-file allocation pattern
+  in `decodePartition`.
+- `S3Target.get`'s body-buffer allocation strategy.
+
+The 16 MiB → 48 MiB cap regression caught in
+[`parquet_bench_test.go`](parquet_bench_test.go) — pooled encode
+silently went **+27% B/op vs no-pool** at sizes above the cap —
+is the kind of issue only benchmarks surface, and it would have
+shipped if the writer pool had been merged without bench data.
+
+For these changes, capture before/after numbers via benchstat and
+attach them to the PR description:
+
+```sh
+git stash                                     # save WIP
+go test -bench=. -benchmem -count=10 -cpu=1 \
+  -run=^$ ./... > /tmp/bench-base.txt
+git stash pop                                 # apply WIP
+go test -bench=. -benchmem -count=10 -cpu=1 \
+  -run=^$ ./... > /tmp/bench-pr.txt
+benchstat /tmp/bench-base.txt /tmp/bench-pr.txt
+```
+
+`-count=10` over `-count=3` because benchstat's confidence
+intervals widen sharply on small samples; 10 samples per
+config matches the upstream Go performance-tracking
+convention and gives meaningful p-values.
+
+For changes that don't touch the paths above, the four-gate
+suite is enough — don't bother running benchmarks.

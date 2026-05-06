@@ -2445,6 +2445,47 @@ code under AGPLv3; it's a drop-in for the testcontainers MinIO
 module. `-count=1` is the Go idiom for "bypass the test cache"
 — without it, unchanged packages return cached results.
 
+### Benchmarks
+
+```
+go test -bench=. -benchmem -benchtime=2s -run=^$ -count=3 \
+  -cpu=1 ./...
+```
+
+Three benches in [`parquet_bench_test.go`](parquet_bench_test.go),
+covering encode (no-pool baseline + pooled steady-state) and decode
+across five size tiers (`few_KB` / `100KB` / `1MB` / `10MB` /
+`20MB`) that match a typical workload distribution.
+
+`go test ./...` and the integration-test gate both *compile*
+benchmark functions but never *execute* them — Go's runner only
+runs `Benchmark*` when `-bench=<pattern>` is passed. Benchmarks
+are a measurement tool you invoke deliberately, not a CI gate.
+
+A few notes for fair runs:
+
+- `-cpu=1` keeps `sync.Pool` measurements honest. The pool is
+  per-P internally; at the default GOMAXPROCS, a fixed `b.N`
+  divides across multiple P slots and obscures the pool-empty
+  vs pool-warm comparison the benches are designed to surface.
+- `-run=^$` skips test functions so the binary only runs
+  benchmarks (saves ~1s of test setup per package).
+- `-count=3` gives variance signal. For two-version comparisons,
+  feed the output to [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
+
+  ```
+  go test -bench=. -benchmem -count=10 -cpu=1 ./... | tee bench-new.txt
+  benchstat bench-old.txt bench-new.txt
+  ```
+
+  Single-sample comparisons can be misleading on noisy hardware.
+- The `Encode_Pooled` allocations-per-op number is the most
+  sensitive signal. A regression there indicates the pool is
+  churning — most likely the `EncodeBufPoolMaxBytes` cap is
+  below the workload's typical produced parquet size; check the
+  `s3store.write.encode_buf_dropped` counter on a running
+  process to confirm.
+
 ## Releasing
 
 Versions are git tags following SemVer. The README badges auto-update
