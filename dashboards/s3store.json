@@ -191,7 +191,7 @@
     {
       "id": 2002,
       "type": "timeseries",
-      "title": "Method duration P95 by method",
+      "title": "Method duration P95 / P99 by method",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
       "targets": [
@@ -200,6 +200,12 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "B"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -268,8 +274,8 @@
     {
       "id": 3001,
       "type": "timeseries",
-      "title": "Records / Write call (P50 / P95)",
-      "description": "Distribution of records committed per Write or WriteWithKey call.",
+      "title": "Records / Write call (P50 / P95 / P99 / P100)",
+      "description": "Distribution of records committed per Write or WriteWithKey call. P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket, not the literal max.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
       "targets": [
@@ -284,6 +290,18 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_method) (rate(s3store_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_method}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -292,8 +310,8 @@
     {
       "id": 3002,
       "type": "timeseries",
-      "title": "Partitions / Write call (P50 / P95)",
-      "description": "Distinct partition keys touched by Write (always 1 for WriteWithKey).",
+      "title": "Partitions / Write call (P50 / P95 / P99 / P100)",
+      "description": "Distinct partition keys touched by Write (always 1 for WriteWithKey). P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket, not the literal max.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
       "targets": [
@@ -308,6 +326,18 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_write_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_method) (rate(s3store_write_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_method}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -316,8 +346,8 @@
     {
       "id": 3003,
       "type": "timeseries",
-      "title": "Bytes / Write call (P50 / P95)",
-      "description": "Total parquet body bytes uploaded per Write or WriteWithKey call.",
+      "title": "Bytes / Write call (P50 / P95 / P99 / P100)",
+      "description": "Total parquet body bytes uploaded per Write or WriteWithKey call. P100 is histogram_quantile(1.0, ...) — the upper bound of the highest non-empty bucket, not the literal max; with byteBuckets boundaries 1KB, 4KB, 16KB, 64KB, 256KB, 1MB, 4MB, 16MB, 32MB, 128MB, 1GB this rounds the actual peak up to the next boundary, which is the right semantic for sizing WriterConfig.EncodeBufPoolMaxBytes against observed peak.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 57},
       "targets": [
@@ -332,6 +362,18 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_method) (rate(s3store_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_method}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -373,8 +415,8 @@
     {
       "id": 4001,
       "type": "timeseries",
-      "title": "Records / read call (P50 / P95)",
-      "description": "Records returned per read-side method call. Covers every read entry point that records s3store.read.records: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / Poll / PollRecords / Lookup / LookupCommit / BackfillProjection.",
+      "title": "Records / read call (P50 / P95 / P99 / P100)",
+      "description": "Records returned per read-side method call. Covers every read entry point that records s3store.read.records: Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / Poll / PollRecords / Lookup / LookupCommit / BackfillProjection. P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 66},
       "targets": [
@@ -389,6 +431,18 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_read_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_method) (rate(s3store_read_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_method}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -397,7 +451,8 @@
     {
       "id": 4002,
       "type": "timeseries",
-      "title": "Bytes / read call (P50 / P95)",
+      "title": "Bytes / read call (P50 / P95 / P99 / P100)",
+      "description": "Total parquet body bytes downloaded per read-side method call. P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket, not the literal max.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 66},
       "targets": [
@@ -412,6 +467,18 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_read_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_method) (rate(s3store_read_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_method}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -420,7 +487,8 @@
     {
       "id": 4003,
       "type": "timeseries",
-      "title": "Files materialised / read call (P50 / P95)",
+      "title": "Files materialised / read call (P50 / P95 / P99 / P100)",
+      "description": "Data files materialised per read-side method call. P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 74},
       "targets": [
@@ -435,6 +503,18 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_read_files_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_method) (rate(s3store_read_files_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_method}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -508,8 +588,8 @@
     {
       "id": 4007,
       "type": "timeseries",
-      "title": "Partitions / read call (P50 / P95)",
-      "description": "Distinct Hive partitions touched per read-side method call. Recorded by every read entry point that funnels through the iter pipeline (Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Poll / Lookup / LookupCommit / BackfillProjection do not contribute. Pre-dedup count: this is the partition cardinality of the LIST result, before per-partition record dedup runs.",
+      "title": "Partitions / read call (P50 / P95 / P99 / P100)",
+      "description": "Distinct Hive partitions touched per read-side method call. Recorded by every read entry point that funnels through the iter pipeline (Read / ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter / PollRecords). Poll / Lookup / LookupCommit / BackfillProjection do not contribute. Pre-dedup count: this is the partition cardinality of the LIST result, before per-partition record dedup runs. P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 90},
       "targets": [
@@ -524,6 +604,18 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_method}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_method) (rate(s3store_read_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_method}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_method) (rate(s3store_read_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_method}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -558,7 +650,7 @@
     {
       "id": 5002,
       "type": "timeseries",
-      "title": "S3 request duration P95 by operation",
+      "title": "S3 request duration P95 / P99 by operation",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 99},
       "targets": [
@@ -567,6 +659,12 @@
           "interval": "1m",
           "legendFormat": "P95 {{s3store_operation}}",
           "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, s3store_operation) (rate(s3store_s3_request_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99 {{s3store_operation}}",
+          "refId": "B"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -610,7 +708,8 @@
     {
       "id": 5005,
       "type": "timeseries",
-      "title": "PUT request body size P95 / P99",
+      "title": "PUT request body size P95 / P99 / P100",
+      "description": "Body size of S3 PUT calls. P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 115},
       "targets": [
@@ -625,6 +724,12 @@
           "interval": "1m",
           "legendFormat": "P99 {{s3store_operation}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_operation) (rate(s3store_s3_request_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_operation}}",
+          "refId": "C"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -633,7 +738,8 @@
     {
       "id": 5006,
       "type": "timeseries",
-      "title": "GET response body size P95 / P99",
+      "title": "GET response body size P95 / P99 / P100",
+      "description": "Body size of S3 GET responses. P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 115},
       "targets": [
@@ -648,6 +754,12 @@
           "interval": "1m",
           "legendFormat": "P99 {{s3store_operation}}",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le, s3store_operation) (rate(s3store_s3_response_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100 {{s3store_operation}}",
+          "refId": "C"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -784,8 +896,8 @@
     {
       "id": 7001,
       "type": "timeseries",
-      "title": "Items per fan-out call (P50 / P95)",
-      "description": "Distribution of items dispatched per fan-out call (s3store internal concurrency primitive).",
+      "title": "Items per fan-out call (P50 / P95 / P99 / P100)",
+      "description": "Distribution of items dispatched per fan-out call (s3store internal concurrency primitive). P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 149},
       "targets": [
@@ -800,6 +912,18 @@
           "interval": "1m",
           "legendFormat": "P95",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(s3store_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le) (rate(s3store_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
@@ -808,8 +932,8 @@
     {
       "id": 7002,
       "type": "timeseries",
-      "title": "Workers per fan-out call (P50 / P95)",
-      "description": "Worker goroutines actually spawned per fan-out call (capped at min(concurrency, items)).",
+      "title": "Workers per fan-out call (P50 / P95 / P99 / P100)",
+      "description": "Worker goroutines actually spawned per fan-out call (capped at min(concurrency, items)). P100 is histogram_quantile(1.0, ...) — upper bound of the highest non-empty bucket.",
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 149},
       "targets": [
@@ -824,6 +948,18 @@
           "interval": "1m",
           "legendFormat": "P95",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(s3store_fanout_workers_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P99",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(1.0, sum by (le) (rate(s3store_fanout_workers_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3store_bucket=~\"$bucket\", s3store_prefix=~\"$prefix\"}[$__rate_interval])))",
+          "interval": "1m",
+          "legendFormat": "P100",
+          "refId": "D"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
